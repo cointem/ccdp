@@ -1,0 +1,744 @@
+// Package mcp implements a Model Context Protocol (MCP) client over stdio,
+// mirroring the MCP support in Claude Code and Codex. Each configured server is
+// a child process speaking newline-delimited JSON-RPC 2.0 on stdin/stdout.
+//
+// The Manager owns the servers; on startup it runs the initialize handshake and
+// tools/list discovery, then registers every advertised tool into the agent's
+// tool registry under the "mcp" scope so the model can call them like any
+// built-in tool.
+package mcp
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ServerConfig describes how to launch one MCP server (config.json
+// "mcp_servers": { "name": { "command": "...", "args": [...], "env": {...} } }).
+// With transport "sse", BaseURL points at an SSE/Streamable-HTTP endpoint and
+// command is ignored.
+type ServerConfig struct {
+	Command   string            `json:"command"`
+	Args      []string          `json:"args"`
+	Env       map[string]string `json:"env"`
+	Transport string            `json:"transport"` // "" | "stdio" (default) | "sse"
+	BaseURL   string            `json:"base_url"`  // required when transport = sse
+}
+
+// ToolDef is the schema of one tool advertised by an MCP server (tools/list).
+type ToolDef struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	InputSchema map[string]any `json:"inputSchema"`
+}
+
+// RPCError is a JSON-RPC 2.0 error object.
+type RPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *RPCError) Error() string { return fmt.Sprintf("mcp error %d: %s", e.Code, e.Message) }
+
+// rpcMessage models one JSON-RPC 2.0 frame on the wire.
+type rpcMessage struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *RPCError       `json:"error,omitempty"`
+}
+
+// ProtocolVersion is the MCP protocol version we advertise.
+const ProtocolVersion = "2024-11-05"
+
+// startupTimeout bounds the initialize + tools/list handshake per server.
+const startupTimeout = 10 * time.Second
+
+// Client is one MCP server connection over stdio.
+type Client struct {
+	name string
+	cfg  ServerConfig
+
+	mu      sync.Mutex
+	nextID  int
+	pending map[int]chan json.RawMessage
+	writeMu sync.Mutex // serializes stdin writes
+
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	closed chan struct{} // closed when the process exits or Close is called
+
+	// SSE transport state.
+	sseClient    *http.Client
+	messagesURL  string
+	sseTransport bool
+
+	tools []ToolDef // cached after a successful tools/list
+
+	// onChange fires after the tool list changes at runtime
+	// (notifications/tools/list_changed), so the manager can re-register.
+	onChange func()
+}
+
+// SetChangeListener registers a callback invoked when the server's tool list
+// changes at runtime.
+func (c *Client) SetChangeListener(fn func()) {
+	c.mu.Lock()
+	c.onChange = fn
+	c.mu.Unlock()
+}
+
+// NewClient creates an unstarted client.
+func NewClient(name string, cfg ServerConfig) *Client {
+	return &Client{
+		name:    name,
+		cfg:     cfg,
+		pending: map[int]chan json.RawMessage{},
+		closed:  make(chan struct{}),
+	}
+}
+
+// Name returns the server name.
+func (c *Client) Name() string { return c.name }
+
+// Tools returns the tools advertised by the server (empty until Start).
+func (c *Client) Tools() []ToolDef {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]ToolDef, len(c.tools))
+	copy(out, c.tools)
+	return out
+}
+
+// Start launches the server (stdio process or SSE endpoint) and performs the
+// MCP handshake: initialize → notifications/initialized → tools/list.
+func (c *Client) Start(ctx context.Context) error {
+	if strings.EqualFold(c.cfg.Transport, "sse") {
+		return c.startSSE(ctx)
+	}
+	cmd := exec.Command(c.cfg.Command, c.cfg.Args...)
+	cmd.Env = append(os.Environ(), envSlice(c.cfg.Env)...)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("mcp %s: stdin: %w", c.name, err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("mcp %s: stdout: %w", c.name, err)
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("mcp %s: start %s: %w", c.name, c.cfg.Command, err)
+	}
+	c.cmd = cmd
+	c.stdin = stdin
+
+	go c.readLoop(stdout)
+
+	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+
+	if err := c.request(ctx, "initialize", map[string]any{
+		"protocolVersion": ProtocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "ccdp", "version": "0.2.0"},
+	}); err != nil {
+		_ = c.Close()
+		return fmt.Errorf("mcp %s: initialize: %w", c.name, err)
+	}
+	if err := c.notify("notifications/initialized", map[string]any{}); err != nil {
+		_ = c.Close()
+		return fmt.Errorf("mcp %s: initialized: %w", c.name, err)
+	}
+
+	var list struct {
+		Tools []ToolDef `json:"tools"`
+	}
+	if err := c.requestJSON(ctx, "tools/list", map[string]any{}, &list); err != nil {
+		_ = c.Close()
+		return fmt.Errorf("mcp %s: tools/list: %w", c.name, err)
+	}
+	c.mu.Lock()
+	c.tools = list.Tools
+	c.mu.Unlock()
+	return nil
+}
+
+// callTimeout bounds a single tools/call when the caller's context carries no
+// deadline (Claude Code's MCP_TOOL_TIMEOUT, shortened for tool use).
+const callTimeout = 5 * time.Minute
+
+// Call invokes a tool on the server and returns its textual content. Image
+// and resource content pieces are surfaced as placeholders so multi-modal
+// output is never silently dropped.
+func (c *Client) Call(ctx context.Context, name string, args map[string]any) (string, error) {
+	params := map[string]any{"name": name, "arguments": args}
+	var resp struct {
+		Content []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			MimeType string `json:"mimeType"`
+			Data     string `json:"data"`
+			URI      string `json:"uri"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	}
+	// Bound the call when the caller gave us no deadline of its own.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, callTimeout)
+		defer cancel()
+	}
+	if err := c.requestJSON(ctx, "tools/call", params, &resp); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	for _, piece := range resp.Content {
+		switch piece.Type {
+		case "text":
+			sb.WriteString(piece.Text)
+			sb.WriteString("\n")
+		case "image":
+			fmt.Fprintf(&sb, "[image: %s, %d bytes of base64 data — the tool returned an image]\n",
+				piece.MimeType, len(piece.Data))
+		case "resource":
+			uri := piece.URI
+			if uri == "" {
+				uri = "embedded resource"
+			}
+			fmt.Fprintf(&sb, "[resource: %s (%s)]\n", uri, piece.MimeType)
+		}
+	}
+	out := strings.TrimRight(sb.String(), "\n")
+	if resp.IsError {
+		if out == "" {
+			out = "tool reported an error"
+		}
+		return out, errors.New(out)
+	}
+	return out, nil
+}
+
+// refreshTools re-fetches tools/list and fires the change listener. It runs
+// on notifications/tools/list_changed from the read loops.
+func (c *Client) refreshTools() {
+	select {
+	case <-c.closed:
+		return
+	default:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
+	defer cancel()
+	var list struct {
+		Tools []ToolDef `json:"tools"`
+	}
+	if err := c.requestJSON(ctx, "tools/list", map[string]any{}, &list); err != nil {
+		return
+	}
+	c.mu.Lock()
+	c.tools = list.Tools
+	fn := c.onChange
+	c.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// Resources lists the resources advertised by the server (resources/list).
+func (c *Client) Resources(ctx context.Context) ([]Resource, error) {
+	var list struct {
+		Resources []Resource `json:"resources"`
+	}
+	if err := c.requestJSON(ctx, "resources/list", map[string]any{}, &list); err != nil {
+		return nil, err
+	}
+	return list.Resources, nil
+}
+
+// ReadResource reads a resource by URI (resources/read). Text contents are
+// returned verbatim; binary (blob) contents are surfaced as placeholders.
+func (c *Client) ReadResource(ctx context.Context, uri string) (string, error) {
+	var resp struct {
+		Contents []struct {
+			URI      string `json:"uri"`
+			MimeType string `json:"mimeType"`
+			Text     string `json:"text"`
+			Blob     string `json:"blob"`
+		} `json:"contents"`
+	}
+	if err := c.requestJSON(ctx, "resources/read", map[string]any{"uri": uri}, &resp); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	for _, pc := range resp.Contents {
+		if pc.Text != "" {
+			sb.WriteString(pc.Text)
+			sb.WriteString("\n")
+			continue
+		}
+		if pc.Blob != "" {
+			fmt.Fprintf(&sb, "[binary resource %s (%s): %d bytes of base64 data]\n",
+				pc.URI, pc.MimeType, len(pc.Blob))
+		}
+	}
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// Prompts lists the prompts advertised by the server (prompts/list).
+func (c *Client) Prompts(ctx context.Context) ([]Prompt, error) {
+	var list struct {
+		Prompts []Prompt `json:"prompts"`
+	}
+	if err := c.requestJSON(ctx, "prompts/list", map[string]any{}, &list); err != nil {
+		return nil, err
+	}
+	return list.Prompts, nil
+}
+
+// GetPrompt retrieves a prompt's rendered messages (prompts/get) with
+// template arguments.
+func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]string) (string, error) {
+	var resp struct {
+		Description string `json:"description"`
+		Messages    []struct {
+			Role    string `json:"role"`
+			Content struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	params := map[string]any{"name": name}
+	if len(args) > 0 {
+		params["arguments"] = args
+	}
+	if err := c.requestJSON(ctx, "prompts/get", params, &resp); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	if resp.Description != "" {
+		fmt.Fprintf(&sb, "[%s]\n", resp.Description)
+	}
+	for _, m := range resp.Messages {
+		fmt.Fprintf(&sb, "%s: %s\n", m.Role, m.Content.Text)
+	}
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// Resource is one MCP resource (resources/list).
+type Resource struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	MimeType    string `json:"mimeType"`
+}
+
+// Prompt is one MCP prompt template (prompts/list).
+type Prompt struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// startSSE connects to an MCP SSE/Streamable-HTTP endpoint: opens the SSE
+// stream, discovers the messages endpoint, then performs the standard handshake
+// over HTTP POSTs.
+func (c *Client) startSSE(ctx context.Context) error {
+	if c.cfg.BaseURL == "" {
+		return fmt.Errorf("mcp %s: transport sse requires base_url", c.name)
+	}
+	c.sseTransport = true
+	c.sseClient = &http.Client{}
+
+	sseURL := strings.TrimRight(c.cfg.BaseURL, "/")
+	// A trailing /sse is the conventional endpoint; the configured URL may
+	// already be the full /sse path.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sseURL, nil)
+	if err != nil {
+		return fmt.Errorf("mcp %s: sse request: %w", c.name, err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := c.sseClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("mcp %s: sse connect: %w", c.name, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("mcp %s: sse status %s", c.name, resp.Status)
+	}
+
+	// Read the stream until the "endpoint" event arrives (bounded wait), then
+	// hand the body to the background read loop.
+	messagesCh := make(chan string, 1)
+	done := make(chan struct{})
+	go c.sseReadLoop(resp.Body, messagesCh, done)
+
+	select {
+	case c.messagesURL = <-messagesCh:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(startupTimeout):
+		return fmt.Errorf("mcp %s: sse endpoint event timeout", c.name)
+	}
+	if c.messagesURL == "" {
+		return fmt.Errorf("mcp %s: sse endpoint event missing", c.name)
+	}
+
+	return c.handshake(ctx)
+}
+
+// handshake runs initialize + initialized + tools/list once the transport is up.
+func (c *Client) handshake(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+
+	if err := c.request(ctx, "initialize", map[string]any{
+		"protocolVersion": ProtocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "ccdp", "version": "0.2.0"},
+	}); err != nil {
+		_ = c.Close()
+		return fmt.Errorf("mcp %s: initialize: %w", c.name, err)
+	}
+	if err := c.notify("notifications/initialized", map[string]any{}); err != nil {
+		_ = c.Close()
+		return fmt.Errorf("mcp %s: initialized: %w", c.name, err)
+	}
+
+	var list struct {
+		Tools []ToolDef `json:"tools"`
+	}
+	if err := c.requestJSON(ctx, "tools/list", map[string]any{}, &list); err != nil {
+		_ = c.Close()
+		return fmt.Errorf("mcp %s: tools/list: %w", c.name, err)
+	}
+	c.mu.Lock()
+	c.tools = list.Tools
+	c.mu.Unlock()
+	return nil
+}
+
+// sseReadLoop parses the SSE event stream, dispatching message events to
+// pending callers and forwarding the endpoint event.
+func (c *Client) sseReadLoop(body io.ReadCloser, messagesCh chan string, done chan struct{}) {
+	defer close(done)
+	defer body.Close()
+
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	var event, data strings.Builder
+	flush := func() {
+		e := strings.TrimSpace(event.String())
+		d := strings.TrimSpace(data.String())
+		event.Reset()
+		data.Reset()
+		switch e {
+		case "endpoint":
+			select {
+			case messagesCh <- d:
+			default:
+			}
+		case "message":
+			c.dispatchRaw([]byte(d))
+		}
+	}
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		if line == "" {
+			flush()
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			event.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "event:")))
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			data.WriteString(strings.TrimPrefix(line, "data:"))
+			data.WriteString("\n")
+		}
+	}
+	flush()
+
+	// Stream ended (server restart): fail pending calls.
+	select {
+	case <-c.closed:
+	default:
+		close(c.closed)
+	}
+	c.mu.Lock()
+	for id, ch := range c.pending {
+		close(ch)
+		delete(c.pending, id)
+	}
+	c.mu.Unlock()
+}
+
+// dispatchRaw routes a JSON-RPC frame to its pending caller. Server-initiated
+// notifications (no ID) and requests (ID + method) are handled here:
+// tools/list_changed triggers a background re-fetch; other server requests
+// get a "not supported" error reply so the server never blocks on us, and
+// never leak into the client's pending-response map (IDs are independent
+// counters and could collide).
+func (c *Client) dispatchRaw(line []byte) {
+	var msg rpcMessage
+	if err := json.Unmarshal(line, &msg); err != nil {
+		return
+	}
+	if len(msg.ID) == 0 {
+		// Server notification.
+		switch msg.Method {
+		case "notifications/tools/list_changed":
+			go c.refreshTools()
+		}
+		return
+	}
+	if msg.Method != "" {
+		// Server-initiated request (sampling, roots, ping…): reply with a
+		// JSON-RPC error instead of silently ignoring it.
+		var id int
+		if err := json.Unmarshal(msg.ID, &id); err != nil {
+			return
+		}
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"error": map[string]any{
+				"code":    -32601,
+				"message": "method not supported by ccdp client: " + msg.Method,
+			},
+		})
+		if err == nil {
+			_ = c.write(body)
+		}
+		return
+	}
+	var id int
+	if err := json.Unmarshal(msg.ID, &id); err != nil {
+		return
+	}
+	c.mu.Lock()
+	ch, ok := c.pending[id]
+	c.mu.Unlock()
+	if ok {
+		select {
+		case ch <- json.RawMessage(line):
+		default:
+		}
+	}
+}
+
+// Close terminates the server process and wakes every pending caller.
+func (c *Client) Close() error {
+	select {
+	case <-c.closed:
+		return nil
+	default:
+	}
+	close(c.closed)
+	var err error
+	if c.cmd != nil {
+		if c.cmd.Process != nil {
+			_ = c.cmd.Process.Kill()
+		}
+		err = c.cmd.Wait()
+	}
+	c.mu.Lock()
+	for id, ch := range c.pending {
+		close(ch)
+		delete(c.pending, id)
+	}
+	c.mu.Unlock()
+	return err
+}
+
+// readLoop forwards response frames to their pending callers.
+func (c *Client) readLoop(stdout io.Reader) {
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		// Responses go to pending callers; server notifications (e.g.
+		// tools/list_changed) are handled in dispatchRaw as well.
+		c.dispatchRaw([]byte(line))
+	}
+	// Process exited; fail pending calls.
+	select {
+	case <-c.closed:
+	default:
+		close(c.closed)
+	}
+	c.mu.Lock()
+	for id, ch := range c.pending {
+		close(ch)
+		delete(c.pending, id)
+	}
+	c.mu.Unlock()
+}
+
+// request performs a JSON-RPC request and decodes the result or error.
+func (c *Client) request(ctx context.Context, method string, params map[string]any) error {
+	var out json.RawMessage
+	return c.requestJSON(ctx, method, params, &out)
+}
+
+// requestJSON performs a JSON-RPC request and unmarshals the result into dst.
+func (c *Client) requestJSON(ctx context.Context, method string, params map[string]any, dst any) error {
+	id := c.allocID()
+	ch := make(chan json.RawMessage, 1)
+	c.mu.Lock()
+	c.pending[id] = ch
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+	}()
+
+	if err := c.writeRequest(id, method, params); err != nil {
+		return err
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closed:
+		return fmt.Errorf("mcp %s: server exited", c.name)
+	case raw, ok := <-ch:
+		if !ok {
+			return fmt.Errorf("mcp %s: server exited", c.name)
+		}
+		var msg rpcMessage
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			return fmt.Errorf("mcp %s: bad response: %w", c.name, err)
+		}
+		if msg.Error != nil {
+			return msg.Error
+		}
+		if dst == nil || len(msg.Result) == 0 {
+			return nil
+		}
+		if err := json.Unmarshal(msg.Result, dst); err != nil {
+			return fmt.Errorf("mcp %s: decode result: %w", c.name, err)
+		}
+		return nil
+	}
+}
+
+// notify sends a notification (no response expected).
+func (c *Client) notify(method string, params map[string]any) error {
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		return err
+	}
+	return c.write(body)
+}
+
+// allocID reserves the next request id.
+func (c *Client) allocID() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextID++
+	return c.nextID
+}
+
+// writeRequest marshals and writes one request.
+func (c *Client) writeRequest(id int, method string, params map[string]any) error {
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		return err
+	}
+	return c.write(body)
+}
+
+// write sends one newline-delimited frame on stdin (stdio) or POSTs it to the
+// messages endpoint (SSE).
+func (c *Client) write(body []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	select {
+	case <-c.closed:
+		return fmt.Errorf("mcp %s: server closed", c.name)
+	default:
+	}
+	if c.sseTransport {
+		req, err := http.NewRequest(http.MethodPost, c.messagesURL, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		resp, err := c.sseClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("mcp %s: sse post: %w", c.name, err)
+		}
+		// Streamable HTTP may return an SSE response or an empty 200.
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("mcp %s: sse post status %s", c.name, resp.Status)
+		}
+		// Some servers reply synchronously with a JSON-RPC message.
+		if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+			go func() {
+				defer resp.Body.Close()
+				sc := bufio.NewScanner(resp.Body)
+				sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+				var data strings.Builder
+				for sc.Scan() {
+					line := strings.TrimSpace(sc.Text())
+					if strings.HasPrefix(line, "data:") {
+						data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+						data.WriteString("\n")
+						c.dispatchRaw([]byte(strings.TrimSpace(data.String())))
+						data.Reset()
+					}
+				}
+			}()
+		} else {
+			resp.Body.Close()
+		}
+		return nil
+	}
+	buf := append(body, '\n')
+	if _, err := c.stdin.Write(buf); err != nil {
+		return fmt.Errorf("mcp %s: write: %w", c.name, err)
+	}
+	return nil
+}
+
+// envSlice flattens extra env vars for the child process.
+func envSlice(extra map[string]string) []string {
+	var out []string
+	for k, v := range extra {
+		out = append(out, k+"="+v)
+	}
+	return out
+}
