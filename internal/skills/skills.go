@@ -45,12 +45,11 @@ func NewStore() *Store {
 }
 
 // Load scans userDir and each project dir for skills and populates the store.
-// Later sources win on name collision (project over user, later dirs first).
+// Project skills override user skills; within projects, earlier dirs win.
 func (s *Store) Load(userDir string, projectDirs ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Project skills override user skills; within projects, earlier dirs win.
 	dirs := make([]string, 0, len(projectDirs)+1)
 	dirs = append(dirs, userDir)
 	dirs = append(dirs, projectDirs...)
@@ -59,12 +58,11 @@ func (s *Store) Load(userDir string, projectDirs ...string) {
 	s.skills = s.skills[:0]
 	s.byName = map[string]Skill{}
 
-	// Apply project dirs in reverse so the first project dir wins the slot,
-	// but user dir is always lowest priority.
+	// De-duplication is first-come-first-served, so process earlier project
+	// dirs first (the first project dir wins the slot) and the user dir last
+	// (project skills always override user skills).
 	order := make([]string, 0, len(dirs))
-	for i := len(dirs) - 1; i >= 1; i-- {
-		order = append(order, dirs[i])
-	}
+	order = append(order, dirs[1:]...)
 	order = append(order, dirs[0]) // user dir last
 
 	for _, dir := range order {

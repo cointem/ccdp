@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -56,7 +57,10 @@ func estimateMessageTokens(m messages.Message) int {
 // tool results if the LLM summarization fails or is interrupted.
 func (a *Agent) compact() {
 	// PreCompact hooks get a chance to veto or log before history is touched.
-	if ho := a.hooks.PreCompact(a.turnCtx); ho.Decision == hooks.DecisionBlock {
+	// hookCtx: a nil turn context (turn not started yet) would panic inside
+	// hooks, and an already-cancelled one would instantly "time out" them.
+	hctx := a.hookCtx()
+	if ho := a.hooks.PreCompact(hctx); ho.Decision == hooks.DecisionBlock {
 		a.emitStatus("compaction blocked by hook: %s", ho.Reason)
 		return
 	}
@@ -73,6 +77,11 @@ func (a *Agent) compact() {
 		return
 	}
 	cut := len(a.history) - keep // messages[cut:] stays intact
+	// Never split a tool_call↔result pair at the boundary: walk cut back past
+	// any tool results whose caller would land in the summarized head.
+	for cut > 1 && a.history[cut].Role == messages.RoleTool {
+		cut--
+	}
 	head := make([]messages.Message, 1)
 	copy(head, a.history[:1])
 	toSummarize := make([]messages.Message, cut-1)
@@ -82,7 +91,7 @@ func (a *Agent) compact() {
 	lastTs := a.history[cut-1].CreatedAt
 	a.mu.Unlock()
 
-	summary, err := a.summarize(toSummarize)
+	summary, err := a.summarize(hctx, toSummarize)
 	if err != nil {
 		a.emitStatus("compaction failed (%v), dropping oldest tool results", err)
 		a.dropOldestToolResults()
@@ -94,21 +103,32 @@ func (a *Agent) compact() {
 	if restore := a.restoreContextSnippet(keptTail); restore != "" {
 		summary += "\n\n" + restore
 	}
+	// Re-attach the content of recently read files (Claude Code's
+	// post-compaction file attachments) so the model keeps its working set
+	// without having to re-Read everything.
+	if att := a.postCompactFileAttachments(keptTail); att != "" {
+		summary += "\n\n" + att
+	}
 
 	// Commit the replacement under the lock. The summary is injected as a user
 	// message with a marker, mirroring Codex's CompactionSummary and Claude
 	// Code's isCompactSummary (never a mid-conversation system message).
+	// sanitizeToolPairs is a belt-and-braces no-op here (the cut boundary
+	// never splits a pair) but keeps the invariant explicit.
+	newHistory := sanitizeToolPairs(func() []messages.Message {
+		nh := make([]messages.Message, 0, 2+len(keptTail))
+		nh = append(nh, head...)
+		nh = append(nh, messages.Message{
+			Role: messages.RoleUser,
+			Content: summaryPrefix + "\n<ccdp-context-summary>\nThis is a structured summary of the earlier conversation; treat it as accurate context.\n\n" +
+				summary + "\n</ccdp-context-summary>" +
+				a.traceEscapeHatch(),
+			CreatedAt: lastTs,
+		})
+		nh = append(nh, keptTail...)
+		return nh
+	}())
 	a.mu.Lock()
-	newHistory := make([]messages.Message, 0, 2+len(keptTail))
-	newHistory = append(newHistory, head...)
-	newHistory = append(newHistory, messages.Message{
-		Role: messages.RoleUser,
-		Content: summaryPrefix + "\n<ccdp-context-summary>\nThis is a structured summary of the earlier conversation; treat it as accurate context.\n\n" +
-			summary + "\n</ccdp-context-summary>" +
-			a.traceEscapeHatch(),
-		CreatedAt: lastTs,
-	})
-	newHistory = append(newHistory, keptTail...)
 	a.history = newHistory
 	// The history was rewritten: the prompt-token baseline no longer maps onto
 	// it, so fall back to full local estimation until the next real usage.
@@ -119,7 +139,7 @@ func (a *Agent) compact() {
 	a.emit(Event{Type: EventCompacted})
 	a.emitStatus("context compacted (kept last %d messages)", keep)
 	a.evbus.Emit(events.TopicCompacted, events.MessageEvent{Role: "system", Content: summary})
-	a.hooks.PostCompact(a.turnCtx)
+	a.hooks.PostCompact(hctx)
 	_ = a.Save()
 }
 
@@ -163,12 +183,10 @@ Structure the summary with EXACTLY these sections:
 6. Pending Tasks and Next Step — the explicit task list state, what was in
    progress when the conversation ended, and the concrete next step.`
 
-// summarize asks the model to compress a span of messages into a structured
-// summary. It runs synchronously and is interruptible via the turn context.
-func (a *Agent) summarize(span []messages.Message) (string, error) {
+// renderSpanView renders a span of messages into a bounded text view for
+// summarization prompts (shared by compaction and branch summaries).
+func renderSpanView(span []messages.Message, inputLimit int) string {
 	var sb strings.Builder
-	sb.WriteString("Summarize the following conversation with the required section structure.\n\n--- conversation ---\n")
-	inputLimit := 6000 // adaptive: longer spans get a larger per-message view
 	for _, m := range span {
 		head := strings.ToUpper(string(m.Role))
 		if len(m.Content) > inputLimit {
@@ -180,19 +198,25 @@ func (a *Agent) summarize(span []messages.Message) (string, error) {
 			sb.WriteString(fmt.Sprintf("[TOOLCALL %s] %s\n", tc.Name, tc.Arguments))
 		}
 	}
+	return sb.String()
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// summarize asks the model to compress a span of messages into a structured
+// summary. It runs synchronously on the given context — the live turn context
+// when compacting mid-turn, so a user interrupt aborts it — and uses the
+// active client/model so a fallback switch is respected.
+func (a *Agent) summarize(ctx context.Context, span []messages.Message) (string, error) {
+	inputLimit := 6000 // adaptive: longer spans get a larger per-message view
 	req := llm.CompletionRequest{
-		Model: a.cfg.Model,
+		Model: a.activeModelSnapshot(),
 		Messages: []llm.ChatMessage{
 			{Role: "system", Content: compactSystem},
-			{Role: "user", Content: sb.String()},
+			{Role: "user", Content: "Summarize the following conversation with the required section structure.\n\n--- conversation ---\n" + renderSpanView(span, inputLimit)},
 		},
 		Stream:    false,
 		MaxTokens: intPtr(4096),
 	}
-	res, err := a.client.Stream(ctx, req, nil)
+	res, err := a.currentClient().Stream(ctx, req, nil)
 	if err != nil {
 		return "", err
 	}
@@ -250,6 +274,68 @@ func (a *Agent) restoreContextSnippet(keptTail []messages.Message) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
+// postCompactFileAttachments re-reads the most recently Read files (Claude
+// Code's createPostCompactFileAttachments) and renders their content into the
+// compaction summary, so the model keeps its working set after the older
+// conversation — which contained those Reads — is summarized away. Files whose
+// content is still visible in the kept tail are skipped, as are files that
+// disappeared from disk. A per-file and total byte budget keeps the
+// attachments from becoming a second compaction problem.
+func (a *Agent) postCompactFileAttachments(keptTail []messages.Message) string {
+	// Paths still referenced by the kept tail do not need re-attachment.
+	inTail := map[string]bool{}
+	for _, m := range keptTail {
+		for _, tc := range m.ToolCalls {
+			for _, key := range []string{"file_path", "path", "file"} {
+				if p, ok := tc.Arguments[key].(string); ok {
+					inTail[p] = true
+				}
+			}
+		}
+	}
+
+	const (
+		maxFiles   = 5
+		maxPerFile = 8000  // chars of content per file
+		maxTotal   = 24000 // chars across all attachments
+	)
+	var (
+		sb    strings.Builder
+		total int
+		count int
+	)
+	for _, rec := range tools.RecentReads(16) {
+		if count >= maxFiles || total >= maxTotal {
+			break
+		}
+		if inTail[rec.Path] {
+			continue
+		}
+		data, err := os.ReadFile(rec.Path)
+		if err != nil {
+			continue // deleted or unreadable since the Read
+		}
+		content := string(data)
+		note := ""
+		if info, serr := os.Stat(rec.Path); serr == nil && !info.ModTime().Equal(rec.Mtime) {
+			note = " — file changed since it was read; excerpt of current content"
+		}
+		if len(content) > maxPerFile {
+			content = content[:maxPerFile] + "\n…[truncated]"
+		}
+		if total+len(content) > maxTotal {
+			content = content[:max(0, maxTotal-total)] + "\n…[truncated]"
+		}
+		if count == 0 {
+			sb.WriteString("Post-compaction file attachments — content of files you read earlier in this conversation, re-attached so you do not have to Read them again:\n")
+		}
+		fmt.Fprintf(&sb, "\n<ccdp-file-attachment path=%q%s>\n%s\n</ccdp-file-attachment>\n", rec.Path, note, content)
+		total += len(content) + 64
+		count++
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
 // dropOldestToolResults removes old tool-result pairs to free space.
 func (a *Agent) dropOldestToolResults() {
 	a.mu.Lock()
@@ -273,6 +359,7 @@ func (a *Agent) dropOldestToolResults() {
 	if drop == 0 {
 		// Nothing to drop; truncate the span to its first message.
 		a.history = append(a.history[:start+1], a.history[cut:]...)
+		a.history = sanitizeToolPairs(a.history)
 		return
 	}
 	// Remove up to half of the tool results from the span.
@@ -289,6 +376,9 @@ func (a *Agent) dropOldestToolResults() {
 		filtered = append(filtered, m)
 	}
 	a.history = append(a.history[:start], append(filtered, a.history[cut:]...)...)
+	// Dropping results strands their assistant tool_calls — providers reject
+	// unpaired calls, so repair the pairing (synthetic results / prose kept).
+	a.history = sanitizeToolPairs(a.history)
 	a.emit(Event{Type: EventCompacted})
 	a.emitStatus("dropped oldest tool results to free context space")
 }

@@ -41,14 +41,9 @@ type ProcessManager struct {
 
 var processStore = &ProcessManager{procs: map[int]*managedProcess{}}
 
-func (m *ProcessManager) start(command, dir string, applyPolicy func(string) error) (int, *managedProcess, error) {
+func (m *ProcessManager) start(command, dir string) (int, *managedProcess, error) {
 	if strings.TrimSpace(command) == "" {
 		return 0, nil, fmt.Errorf("ProcessStart: empty command")
-	}
-	if applyPolicy != nil {
-		if err := applyPolicy(command); err != nil {
-			return 0, nil, err
-		}
 	}
 	shell := os.Getenv("SHELL")
 	if shell == "" {
@@ -79,10 +74,23 @@ func (m *ProcessManager) start(command, dir string, applyPolicy func(string) err
 		stdin: stdin,
 		done:  make(chan struct{}),
 	}
+	// Drain both streams concurrently: draining them sequentially deadlocks
+	// when a process writes only to stderr — stdout never reaches EOF until
+	// the process exits, the pipe goroutine never reaches stderr, the 64KB
+	// stderr pipe fills, and the blocked process never exits.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		mp.pipe(stdout)
+	}()
+	go func() {
+		defer wg.Done()
+		mp.pipe(stderr)
+	}()
 	go func() {
 		defer close(mp.done)
-		mp.pipe(stdout)
-		mp.pipe(stderr)
+		wg.Wait()
 		mp.err = cmd.Wait()
 		mp.mu.Lock()
 		mp.exited = true
@@ -107,10 +115,16 @@ func (mp *managedProcess) pipe(r io.Reader) {
 		mp.buf = append(mp.buf, line...)
 		mp.buf = append(mp.buf, '\n')
 		if len(mp.buf) > maxProcOutput {
-			mp.buf = append([]byte(nil), mp.buf[len(mp.buf)-maxProcOutput:]...)
-			mp.readPos -= len(mp.buf) - maxProcOutput
-			if mp.readPos < 0 {
-				mp.readPos = 0
+			oldLen := len(mp.buf)
+			mp.buf = append([]byte(nil), mp.buf[oldLen-maxProcOutput:]...)
+			// Shift readPos by the number of dropped bytes (computed before
+			// truncation) so unread output stays contiguous — no bytes are
+			// silently skipped and newly written lines are still returned.
+			if dropped := oldLen - maxProcOutput; dropped > 0 {
+				mp.readPos -= dropped
+				if mp.readPos < 0 {
+					mp.readPos = 0
+				}
 			}
 		}
 		mp.mu.Unlock()
@@ -208,11 +222,25 @@ func (t *ProcessStartTool) Parameters() map[string]any {
 
 func (t *ProcessStartTool) Run(ctx *Context) (string, error) {
 	command := StringArg(ctx.Args, "command", "")
-	var policy func(string) error
 	if ctx.Sandbox != nil {
-		policy = ctx.Sandbox.CommandPolicy
+		// Sandbox command policy (strict mode blocks workspace escapes + network).
+		if err := ctx.Sandbox.CommandPolicy(command); err != nil {
+			return "", err
+		}
 	}
-	id, mp, err := processStore.start(command, ctx.WorkingDir, policy)
+	cmdline := command
+	if ctx.Sandbox != nil {
+		// Resource limits (ulimit prefix) and, on macOS with strict mode, a
+		// sandbox-exec profile wrap the command — mirroring BashTool so the
+		// background process can't bypass the sandbox.
+		if p := ctx.Sandbox.Prefix(); p != "" {
+			cmdline = p + " " + cmdline
+		}
+		if wrapped := ctx.Sandbox.WrapCommand(cmdline); wrapped != "" {
+			cmdline = wrapped
+		}
+	}
+	id, mp, err := processStore.start(cmdline, ctx.WorkingDir)
 	if err != nil {
 		return "", err
 	}

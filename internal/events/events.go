@@ -37,46 +37,59 @@ type Payload any
 // Handler receives events of a subscribed topic.
 type Handler func(topic Topic, payload Payload)
 
+// subscription is one registered handler. Disposers remove their node by
+// pointer identity, so disposing subscriptions in any order can never remove
+// or shift someone else's handler.
+type subscription struct {
+	h Handler
+}
+
 // Bus is a concurrent, synchronous, multi-subscriber event bus. Emit runs
 // handlers in registration order; a panicking handler is isolated so one bad
 // plugin cannot crash the agent.
 type Bus struct {
 	mu   sync.RWMutex
-	subs map[Topic][]Handler
+	subs map[Topic][]*subscription
 }
 
 // NewBus returns an empty bus.
 func NewBus() *Bus {
-	return &Bus{subs: map[Topic][]Handler{}}
+	return &Bus{subs: map[Topic][]*subscription{}}
 }
 
 // Subscribe registers h for a topic and returns a disposer that detaches it.
 func (b *Bus) Subscribe(topic Topic, h Handler) func() {
 	b.mu.Lock()
-	b.subs[topic] = append(b.subs[topic], h)
-	i := len(b.subs[topic]) - 1
+	sub := &subscription{h: h}
+	b.subs[topic] = append(b.subs[topic], sub)
 	b.mu.Unlock()
 
 	return func() {
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		slice := b.subs[topic]
-		if i < len(slice) {
-			b.subs[topic] = append(slice[:i], slice[i+1:]...)
+		for i, s := range slice {
+			if s == sub {
+				b.subs[topic] = append(slice[:i], slice[i+1:]...)
+				return
+			}
 		}
 	}
 }
 
 // Emit synchronously delivers payload to all handlers of topic, in
-// registration order. Handler panics are recovered and swallowed.
+// registration order. Handler panics are recovered and swallowed. The
+// subscriber list is copied under the lock, so concurrent disposers (which
+// move elements in place) never race with the iteration.
 func (b *Bus) Emit(topic Topic, payload Payload) {
 	b.mu.RLock()
-	handlers := b.subs[topic]
+	handlers := make([]*subscription, len(b.subs[topic]))
+	copy(handlers, b.subs[topic])
 	b.mu.RUnlock()
-	for _, h := range handlers {
+	for _, sub := range handlers {
 		func() {
 			defer func() { _ = recover() }()
-			h(topic, payload)
+			sub.h(topic, payload)
 		}()
 	}
 }

@@ -191,6 +191,14 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		return StreamResult{}, retryable, false, after, errors.New(msg)
 	}
 
+	// A 200 without an SSE content-type is not a stream: gateways return
+	// 200+JSON error bodies, and providers that ignore the stream parameter
+	// reply with a regular completion. Surfacing it beats silently returning
+	// an empty result.
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		return StreamResult{}, false, false, 0, nonStreamError(resp, ct)
+	}
+
 	var (
 		toolCalls = map[int]*ToolCall{} // index → call being assembled
 		callOrder []int                 // preserve first-seen order of indexes
@@ -301,30 +309,68 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 	return result, false, emitted, 0, nil
 }
 
+// nonStreamError builds a descriptive error for a 200 response that is not an
+// SSE stream: a JSON body carrying an "error" object is reported as a
+// structured provider error, a "choices" body means the provider ignored the
+// stream parameter, and anything else is reported with a body summary.
+func nonStreamError(resp *http.Response, contentType string) error {
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	body := strings.TrimSpace(string(raw))
+
+	var probe struct {
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+		} `json:"error"`
+		Choices []any `json:"choices"`
+	}
+	isJSON := len(body) > 0 && json.Unmarshal([]byte(body), &probe) == nil
+	if isJSON && probe.Error != nil {
+		msg := probe.Error.Message
+		if msg == "" {
+			msg = body
+		}
+		return fmt.Errorf("llm: provider error (%d): %s", resp.StatusCode, msg)
+	}
+	if isJSON && len(probe.Choices) > 0 {
+		return errors.New("llm: provider returned non-streaming response; check base_url/model")
+	}
+	if body == "" {
+		return fmt.Errorf("llm: provider returned an empty %s response (content-type %q); check base_url/model", resp.Status, contentType)
+	}
+	summary := body
+	if len(summary) > 256 {
+		summary = summary[:256] + "…"
+	}
+	return fmt.Errorf("llm: unexpected non-streaming response (content-type %q): %s", contentType, summary)
+}
+
 // EstimateTokens is a token-count heuristic used for compaction decisions when
 // the provider reports no usage. Latin text runs ≈4 chars/token; CJK and other
-// multibyte scripts count closer to 1 char/token, so we weight each rune by its
-// byte length (1 byte → 1/4 token, 3+ bytes → 1 token).
+// multibyte scripts count closer to 1 char/token, so each rune contributes its
+// byte length in quarter-token units and the total is divided by four
+// (1 byte → 1/4 token, 3-4 bytes → 1 token).
 func EstimateTokens(s string) int {
 	if s == "" {
 		return 0
 	}
-	tokens := 0
+	quarters := 0
 	for _, r := range s {
 		switch {
 		case r < 0x80:
-			tokens += 4 // one token covers ~4 ASCII chars (approx)
+			quarters += 1 // 1 byte ≈ ¼ token
 		case r < 0x800:
-			tokens += 2 // 2-byte runes are denser per token
+			quarters += 2
 		default:
-			tokens += 1 // 3-4 byte runes ≈ 1 token each
+			quarters += 4 // 3-4 byte runes ≈ 1 token each
 		}
 	}
-	if tokens == 0 {
+	if quarters == 0 {
 		return 0
 	}
-	t := tokens / 4
-	if tokens%4 != 0 {
+	t := quarters / 4
+	if quarters%4 != 0 {
 		t++
 	}
 	if t < 1 {

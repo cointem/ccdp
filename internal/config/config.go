@@ -222,12 +222,14 @@ type Config struct {
 	MaxToolOutputCharsPerTurn int `json:"max_tool_output_chars_per_turn"`
 
 	// EnableGuardian runs a review sub-agent before high-risk tool calls
-	// (Codex's guardian). Costs extra model calls; off by default.
-	EnableGuardian bool `json:"enable_guardian"`
+	// (Codex's guardian). Costs extra model calls; off by default. A nil
+	// pointer means "not set" (defaults to false; see GuardianEnabled).
+	EnableGuardian *bool `json:"enable_guardian"`
 
 	// EnableMemory keeps a lightweight session memory log that is injected
-	// into later system prompts (Claude's AutoMem, simplified).
-	EnableMemory bool `json:"enable_memory"`
+	// into later system prompts (Claude's AutoMem, simplified). A nil pointer
+	// means "not set" (defaults to false; see MemoryEnabled).
+	EnableMemory *bool `json:"enable_memory"`
 
 	// Sandbox & execution policy
 	SandboxMode      string `json:"sandbox_mode"`       // confine | strict | none
@@ -249,8 +251,9 @@ type Config struct {
 	// form (see hooks.Config).
 	Hooks hooks.Config `json:"hooks"`
 
-	// Web tools
-	EnableWebTools bool `json:"enable_web_tools"`
+	// Web tools. A nil pointer means "not set" (defaults to true; see
+	// WebToolsEnabled).
+	EnableWebTools *bool `json:"enable_web_tools"`
 
 	// Tools are user-defined external tools (Codex's config tools): shell
 	// commands the model can invoke; the tool arguments arrive as JSON on stdin.
@@ -322,7 +325,7 @@ func Default() Config {
 		SandboxMode:        "confine",
 		MaxParallelTools:   4,
 		Hooks:              hooks.Config{},
-		EnableWebTools:     true,
+		EnableWebTools:     BoolPtr(true),
 		MCPServers:         map[string]mcp.ServerConfig{},
 		Providers:          map[string]ProviderConfig{},
 		Pricing:            DefaultPricing(),
@@ -430,12 +433,10 @@ func merge(dst, src *Config) {
 	if src.MaxToolOutputCharsPerTurn > 0 {
 		dst.MaxToolOutputCharsPerTurn = src.MaxToolOutputCharsPerTurn
 	}
-	if src.EnableGuardian {
-		dst.EnableGuardian = src.EnableGuardian
-	}
-	if src.EnableMemory {
-		dst.EnableMemory = src.EnableMemory
-	}
+	// Tri-state booleans: the pointer is nil when the file didn't set the key,
+	// so an explicit false overrides the default (nil = "unset", not false).
+	dst.EnableGuardian = src.EnableGuardian
+	dst.EnableMemory = src.EnableMemory
 	if src.SessionDir != "" {
 		dst.SessionDir = src.SessionDir
 	}
@@ -453,7 +454,7 @@ func merge(dst, src *Config) {
 			dst.Hooks[ev] = cmds
 		}
 	}
-	if src.EnableWebTools {
+	if src.EnableWebTools != nil {
 		dst.EnableWebTools = src.EnableWebTools
 	}
 	if len(src.Tools) > 0 {
@@ -689,7 +690,23 @@ func mergeProject(dst, src *Config) {
 			dst.Hooks[ev] = cmds
 		}
 	}
-	if src.EnableWebTools {
+	if src.EnableWebTools != nil {
 		dst.EnableWebTools = src.EnableWebTools
 	}
 }
+
+// BoolPtr returns a pointer to b (helper for tri-state config booleans: a nil
+// field means "not set").
+func BoolPtr(b bool) *bool { return &b }
+
+// WebToolsEnabled reports whether the web tools (WebFetch/WebSearch) load.
+// Unset (nil) defaults to true.
+func (c *Config) WebToolsEnabled() bool { return c.EnableWebTools == nil || *c.EnableWebTools }
+
+// GuardianEnabled reports whether the guardian review sub-agent runs before
+// high-risk tool calls. Unset (nil) defaults to false.
+func (c *Config) GuardianEnabled() bool { return c.EnableGuardian != nil && *c.EnableGuardian }
+
+// MemoryEnabled reports whether the session memory log is active. Unset (nil)
+// defaults to false.
+func (c *Config) MemoryEnabled() bool { return c.EnableMemory != nil && *c.EnableMemory }

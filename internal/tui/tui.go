@@ -60,6 +60,10 @@ type logItem struct {
 	toolID string
 	status string // running | success | error | denied
 
+	// tool entries: whether the second line of text is the command/path/args
+	// meta line (colored at render time, after sanitization).
+	toolMeta bool
+
 	// sanitizeANSI display cache (valid while sanitizedLen == len(text)).
 	sanitized    string
 	sanitizedLen int
@@ -101,16 +105,18 @@ type Model struct {
 
 	// cmdSug is the live slash-command autocomplete list (popup above the
 	// input) while the user is typing a command name after "/". cmdSugIdx is
-	// the highlighted entry; up/down navigate, tab/enter accept.
-	cmdSug    []string
-	cmdSugIdx int
+	// the highlighted entry; up/down navigate, tab/enter accept. The popup
+	// shows at most maxCmdSuggestions entries; cmdSugMore is how many matches
+	// were hidden (rendered as a "+N more" hint, not selectable).
+	cmdSug     []string
+	cmdSugIdx  int
+	cmdSugMore int
 
 	// customCmds holds user-defined slash commands loaded from
 	// ~/.ccdp/commands and <workspace>/.ccdp/commands.
 	customCmds []customCommand
 
 	modalErr string // transient message inside the modal area
-	quit     bool
 
 	// turnStarted is when the current turn began, for the completion bell.
 	turnStarted time.Time
@@ -148,6 +154,20 @@ type eventMsg struct{ ev agent.Event }
 
 // errMsg is a local error surfaced to the UI.
 type errMsg struct{ err error }
+
+// initResumeMsg triggers the saved-session picker after the first Update.
+// Init runs on a value copy of the model (opening the picker there would
+// mutate the copy and be lost), so it schedules this message and Update —
+// whose returned model is the persistent state — performs the actual work.
+type initResumeMsg struct{}
+
+// gitResultMsg carries the output of an asynchronous local git command
+// (/diff, /review, /git) back into the Update loop, which shows it in the
+// conversation log.
+type gitResultMsg struct {
+	output string
+	isErr  bool
+}
 
 // New builds the TUI model. With autoResume set (ccdp -c) it immediately opens
 // the saved-session picker.
@@ -219,13 +239,14 @@ Type /help for commands. Dangerous actions will ask for your approval.`, ws)
 }
 
 // Init starts the event watcher and spinner, and titles the terminal window.
+// With autoResume set (ccdp -c) it schedules initResumeMsg; the picker must be
+// opened from Update because Init receives a value copy of the model.
 func (m Model) Init() tea.Cmd {
 	// OSC 0: set window title (workspace in the title helps multitaskers).
 	fmt.Fprintf(os.Stdout, "\x1b]0;ccdp — %s\x07", m.workspace)
 	cmds := []tea.Cmd{m.waitEvent(), m.spinner.Tick}
 	if m.autoResume {
-		m.autoResume = false // only once
-		m.startResumePicker()
+		cmds = append(cmds, func() tea.Msg { return initResumeMsg{} })
 	}
 	return tea.Batch(cmds...)
 }
@@ -262,6 +283,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.pushStatus("error: " + msg.err.Error())
 		return m, nil
+
+	case initResumeMsg:
+		m.autoResume = false // only once
+		m.startResumePicker()
+		return m, nil
+
+	case gitResultMsg:
+		// Result of an asynchronous local git command (/diff, /review, /git).
+		if msg.isErr {
+			m.pushLog("error", msg.output)
+		} else {
+			m.pushLog("system", msg.output)
+		}
+		return m, nil
 	}
 
 	// Default: forward to textarea (keeps cursor behavior live).
@@ -293,13 +328,17 @@ func (m *Model) layout() {
 }
 
 // syncViewportHeight reserves room for the command-suggestion popup so opening
-// it does not push the footer off-screen.
+// it does not push the footer off-screen. The "+N more" hint line counts as a
+// popup row too.
 func (m *Model) syncViewportHeight() {
 	h := m.baseVpH
 	if h == 0 {
 		h = 20 // sane default before the first WindowSizeMsg
 	}
 	if n := len(m.cmdSug); n > 0 {
+		if m.cmdSugMore > 0 {
+			n++ // hint line
+		}
 		h -= n + 3 // content lines + border rows + spacing line
 		if h < 3 {
 			h = 3
@@ -352,24 +391,26 @@ func (m *Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		for i := len(m.items) - 1; i >= 0; i-- {
 			if m.items[i].kind == "tool" && m.items[i].toolID == t.ID {
 				m.items[i].status = t.Status
-				m.items[i].text = renderToolText(t.Name, t.Args, t.Status, t.Output)
+				m.items[i].text, m.items[i].toolMeta = renderToolText(t.Name, t.Args, t.Status, t.Output)
 				found = true
 				break
 			}
 		}
 		if !found {
+			text, meta := renderToolText(t.Name, t.Args, t.Status, t.Output)
 			m.items = append(m.items, logItem{
 				kind: "tool", toolID: t.ID, status: t.Status,
-				text: renderToolText(t.Name, t.Args, t.Status, t.Output),
+				text: text, toolMeta: meta,
 			})
 		}
 
 	case agent.EventToolStart:
 		t := ev.Tool
 		if t != nil {
+			text, meta := renderToolText(t.Name, t.Args, "running", "")
 			m.items = append(m.items, logItem{
 				kind: "tool", toolID: t.ID, status: "running",
-				text: renderToolText(t.Name, t.Args, "running", ""),
+				text: text, toolMeta: meta,
 			})
 		}
 
@@ -383,7 +424,9 @@ func (m *Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 			if m.items[i].kind == "tool" && m.items[i].toolID == t.ID && m.items[i].status == "running" {
 				text := m.items[i].text
 				if text == "" {
-					text = styleToolRun.Render(t.Name) + "\n"
+					// Plain text: styling happens in renderItem, after
+					// sanitization (embedded styles would be stripped).
+					text = t.Name + "\n"
 				}
 				text += t.Output + "\n"
 				m.items[i].text = text
@@ -447,6 +490,12 @@ func (m *Model) handleEvent(ev agent.Event) (tea.Model, tea.Cmd) {
 		if ev.Usage != nil {
 			m.usage = *ev.Usage
 		}
+
+	case agent.EventSessionChanged:
+		// The agent switched sessions (fork/resume): track the new id and
+		// clear the local log; the conversation reloads on the next turn.
+		m.sessionID = ev.Text
+		m.items = m.items[:0]
 
 	case agent.EventHistoryChanged:
 		// History was edited server-side; keep the local log in sync by
@@ -516,7 +565,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Two-stage exit (Claude Code): the first press asks for
 		// confirmation, the second actually quits.
 		if m.quitArmed {
-			m.quit = true
 			return m, tea.Quit
 		}
 		m.quitArmed = true
@@ -563,6 +611,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// maxCmdSuggestions caps the command-suggestion popup so 40+ commands cannot
+// overflow the screen; extra matches collapse into a "+N more" hint line.
+const maxCmdSuggestions = 8
+
 // refreshCmdSuggest recomputes the slash-command popup from the current input:
 // it opens whenever the input is a "/"-prefixed command name (no whitespace
 // yet) that is a strict prefix of at least one command, and closes otherwise.
@@ -584,6 +636,11 @@ func (m *Model) refreshCmdSuggest() {
 	if len(matches) == 0 || (len(matches) == 1 && matches[0] == prefix) {
 		return
 	}
+	// Cap the popup height: hide everything past the first few matches.
+	if len(matches) > maxCmdSuggestions {
+		m.cmdSugMore = len(matches) - maxCmdSuggestions
+		matches = matches[:maxCmdSuggestions]
+	}
 	m.cmdSug = matches
 	m.cmdSugIdx = 0
 	m.syncViewportHeight()
@@ -603,6 +660,7 @@ func (m *Model) acceptCmdSuggestion() tea.Model {
 func (m *Model) closeCmdSuggest() {
 	m.cmdSug = nil
 	m.cmdSugIdx = 0
+	m.cmdSugMore = 0
 	m.syncViewportHeight()
 }
 
@@ -711,7 +769,7 @@ func (m *Model) submit() (tea.Model, tea.Cmd) {
 	m.closeCmdSuggest()
 
 	if strings.HasPrefix(text, "/") {
-		return m.runCommand(text), nil
+		return m.runCommand(text)
 	}
 
 	m.history = append(m.history, text)

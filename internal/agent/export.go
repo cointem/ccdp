@@ -84,15 +84,20 @@ func (a *Agent) ReloadSettings() error {
 			a.SetSandboxMode(mode)
 		}
 	}
-	if proj.EnableWebTools {
-		a.cfg.EnableWebTools = true
+	if proj.EnableWebTools != nil {
+		// Tri-state: an explicit enable_web_tools:false in project settings
+		// must be able to turn the web tools off.
+		a.cfg.EnableWebTools = proj.EnableWebTools
 	}
 	a.emitStatus("settings reloaded from .ccdp/settings.json")
 	return nil
 }
 
 // SetWorkspace changes the agent's working directory at runtime (Codex /cd),
-// rebuilding the sandbox and invalidating the workspace model.
+// rebuilding the sandbox and invalidating the workspace model. The sandbox
+// pointer and workspace are swapped atomically under a.mu; tool goroutines
+// read them via currentSandbox(), so a /cd during a running turn never gives
+// half of one batch the old directory and half the new one.
 func (a *Agent) SetWorkspace(dir string) error {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -102,11 +107,37 @@ func (a *Agent) SetWorkspace(dir string) error {
 	if err != nil || !st.IsDir() {
 		return fmt.Errorf("not a directory: %s", dir)
 	}
+	sb := buildSandbox(a.cfg, abs)
+	a.mu.Lock()
 	a.cfg.Workspace = abs
-	a.sandbox = a.cfg.Sandbox()
+	a.sandbox = sb
+	a.mu.Unlock()
 	a.wsInfo = nil
 	a.emitStatus("workspace → %s", abs)
 	return nil
+}
+
+// buildSandbox assembles the runtime sandbox for dir from config (mirrors
+// config.Config.Sandbox but for an arbitrary workspace, without touching the
+// config package).
+func buildSandbox(cfg *config.Config, dir string) *sandbox.Sandbox {
+	mode, err := sandbox.ParseMode(cfg.SandboxMode)
+	if err != nil {
+		mode = sandbox.ModeConfine
+	}
+	s := sandbox.New(dir, mode)
+	if cfg.SandboxLimits != nil {
+		lim := *cfg.SandboxLimits
+		s.Limits = &lim
+	}
+	s.AllowNetwork = cfg.SandboxAllowNetwork
+	for _, d := range cfg.AdditionalDirectories {
+		s.AddDir(d)
+	}
+	for _, d := range cfg.DisallowedDirectories {
+		s.AddDisallowedDir(d)
+	}
+	return s
 }
 
 // ExportMarkdown renders the session as a markdown transcript (Codex /export).

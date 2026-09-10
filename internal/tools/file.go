@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -104,7 +105,9 @@ func readRange(path string, offset, limit int) ([]byte, error) {
 	return buf[:n], nil
 }
 
-// countLines estimates the 1-based line number at a byte offset.
+// countLines estimates the 1-based line number at a byte offset. It reads in
+// fixed 64KB chunks (an offset-sized allocation would let a huge offset OOM
+// the process) and loops to survive short reads.
 func countLines(path string, offset int) int {
 	if offset <= 0 {
 		return 1
@@ -114,9 +117,22 @@ func countLines(path string, offset int) int {
 		return 1
 	}
 	defer f.Close()
-	buf := make([]byte, offset)
-	n, _ := f.Read(buf)
-	return strings.Count(string(buf[:n]), "\n") + 1
+
+	buf := make([]byte, 64*1024)
+	lines := 1
+	for remaining := offset; remaining > 0; {
+		chunk := buf
+		if remaining < len(chunk) {
+			chunk = chunk[:remaining]
+		}
+		n, err := f.Read(chunk)
+		lines += bytes.Count(chunk[:n], []byte("\n"))
+		remaining -= n
+		if err != nil || n == 0 {
+			break
+		}
+	}
+	return lines
 }
 
 // ---------- Write ----------

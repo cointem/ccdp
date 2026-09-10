@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -28,15 +29,28 @@ func (a *Agent) restoreDiscoveredFromTrace() {
 		if !strings.Contains(line, `"tool":`) || !strings.Contains(line, `ToolSearch`) {
 			continue
 		}
-		// ToolSearch success results contain "Name: <tool>".
-		if i := strings.Index(line, `"Name: `); i > 0 {
-			rest := line[i+len(`"Name: `):]
-			if end := strings.IndexAny(rest, "\\\n"); end > 0 {
+		// ToolSearch success results contain "Name: <tool>". The trace line is
+		// JSON-escaped, so the newline before "Name: " is the two bytes `\n`
+		// — search for the unquoted form (a quoted form never occurs: the
+		// quote would have to be part of the JSON string itself).
+		if i := strings.Index(line, `Name: `); i > 0 {
+			rest := line[i+len(`Name: `):]
+			// Cut at the JSON escape of the trailing newline (backslash) or at
+			// any quote/backslash; `end >= 0` so an empty name never slips the
+			// whole rest of the line through.
+			if end := strings.IndexAny(rest, `\"`+"\n"); end >= 0 {
 				rest = rest[:end]
 			}
-			if name := strings.TrimSpace(rest); name != "" {
+			if name := strings.TrimSpace(rest); isToolNameToken(name) {
 				a.markDiscovered(name)
 			}
 		}
 	}
+}
+
+// isToolNameToken validates a candidate tool name recovered from a trace line.
+var toolNameTokenRe = regexp.MustCompile(`^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?$`)
+
+func isToolNameToken(s string) bool {
+	return len(s) > 0 && len(s) <= 128 && toolNameTokenRe.MatchString(s)
 }

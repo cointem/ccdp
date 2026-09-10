@@ -3,7 +3,9 @@ package sandbox
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -204,4 +206,95 @@ func TestCheckInteractive(t *testing.T) {
 			t.Errorf("expected allow for %q: %v", ok, err)
 		}
 	}
+}
+
+func TestInWorkspaceSymlinkEscapeCanonicalPath(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "passwd"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "evil")); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+	s := New(dir, ModeConfine)
+
+	// Use the resolved workspace root as the base so the path is lexically
+	// inside the workspace (the earlier check only caught the unresolved
+	// /var → /private/var form on macOS).
+	escape := filepath.Join(s.Workspace, "evil", "passwd")
+	if s.InWorkspace(escape) {
+		t.Errorf("symlink escape %q must not be inside the workspace", escape)
+	}
+	// A write through the escape is rejected.
+	if _, err := s.ResolveWrite(escape); err == nil {
+		t.Error("expected symlink escape write to be blocked")
+	}
+	// Regular files inside (existing or not) stay inside.
+	if !s.InWorkspace(filepath.Join(s.Workspace, "sub", "new.txt")) {
+		t.Error("regular workspace path reported outside")
+	}
+}
+
+func TestInWorkspaceDisallowedViaSymlink(t *testing.T) {
+	dir := t.TempDir()
+	secret := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secret, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(dir, "slink")); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+	s := New(dir, ModeConfine)
+	s.AddDisallowedDir(secret)
+	// Even though the path is lexically inside the workspace, it resolves into
+	// the disallowed dir and must be blocked.
+	if s.InWorkspace(filepath.Join(s.Workspace, "slink", "f")) {
+		t.Error("disallowed dir reached through a symlink must be blocked")
+	}
+}
+
+func TestWrapCommandRunsInsideShC(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("sandbox-exec is macOS-only")
+	}
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not available")
+	}
+	dir := t.TempDir()
+	s := New(dir, ModeStrict)
+	s.Limits = &Limits{CPUSeconds: 30}
+	w := s.WrapCommand("ulimit -t 30 && echo hi && echo done")
+	// The entire command line (ulimit prefix included) must be the argument of
+	// a /bin/sh -c inside the sandbox, not appended after `--`.
+	if !strings.Contains(w, "-- /bin/sh -c ") {
+		t.Fatalf("expected sandbox-exec to exec /bin/sh -c, got %q", w)
+	}
+	if !strings.Contains(w, `'ulimit -t 30 && echo hi && echo done'`) {
+		t.Errorf("full command line must be quoted inside sh -c: %q", w)
+	}
+}
+
+func TestSandboxConcurrentAccess(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir, ModeConfine)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_, _ = s.Resolve("a/b.txt")
+				_, _ = s.ResolveRead("a/b.txt")
+				_, _ = s.ResolveWrite("a/b.txt")
+				_ = s.InWorkspace(filepath.Join(dir, "x"))
+				_ = s.CurrentMode()
+				s.AddDir(filepath.Join(dir, "extra"))
+				s.AddDisallowedDir(filepath.Join(dir, "bad"))
+				s.SetMode(ModeStrict)
+				s.SetMode(ModeConfine)
+			}
+		}(i)
+	}
+	wg.Wait()
 }

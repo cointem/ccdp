@@ -16,7 +16,7 @@ func newMemoryAgent(t *testing.T) *Agent {
 	cfg := config.Default()
 	cfg.Workspace = dir
 	cfg.SessionDir = dir + "/sessions"
-	cfg.EnableMemory = true
+	cfg.EnableMemory = config.BoolPtr(true)
 	events := make(chan Event, 64)
 	ctrl := make(chan Control, 16)
 	ag, err := New(&cfg, events, ctrl)
@@ -31,7 +31,7 @@ func TestMemoryDisabledRecordsNothing(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace = dir
 	cfg.SessionDir = dir + "/sessions"
-	cfg.EnableMemory = false // default: off
+	cfg.EnableMemory = config.BoolPtr(false) // default: off
 	events := make(chan Event, 64)
 	ctrl := make(chan Control, 16)
 	ag, err := New(&cfg, events, ctrl)

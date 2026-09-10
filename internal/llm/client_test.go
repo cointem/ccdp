@@ -147,3 +147,57 @@ func TestStreamToolCallIndexMerge(t *testing.T) {
 		t.Errorf("call B corrupted: %+v", b)
 	}
 }
+
+func TestEstimateTokensWeights(t *testing.T) {
+	if got := EstimateTokens(""); got != 0 {
+		t.Errorf("empty = %d, want 0", got)
+	}
+	// ASCII ≈ 4 chars/token: 8000 chars → ~2000 tokens.
+	if got := EstimateTokens(strings.Repeat("x", 8000)); got != 2000 {
+		t.Errorf("ASCII 8000 chars = %d tokens, want 2000", got)
+	}
+	// CJK ≈ 1 token/char: 100 3-byte runes → ~100 tokens.
+	if got := EstimateTokens(strings.Repeat("中", 100)); got != 100 {
+		t.Errorf("CJK 100 chars = %d tokens, want 100", got)
+	}
+	// 2-byte runes ≈ ½ token/char.
+	if got := EstimateTokens(strings.Repeat("é", 100)); got != 50 {
+		t.Errorf("2-byte 100 chars = %d tokens, want 50", got)
+	}
+}
+
+func TestStreamSurfacesNonStreaming200(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		wantSub     string
+	}{
+		{"gateway json error", "application/json", `{"error":{"message":"quota exceeded","type":"insufficient_quota"}}`, "quota exceeded"},
+		{"provider ignored stream", "application/json", `{"choices":[{"message":{"content":"hi"}}]}`, "non-streaming response"},
+		{"empty body", "text/plain", "", "empty"},
+		{"opaque body", "text/html", "<html>boom</html>", "unexpected non-streaming response"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			c, err := NewClient(Config{BaseURL: srv.URL, APIKey: "k", Model: "m", MaxRetries: 1, RetryDelay: time.Millisecond})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = c.Stream(context.Background(), CompletionRequest{Model: "m"}, nil)
+			if err == nil {
+				t.Fatalf("expected an error for a non-streaming 200")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q missing %q", err, tc.wantSub)
+			}
+		})
+	}
+}

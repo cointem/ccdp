@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -95,6 +96,37 @@ func TestProcessBoundedBuffer(t *testing.T) {
 	if mp.readPos != len(mp.buf) {
 		t.Errorf("readPos %d, want %d", mp.readPos, len(mp.buf))
 	}
+}
+
+func TestProcessTruncationKeepsUnreadContiguous(t *testing.T) {
+	mp := &managedProcess{done: make(chan struct{})}
+	// Feed more than maxProcOutput through the real pipe() path, consume it
+	// all (readPos reaches the end), then feed another chunk: the consumer
+	// must see exactly that chunk — no dropped, skipped or duplicated bytes.
+	chunk1 := makeLines(0, 4500)
+	mp.pipe(strings.NewReader(chunk1))
+	out1, _, _ := mp.read()
+	if len(out1) != maxProcOutput {
+		t.Fatalf("first read = %d bytes, want capped %d", len(out1), maxProcOutput)
+	}
+	chunk2 := makeLines(4500, 4600)
+	mp.pipe(strings.NewReader(chunk2))
+	out2, _, _ := mp.read()
+	if out2 != chunk2 {
+		t.Errorf("second read = %d bytes, want the full %d-byte chunk uninterrupted", len(out2), len(chunk2))
+	}
+	if mp.readPos != len(mp.buf) {
+		t.Errorf("readPos %d, want %d", mp.readPos, len(mp.buf))
+	}
+}
+
+// makeLines builds a deterministic "NNNN aaaa…\n" block of to-from lines.
+func makeLines(from, to int) string {
+	var sb strings.Builder
+	for i := from; i < to; i++ {
+		fmt.Fprintf(&sb, "%04d %s\n", i, strings.Repeat("a", 120))
+	}
+	return sb.String()
 }
 
 func ctxWithArgs(ctx *Context, args map[string]any) *Context {

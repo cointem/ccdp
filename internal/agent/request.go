@@ -146,7 +146,7 @@ func (a *Agent) buildRequest() llm.CompletionRequest {
 
 	// Session memory (AutoMem): facts learned earlier in this session. Injected
 	// only when enable_memory is on and the log is non-empty.
-	if a.cfg.EnableMemory {
+	if a.cfg.MemoryEnabled() {
 		if sec := a.MemorySection(); sec != "" {
 			sys += sec
 		}
@@ -201,6 +201,9 @@ func filterReadOnlyTools(tools []llm.ToolDef) []llm.ToolDef {
 // prompt and history. The main loop and sub-agent loops share this path so the
 // wire format stays identical everywhere.
 func (a *Agent) buildRequestFrom(sys string, history []messages.Message) llm.CompletionRequest {
+	// Hard guarantee: never put an unpaired tool_call / tool message on the
+	// wire, whatever a history rewrite left behind (providers 400).
+	history = sanitizeToolPairs(history)
 	msgs := make([]llm.ChatMessage, 0, len(history)+1)
 	msgs = append(msgs, llm.ChatMessage{Role: "system", Content: sys})
 
@@ -246,7 +249,9 @@ func (a *Agent) buildRequestFrom(sys string, history []messages.Message) llm.Com
 	}
 
 	req := llm.CompletionRequest{
-		Model:    a.cfg.Model,
+		// The active model follows fallback switches and /model: the model
+		// name must match the endpoint the request is sent to.
+		Model:    a.activeModelSnapshot(),
 		Messages: msgs,
 		Tools:    tools,
 		Stream:   true,
@@ -265,6 +270,60 @@ func wireToolCalls(calls []messages.ToolCall) []llm.ToolCall {
 			Type:     "function",
 			Function: llm.Function{Name: c.Name, Arguments: llm.ArgumentsJSON(messages.MarshalArguments(c.Arguments))},
 		})
+	}
+	return out
+}
+
+// sanitizeToolPairs repairs tool_call↔tool-result pairing after any history
+// rewrite (compact, dropOldestToolResults, /remove, /rewind, fork, resume of
+// an older snapshot). OpenAI-compatible endpoints reject requests where an
+// assistant tool_calls message is not followed by a tool result for every
+// call id, or where a tool message has no preceding call — a single dangling
+// pair fails EVERY subsequent request and deadlocks the session.
+//
+// Rules:
+//   - an assistant message keeps only the calls that have results immediately
+//     following it; calls without results are answered with a synthetic tool
+//     result so the protocol stays intact (matching dispatchTools' interrupt
+//     behavior);
+//   - orphan tool results whose caller is gone are dropped;
+//   - prose-only assistant messages survive untouched.
+func sanitizeToolPairs(hist []messages.Message) []messages.Message {
+	out := make([]messages.Message, 0, len(hist))
+	for i := 0; i < len(hist); {
+		m := hist[i]
+		if m.Role != messages.RoleAssistant || len(m.ToolCalls) == 0 {
+			if m.Role == messages.RoleTool {
+				// Orphan result: its caller was dropped earlier.
+				i++
+				continue
+			}
+			out = append(out, m)
+			i++
+			continue
+		}
+		// Collect the consecutive tool results following this assistant.
+		callIDs := make(map[string]bool, len(m.ToolCalls))
+		for _, tc := range m.ToolCalls {
+			callIDs[tc.ID] = true
+		}
+		j := i + 1
+		answered := make(map[string]bool, len(m.ToolCalls))
+		for j < len(hist) && hist[j].Role == messages.RoleTool && callIDs[hist[j].ToolCallID] {
+			answered[hist[j].ToolCallID] = true
+			j++
+		}
+		out = append(out, m)
+		out = append(out, hist[i+1:j]...)
+		// Synthetic results for calls that never got one (their result was
+		// dropped, or the assistant message is the last thing in history).
+		for _, tc := range m.ToolCalls {
+			if !answered[tc.ID] {
+				out = append(out, messages.NewToolResult(tc,
+					"not executed: the tool result was lost in a history rewrite. Re-issue the call if still needed.", true))
+			}
+		}
+		i = j
 	}
 	return out
 }

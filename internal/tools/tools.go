@@ -217,14 +217,34 @@ func (r *Registry) Schemas() []map[string]any {
 }
 
 // SchemasFiltered returns tool declarations for names passing keep (nil keeps
-// all), sorted by name. Used for deferred tool injection.
+// all), sorted by name. Used for deferred tool injection. Names and tools are
+// collected under a single read lock so a concurrent Unregister can't produce
+// a nil tool between Names() and Get().
 func (r *Registry) SchemasFiltered(keep func(name string) bool) []map[string]any {
-	schemas := make([]map[string]any, 0, len(r.Names()))
-	for _, name := range r.Names() {
+	r.mu.RLock()
+	tools := make(map[string]Tool, 16)
+	for _, scope := range r.scopes {
+		for n, t := range r.layers[scope] {
+			tools[n] = t // later scopes override earlier ones, matching Get
+		}
+	}
+	r.mu.RUnlock()
+
+	names := make([]string, 0, len(tools))
+	for n := range tools {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	schemas := make([]map[string]any, 0, len(names))
+	for _, name := range names {
 		if keep != nil && !keep(name) {
 			continue
 		}
-		t, _ := r.Get(name)
+		t := tools[name]
+		if t == nil {
+			continue
+		}
 		schemas = append(schemas, map[string]any{
 			"type": "function",
 			"function": map[string]any{

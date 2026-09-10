@@ -71,6 +71,28 @@ func TestProjectOverridesUser(t *testing.T) {
 	}
 }
 
+func TestEarlierProjectDirWins(t *testing.T) {
+	user := t.TempDir()
+	projA := t.TempDir()
+	projB := t.TempDir()
+	writeSkill(t, user, "x", "name: dup\ndescription: user version\n", "user body")
+	writeSkill(t, projA, "x", "name: dup\ndescription: first project version\n", "first project body")
+	writeSkill(t, projB, "x", "name: dup\ndescription: second project version\n", "second project body")
+
+	s := NewStore()
+	s.Load(user, projA, projB)
+	sk, ok := s.Get("dup")
+	if !ok {
+		t.Fatal("missing dup")
+	}
+	if !strings.Contains(sk.Body, "first project body") {
+		t.Errorf("earlier project dir should win, got: %+v", sk)
+	}
+	if sk.Source != "project" {
+		t.Errorf("source should be project, got %q", sk.Source)
+	}
+}
+
 func TestFoldedDescription(t *testing.T) {
 	user := t.TempDir()
 	writeSkill(t, user, "multi",

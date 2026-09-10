@@ -111,14 +111,15 @@ func (a *Agent) writeTrace(ev Event) {
 	_, _ = a.trace.Write(append(b, '\n'))
 }
 
-// closeTrace flushes and closes the trace file.
+// closeTrace flushes and closes the trace file. The nil check and the close
+// both happen under traceMu so it cannot race with a running turn's
+// writeTrace (Close may be called while a turn is still streaming).
 func (a *Agent) closeTrace() {
-	if a.trace == nil {
-		return
-	}
 	a.traceMu.Lock()
-	_ = a.trace.Close()
-	a.trace = nil
+	if a.trace != nil {
+		_ = a.trace.Close()
+		a.trace = nil
+	}
 	a.traceMu.Unlock()
 }
 

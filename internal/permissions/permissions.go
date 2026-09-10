@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // Mode mirrors Claude Code's permission modes (including plan).
@@ -53,8 +54,11 @@ type Policy struct {
 	AlwaysDeny  []string `json:"always_deny"`
 }
 
-// Manager answers permission questions for a session.
+// Manager answers permission questions for a session. It is safe for
+// concurrent use: Check runs on tool goroutines while the TUI/agent loop
+// mutates mode, policy and rememberance via the setters.
 type Manager struct {
+	mu       sync.RWMutex
 	Mode     Mode
 	Policy   Policy
 	AllowAll bool            // bypass mode
@@ -73,19 +77,39 @@ func NewManager(mode Mode, policy Policy) *Manager {
 }
 
 // SetMode switches the permission mode at runtime.
-func (m *Manager) SetMode(mode Mode) { m.Mode = mode }
+func (m *Manager) SetMode(mode Mode) {
+	m.mu.Lock()
+	m.Mode = mode
+	m.mu.Unlock()
+}
 
 // SetPolicy replaces the persistent rule set at runtime (settings reload).
-func (m *Manager) SetPolicy(p Policy) { m.Policy = p }
+func (m *Manager) SetPolicy(p Policy) {
+	m.mu.Lock()
+	m.Policy = p
+	m.mu.Unlock()
+}
 
 // Mode returns the current mode.
-func (m *Manager) CurrentMode() Mode { return m.Mode }
+func (m *Manager) CurrentMode() Mode {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Mode
+}
 
 // RememberAllow records a session-scoped "always allow" key.
-func (m *Manager) RememberAllow(key string) { m.allowMap[key] = true }
+func (m *Manager) RememberAllow(key string) {
+	m.mu.Lock()
+	m.allowMap[key] = true
+	m.mu.Unlock()
+}
 
 // RememberDeny records a session-scoped "never allow" key.
-func (m *Manager) RememberDeny(key string) { m.denyMap[key] = true }
+func (m *Manager) RememberDeny(key string) {
+	m.mu.Lock()
+	m.denyMap[key] = true
+	m.mu.Unlock()
+}
 
 // CommandKey builds the stable key used for command-level rememberance.
 func CommandKey(command string) string { return "command:" + command }
@@ -94,47 +118,55 @@ func CommandKey(command string) string { return "command:" + command }
 //
 // toolName is e.g. "Bash", "Write". For Bash, args["command"] is inspected for
 // classification. For file tools, the mode drives the decision.
+//
+// Decision order is: persistent deny rules → session denies → persistent allow
+// rules → session allows → per-tool classification. Persistent deny rules
+// outrank even a session-remembered allow, so a "remember for this session"
+// decision can never bypass always_deny.
 func (m *Manager) Check(toolName string, args map[string]any) (Decision, string) {
-	if m.AllowAll || m.Mode == ModeBypass {
+	m.mu.RLock()
+	mode, allowAll := m.Mode, m.AllowAll
+	policy := m.Policy
+	_, deniedSession := m.denyMap[SessionKey(toolName, args)]
+	_, allowedSession := m.allowMap[SessionKey(toolName, args)]
+	m.mu.RUnlock()
+
+	if allowAll || mode == ModeBypass {
 		return DecisionAllow, "bypass mode"
 	}
 
-	// Session-level rememberance first.
-	desc := SessionKey(toolName, args)
-	if m.denyMap[desc] {
-		return DecisionDeny, "denied by session rule"
-	}
-	if m.allowMap[desc] {
-		return DecisionAllow, "allowed by session rule"
-	}
-
-	// Persistent policy rules (tool-level or tool:value globs). Rules are
-	// matched against the canonical invocation descriptor ("Bash:<cmd>",
-	// "Write:<path>"), not the session-rememberance key form.
+	// Rules are matched against the canonical invocation descriptor
+	// ("Bash:<cmd>", "Write:<path>"), not the session-rememberance key form.
 	invocation := describeInvocation(toolName, args)
-	for _, deny := range m.Policy.AlwaysDeny {
+	for _, deny := range policy.AlwaysDeny {
 		if ruleMatches(deny, toolName, invocation) {
 			return DecisionDeny, fmt.Sprintf("denied by always_deny rule %q", deny)
 		}
 	}
-	for _, allow := range m.Policy.AlwaysAllow {
+	if deniedSession {
+		return DecisionDeny, "denied by session rule"
+	}
+	for _, allow := range policy.AlwaysAllow {
 		if ruleMatches(allow, toolName, invocation) {
 			return DecisionAllow, fmt.Sprintf("allowed by always_allow rule %q", allow)
 		}
+	}
+	if allowedSession {
+		return DecisionAllow, "allowed by session rule"
 	}
 
 	// Tool-specific classification.
 	switch toolName {
 	case "Bash":
-		if m.Mode == ModePlan {
+		if mode == ModePlan {
 			return DecisionAsk, "Bash is not available in plan mode"
 		}
-		return m.checkBash(StringArg(args, "command", ""))
+		return m.checkBash(mode, StringArg(args, "command", ""))
 	case "Write", "Edit":
-		if m.Mode == ModePlan {
+		if mode == ModePlan {
 			return DecisionAsk, fmt.Sprintf("%s is not available in plan mode", toolName)
 		}
-		switch m.Mode {
+		switch mode {
 		case ModeAcceptEdits:
 			return DecisionAllow, "edit accepted by acceptEdits mode"
 		case ModeDefault:
@@ -148,13 +180,13 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 		return DecisionAllow, "read-only tool"
 	case "GitCommit":
 		// Mutates history; bypass mode alone skips the gate.
-		if m.Mode == ModeBypass {
+		if mode == ModeBypass {
 			return DecisionAllow, "bypass mode"
 		}
 		return DecisionAsk, "GitCommit requires approval (mutates repository history)"
 	case "WebFetch", "WebSearch":
 		// Network access is a side effect; ask outside bypass mode.
-		if m.Mode == ModeBypass {
+		if mode == ModeBypass {
 			return DecisionAllow, "bypass mode"
 		}
 		return DecisionAsk, fmt.Sprintf("%s requires approval (network access)", toolName)
@@ -164,19 +196,10 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 	return DecisionAsk, fmt.Sprintf("unknown tool %q", toolName)
 }
 
-func (m *Manager) checkBash(command string) (Decision, string) {
+func (m *Manager) checkBash(mode Mode, command string) (Decision, string) {
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return DecisionDeny, "empty command"
-	}
-
-	// Session rememberance for the whole command line.
-	key := CommandKey(command)
-	if m.denyMap[key] {
-		return DecisionDeny, "denied by session rule"
-	}
-	if m.allowMap[key] {
-		return DecisionAllow, "allowed by session rule"
 	}
 
 	// Dangerous patterns are always denied, regardless of mode.
@@ -191,12 +214,12 @@ func (m *Manager) checkBash(command string) (Decision, string) {
 	if safeTokens[first] && !hasDangerousOperator(command) {
 		return DecisionAllow, "read-only command"
 	}
-	if gitSafe(command) {
+	if !hasDangerousOperator(command) && gitSafe(command) {
 		return DecisionAllow, "safe git command"
 	}
 
 	// Everything else asks, even in acceptEdits (which only auto-accepts file edits).
-	if m.Mode == ModeBypass {
+	if mode == ModeBypass {
 		return DecisionAllow, "bypass mode"
 	}
 	return DecisionAsk, "command is not in the safe allowlist"
@@ -243,19 +266,40 @@ func ruleMatches(rule, toolName, desc string) bool {
 	return false
 }
 
-// globMatch does a simple * glob match.
+// globMatch does a simple * glob match. Patterns containing "/" (file-path
+// rules) use path-glob semantics; bare patterns keep loose command-glob
+// semantics.
 func globMatch(pattern, s string) (bool, error) {
 	return regexp.MatchString(globToRegex(pattern), s)
 }
 
+// globToRegex converts a permission rule glob to an anchored regex.
+//
+// Patterns whose value contains a "/" are treated as file paths: "*" matches
+// within a single path segment ("[^/]*"), "**" spans segments (".*") and every
+// other character is literal — so "Write:/tmp/*.log" matches /tmp/a.log but
+// not /tmp/sub/a.log. Patterns without a "/" keep the loose historical
+// semantics ("*" crosses anything, "?" matches one char), which command rules
+// like "Bash:git status*" and bare rules like "go test *" rely on to match
+// across spaces. Matching stays case-insensitive either way.
 func globToRegex(pattern string) string {
+	pathGlob := strings.Contains(pattern, "/")
+	runes := []rune(pattern)
 	var sb strings.Builder
 	sb.WriteString("(?i)^")
-	for _, r := range pattern {
-		switch r {
-		case '*':
-			sb.WriteString(".*")
-		case '?':
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case r == '*':
+			if pathGlob && i+1 < len(runes) && runes[i+1] == '*' {
+				sb.WriteString(".*")
+				i++
+			} else if pathGlob {
+				sb.WriteString("[^/]*")
+			} else {
+				sb.WriteString(".*")
+			}
+		case r == '?' && !pathGlob:
 			sb.WriteString(".")
 		default:
 			sb.WriteString(regexp.QuoteMeta(string(r)))
@@ -277,12 +321,13 @@ func StringArg(args map[string]any, key, fallback string) string {
 func firstToken(s string) string {
 	s = strings.TrimSpace(s)
 	// Strip environment assignments and `cd` prefixes which don't change safety.
+	// `sudo` is deliberately NOT stripped: a sudo command must fall through to
+	// the ask gate, not inherit the safety of the wrapped command.
 	for {
 		if len(s) == 0 {
 			return ""
 		}
-		// skip leading cd / env / sudo
-		for _, prefix := range []string{"cd ", "env ", "sudo "} {
+		for _, prefix := range []string{"cd ", "env "} {
 			if strings.HasPrefix(s, prefix) {
 				s = strings.TrimSpace(strings.TrimPrefix(s, prefix))
 			}
@@ -294,9 +339,10 @@ func firstToken(s string) string {
 	}
 }
 
-// hasDangerousOperator flags commands combining operators with non-readonly first tokens.
+// hasDangerousOperator flags shell operators (including embedded newlines and
+// command substitutions) that make a command unsafe to auto-allow.
 func hasDangerousOperator(s string) bool {
-	for _, op := range []string{">", ">>", "|", ";", "&&", "||", "$(", "`"} {
+	for _, op := range []string{">", ">>", "|", ";", "&&", "||", "$(", "`", "\n"} {
 		if strings.Contains(s, op) {
 			return true
 		}

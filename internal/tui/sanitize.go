@@ -1,6 +1,9 @@
 package tui
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // ANSI sanitization: tool output and user/assistant text can contain terminal
 // escape sequences (a file catted by the Bash tool may embed them, or a
@@ -17,15 +20,23 @@ var (
 	escRe = regexp.MustCompile(`\x1b[@-Z\\-_]`)
 )
 
-// sanitizeANSI strips terminal escape sequences from display text.
+// sanitizeANSI strips terminal escape sequences and disruptive C0 control
+// characters (\r, \x00, \x07, \x08) from display text. Newlines are kept;
+// the stripped controls could otherwise fake line edits, bells or visual
+// carriage returns inside the TUI.
 func sanitizeANSI(s string) string {
-	if !stringsContainsESC(s) {
-		return s
+	if stringsContainsESC(s) {
+		s = oscRe.ReplaceAllString(s, "")
+		s = csiRe.ReplaceAllString(s, "")
+		s = escRe.ReplaceAllString(s, "")
 	}
-	s = oscRe.ReplaceAllString(s, "")
-	s = csiRe.ReplaceAllString(s, "")
-	s = escRe.ReplaceAllString(s, "")
-	return s
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', 0x00, 0x07, 0x08:
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func stringsContainsESC(s string) bool {

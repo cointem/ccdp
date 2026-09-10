@@ -47,7 +47,7 @@ func (a *Agent) MemorySection() string {
 // recordMemory appends one AutoMem entry for the turn that just finished and
 // caps the log at maxMemoryEntries. Called from turnFinished.
 func (a *Agent) recordMemory() {
-	if !a.cfg.EnableMemory {
+	if !a.cfg.MemoryEnabled() {
 		return
 	}
 	a.mu.Lock()

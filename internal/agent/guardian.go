@@ -55,7 +55,13 @@ func (a *Agent) guardianCheck(tc messages.ToolCall) error {
 		a.emitStatus("guardian review failed (%v) — proceeding", err)
 		return nil
 	}
-	verdict := parseGuardianVerdict(out)
+	verdict, parsed := parseGuardianVerdict(out)
+	if !parsed {
+		// Fail-open is the documented trade-off (a hard block on unparseable
+		// output would be too noisy), but it must be visible: this is exactly
+		// the mode where the guard is absent.
+		a.emitStatus("guardian review produced no valid verdict — allowing (fail-open)")
+	}
 	if verdict.Approved {
 		a.emitStatus("guardian approved %s", tc.Name)
 		return nil
@@ -74,20 +80,21 @@ type guardianVerdict struct {
 }
 
 // parseGuardianVerdict extracts the JSON verdict from the sub-agent output,
-// tolerating surrounding prose.
-func parseGuardianVerdict(out string) guardianVerdict {
+// tolerating surrounding prose. The bool reports whether a valid JSON verdict
+// was found at all (callers surface fail-open).
+func parseGuardianVerdict(out string) (guardianVerdict, bool) {
 	var v guardianVerdict
 	start := strings.Index(out, "{")
 	end := strings.LastIndex(out, "}")
 	if start >= 0 && end > start {
 		if err := json.Unmarshal([]byte(out[start:end+1]), &v); err == nil {
-			return v
+			return v, true
 		}
 	}
-	// Fallback: no JSON found — err on the side of caution is too noisy;
+	// Fallback: no JSON found — erring on the side of caution is too noisy;
 	// treat unparseable output as approval with a note (the review already
 	// cost a turn).
-	return guardianVerdict{Approved: true}
+	return guardianVerdict{Approved: true}, false
 }
 
 // resetGuardianBudget clears the per-turn guardian circuit breaker.

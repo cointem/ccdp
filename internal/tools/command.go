@@ -69,6 +69,7 @@ func (t *CommandTool) Run(ctx *Context) (string, error) {
 	cmd.Dir = ctx.WorkingDir
 	cmd.Env = os.Environ()
 	cmd.Stdin = bytes.NewReader(argsJSON)
+	setProcessGroup(cmd)
 
 	// Stream output lines to Notify when set (live output in the TUI), while
 	// still collecting the full output for the result.
@@ -93,7 +94,7 @@ func (t *CommandTool) Run(ctx *Context) (string, error) {
 		runErr := cmd.Run()
 		_ = pw.Close()
 		<-scannerDone
-		if runErr != nil {
+		if runErr != nil && !benignPipeClose(runErr) {
 			if cctx.Err() != nil {
 				return out.String() + fmt.Sprintf("\n[%s timed out]", t.name), nil
 			}
@@ -105,7 +106,7 @@ func (t *CommandTool) Run(ctx *Context) (string, error) {
 	cmd.Stdout = out
 	cmd.Stderr = out
 
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil && !benignPipeClose(err) {
 		if cctx.Err() != nil {
 			return out.String() + fmt.Sprintf("\n[%s timed out]", t.name), nil
 		}

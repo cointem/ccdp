@@ -78,7 +78,9 @@ func (m *Manager) ToolNames() map[string][]string {
 // RegisterTools wraps every advertised tool as a tools.Tool and registers it
 // into the registry under the "mcp" scope. On name collisions between servers,
 // the first registered server wins. The registry reference is kept so a
-// server's notifications/tools/list_changed can re-sync at runtime.
+// server's notifications/tools/list_changed can re-sync at runtime, and so a
+// dead server's tools are unregistered instead of lingering (a call into a
+// dead server would just fail with "server exited" forever).
 func (m *Manager) RegisterTools(reg *tools.Registry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -86,16 +88,32 @@ func (m *Manager) RegisterTools(reg *tools.Registry) {
 	for _, name := range m.names {
 		client := m.clients[name]
 		m.registerClientTools(client)
-		// Hot refresh: when the server advertises a changed tool list,
-		// re-register everything under the "mcp" scope (old entries are
-		// replaced by name; removed tools are unregistered first).
-		client.SetChangeListener(func() {
+		resync := func() {
 			reg.UnregisterScope("mcp")
 			m.mu.Lock()
 			for _, n := range m.names {
 				m.registerClientTools(m.clients[n])
 			}
 			m.mu.Unlock()
+		}
+		// Hot refresh: when the server advertises a changed tool list,
+		// re-register everything under the "mcp" scope (old entries are
+		// replaced by name; removed tools are unregistered first).
+		client.SetChangeListener(resync)
+		// Connection death (process exit, SSE stream end): drop the server
+		// and re-sync the "mcp" scope from the survivors.
+		client.SetCloseListener(func() {
+			log.Printf("mcp: server %q disconnected; unregistering its tools", name)
+			m.mu.Lock()
+			delete(m.clients, name)
+			for i, n := range m.names {
+				if n == name {
+					m.names = append(m.names[:i], m.names[i+1:]...)
+					break
+				}
+			}
+			m.mu.Unlock()
+			resync()
 		})
 	}
 }
@@ -113,12 +131,20 @@ func (m *Manager) registerClientTools(client *Client) {
 	}
 }
 
-// Close shuts down every server.
+// Close shuts down every server. The clients are closed WITHOUT the manager
+// lock held: each Close fires the close listener, which re-enters the manager
+// to unregister the server (and would deadlock if m.mu were already held).
 func (m *Manager) Close() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, name := range m.names {
-		_ = m.clients[name].Close()
+	clients := make([]*Client, 0, len(m.clients))
+	for _, c := range m.clients {
+		clients = append(clients, c)
+	}
+	m.clients = map[string]*Client{}
+	m.names = nil
+	m.mu.Unlock()
+	for _, c := range clients {
+		_ = c.Close()
 	}
 }
 

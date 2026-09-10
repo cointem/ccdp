@@ -3,11 +3,13 @@ package tools
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"ccdp/internal/sandbox"
@@ -15,6 +17,35 @@ import (
 
 // DefaultShellTimeout bounds a single Bash tool invocation.
 const DefaultShellTimeout = 120 * time.Second
+
+// waitPipeDelay bounds how long Wait may linger after the shell exits when
+// grandchild processes (e.g. `npm run dev &`) inherited stdout/stderr and keep
+// the pipes open. Once it elapses, exec closes the pipe ends so the scanner
+// goroutine gets EOF instead of blocking forever.
+const waitPipeDelay = 3 * time.Second
+
+// setProcessGroup configures cmd to run in its own process group, so that a
+// context timeout kills the whole tree (children and grandchildren) rather
+// than only the shell, and bounds pipe-drain lingering with WaitDelay.
+func setProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// Kill the entire process group (negative pid). ErrProcessDone tells
+		// Wait to ignore a race where the group died before the kill landed.
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
+		}
+		return os.ErrProcessDone
+	}
+	cmd.WaitDelay = waitPipeDelay
+}
+
+// benignPipeClose reports whether err is the benign Wait error after WaitDelay
+// force-closed pipes that grandchildren kept open. The shell itself exited
+// fine — this is not a launch failure and the collected output stands.
+func benignPipeClose(err error) bool {
+	return errors.Is(err, exec.ErrWaitDelay) || errors.Is(err, os.ErrClosed)
+}
 
 // BashResult is the structured output of a shell invocation.
 type BashResult struct {
@@ -46,6 +77,7 @@ func RunShell(ctx *Context, command string) (BashResult, error) {
 	cmd := exec.CommandContext(cctx, shell, shellFlag, command)
 	cmd.Dir = ctx.WorkingDir
 	cmd.Env = os.Environ()
+	setProcessGroup(cmd)
 
 	// Stream output lines to the Notify callback when one is set (live tool
 	// output in the TUI), while still collecting the full output for the result.
@@ -81,6 +113,9 @@ func RunShell(ctx *Context, command string) (BashResult, error) {
 		if err != nil {
 			if ee, ok := err.(*exec.ExitError); ok {
 				res.ExitCode = ee.ExitCode()
+			} else if benignPipeClose(err) {
+				// Grandchildren held the pipes; WaitDelay force-closed them
+				// after the shell exited. Not a bash failure.
 			} else {
 				return res, fmt.Errorf("bash: %w", err)
 			}
@@ -103,6 +138,8 @@ func RunShell(ctx *Context, command string) (BashResult, error) {
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			res.ExitCode = ee.ExitCode()
+		} else if benignPipeClose(err) {
+			// See above: leftover grandchildren holding the pipes.
 		} else {
 			return res, fmt.Errorf("bash: %w", err)
 		}

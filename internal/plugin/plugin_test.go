@@ -103,7 +103,7 @@ func TestHostDetectsCycles(t *testing.T) {
 	}
 }
 
-func TestHostUnloadGuardsDependents(t *testing.T) {
+func TestHostUnloadCascadesDependents(t *testing.T) {
 	h := NewHost(newTestCtx())
 	var log []string
 	base := &recordPlugin{name: "base", initLog: &log}
@@ -114,14 +114,51 @@ func TestHostUnloadGuardsDependents(t *testing.T) {
 	if err := h.Load(app); err != nil {
 		t.Fatalf("Load(app): %v", err)
 	}
-	if err := h.Unload("base"); err == nil {
-		t.Fatal("expected unload of depended-upon plugin to fail")
-	}
-	if err := h.Unload("app"); err != nil {
-		t.Fatalf("Unload(app): %v", err)
-	}
+	// Unloading a depended-upon plugin cascades: the dependent is unloaded
+	// first (so it never sees a torn-down dependency), then the dependency.
 	if err := h.Unload("base"); err != nil {
 		t.Fatalf("Unload(base): %v", err)
+	}
+	if names := h.Names(); len(names) != 0 {
+		t.Fatalf("expected empty host after cascade, got %v", names)
+	}
+	if len(log) != 4 || log[2] != "deinit:app" || log[3] != "deinit:base" {
+		t.Fatalf("expected dependent teardown before dependency, got %v", log)
+	}
+}
+
+func TestHostPendingPluginLoadsWhenDependencyArrives(t *testing.T) {
+	h := NewHost(newTestCtx())
+	var log []string
+	base := &recordPlugin{name: "zbase", initLog: &log}
+	app := &recordPlugin{name: "aapp", requires: []string{"zbase"}, initLog: &log}
+
+	// The dependency is not available yet: the plugin stays pending and Load
+	// reports the missing requirement, but keeps it registered.
+	if err := h.Load(app); err == nil || !strings.Contains(err.Error(), "pending") {
+		t.Fatalf("expected pending error, got %v", err)
+	}
+	if got := h.Pending(); len(got) != 1 || got[0] != "aapp" {
+		t.Fatalf("expected aapp pending, got %v", got)
+	}
+
+	// Registering the dependency (even under a different name) satisfies the
+	// requirement on the next Load and auto-loads the pending plugin.
+	registerBuiltin(t, base)
+	if err := h.Load(&recordPlugin{name: "unrelated", initLog: &log}); err != nil {
+		t.Fatalf("Load(unrelated): %v", err)
+	}
+	if got := h.Pending(); len(got) != 0 {
+		t.Fatalf("expected no pending plugins after dependency arrived, got %v", got)
+	}
+	found := false
+	for _, n := range h.Names() {
+		if n == "aapp" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("aapp should have auto-loaded, got %v", h.Names())
 	}
 }
 
@@ -254,6 +291,32 @@ func TestGoHooksDisposer(t *testing.T) {
 	}
 }
 
+func TestGoHooksDisposerOrderIndependent(t *testing.T) {
+	g := NewGoHooks()
+	var ran []string
+	d1 := g.AddPreTool(func(string, map[string]any) (ToolDecision, string) {
+		ran = append(ran, "one")
+		return DecisionNone, ""
+	})
+	d2 := g.AddPreTool(func(string, map[string]any) (ToolDecision, string) {
+		ran = append(ran, "two")
+		return DecisionNone, ""
+	})
+	// Dispose the first registration out of order: the remaining hook must
+	// still run and still be removable afterwards.
+	d1()
+	g.RunPreTool("Any", nil)
+	if len(ran) != 1 || ran[0] != "two" {
+		t.Fatalf("expected only the remaining hook to run, got %v", ran)
+	}
+	d2()
+	ran = nil
+	g.RunPreTool("Any", nil)
+	if len(ran) != 0 {
+		t.Fatalf("remaining hook should be removable, got %v", ran)
+	}
+}
+
 // ---------- Event bus ----------
 
 func TestBusSubscribeEmitAndDispose(t *testing.T) {
@@ -312,5 +375,26 @@ func TestSessionCallbacks(t *testing.T) {
 	}
 	if len(disposed) != 1 || disposed[0] != "s1" {
 		t.Fatalf("unexpected dispose: %v", disposed)
+	}
+}
+
+func TestSessionCallbacksDisposerOrderIndependent(t *testing.T) {
+	s := NewSessionRegistry()
+	var created []string
+	d1 := s.OnCreate(func(id, ws string) { created = append(created, "one") })
+	d2 := s.OnCreate(func(id, ws string) { created = append(created, "two") })
+
+	// Dispose the first registration out of order: the remaining callback
+	// must still run and still be removable afterwards.
+	d1()
+	s.RunCreate("s1", "/ws")
+	if len(created) != 1 || created[0] != "two" {
+		t.Fatalf("expected only the remaining callback, got %v", created)
+	}
+	d2()
+	created = nil
+	s.RunCreate("s2", "/ws")
+	if len(created) != 0 {
+		t.Fatalf("remaining callback should be removable, got %v", created)
 	}
 }

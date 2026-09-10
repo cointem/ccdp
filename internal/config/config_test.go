@@ -87,3 +87,40 @@ func TestLoadFromMissingFile(t *testing.T) {
 		t.Errorf("defaults not applied: %+v", cfg)
 	}
 }
+
+func TestTriStateBoolMerge(t *testing.T) {
+	// An explicit false must survive the merge over the true default.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	content := `{
+		"enable_web_tools": false,
+		"enable_guardian": true,
+		"enable_memory": false
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if cfg.WebToolsEnabled() {
+		t.Error("enable_web_tools:false was ignored by the merge")
+	}
+	if !cfg.GuardianEnabled() {
+		t.Error("enable_guardian:true was ignored by the merge")
+	}
+	if cfg.MemoryEnabled() {
+		t.Error("enable_memory:false was ignored by the merge")
+	}
+
+	// Unset keys fall back to the defaults (web on, guardian/memory off).
+	cfg2, err := LoadFrom(filepath.Join(t.TempDir(), "empty.json"))
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if !cfg2.WebToolsEnabled() || cfg2.GuardianEnabled() || cfg2.MemoryEnabled() {
+		t.Errorf("defaults wrong: web=%v guardian=%v memory=%v",
+			cfg2.WebToolsEnabled(), cfg2.GuardianEnabled(), cfg2.MemoryEnabled())
+	}
+}

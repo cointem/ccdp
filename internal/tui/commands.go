@@ -86,6 +86,8 @@ const commandHelp = `ccdp commands
                             switch sandbox mode
 /remove [n]                 remove the last n messages (default 1)
 /rewind [n]                 keep the first n messages; no arg = pick interactively
+/fork [n]                   branch a new session from message n (no arg = full copy);
+                            the abandoned direction is summarized into the new session
 /checkpoint [summary|id]    create a checkpoint, or restore one by id
 /review                     show changes and checkpoints
 /add-dir <dir>              allow the sandbox to touch another directory
@@ -117,8 +119,9 @@ Keys
   esc          clear input / dismiss
 `
 
-// runCommand executes a slash command entered in the input box.
-func (m *Model) runCommand(text string) tea.Model {
+// runCommand executes a slash command entered in the input box. Commands that
+// need the tea runtime (e.g. quitting) return a tea.Cmd alongside the model.
+func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	fields := strings.Fields(text)
 	cmd := strings.ToLower(strings.TrimPrefix(fields[0], "/"))
 	args := fields[1:]
@@ -140,7 +143,11 @@ func (m *Model) runCommand(text string) tea.Model {
 		m.pushLog("system", renderUsage(m.ag.Usage(), m.modelName))
 
 	case "plugins":
-		m.pushLog("system", renderPlugins(m.ag.PluginNames(), m.ag.ProviderNames()))
+		extra := m.ag.PluginNames()
+		if pending := m.ag.HostPending(); len(pending) > 0 {
+			extra = append(append([]string{}, extra...), fmt.Sprintf("(pending: %s)", strings.Join(pending, ", ")))
+		}
+		m.pushLog("system", renderPlugins(extra, m.ag.ProviderNames()))
 
 	case "mcp":
 		info := m.ag.MCPInfo()
@@ -148,7 +155,7 @@ func (m *Model) runCommand(text string) tea.Model {
 		prompts := m.ag.MCPPrompts()
 		if len(info) == 0 {
 			m.pushLog("system", "no MCP servers connected — configure mcp_servers in ~/.ccdp/config.json")
-			return m
+			return m, nil
 		}
 		var sb strings.Builder
 		sb.WriteString("MCP servers:\n")
@@ -171,19 +178,19 @@ func (m *Model) runCommand(text string) tea.Model {
 		path, err := workspace.InitInstructionsFile(m.workspace)
 		if err != nil {
 			m.pushLog("error", "init failed: "+err.Error())
-			return m
+			return m, nil
 		}
 		m.pushStatus("wrote " + path + " (edit it with project guidance)")
 
 	case "mode":
 		if len(args) == 0 {
 			m.pushStatus(fmt.Sprintf("current permission mode: %s", m.mode))
-			return m
+			return m, nil
 		}
 		mode, err := permissions.ParseMode(args[0])
 		if err != nil {
 			m.pushLog("error", err.Error())
-			return m
+			return m, nil
 		}
 		m.ctrl <- agent.Control{Type: agent.ControlSetMode, Mode: mode}
 		m.mode = mode
@@ -192,7 +199,7 @@ func (m *Model) runCommand(text string) tea.Model {
 	case "model":
 		if len(args) == 0 {
 			m.pushStatus("model: " + m.modelName)
-			return m
+			return m, nil
 		}
 		m.ag.SetModel(args[0])
 		m.modelName = args[0]
@@ -208,7 +215,7 @@ func (m *Model) runCommand(text string) tea.Model {
 				on = false
 			default:
 				m.pushLog("error", "usage: /plan [on|off]")
-				return m
+				return m, nil
 			}
 		}
 		m.ctrl <- agent.Control{Type: agent.ControlSetPlan, PlanOn: on}
@@ -222,12 +229,12 @@ func (m *Model) runCommand(text string) tea.Model {
 	case "sandbox":
 		if len(args) == 0 {
 			m.pushStatus("sandbox mode: " + string(m.ag.SandboxMode()))
-			return m
+			return m, nil
 		}
 		mode, err := sandbox.ParseMode(args[0])
 		if err != nil {
 			m.pushLog("error", err.Error())
-			return m
+			return m, nil
 		}
 		m.ctrl <- agent.Control{Type: agent.ControlSetSandbox, SandboxMode: mode}
 		m.pushStatus("sandbox mode → " + string(mode))
@@ -238,7 +245,7 @@ func (m *Model) runCommand(text string) tea.Model {
 			v, err := strconv.Atoi(args[0])
 			if err != nil || v < 1 {
 				m.pushLog("error", "usage: /remove [n] (n >= 1)")
-				return m
+				return m, nil
 			}
 			n = v
 		}
@@ -252,7 +259,7 @@ func (m *Model) runCommand(text string) tea.Model {
 			previews := m.ag.HistoryPreview(10)
 			if len(previews) == 0 {
 				m.pushLog("error", "nothing to rewind to")
-				return m
+				return m, nil
 			}
 			lines := make([]string, len(previews))
 			for i, p := range previews {
@@ -267,15 +274,31 @@ func (m *Model) runCommand(text string) tea.Model {
 				m.ctrl <- agent.Control{Type: agent.ControlRewind, Count: keep}
 				m.pushStatus(fmt.Sprintf("rewinding to message %d…", keep))
 			})
-			return m
+			return m, nil
 		}
 		n, err := strconv.Atoi(args[0])
 		if err != nil || n < 0 {
 			m.pushLog("error", "usage: /rewind [<n>] (keep the first n messages; no arg picks interactively)")
-			return m
+			return m, nil
 		}
 		m.ctrl <- agent.Control{Type: agent.ControlRewind, Count: n}
 		m.pushStatus(fmt.Sprintf("rewinding to message %d…", n))
+
+	case "fork":
+		// /fork [n] — branch a new session from message n (pi's session tree).
+		// No argument forks the whole history; the abandoned direction is
+		// summarized by the model into the new session.
+		n := -1
+		if len(args) > 0 {
+			v, err := strconv.Atoi(args[0])
+			if err != nil || v < 0 {
+				m.pushLog("error", "usage: /fork [n] (branch from message n; no arg = full copy)")
+				return m, nil
+			}
+			n = v
+		}
+		m.ctrl <- agent.Control{Type: agent.ControlFork, Count: n}
+		m.pushStatus("forking session…")
 
 	case "checkpoint":
 		// With a known checkpoint id: restore. Otherwise: create one with the
@@ -285,10 +308,10 @@ func (m *Model) runCommand(text string) tea.Model {
 				if r.ID == args[0] {
 					if err := m.ag.RestoreCheckpoint(args[0]); err != nil {
 						m.pushLog("error", "restore failed: "+err.Error())
-						return m
+						return m, nil
 					}
 					m.pushStatus("restored checkpoint " + args[0])
-					return m
+					return m, nil
 				}
 			}
 		}
@@ -303,12 +326,12 @@ func (m *Model) runCommand(text string) tea.Model {
 		}
 
 	case "review":
-		m.runReview()
+		return m, m.runReview()
 
 	case "add-dir":
 		if len(args) == 0 {
 			m.pushLog("error", "usage: /add-dir <directory>")
-			return m
+			return m, nil
 		}
 		m.ag.AddDirectory(args[0])
 		m.pushStatus("additional directory → " + args[0])
@@ -316,7 +339,7 @@ func (m *Model) runCommand(text string) tea.Model {
 	case "disallowed-dir":
 		if len(args) == 0 {
 			m.pushLog("error", "usage: /disallowed-dir <directory>")
-			return m
+			return m, nil
 		}
 		m.ag.AddDisallowedDirectory(args[0])
 		m.pushStatus("disallowed directory → " + args[0])
@@ -329,7 +352,7 @@ func (m *Model) runCommand(text string) tea.Model {
 		}
 		if err := os.WriteFile(path, []byte(md), 0o644); err != nil {
 			m.pushLog("error", "export failed: "+err.Error())
-			return m
+			return m, nil
 		}
 		m.pushStatus(fmt.Sprintf("exported %d messages to %s", strings.Count(md, "## "), path))
 
@@ -339,11 +362,11 @@ func (m *Model) runCommand(text string) tea.Model {
 	case "cd":
 		if len(args) == 0 {
 			m.pushLog("error", "usage: /cd <dir>")
-			return m
+			return m, nil
 		}
 		if err := m.ag.SetWorkspace(args[0]); err != nil {
 			m.pushLog("error", "cd failed: "+err.Error())
-			return m
+			return m, nil
 		}
 		m.workspace = m.ag.WorkspaceLabel()
 		// Project-scoped custom commands follow the workspace.
@@ -356,18 +379,18 @@ func (m *Model) runCommand(text string) tea.Model {
 	case "statusline":
 		if len(args) == 0 {
 			m.pushStatus("statusline items: " + strings.Join(m.statusItems, " "))
-			return m
+			return m, nil
 		}
 		if args[0] == "default" {
 			m.statusItems = append([]string{}, defaultStatusItems...)
 			m.pushStatus("statusline reset")
-			return m
+			return m, nil
 		}
 		var items []string
 		for _, a := range args {
 			if !statuslineTokens[a] {
 				m.pushLog("error", fmt.Sprintf("unknown statusline item %q (valid: version model mode session workspace cost context)", a))
-				return m
+				return m, nil
 			}
 			items = append(items, a)
 		}
@@ -378,23 +401,23 @@ func (m *Model) runCommand(text string) tea.Model {
 		names := m.ag.SkillNames()
 		if len(names) == 0 {
 			m.pushLog("system", "no skills — create ~/.ccdp/skills/<name>/SKILL.md or .ccdp/skills/<name>/SKILL.md")
-			return m
+			return m, nil
 		}
 		m.pushLog("system", "skills: "+strings.Join(names, ", "))
 
 	case "apply":
 		if len(args) == 0 {
 			m.pushLog("error", "usage: /apply <file.md|file.patch> — applies a plan or git patch to the workspace")
-			return m
+			return m, nil
 		}
 		m.runApply(args[0])
 
 	case "git":
 		if len(args) == 0 {
 			m.pushLog("error", "usage: /git <subcommand> [args…], e.g. /git status --short")
-			return m
+			return m, nil
 		}
-		m.runGit(args)
+		return m, m.runGit(args)
 
 	case "save":
 		if err := m.ag.Save(); err != nil {
@@ -407,11 +430,11 @@ func (m *Model) runCommand(text string) tea.Model {
 		sessions, err := agent.ListSessions(m.ag.SessionDir())
 		if err != nil {
 			m.pushLog("error", err.Error())
-			return m
+			return m, nil
 		}
 		if len(sessions) == 0 {
 			m.pushLog("system", "no saved sessions")
-			return m
+			return m, nil
 		}
 		var sb strings.Builder
 		sb.WriteString("Saved sessions (newest first):\n")
@@ -424,8 +447,12 @@ func (m *Model) runCommand(text string) tea.Model {
 			if title == "" {
 				title = "(no user message)"
 			}
-			fmt.Fprintf(&sb, "  %s  %s  %s\n    %s  (%d messages)\n",
-				s.ID, s.UpdatedAt.Format("2006-01-02 15:04"), s.Model, title, len(s.History))
+			forkNote := ""
+			if s.ParentID != "" {
+				forkNote = fmt.Sprintf("  ← fork of %s @ %d", s.ParentID, s.BranchPoint)
+			}
+			fmt.Fprintf(&sb, "  %s  %s  %s\n    %s  (%d messages)%s\n",
+				s.ID, s.UpdatedAt.Format("2006-01-02 15:04"), s.Model, title, len(s.History), forkNote)
 		}
 		m.pushLog("system", sb.String())
 
@@ -433,18 +460,18 @@ func (m *Model) runCommand(text string) tea.Model {
 		// No argument → interactive picker over saved sessions.
 		if len(args) == 0 {
 			m.startResumePicker()
-			return m
+			return m, nil
 		}
 		if err := m.resumeSession(args[0]); err != nil {
 			m.pushLog("error", "resume failed: "+err.Error())
-			return m
+			return m, nil
 		}
 		m.pushStatus("resumed session " + args[0])
 
 	case "config":
 		if len(args) == 0 {
 			m.pushLog("system", m.ag.ConfigSummary())
-			return m
+			return m, nil
 		}
 		// /config set <key> <value> — runtime settable keys reuse the existing
 		// commands (model, mode, sandbox); anything else is read-only.
@@ -459,7 +486,7 @@ func (m *Model) runCommand(text string) tea.Model {
 				mode, err := permissions.ParseMode(val)
 				if err != nil {
 					m.pushLog("error", err.Error())
-					return m
+					return m, nil
 				}
 				m.ctrl <- agent.Control{Type: agent.ControlSetMode, Mode: mode}
 				m.mode = mode
@@ -468,14 +495,14 @@ func (m *Model) runCommand(text string) tea.Model {
 				mode, err := sandbox.ParseMode(val)
 				if err != nil {
 					m.pushLog("error", err.Error())
-					return m
+					return m, nil
 				}
 				m.ctrl <- agent.Control{Type: agent.ControlSetSandbox, SandboxMode: mode}
 				m.pushStatus("sandbox mode → " + string(mode))
 			default:
 				m.pushLog("error", "/config set supports: model, mode, sandbox (others are read-only)")
 			}
-			return m
+			return m, nil
 		}
 		m.pushLog("error", "usage: /config  |  /config set <model|mode|sandbox> <value>")
 
@@ -485,14 +512,14 @@ func (m *Model) runCommand(text string) tea.Model {
 	case "permissions":
 		if len(args) == 0 {
 			m.pushLog("system", m.ag.PermissionsInfo())
-			return m
+			return m, nil
 		}
 		// /permissions allow|deny|remove <rule>
 		switch args[0] {
 		case "allow", "deny":
 			if len(args) < 2 {
 				m.pushLog("error", "usage: /permissions allow|deny <rule> (e.g. Bash:git status)")
-				return m
+				return m, nil
 			}
 			rule := strings.Join(args[1:], " ")
 			if err := m.ag.AddAlwaysRule(args[0], rule); err != nil {
@@ -501,7 +528,7 @@ func (m *Model) runCommand(text string) tea.Model {
 		case "remove":
 			if len(args) < 3 {
 				m.pushLog("error", "usage: /permissions remove <allow|deny> <rule>")
-				return m
+				return m, nil
 			}
 			rule := strings.Join(args[2:], " ")
 			if err := m.ag.RemoveAlwaysRule(args[1], rule); err != nil {
@@ -518,12 +545,12 @@ func (m *Model) runCommand(text string) tea.Model {
 			} else {
 				m.pushStatus("session memory cleared")
 			}
-			return m
+			return m, nil
 		}
 		text := m.ag.MemoryText()
 		if text == "" {
 			m.pushLog("system", "no session memory yet — set \"enable_memory\": true in ~/.ccdp/config.json to record facts learned each turn")
-			return m
+			return m, nil
 		}
 		m.pushLog("system", text)
 
@@ -537,7 +564,7 @@ func (m *Model) runCommand(text string) tea.Model {
 		msg := strings.Join(args, " ")
 		if msg == "" {
 			m.pushLog("error", "usage: /commit-push-pr <commit message>")
-			return m
+			return m, nil
 		}
 		m.pushLog("system", m.ag.CommitPushPR(msg))
 
@@ -549,158 +576,177 @@ func (m *Model) runCommand(text string) tea.Model {
 		}
 
 	case "status":
+		parent, branchPoint := m.ag.Lineage()
+		lineage := ""
+		if parent != "" {
+			lineage = fmt.Sprintf("\nforked from: %s @ message %d", parent, branchPoint)
+		}
 		m.pushLog("system", fmt.Sprintf(
-			"model: %s\nmode: %s\nplan: %v\nsession: %s\nworkspace: %s\ntrace: %s",
-			m.modelName, m.mode, m.ag.PlanMode(), m.sessionID, m.workspace, m.ag.TracePath()))
+			"model: %s\nmode: %s\nplan: %v\nsession: %s\nworkspace: %s\ntrace: %s%s",
+			m.modelName, m.mode, m.ag.PlanMode(), m.sessionID, m.workspace, m.ag.TracePath(), lineage))
 
 	case "commands":
 		names := m.customCommandNames()
 		if len(names) == 0 {
 			m.pushLog("system", "no custom commands — create ~/.ccdp/commands/<name>.md or .ccdp/commands/<name>.md ($ARGUMENTS is replaced by the arguments)")
-			return m
+			return m, nil
 		}
 		m.pushLog("system", "custom commands: "+strings.Join(names, ", "))
 
 	case "quit", "exit":
-		m.quit = true
-		return m
+		return m, tea.Quit
 
 	default:
 		// User-defined slash commands (markdown templates).
 		if cc := m.findCustomCommand(cmd); cc != nil {
 			m.runCustomCommand(cc, args)
-			return m
+			return m, nil
 		}
 		m.pushLog("error", "unknown command /"+cmd+" (try /help)")
 	}
-	return m
+	return m, nil
 }
 
 // runDiff shows the working tree state (Codex /diff): a compact status, a diff
 // stat, and optionally the full diff for the given paths. Untracked files are
-// listed but not diffed (no baseline exists).
-func (m *Model) runDiff(paths []string) {
-	run := func(name string, args ...string) (string, bool) {
-		out := &strings.Builder{}
-		cmd := exec.Command("git", args...)
-		cmd.Dir = m.workspace
-		cmd.Stdout = out
-		cmd.Stderr = out
-		if err := cmd.Run(); err != nil {
-			return strings.TrimSpace(out.String()), false
+// listed but not diffed (no baseline exists). The git commands run in a
+// goroutine (tea.Cmd) so a large repository cannot stall the UI loop; the
+// result lands in the log via gitResultMsg.
+func (m *Model) runDiff(paths []string) tea.Cmd {
+	workspace := m.workspace
+	return func() tea.Msg {
+		run := func(name string, args ...string) (string, bool) {
+			out := &strings.Builder{}
+			cmd := exec.Command("git", args...)
+			cmd.Dir = workspace
+			cmd.Stdout = out
+			cmd.Stderr = out
+			if err := cmd.Run(); err != nil {
+				return strings.TrimSpace(out.String()), false
+			}
+			return strings.TrimRight(out.String(), "\n"), true
 		}
-		return strings.TrimRight(out.String(), "\n"), true
-	}
 
-	var sb strings.Builder
-	if status, ok := run("status", "status", "--short"); ok && status != "" {
-		sb.WriteString("Changed files:\n")
-		sb.WriteString(status)
-		sb.WriteString("\n")
-	}
-
-	diffArgs := append([]string{"diff", "--stat"}, paths...)
-	if stat, ok := run("diffstat", diffArgs...); ok && stat != "" {
-		sb.WriteString("\nDiff stat:\n")
-		sb.WriteString(stat)
-		sb.WriteString("\n")
-	}
-
-	body := append([]string{"diff"}, paths...)
-	if d, ok := run("diff", body...); ok && d != "" {
-		sb.WriteString("\nDiff:\n")
-		if len(d) > 8000 {
-			d = d[:8000] + "\n…[truncated]"
+		var sb strings.Builder
+		if status, ok := run("status", "status", "--short"); ok && status != "" {
+			sb.WriteString("Changed files:\n")
+			sb.WriteString(status)
+			sb.WriteString("\n")
 		}
-		sb.WriteString(d)
-		sb.WriteString("\n")
-	}
 
-	if sb.Len() == 0 {
-		m.pushLog("system", "no changes in the working tree")
-		return
+		diffArgs := append([]string{"diff", "--stat"}, paths...)
+		if stat, ok := run("diffstat", diffArgs...); ok && stat != "" {
+			sb.WriteString("\nDiff stat:\n")
+			sb.WriteString(stat)
+			sb.WriteString("\n")
+		}
+
+		body := append([]string{"diff"}, paths...)
+		if d, ok := run("diff", body...); ok && d != "" {
+			sb.WriteString("\nDiff:\n")
+			if len(d) > 8000 {
+				d = d[:8000] + "\n…[truncated]"
+			}
+			sb.WriteString(d)
+			sb.WriteString("\n")
+		}
+
+		if sb.Len() == 0 {
+			return gitResultMsg{output: "no changes in the working tree"}
+		}
+		return gitResultMsg{output: strings.TrimRight(sb.String(), "\n")}
 	}
-	m.pushLog("system", strings.TrimRight(sb.String(), "\n"))
 }
 
 // runGit executes git locally in the workspace and shows the output. It is a
 // user-driven convenience; the agent's own Git* tools remain the primary path.
-func (m *Model) runGit(args []string) {
-	out := &strings.Builder{}
-	cmd := exec.Command("git", args...)
-	cmd.Dir = m.workspace
-	cmd.Stdout = out
-	cmd.Stderr = out
+// The command runs in a goroutine (tea.Cmd) and is killed after 120s, so a
+// hung git cannot stall the UI loop; the result lands in the log via
+// gitResultMsg.
+func (m *Model) runGit(args []string) tea.Cmd {
+	workspace := m.workspace
+	return func() tea.Msg {
+		out := &strings.Builder{}
+		cmd := exec.Command("git", args...)
+		cmd.Dir = workspace
+		cmd.Stdout = out
+		cmd.Stderr = out
 
-	done := make(chan struct{})
-	if err := cmd.Start(); err != nil {
-		m.pushLog("error", "git: "+err.Error())
-		return
+		if err := cmd.Start(); err != nil {
+			return gitResultMsg{output: "git: " + err.Error(), isErr: true}
+		}
+		done := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(120 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+			out.WriteString("\n[git command timed out after 120s]")
+		}
+
+		return gitResultMsg{output: "git " + strings.Join(args, " ") + "\n" + strings.TrimRight(out.String(), "\n")}
 	}
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(120 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
-		out.WriteString("\n[git command timed out after 120s]")
-	}
-
-	m.pushLog("system", "git "+strings.Join(args, " ")+"\n"+strings.TrimRight(out.String(), "\n"))
 }
 
 // runReview shows the full review surface (Claude Code's /review): changed
-// files, a diff, and any checkpoints the user can restore.
-func (m *Model) runReview() {
-	run := func(name string, args ...string) (string, bool) {
-		out := &strings.Builder{}
-		cmd := exec.Command("git", args...)
-		cmd.Dir = m.workspace
-		cmd.Stdout = out
-		cmd.Stderr = out
-		if err := cmd.Run(); err != nil {
-			return strings.TrimSpace(out.String()), false
-		}
-		return strings.TrimRight(out.String(), "\n"), true
-	}
-
-	var sb strings.Builder
-	if status, ok := run("status", "status", "--short"); ok && status != "" {
-		sb.WriteString("Changed files:\n")
-		sb.WriteString(status)
-		sb.WriteString("\n")
-	}
-	if stat, ok := run("diffstat", "diff", "--stat"); ok && stat != "" {
-		sb.WriteString("\nDiff stat:\n")
-		sb.WriteString(stat)
-		sb.WriteString("\n")
-	}
-	if d, ok := run("diff", "diff"); ok && d != "" {
-		sb.WriteString("\nDiff:\n")
-		if len(d) > 8000 {
-			d = d[:8000] + "\n…[truncated]"
-		}
-		sb.WriteString(d)
-		sb.WriteString("\n")
-	}
-
+// files, a diff, and any checkpoints the user can restore. The git commands
+// run in a goroutine (tea.Cmd) so a large repository cannot stall the UI
+// loop; the result lands in the log via gitResultMsg.
+func (m *Model) runReview() tea.Cmd {
+	// CheckpointList reads agent state: take it synchronously, before the
+	// background goroutine starts.
 	recs := m.ag.CheckpointList()
-	if len(recs) > 0 {
-		sb.WriteString("\nCheckpoints (restore with /checkpoint <id>):\n")
-		for _, r := range recs {
-			fmt.Fprintf(&sb, "  %s  %s  %s\n", r.ID, r.CreatedAt.Format("15:04:05"), r.Summary)
+	workspace := m.workspace
+	return func() tea.Msg {
+		run := func(name string, args ...string) (string, bool) {
+			out := &strings.Builder{}
+			cmd := exec.Command("git", args...)
+			cmd.Dir = workspace
+			cmd.Stdout = out
+			cmd.Stderr = out
+			if err := cmd.Run(); err != nil {
+				return strings.TrimSpace(out.String()), false
+			}
+			return strings.TrimRight(out.String(), "\n"), true
 		}
-	}
 
-	if sb.Len() == 0 {
-		m.pushLog("system", "working tree clean, no checkpoints")
-		return
+		var sb strings.Builder
+		if status, ok := run("status", "status", "--short"); ok && status != "" {
+			sb.WriteString("Changed files:\n")
+			sb.WriteString(status)
+			sb.WriteString("\n")
+		}
+		if stat, ok := run("diffstat", "diff", "--stat"); ok && stat != "" {
+			sb.WriteString("\nDiff stat:\n")
+			sb.WriteString(stat)
+			sb.WriteString("\n")
+		}
+		if d, ok := run("diff", "diff"); ok && d != "" {
+			sb.WriteString("\nDiff:\n")
+			if len(d) > 8000 {
+				d = d[:8000] + "\n…[truncated]"
+			}
+			sb.WriteString(d)
+			sb.WriteString("\n")
+		}
+
+		if len(recs) > 0 {
+			sb.WriteString("\nCheckpoints (restore with /checkpoint <id>):\n")
+			for _, r := range recs {
+				fmt.Fprintf(&sb, "  %s  %s  %s\n", r.ID, r.CreatedAt.Format("15:04:05"), r.Summary)
+			}
+		}
+
+		if sb.Len() == 0 {
+			return gitResultMsg{output: "working tree clean, no checkpoints"}
+		}
+		return gitResultMsg{output: strings.TrimRight(sb.String(), "\n")}
 	}
-	m.pushLog("system", strings.TrimRight(sb.String(), "\n"))
 }
 
 // startResumePicker opens the interactive saved-session selector.
@@ -836,9 +882,6 @@ func (m *Model) pushLog(kind, text string) {
 	m.render()
 	m.viewport.GotoBottom()
 }
-
-// quitRequested reports whether the user asked to quit.
-func (m *Model) quitRequested() bool { return m.quit }
 
 // SessionDir delegates to the agent's session directory.
 func (m *Model) SessionDir() string { return m.ag.SessionDir() }

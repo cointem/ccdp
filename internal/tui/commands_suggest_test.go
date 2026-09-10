@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -58,11 +59,15 @@ func TestRefreshCmdSuggest(t *testing.T) {
 		t.Errorf("plain text opened suggestions: %v", m.cmdSug)
 	}
 
-	// "/" alone: all commands suggested.
+	// "/" alone: suggestions are capped at maxCmdSuggestions entries; the
+	// hidden remainder is surfaced via cmdSugMore (the "+N more" hint).
 	m.textarea.SetValue("/")
 	m.refreshCmdSuggest()
-	if len(m.cmdSug) != len(commandNames) {
-		t.Errorf("'/' should suggest all %d commands, got %d", len(commandNames), len(m.cmdSug))
+	if len(m.cmdSug) != maxCmdSuggestions {
+		t.Errorf("'/' should suggest %d commands, got %d", maxCmdSuggestions, len(m.cmdSug))
+	}
+	if m.cmdSugMore != len(commandNames)-maxCmdSuggestions {
+		t.Errorf("expected %d hidden matches, got %d", len(commandNames)-maxCmdSuggestions, m.cmdSugMore)
 	}
 	if m.cmdSugIdx != 0 {
 		t.Errorf("selection should start at 0, got %d", m.cmdSugIdx)
@@ -218,6 +223,58 @@ func TestAltEnterInsertsNewline(t *testing.T) {
 	}
 }
 
+func TestQuitCommandReturnsQuitMsg(t *testing.T) {
+	m := sugModel()
+	for _, input := range []string{"/quit", "/exit"} {
+		_, cmd := m.runCommand(input)
+		if cmd == nil {
+			t.Errorf("%s should return a quit command", input)
+			continue
+		}
+		msg := cmd()
+		if _, ok := msg.(tea.QuitMsg); !ok {
+			t.Errorf("%s should produce a tea.QuitMsg, got %T", input, msg)
+		}
+	}
+}
+
+func TestCmdSuggestRendersMoreHint(t *testing.T) {
+	m := sugModel()
+	m.textarea.SetValue("/")
+	m.refreshCmdSuggest()
+	if m.cmdSugMore == 0 {
+		t.Skip("no hidden matches to hint about")
+	}
+	out := m.renderCmdSuggest()
+	if !strings.Contains(out, fmt.Sprintf("… +%d more", m.cmdSugMore)) {
+		t.Errorf("expected a '+N more' hint line in the popup: %q", out)
+	}
+	// The hint is not an entry: len(cmdSug) downs from index 0 must wrap
+	// straight back to 0 (an extra selectable line would land on index 8).
+	for i := 0; i < len(m.cmdSug); i++ {
+		m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	if m.cmdSugIdx != 0 {
+		t.Errorf("down should wrap within the %d entries, got index %d", len(m.cmdSug), m.cmdSugIdx)
+	}
+}
+
+func TestRunDiffAndRunGitAreAsync(t *testing.T) {
+	m := sugModel()
+
+	if cmd := m.runDiff(nil); cmd == nil {
+		t.Error("runDiff should return a tea.Cmd")
+	} else if msg, ok := cmd().(gitResultMsg); !ok {
+		t.Errorf("runDiff cmd should yield gitResultMsg, got %T", msg)
+	}
+
+	if cmd := m.runGit([]string{"status", "--short"}); cmd == nil {
+		t.Error("runGit should return a tea.Cmd")
+	} else if msg, ok := cmd().(gitResultMsg); !ok {
+		t.Errorf("runGit cmd should yield gitResultMsg, got %T", msg)
+	}
+}
+
 func TestPopupReservesViewportSpace(t *testing.T) {
 	m := sugModel()
 	m.viewport = viewport.New(40, 20)
@@ -229,11 +286,14 @@ func TestPopupReservesViewportSpace(t *testing.T) {
 		t.Fatal("popup should open for '/'")
 	}
 	want := 20 - len(m.cmdSug) - 3
+	if m.cmdSugMore > 0 {
+		want-- // the "+N more" hint line
+	}
 	if want < 3 {
 		want = 3
 	}
 	if m.viewport.Height != want {
-		t.Errorf("viewport height = %d, want %d (popup %d entries)", m.viewport.Height, want, len(m.cmdSug))
+		t.Errorf("viewport height = %d, want %d (popup %d entries + hint)", m.viewport.Height, want, len(m.cmdSug))
 	}
 
 	m.closeCmdSuggest()

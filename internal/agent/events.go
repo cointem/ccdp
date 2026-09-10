@@ -34,6 +34,7 @@ const (
 	EventSandboxChanged                   // sandbox mode changed
 	EventPlan                             // a plan is ready for approval (Plan Mode)
 	EventPlanModeChanged                  // plan mode was toggled
+	EventSessionChanged                   // the agent switched to another session (fork/resume)
 )
 
 // Usage is the accumulated token and cost accounting for the session.
@@ -97,6 +98,7 @@ const (
 	ControlSetSandbox // switch the sandbox mode
 	ControlSetPlan    // toggle plan mode on/off
 	ControlPlanResp   // answer a plan approval request
+	ControlFork       // branch a new session from message Count (-1 = full copy)
 )
 
 // Control is an instruction from the UI to the agent.

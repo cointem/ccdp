@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 // Mode selects how aggressively the sandbox confines tool access.
@@ -43,7 +44,9 @@ func ParseMode(s string) (Mode, error) {
 	return "", fmt.Errorf("unknown sandbox mode %q (want confine|strict|none)", s)
 }
 
-// Sandbox is a workspace-bound path resolver and process guard.
+// Sandbox is a workspace-bound path resolver and process guard. It is safe for
+// concurrent use: tool goroutines resolve paths while the TUI/agent loop adds
+// directories or switches the mode.
 type Sandbox struct {
 	Workspace string // absolute workspace root
 	Mode      Mode
@@ -64,6 +67,22 @@ type Sandbox struct {
 	// AllowNetwork permits outbound network commands in strict mode. When
 	// false, strict mode blocks obvious network clients.
 	AllowNetwork bool
+
+	mu sync.RWMutex // guards Mode, AdditionalDirs and DisallowedDirs
+}
+
+// SetMode switches the sandbox mode at runtime (safe for concurrent use).
+func (s *Sandbox) SetMode(m Mode) {
+	s.mu.Lock()
+	s.Mode = m
+	s.mu.Unlock()
+}
+
+// CurrentMode returns the sandbox mode (safe for concurrent use).
+func (s *Sandbox) CurrentMode() Mode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Mode
 }
 
 // AddDir grants access to an extra directory at runtime. Relative paths are
@@ -73,6 +92,8 @@ func (s *Sandbox) AddDir(dir string) {
 	if abs == "" {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, d := range s.AdditionalDirs {
 		if d == abs {
 			return
@@ -88,6 +109,8 @@ func (s *Sandbox) AddDisallowedDir(dir string) {
 	if abs == "" {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, d := range s.DisallowedDirs {
 		if d == abs {
 			return
@@ -115,6 +138,8 @@ func (s *Sandbox) absDir(dir string) string {
 
 // blockedByDisallowed reports whether abs falls inside any disallowed dir.
 func (s *Sandbox) blockedByDisallowed(abs string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, d := range s.DisallowedDirs {
 		if pathWithin(d, abs) {
 			return true
@@ -215,7 +240,13 @@ func New(workspace string, mode Mode) *Sandbox {
 // checked against the symlink-resolved form so symlinks can't smuggle access
 // outside the workspace.
 func (s *Sandbox) Resolve(p string) (string, error) {
-	if s == nil || s.Mode == ModeNone {
+	if s == nil {
+		if filepath.IsAbs(p) {
+			return filepath.Clean(p), nil
+		}
+		return filepath.Join(".", p), nil
+	}
+	if s.CurrentMode() == ModeNone {
 		if filepath.IsAbs(p) {
 			return filepath.Clean(p), nil
 		}
@@ -235,7 +266,7 @@ func (s *Sandbox) Resolve(p string) (string, error) {
 // ResolveWrite is like Resolve but additionally enforces write confinement:
 // writes are confined to the workspace in every mode except none.
 func (s *Sandbox) ResolveWrite(p string) (string, error) {
-	if s == nil || s.Mode == ModeNone {
+	if s == nil || s.CurrentMode() == ModeNone {
 		return s.Resolve(p)
 	}
 	abs, err := s.Resolve(p)
@@ -250,14 +281,18 @@ func (s *Sandbox) ResolveWrite(p string) (string, error) {
 
 // ResolveRead enforces strict-mode read confinement.
 func (s *Sandbox) ResolveRead(p string) (string, error) {
-	if s == nil || s.Mode == ModeNone {
+	if s == nil {
+		return s.Resolve(p)
+	}
+	mode := s.CurrentMode()
+	if mode == ModeNone {
 		return s.Resolve(p)
 	}
 	abs, err := s.Resolve(p)
 	if err != nil {
 		return "", err
 	}
-	if s.Mode == ModeStrict && !s.InWorkspace(abs) {
+	if mode == ModeStrict && !s.InWorkspace(abs) {
 		return "", fmt.Errorf("sandbox: read of %s is outside workspace %s (strict mode)", p, s.Workspace)
 	}
 	return abs, nil
@@ -265,35 +300,43 @@ func (s *Sandbox) ResolveRead(p string) (string, error) {
 
 // InWorkspace reports whether abs refers to a location inside the workspace or
 // an additional dir, resolving symlinks in the deepest existing ancestor to
-// defeat escape attempts through links. Disallowed dirs always win.
+// defeat escape attempts through links (e.g. `ln -s /etc ./evil` followed by a
+// write to evil/passwd). Disallowed dirs always win.
 func (s *Sandbox) InWorkspace(abs string) bool {
-	if s.blockedByDisallowed(abs) {
-		return false
-	}
-	// Additional dirs are treated exactly like the workspace.
-	for _, d := range s.AdditionalDirs {
-		if pathWithin(d, abs) {
-			return true
-		}
-	}
 	root := filepath.Clean(s.Workspace)
-	rel, err := filepath.Rel(root, abs)
-	if err != nil {
-		return false
-	}
-	if rel == "." {
-		return true
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		// Lexical escape: check the symlink-resolved location too.
-		resolved, err := resolveExisting(abs)
+	withinRoot := func(p string) bool {
+		rel, err := filepath.Rel(root, p)
 		if err != nil {
 			return false
 		}
-		rel2, err2 := filepath.Rel(root, resolved)
-		return err2 == nil && rel2 != ".." && !strings.HasPrefix(rel2, ".."+string(filepath.Separator))
+		if rel == "." {
+			return true
+		}
+		return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 	}
-	return true
+	// Resolve symlinks (longest existing ancestor) so a link can't smuggle a
+	// lexically-inside path outside the workspace — or into a disallowed dir.
+	// Not-yet-created files resolve through their existing parents.
+	resolved, rerr := resolveExisting(abs)
+	if rerr != nil {
+		resolved = abs // nothing resolvable; judge the lexical path
+	}
+	if s.blockedByDisallowed(abs) || s.blockedByDisallowed(resolved) {
+		return false
+	}
+	// Additional dirs are treated exactly like the workspace; both the caller's
+	// path and its resolved form must land inside the same additional dir.
+	s.mu.RLock()
+	additional := append([]string(nil), s.AdditionalDirs...)
+	s.mu.RUnlock()
+	for _, d := range additional {
+		if pathWithin(d, abs) && pathWithin(d, resolved) {
+			return true
+		}
+	}
+	// The symlink-resolved location decides: a lexical hit that turns out to
+	// pass through a link leaving the workspace is not inside.
+	return withinRoot(resolved)
 }
 
 // resolveExisting resolves symlinks for the longest existing prefix of p so
@@ -319,7 +362,7 @@ func resolveExisting(p string) (string, error) {
 // sandboxing is active. Returns an error for commands that would operate
 // outside the workspace's control.
 func (s *Sandbox) CommandPolicy(command string) error {
-	if s == nil || s.Mode != ModeStrict {
+	if s == nil || s.CurrentMode() != ModeStrict {
 		return nil
 	}
 	c := strings.TrimSpace(command)
@@ -361,11 +404,14 @@ func (s *Sandbox) CommandPolicy(command string) error {
 }
 
 // WrapCommand returns a sandbox-exec wrapped command line when strict mode is
-// active on macOS and the sandbox-exec utility exists; "" otherwise. The
-// profile confines file writes to the workspace, allows reads broadly, permits
-// localhost, and denies other network activity.
+// active on macOS and the sandbox-exec utility exists; "" otherwise. The whole
+// command line — including any ulimit prefix — is handed to a /bin/sh -c inside
+// the sandboxed process, so shell operators (`;`, `&&`, …) cannot split
+// execution into a part that runs outside the profile. The profile confines
+// file writes to the workspace, allows reads broadly, permits localhost, and
+// denies other network activity.
 func (s *Sandbox) WrapCommand(cmdline string) string {
-	if s == nil || s.Mode != ModeStrict || cmdline == "" {
+	if s == nil || s.CurrentMode() != ModeStrict || cmdline == "" {
 		return ""
 	}
 	if runtime.GOOS != "darwin" {
@@ -383,7 +429,7 @@ func (s *Sandbox) WrapCommand(cmdline string) string {
 (allow file-write* (subpath %q) (subpath "/private/tmp") (subpath "/tmp"))
 (deny process-fork)
 (allow process-fork (literal "/bin/sh") (literal "/bin/zsh") (literal "/bin/bash"))`, s.Workspace)
-	return "sandbox-exec -p " + shellQuote(profile) + " -- " + cmdline
+	return "sandbox-exec -p " + shellQuote(profile) + " -- /bin/sh -c " + shellQuote(cmdline)
 }
 
 // shellQuote single-quotes a string for safe shell embedding.

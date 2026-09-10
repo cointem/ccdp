@@ -61,7 +61,11 @@ type Agent struct {
 	events chan Event   // agent → UI
 	ctrl   chan Control // UI → agent
 
-	// Turn lifecycle (guarded by mu where cross-goroutine).
+	// Turn lifecycle (guarded by mu where cross-goroutine). pendingMsgs is the
+	// persistent inbox: user messages submitted while a turn is busy. They are
+	// steered into the running turn at tool-result boundaries (pi's steering),
+	// drained as follow-up turns when the turn ends, and persisted in the
+	// session snapshot so a crash never loses a queued message.
 	mu            sync.Mutex
 	busy          bool
 	interruptFlag bool
@@ -69,6 +73,15 @@ type Agent struct {
 	turnCancel    context.CancelFunc
 	turnCtx       context.Context
 	pendingMsgs   []string
+
+	// approvalCache memoizes approval decisions within one turn, keyed by the
+	// permission SessionKey (Codex's approval cache). Parallel workers
+	// submitting the same call — or the Go-hook / shell-hook / permission
+	// gates all asking about one call — get the first decision replayed
+	// instead of a second modal. Reset at the start of every turn so the
+	// security posture never outlives the turn; "always allow" decisions that
+	// should persist go through perms.RememberAllow as before.
+	approvalCache map[string]bool
 
 	// Pending approval (guarded by mu).
 	pendingApproval *ApprovalRequest
@@ -100,8 +113,16 @@ type Agent struct {
 	// fallbackClient is used when the primary model fails (Claude's
 	// --fallback-model). usedFallback latches per turn so each turn gets one
 	// fallback attempt. activeModel tracks the model actually in use so usage
-	// is priced with the right rate card after a fallback switch.
+	// is priced with the right rate card after a fallback switch. primaryClient
+	// remembers the session's original client so every turn can restore it: a
+	// transient primary failure must not disable the primary for the rest of
+	// the session.
+	//
+	// client, primaryClient and cfg.Model are written by SetModel (UI
+	// goroutine) and the fallback switch (turn goroutine), so every access
+	// goes through a.mu (see currentClient / activeModelSnapshot).
 	fallbackClient *llm.Client
+	primaryClient  *llm.Client
 	usedFallback   bool
 	activeModel    string
 
@@ -132,6 +153,13 @@ type Agent struct {
 	// (Codex's INTERRUPTED_GUIDANCE): after a user interrupt the model must
 	// know that tools may have partially executed and verify state.
 	interruptNote bool
+
+	// Session lineage (pi's session tree), set by Fork and persisted by Save:
+	// the session this one branched from, the history index the branch starts
+	// at, and the LLM summary of the abandoned direction.
+	parentID      string
+	branchPoint   int
+	branchSummary string
 
 	// trace is the JSONL session trace file (nil when tracing is off).
 	trace   *os.File
@@ -181,7 +209,7 @@ func New(cfg *config.Config, evCh chan Event, ctrl chan Control) (*Agent, error)
 	registry.SetChangeListener(func() {
 		bus.Emit(events.TopicToolChange, events.ToolEvent{ToolName: ""})
 	})
-	if err := host.Load(plugin.NewToolsPlugin(cfg.EnableWebTools)); err != nil {
+	if err := host.Load(plugin.NewToolsPlugin(cfg.WebToolsEnabled())); err != nil {
 		return nil, err
 	}
 	if err := host.Load(plugin.NewProviderPlugin(client)); err != nil {
@@ -221,6 +249,7 @@ func New(cfg *config.Config, evCh chan Event, ctrl chan Control) (*Agent, error)
 	a := &Agent{
 		cfg:            cfg,
 		client:         client,
+		primaryClient:  client,
 		registry:       registry,
 		host:           host,
 		evbus:          bus,
@@ -234,6 +263,7 @@ func New(cfg *config.Config, evCh chan Event, ctrl chan Control) (*Agent, error)
 		events:         evCh,
 		ctrl:           ctrl,
 		customPerms:    customPerms,
+		approvalCache:  map[string]bool{},
 		deferTools:     map[string]bool{},
 		discovered:     map[string]bool{},
 		sessionStartAt: time.Now(),
@@ -339,6 +369,14 @@ func Resume(cfg *config.Config, snap *SessionSnapshot, evCh chan Event, ctrl cha
 	a.sessionID = snap.ID
 	a.createdAt = snap.CreatedAt
 	a.history = snap.History
+	// Restore the persistent inbox and lineage from the snapshot.
+	a.mu.Lock()
+	a.pendingMsgs = snap.Pending
+	a.parentID, a.branchPoint, a.branchSummary = snap.ParentID, snap.BranchPoint, snap.BranchSummary
+	a.mu.Unlock()
+	if len(snap.Pending) > 0 {
+		a.emitStatus("%d queued message(s) restored — they will run after the next turn", len(snap.Pending))
+	}
 	// The trace file was opened with the generated id in New; reopen it under
 	// the resumed session's id, then re-discover deferred tools.
 	a.closeTrace()
@@ -377,6 +415,9 @@ func (a *Agent) Close() {
 
 // PluginNames returns the loaded plugin names in load order.
 func (a *Agent) PluginNames() []string { return a.host.Names() }
+
+// HostPending returns registered plugin names waiting for their dependencies.
+func (a *Agent) HostPending() []string { return a.host.Pending() }
 
 // ProviderNames returns the registered LLM provider names.
 func (a *Agent) ProviderNames() []string { return a.models.Names() }
@@ -450,13 +491,16 @@ func (a *Agent) SetPermissionMode(mode permissions.Mode) {
 
 // SandboxMode returns the active sandbox mode.
 func (a *Agent) SandboxMode() sandbox.Mode {
-	return a.sandbox.Mode
+	return a.currentSandbox().CurrentMode()
 }
 
-// SetSandboxMode switches the sandbox mode at runtime.
+// SetSandboxMode switches the sandbox mode at runtime. Safe to call from the
+// UI goroutine while a turn is running (the sandbox protects its own state).
 func (a *Agent) SetSandboxMode(mode sandbox.Mode) {
-	a.sandbox.Mode = mode
+	a.currentSandbox().SetMode(mode)
+	a.mu.Lock()
 	a.cfg.SandboxMode = string(mode)
+	a.mu.Unlock()
 	a.emit(Event{Type: EventSandboxChanged})
 	a.emitStatus("sandbox mode → %s", mode)
 }
@@ -521,8 +565,54 @@ func (a *Agent) WorkspaceLabel() string { return a.cfg.Workspace }
 // SessionDir returns the directory where sessions are persisted.
 func (a *Agent) SessionDir() string { return a.cfg.SessionDir }
 
+// currentClient returns the LLM client currently in use (primary or fallback).
+// Safe for concurrent use with SetModel and the fallback switch.
+func (a *Agent) currentClient() *llm.Client {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.client
+}
+
+// activeModelSnapshot returns the model name requests should carry: the
+// fallback model after a fallback switch, otherwise the configured primary.
+// Safe for concurrent use with SetModel and the fallback switch.
+func (a *Agent) activeModelSnapshot() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activeModel != "" {
+		return a.activeModel
+	}
+	return a.cfg.Model
+}
+
+// currentSandbox returns the sandbox in use. The pointer is swapped by
+// SetWorkspace (UI goroutine), so tools and turn goroutines must not read the
+// field directly.
+func (a *Agent) currentSandbox() *sandbox.Sandbox {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sandbox
+}
+
+// hookCtx returns the context for hook / summarization calls that may run
+// outside a live turn: the turn context while one is running, otherwise
+// Background. A nil turn context would panic context.WithTimeout, and an
+// already-cancelled one would instantly "time out" every hook.
+func (a *Agent) hookCtx() context.Context {
+	a.mu.Lock()
+	ctx := a.turnCtx
+	a.mu.Unlock()
+	if ctx == nil || ctx.Err() != nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 // SetModel switches the model by resolving its provider, rebuilding the LLM
-// client and re-routing the provider through the ModelRegistry.
+// client and re-routing the provider through the ModelRegistry. Safe to call
+// from the UI goroutine while a turn is running: the new client/model pair is
+// published atomically under a.mu, and the request builder reads both through
+// currentClient / activeModelSnapshot.
 func (a *Agent) SetModel(model string) {
 	if model == "" {
 		return
@@ -539,8 +629,12 @@ func (a *Agent) SetModel(model string) {
 		a.emitStatus("failed to switch model: %v", err)
 		return
 	}
+	a.mu.Lock()
 	a.cfg.Model = model
 	a.client = client
+	a.primaryClient = client
+	a.activeModel = model
+	a.mu.Unlock()
 	a.models.Register(client)
 	a.models.Route(model, client.Name())
 	a.mu.Lock()
@@ -597,7 +691,7 @@ func (a *Agent) handle(c Control) {
 			a.mu.Lock()
 			a.pendingMsgs = append(a.pendingMsgs, c.Text)
 			a.mu.Unlock()
-			a.emitStatus("queued message (agent is busy; press ctrl+c to interrupt)")
+			a.emitStatus("queued (will be steered into the running turn at the next tool boundary)")
 			return
 		}
 		a.startTurn(c.Text)
@@ -629,6 +723,16 @@ func (a *Agent) handle(c Control) {
 		}
 		a.emitStatus("stop requested")
 	case ControlClearHistory:
+		a.mu.Lock()
+		busy := a.busy
+		a.mu.Unlock()
+		if busy {
+			// Clearing history under a running turn would leave the turn
+			// appending to a fresh history (orphan replies, revived compaction
+			// snapshots) — same protection as remove/rewind/compact/fork.
+			a.emitStatus("cannot clear history while a turn is running")
+			return
+		}
 		a.clearHistory()
 	case ControlCompactNow:
 		a.mu.Lock()
@@ -647,6 +751,17 @@ func (a *Agent) handle(c Control) {
 		a.removeLast(c.Count)
 	case ControlRewind:
 		a.rewindTo(c.Count)
+	case ControlFork:
+		a.mu.Lock()
+		busy := a.busy
+		a.mu.Unlock()
+		if busy {
+			a.emitStatus("cannot fork while a turn is running")
+			return
+		}
+		if _, err := a.Fork(c.Count); err != nil {
+			a.emit(Event{Type: EventError, Text: "fork failed: " + err.Error()})
+		}
 	default:
 		a.emitStatus("unhandled control %d", c.Type)
 	}
@@ -668,15 +783,22 @@ func (a *Agent) runTurn(text string) {
 	a.mu.Lock()
 	a.interruptFlag = false
 	a.stop = false
+	// The approval cache is per-turn: decisions made for one user request
+	// never leak into the next one.
+	a.approvalCache = map[string]bool{}
 	a.mu.Unlock()
 	a.resetOutputBudget()
 	a.resetGuardianBudget()
 	// Fallback budget resets per turn: one fallback attempt per turn, not per
 	// session (a transient primary failure should not disable the primary for
-	// the rest of the session).
+	// the rest of the session). The primary client is restored too, so the
+	// reset is real and not just cosmetic.
 	a.mu.Lock()
 	a.usedFallback = false
 	a.activeModel = a.cfg.Model
+	if a.primaryClient != nil {
+		a.client = a.primaryClient
+	}
 	a.mu.Unlock()
 
 	// AutoMem: reset the per-turn tracking for this turn.
@@ -691,6 +813,17 @@ func (a *Agent) runTurn(text string) {
 		reason := ho.Reason
 		if reason == "" {
 			reason = "blocked by UserPromptSubmit hook"
+		}
+		a.emit(Event{Type: EventUserMsg, Text: text})
+		a.emit(Event{Type: EventError, Text: reason})
+		a.emit(Event{Type: EventTurnDone})
+		return
+	} else if ho.Continue != nil && !*ho.Continue {
+		// {"continue": false} from a hook stops the agent loop entirely
+		// (Claude Code hook semantics).
+		reason := ho.Reason
+		if reason == "" {
+			reason = "stopped by UserPromptSubmit hook"
 		}
 		a.emit(Event{Type: EventUserMsg, Text: text})
 		a.emit(Event{Type: EventError, Text: reason})
@@ -758,13 +891,14 @@ func (a *Agent) runTurn(text string) {
 
 		a.emitStatus("thinking…")
 		req := a.buildRequest()
+		client := a.currentClient()
 
 		var streamed strings.Builder
 		var res llm.StreamResult
 		var streamErr error
 		streamDone := make(chan struct{})
 		go func() {
-			r, err := a.client.StreamWithReasoning(turnCtx, req, func(delta string) {
+			r, err := client.StreamWithReasoning(turnCtx, req, func(delta string) {
 				streamed.WriteString(delta)
 				a.emit(Event{Type: EventStream, Text: delta})
 			}, func(delta string) {
@@ -787,11 +921,13 @@ func (a *Agent) runTurn(text string) {
 			}
 			// Fallback model (Claude's --fallback-model): one retry on the
 			// backup client, then give up. activeModel follows so usage is
-			// priced with the fallback rate card.
+			// priced with the fallback rate card, and the request builder
+			// sends the fallback MODEL NAME to the fallback endpoint
+			// (req.Model comes from activeModelSnapshot).
 			if !a.usedFallback && a.fallbackClient != nil {
 				a.usedFallback = true
-				a.client = a.fallbackClient
 				a.mu.Lock()
+				a.client = a.fallbackClient
 				a.activeModel = a.cfg.FallbackModel
 				a.mu.Unlock()
 				a.emitStatus("primary model failed (%v) — falling back to %s", streamErr, a.cfg.FallbackModel)
@@ -859,7 +995,25 @@ func (a *Agent) runTurn(text string) {
 		// -- ToolDispatch + ApprovalGate --
 		// Parallel dispatch (Codex-style) when configured; results are always
 		// appended in call order so the conversation stays deterministic.
-		results := a.dispatchTools(calls)
+		//
+		// Pi's failToolCallsFromTruncatedMessage: a reply cut off by the token
+		// limit may carry tool calls whose streamed arguments were "salvaged"
+		// into plausible-looking but incomplete JSON. Never execute those —
+		// hand back an error result so the model re-issues the call with the
+		// complete arguments.
+		var results []toolRunResult
+		if res.FinishReason == "length" && len(calls) > 0 {
+			a.emitStatus("reply truncated by the token limit — voiding %d incomplete tool call(s)", len(calls))
+			results = make([]toolRunResult, len(calls))
+			for i, tc := range calls {
+				out := "not executed: the assistant message hit the token limit before this tool call finished streaming, " +
+					"so its arguments may be incomplete. Re-issue the tool call with the full arguments."
+				results[i] = toolRunResult{output: out, isErr: true}
+				a.emit(toolEvent(tc, "denied", "voided (message truncated)"))
+			}
+		} else {
+			results = a.dispatchTools(calls)
+		}
 		// Every tool_call id MUST get a result message or the next request
 		// violates the protocol (providers answer 400). dispatchTools fills
 		// synthetic results for calls skipped by an interrupt, so we append
@@ -867,8 +1021,33 @@ func (a *Agent) runTurn(text string) {
 		for i, r := range results {
 			a.appendHistory(messages.NewToolResult(calls[i], r.output, r.isErr))
 		}
+
+		// Steer (pi's one-at-a-time steering): a user message queued while the
+		// turn was busy is injected at this tool-result boundary so the model
+		// can react to it inside the running turn. Messages that arrive after
+		// the last tool round drain as follow-up turns in turnFinished.
+		if msg, ok := a.popPendingMsg(); ok {
+			a.emit(Event{Type: EventUserMsg, Text: msg})
+			a.appendHistory(messages.Message{
+				Role: messages.RoleUser, Content: msg, CreatedAt: time.Now(),
+			})
+			a.emitStatus("steered your message into the running turn")
+		}
 		// Loop back to Infer with the tool results appended.
 	}
+}
+
+// popPendingMsg claims the oldest queued user message (pi's one-at-a-time
+// steering delivery: at most one message crosses a tool boundary per round).
+func (a *Agent) popPendingMsg() (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.pendingMsgs) == 0 {
+		return "", false
+	}
+	next := a.pendingMsgs[0]
+	a.pendingMsgs = a.pendingMsgs[1:]
+	return next, true
 }
 
 // turnFinished runs when a turn completes: persists the session, flushes the
@@ -962,6 +1141,18 @@ type toolRunResult struct {
 // tokens served from a provider cache (OpenAI prompt_tokens_details). Cost is
 // priced with the ACTIVE model, which may be the fallback after a switch.
 func (a *Agent) recordUsage(inputTok, outputTok, cachedTok int) {
+	a.recordUsageOpts(inputTok, outputTok, cachedTok, true)
+}
+
+// recordUsageNoBaseline accumulates usage without re-anchoring the compaction
+// token baseline. Sub-agent loops report usage for requests built from their
+// OWN history, not the parent's — anchoring on the parent history length
+// would corrupt needsCompact until the next main-loop request.
+func (a *Agent) recordUsageNoBaseline(inputTok, outputTok, cachedTok int) {
+	a.recordUsageOpts(inputTok, outputTok, cachedTok, false)
+}
+
+func (a *Agent) recordUsageOpts(inputTok, outputTok, cachedTok int, anchorBaseline bool) {
 	a.mu.Lock()
 	a.usage.InputTokens += inputTok
 	a.usage.OutputTokens += outputTok
@@ -976,8 +1167,10 @@ func (a *Agent) recordUsage(inputTok, outputTok, cachedTok int) {
 	// Anchor the compaction estimate: this usage was reported for a request
 	// built from the current history length (the assistant reply and tool
 	// results are appended after this point).
-	a.tokenBaseline.promptTokens = inputTok
-	a.tokenBaseline.historyLen = len(a.history)
+	if anchorBaseline {
+		a.tokenBaseline.promptTokens = inputTok
+		a.tokenBaseline.historyLen = len(a.history)
+	}
 	a.mu.Unlock()
 	ev := Event{Type: EventUsage, Usage: &u}
 	a.events <- ev
@@ -1007,7 +1200,7 @@ func (a *Agent) executeTool(tc messages.ToolCall) (string, bool) {
 	// Sandbox × approval linkage: in strict sandbox mode, network tools are
 	// blocked unless network access was explicitly allowed (Codex's
 	// sandbox_mode ↔ approval matrix).
-	if a.sandbox != nil && a.sandbox.Mode == sandbox.ModeStrict && !a.sandbox.AllowNetwork {
+	if sb := a.currentSandbox(); sb != nil && sb.CurrentMode() == sandbox.ModeStrict && !sb.AllowNetwork {
 		switch tc.Name {
 		case "WebFetch", "WebSearch":
 			a.emit(toolEvent(tc, "denied", "network blocked by strict sandbox"))
@@ -1108,7 +1301,7 @@ func (a *Agent) executeTool(tc messages.ToolCall) (string, bool) {
 func (a *Agent) runTool(tc messages.ToolCall, tool tools.Tool) (string, bool) {
 	// Guardian review (Codex's guardian): high-risk calls are reviewed by a
 	// read-only sub-agent before executing. Enabled via enable_guardian.
-	if a.cfg.EnableGuardian && guardianRisk(tc.Name) {
+	if a.cfg.GuardianEnabled() && guardianRisk(tc.Name) {
 		if err := a.guardianCheck(tc); err != nil {
 			a.emit(toolEvent(tc, "denied", err.Error()))
 			return err.Error(), true
@@ -1125,7 +1318,7 @@ func (a *Agent) runTool(tc messages.ToolCall, tool tools.Tool) (string, bool) {
 		SessionDir: a.cfg.SessionDir,
 		Args:       tc.Arguments,
 		Timeout:    a.cfg.BashTimeout(),
-		Sandbox:    a.sandbox,
+		Sandbox:    a.currentSandbox(),
 		Subagent:   a.runSubagent,
 		Subagents:  a.runSubagents,
 		Skills:     a.skills,
@@ -1151,7 +1344,7 @@ func (a *Agent) runTool(tc messages.ToolCall, tool tools.Tool) (string, bool) {
 
 	// AutoMem: remember files the turn modified so the memory log can say what
 	// changed. Only Write/Edit carry a reliable file_path argument.
-	if a.cfg.EnableMemory {
+	if a.cfg.MemoryEnabled() {
 		switch tc.Name {
 		case "Write", "Edit":
 			if p, _ := tc.Arguments["file_path"].(string); p != "" {
@@ -1192,9 +1385,29 @@ func (a *Agent) runTool(tc messages.ToolCall, tool tools.Tool) (string, bool) {
 // safe for concurrent tool workers: approvalMu serializes the whole
 // request-answer cycle so only one modal is ever pending (Codex's single
 // approval slot).
+//
+// Within a turn the decision is memoized by permission SessionKey (Codex's
+// approval cache): parallel workers submitting identical calls — and the
+// Go-hook / shell-hook / permission gates asking about the same call — replay
+// the first answer instead of re-prompting. The cache lives only for the
+// current turn; lasting grants go through the remember flag / permission rules.
 func (a *Agent) requestApproval(tc messages.ToolCall, reason string) (bool, bool) {
 	a.approvalMu.Lock()
 	defer a.approvalMu.Unlock()
+
+	// Replay a decision made earlier this turn for the same invocation. The
+	// lookup happens after approvalMu is acquired, so the deciding worker has
+	// always stored its answer by the time a second worker gets here.
+	key := permissions.SessionKey(tc.Name, tc.Arguments)
+	a.mu.Lock()
+	if dec, ok := a.approvalCache[key]; ok {
+		a.mu.Unlock()
+		if dec {
+			a.emitStatus("auto-approved %s (same call was already approved this turn)", tc.Name)
+		}
+		return dec, false
+	}
+	a.mu.Unlock()
 
 	req := &ApprovalRequest{
 		ID:      tc.ID,
@@ -1212,6 +1425,9 @@ func (a *Agent) requestApproval(tc messages.ToolCall, reason string) (bool, bool
 
 	select {
 	case ans := <-resp:
+		a.mu.Lock()
+		a.approvalCache[key] = ans.approve
+		a.mu.Unlock()
 		return ans.approve, ans.remember
 	case <-a.turnCtx.Done():
 		a.emitStatus("approval skipped (interrupted)")
@@ -1292,6 +1508,9 @@ func (a *Agent) removeLast(n int) {
 			n = len(a.history)
 		}
 		a.history = a.history[:len(a.history)-n]
+		// Truncation can orphan a trailing assistant tool_calls message (its
+		// results were removed) — repair pairing so the next request is valid.
+		a.history = sanitizeToolPairs(a.history)
 	}
 	a.mu.Unlock()
 	if busy {
@@ -1314,6 +1533,7 @@ func (a *Agent) rewindTo(n int) {
 			n = len(a.history)
 		}
 		a.history = a.history[:n]
+		a.history = sanitizeToolPairs(a.history)
 	}
 	a.mu.Unlock()
 	if busy {

@@ -16,6 +16,7 @@ package plugin
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"ccdp/internal/events"
@@ -46,129 +47,238 @@ type Plugin interface {
 	Deinit() error
 }
 
-// Host loads and unloads plugins with dependency ordering.
+// Host loads and unloads plugins with dependency ordering. It implements the
+// availability-driven (epoch fingerprint) model of deepseek-harness's Cordis
+// kernel: a plugin is loaded whenever all of its Requires are loaded, and
+// automatically unloaded again when any requirement disappears — regardless of
+// the order Load calls arrived in. Plugins whose requirements are not (yet)
+// met stay registered as "pending" and are loaded automatically once their
+// dependencies appear.
 type Host struct {
-	ctx     *Context
-	mu      sync.Mutex
-	plugins map[string]Plugin
-	order   []string // load order (topological)
+	ctx    *Context
+	mu     sync.Mutex
+	wanted map[string]Plugin // registered, may be loaded or pending
+	loaded map[string]bool
+	order  []string // load order (topological, stable)
 }
 
 // NewHost builds an empty host over a Context.
 func NewHost(ctx *Context) *Host {
-	return &Host{ctx: ctx, plugins: map[string]Plugin{}}
+	return &Host{
+		ctx:    ctx,
+		wanted: map[string]Plugin{},
+		loaded: map[string]bool{},
+	}
 }
 
-// Load initializes p after its Requires plugins, which are loaded recursively
-// if absent. On Init failure the plugins added by this call are deinitialized
-// and removed so the host stays consistent.
+// Load registers p and brings the host to a consistent state (loading p and
+// any missing built-in dependencies, in dependency order). Requirements that
+// are not yet satisfiable leave the plugin pending — the error is reported
+// but the plugin stays registered and loads automatically once the
+// dependency shows up. A failed Init rolls back everything this call loaded
+// and drops the plugin entirely; a dependency cycle is rejected outright.
 func (h *Host) Load(p Plugin) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if p == nil || p.Name() == "" {
 		return fmt.Errorf("plugin: name is required")
 	}
-	if _, ok := h.plugins[p.Name()]; ok {
-		return fmt.Errorf("plugin: %q already loaded", p.Name())
+	if _, ok := h.wanted[p.Name()]; ok {
+		return fmt.Errorf("plugin: %q already registered", p.Name())
 	}
-	start := len(h.order)
-	if err := h.loadDeps(p, map[string]bool{p.Name(): true}); err != nil {
+	if err := h.detectCycle(p); err != nil {
 		return err
 	}
-	if err := p.Init(h.ctx); err != nil {
-		h.rollback(start)
-		return fmt.Errorf("plugin %q init: %w", p.Name(), err)
+	start := len(h.order)
+	h.wanted[p.Name()] = p
+	if err := h.refresh(start, true); err != nil {
+		return err
 	}
-	h.plugins[p.Name()] = p
-	h.order = append(h.order, p.Name())
+	if !h.loaded[p.Name()] {
+		return fmt.Errorf("plugin: %q pending — unsatisfied requirements: %s", p.Name(), strings.Join(h.missingFor(p), ", "))
+	}
 	return nil
+}
+
+// detectCycle walks the requirement graph through wanted/known plugins and
+// rejects a plugin that (transitively) requires itself.
+func (h *Host) detectCycle(p Plugin) error {
+	var walk func(name string, path []string) error
+	seen := map[string]bool{}
+	walk = func(name string, path []string) error {
+		if name == p.Name() {
+			return fmt.Errorf("plugin: dependency cycle involving %q", p.Name())
+		}
+		if seen[name] {
+			return nil
+		}
+		seen[name] = true
+		next, ok := h.wanted[name]
+		if !ok {
+			if kp, kok := knownPlugins[name]; kok {
+				next = kp
+			} else {
+				return nil
+			}
+		}
+		for _, dep := range next.Requires() {
+			if err := walk(dep, append(path, name)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, dep := range p.Requires() {
+		if err := walk(dep, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// refresh drives the host to a fixpoint (the Cordis epoch step): load every
+// pending plugin whose requirements are now met, then unload every loaded
+// plugin whose requirements no longer are, repeating until stable. On an Init
+// failure everything loaded during this refresh is rolled back and the broken
+// plugin is dropped from the host.
+func (h *Host) refresh(start int, allowLoads bool) error {
+	// Load pass — deterministic order (sorted names; map iteration would be
+	// random), passes repeat until no progress is made. Missing requirements
+	// that are known built-ins are pulled in automatically, like the old
+	// recursive loadDeps did. Passes make progress either by loading a plugin
+	// or by auto-registering one, so a fresh registration always gets its own
+	// pass on the next iteration. Skipped during an Unload cascade: loading
+	// pending plugins whose dependencies happen to be met would init them
+	// just to deinit them again in the same pass.
+	if allowLoads {
+		for {
+			progress := false
+			for _, name := range h.wantedOrder() {
+				if h.loaded[name] {
+					continue
+				}
+				p := h.wanted[name]
+				missing := h.missingFor(p)
+				// Auto-register known built-ins for unsatisfied requirements.
+				for _, dep := range missing {
+					if _, wanted := h.wanted[dep]; !wanted {
+						if kp, ok := knownPlugins[dep]; ok {
+							h.wanted[dep] = kp
+							progress = true
+						}
+					}
+				}
+				if len(h.missingFor(p)) > 0 {
+					continue // still pending
+				}
+				if err := p.Init(h.ctx); err != nil {
+					h.rollback(start)
+					delete(h.wanted, name)
+					return fmt.Errorf("plugin %q init: %w", name, err)
+				}
+				h.loaded[name] = true
+				h.order = append(h.order, name)
+				progress = true
+			}
+			if !progress {
+				break
+			}
+		}
+	}
+	// Unload pass — requirements vanished (an Unload cascade): deinit in
+	// reverse load order, repeat until stable. Unloaded plugins stay wanted
+	// and reload automatically if their dependencies come back.
+	for {
+		progress := false
+		for i := len(h.order) - 1; i >= 0; i-- {
+			name := h.order[i]
+			if !h.loaded[name] {
+				continue
+			}
+			if len(h.missingFor(h.wanted[name])) > 0 {
+				_ = h.wanted[name].Deinit()
+				h.loaded[name] = false
+				h.order = append(h.order[:i], h.order[i+1:]...)
+				progress = true
+				break // order shifted; restart the scan
+			}
+		}
+		if !progress {
+			break
+		}
+	}
+	return nil
+}
+
+// missingFor lists the plugin's requirements that are not currently loaded.
+func (h *Host) missingFor(p Plugin) []string {
+	var missing []string
+	for _, dep := range p.Requires() {
+		if !h.loaded[dep] {
+			missing = append(missing, dep)
+		}
+	}
+	return missing
+}
+
+// wantedOrder returns the wanted plugin names in registration order
+// (deterministic load passes; map iteration would be random).
+func (h *Host) wantedOrder() []string {
+	names := make([]string, 0, len(h.wanted))
+	for n := range h.wanted {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // rollback deinitializes and removes every plugin loaded after index start.
 func (h *Host) rollback(start int) {
+	if start > len(h.order) {
+		start = len(h.order) // the unload pass may have shrunk the order
+	}
 	for i := len(h.order) - 1; i >= start; i-- {
 		name := h.order[i]
-		if pl, ok := h.plugins[name]; ok {
-			_ = pl.Deinit()
-			delete(h.plugins, name)
+		if p, ok := h.wanted[name]; ok && h.loaded[name] {
+			_ = p.Deinit()
+			h.loaded[name] = false
 		}
 	}
 	h.order = h.order[:start]
 }
 
-// loadDeps recursively loads Requires() plugins, detecting cycles.
-func (h *Host) loadDeps(p Plugin, visiting map[string]bool) error {
-	for _, dep := range p.Requires() {
-		if _, ok := h.plugins[dep]; ok {
-			continue
-		}
-		if visiting[dep] {
-			return fmt.Errorf("plugin: dependency cycle involving %q", dep)
-		}
-		depPlugin, err := h.resolve(dep)
-		if err != nil {
-			return err
-		}
-		next := make(map[string]bool, len(visiting)+1)
-		for k, v := range visiting {
-			next[k] = v
-		}
-		next[dep] = true
-		if err := h.loadDeps(depPlugin, next); err != nil {
-			return err
-		}
-		if err := depPlugin.Init(h.ctx); err != nil {
-			return fmt.Errorf("plugin %q init: %w", dep, err)
-		}
-		h.plugins[dep] = depPlugin
-		h.order = append(h.order, dep)
-	}
-	return nil
-}
-
-// resolve looks up a dependency plugin by name. Built-in plugins are known to
-// the host; unknown names are an error.
-func (h *Host) resolve(name string) (Plugin, error) {
-	if p, ok := knownPlugins[name]; ok {
-		return p, nil
-	}
-	return nil, fmt.Errorf("plugin: unknown dependency %q", name)
-}
-
-// knownPlugins is the catalog of built-in plugins resolvable by name.
-var knownPlugins = map[string]Plugin{}
-
-// RegisterBuiltin makes a plugin available for dependency resolution by name.
-func RegisterBuiltin(p Plugin) {
-	if p != nil && p.Name() != "" {
-		knownPlugins[p.Name()] = p
-	}
-}
-
-// Unload removes a plugin, calling its Deinit. Plugins that depend on it are
-// refused until they are unloaded first.
+// Unload removes a plugin from the host. Plugins that depend on it are
+// unloaded too (Cordis cascade semantics): dependents tear down first (in
+// reverse load order) so they never see a torn-down dependency, then the
+// plugin itself. Dependents stay registered and reload automatically if the
+// dependency is ever added back.
 func (h *Host) Unload(name string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	p, ok := h.plugins[name]
+	p, ok := h.wanted[name]
 	if !ok {
 		return fmt.Errorf("plugin: %q not loaded", name)
 	}
-	for _, other := range h.plugins {
-		for _, dep := range other.Requires() {
-			if dep == name && other.Name() != name {
-				return fmt.Errorf("plugin: %q depends on %q; unload it first", other.Name(), name)
-			}
-		}
-	}
-	if err := p.Deinit(); err != nil {
-		return fmt.Errorf("plugin %q deinit: %w", name, err)
-	}
-	delete(h.plugins, name)
+	wasLoaded := h.loaded[name]
+	start := len(h.order)
+	// Take the plugin out of the host first; the unload pass below then
+	// cascades its dependents down without touching it again.
+	delete(h.wanted, name)
+	delete(h.loaded, name)
 	for i, n := range h.order {
 		if n == name {
 			h.order = append(h.order[:i], h.order[i+1:]...)
 			break
+		}
+	}
+	// No load pass here: loading pending plugins whose dependencies happen to
+	// be met would init them just to deinit them again in the same cascade.
+	if err := h.refresh(start, false); err != nil {
+		return err
+	}
+	if wasLoaded {
+		if err := p.Deinit(); err != nil {
+			return fmt.Errorf("plugin %q deinit: %w", name, err)
 		}
 	}
 	return nil
@@ -183,23 +293,48 @@ func (h *Host) Names() []string {
 	return out
 }
 
-// Close deinits all plugins in reverse load order.
+// Pending returns registered plugin names that are not loaded because their
+// requirements are not met (waiting for a dependency to appear).
+func (h *Host) Pending() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, name := range h.wantedOrder() {
+		if !h.loaded[name] {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// Close deinits all loaded plugins in reverse load order.
 func (h *Host) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	var errs []string
 	for i := len(h.order) - 1; i >= 0; i-- {
 		name := h.order[i]
-		if err := h.plugins[name].Deinit(); err != nil {
+		if err := h.wanted[name].Deinit(); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
 		}
 	}
-	h.plugins = map[string]Plugin{}
+	h.wanted = map[string]Plugin{}
+	h.loaded = map[string]bool{}
 	h.order = nil
 	if len(errs) > 0 {
 		return fmt.Errorf("plugin close: %s", joinErrs(errs))
 	}
 	return nil
+}
+
+// knownPlugins is the catalog of built-in plugins resolvable by name.
+var knownPlugins = map[string]Plugin{}
+
+// RegisterBuiltin makes a plugin available for dependency resolution by name.
+func RegisterBuiltin(p Plugin) {
+	if p != nil && p.Name() != "" {
+		knownPlugins[p.Name()] = p
+	}
 }
 
 func joinErrs(errs []string) string {
@@ -313,11 +448,18 @@ type PreToolHook func(toolName string, args map[string]any) (ToolDecision, strin
 // PostToolHook observes a tool result; the returned text is appended to it.
 type PostToolHook func(toolName string, args map[string]any, result string) string
 
+// preHookNode and postHookNode let disposers remove their own hook by pointer
+// identity: disposing in any order can never remove or shift someone else's
+// registration.
+type preHookNode struct{ h PreToolHook }
+
+type postHookNode struct{ h PostToolHook }
+
 // GoHooks is a registry of in-process hooks run alongside shell hooks.
 type GoHooks struct {
 	mu   sync.RWMutex
-	pre  []PreToolHook
-	post []PostToolHook
+	pre  []*preHookNode
+	post []*postHookNode
 }
 
 // NewGoHooks builds an empty hook registry.
@@ -326,14 +468,17 @@ func NewGoHooks() *GoHooks { return &GoHooks{} }
 // AddPreTool registers a pre-tool hook and returns a disposer.
 func (g *GoHooks) AddPreTool(h PreToolHook) func() {
 	g.mu.Lock()
-	g.pre = append(g.pre, h)
-	i := len(g.pre) - 1
+	node := &preHookNode{h: h}
+	g.pre = append(g.pre, node)
 	g.mu.Unlock()
 	return func() {
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		if i < len(g.pre) {
-			g.pre = append(g.pre[:i], g.pre[i+1:]...)
+		for i, s := range g.pre {
+			if s == node {
+				g.pre = append(g.pre[:i], g.pre[i+1:]...)
+				return
+			}
 		}
 	}
 }
@@ -341,25 +486,31 @@ func (g *GoHooks) AddPreTool(h PreToolHook) func() {
 // AddPostTool registers a post-tool hook and returns a disposer.
 func (g *GoHooks) AddPostTool(h PostToolHook) func() {
 	g.mu.Lock()
-	g.post = append(g.post, h)
-	i := len(g.post) - 1
+	node := &postHookNode{h: h}
+	g.post = append(g.post, node)
 	g.mu.Unlock()
 	return func() {
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		if i < len(g.post) {
-			g.post = append(g.post[:i], g.post[i+1:]...)
+		for i, s := range g.post {
+			if s == node {
+				g.post = append(g.post[:i], g.post[i+1:]...)
+				return
+			}
 		}
 	}
 }
 
-// RunPreTool invokes all pre-tool hooks; the first non-none verdict wins.
+// RunPreTool invokes all pre-tool hooks; the first non-none verdict wins. The
+// hook list is copied under the lock so concurrent disposers (which move
+// elements in place) never race with the iteration.
 func (g *GoHooks) RunPreTool(toolName string, args map[string]any) (ToolDecision, string) {
 	g.mu.RLock()
-	hooks := g.pre
+	hooks := make([]*preHookNode, len(g.pre))
+	copy(hooks, g.pre)
 	g.mu.RUnlock()
-	for _, h := range hooks {
-		dec, reason := h(toolName, args)
+	for _, node := range hooks {
+		dec, reason := node.h(toolName, args)
 		if dec != DecisionNone {
 			return dec, reason
 		}
@@ -370,11 +521,12 @@ func (g *GoHooks) RunPreTool(toolName string, args map[string]any) (ToolDecision
 // RunPostTool invokes all post-tool hooks and concatenates their additions.
 func (g *GoHooks) RunPostTool(toolName string, args map[string]any, result string) string {
 	g.mu.RLock()
-	hooks := g.post
+	hooks := make([]*postHookNode, len(g.post))
+	copy(hooks, g.post)
 	g.mu.RUnlock()
 	extra := ""
-	for _, h := range hooks {
-		if add := h(toolName, args, result); add != "" {
+	for _, node := range hooks {
+		if add := node.h(toolName, args, result); add != "" {
 			extra += "\n" + add
 		}
 	}
@@ -383,12 +535,21 @@ func (g *GoHooks) RunPostTool(toolName string, args map[string]any, result strin
 
 // ---------- SessionRegistry (session lifecycle callbacks) ----------
 
+// createNode, resumeNode and disposeNode let disposers remove their own
+// callback by pointer identity: disposing in any order can never remove or
+// shift someone else's registration.
+type createNode struct{ fn func(id, workspace string) }
+
+type resumeNode struct{ fn func(id string) }
+
+type disposeNode struct{ fn func(id string) }
+
 // SessionRegistry lets plugins observe session create/resume/dispose.
 type SessionRegistry struct {
 	mu        sync.RWMutex
-	onCreate  []func(id, workspace string)
-	onResume  []func(id string)
-	onDispose []func(id string)
+	onCreate  []*createNode
+	onResume  []*resumeNode
+	onDispose []*disposeNode
 }
 
 // NewSessionRegistry builds an empty registry.
@@ -397,56 +558,88 @@ func NewSessionRegistry() *SessionRegistry { return &SessionRegistry{} }
 // OnCreate registers a callback for newly created sessions.
 func (r *SessionRegistry) OnCreate(fn func(id, workspace string)) func() {
 	r.mu.Lock()
-	r.onCreate = append(r.onCreate, fn)
-	i := len(r.onCreate) - 1
+	node := &createNode{fn: fn}
+	r.onCreate = append(r.onCreate, node)
 	r.mu.Unlock()
-	return func() { r.mu.Lock(); defer r.mu.Unlock(); r.onCreate = append(r.onCreate[:i], r.onCreate[i+1:]...) }
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for i, s := range r.onCreate {
+			if s == node {
+				r.onCreate = append(r.onCreate[:i], r.onCreate[i+1:]...)
+				return
+			}
+		}
+	}
 }
 
 // OnResume registers a callback for resumed sessions.
 func (r *SessionRegistry) OnResume(fn func(id string)) func() {
 	r.mu.Lock()
-	r.onResume = append(r.onResume, fn)
-	i := len(r.onResume) - 1
+	node := &resumeNode{fn: fn}
+	r.onResume = append(r.onResume, node)
 	r.mu.Unlock()
-	return func() { r.mu.Lock(); defer r.mu.Unlock(); r.onResume = append(r.onResume[:i], r.onResume[i+1:]...) }
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for i, s := range r.onResume {
+			if s == node {
+				r.onResume = append(r.onResume[:i], r.onResume[i+1:]...)
+				return
+			}
+		}
+	}
 }
 
 // OnDispose registers a callback for disposed sessions.
 func (r *SessionRegistry) OnDispose(fn func(id string)) func() {
 	r.mu.Lock()
-	r.onDispose = append(r.onDispose, fn)
-	i := len(r.onDispose) - 1
+	node := &disposeNode{fn: fn}
+	r.onDispose = append(r.onDispose, node)
 	r.mu.Unlock()
-	return func() { r.mu.Lock(); defer r.mu.Unlock(); r.onDispose = append(r.onDispose[:i], r.onDispose[i+1:]...) }
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for i, s := range r.onDispose {
+			if s == node {
+				r.onDispose = append(r.onDispose[:i], r.onDispose[i+1:]...)
+				return
+			}
+		}
+	}
 }
 
-// RunCreate notifies create callbacks.
+// RunCreate notifies create callbacks. The list is copied under the lock so
+// concurrent disposers (which move elements in place) never race with the
+// iteration.
 func (r *SessionRegistry) RunCreate(id, workspace string) {
 	r.mu.RLock()
-	fns := r.onCreate
+	nodes := make([]*createNode, len(r.onCreate))
+	copy(nodes, r.onCreate)
 	r.mu.RUnlock()
-	for _, fn := range fns {
-		fn(id, workspace)
+	for _, node := range nodes {
+		node.fn(id, workspace)
 	}
 }
 
 // RunResume notifies resume callbacks.
 func (r *SessionRegistry) RunResume(id string) {
 	r.mu.RLock()
-	fns := r.onResume
+	nodes := make([]*resumeNode, len(r.onResume))
+	copy(nodes, r.onResume)
 	r.mu.RUnlock()
-	for _, fn := range fns {
-		fn(id)
+	for _, node := range nodes {
+		node.fn(id)
 	}
 }
 
 // RunDispose notifies dispose callbacks.
 func (r *SessionRegistry) RunDispose(id string) {
 	r.mu.RLock()
-	fns := r.onDispose
+	nodes := make([]*disposeNode, len(r.onDispose))
+	copy(nodes, r.onDispose)
 	r.mu.RUnlock()
-	for _, fn := range fns {
-		fn(id)
+	for _, node := range nodes {
+		node.fn(id)
 	}
 }

@@ -19,9 +19,17 @@ type fileReadEntry struct {
 	size  int64
 }
 
+// FileReadRecord is the observable state of one tracked path, for consumers
+// that need recency (e.g. the agent's post-compaction file restore).
+type FileReadRecord struct {
+	Path  string
+	Mtime time.Time
+}
+
 var fileReadState = struct {
 	mu    sync.Mutex
 	paths map[string]fileReadEntry
+	order []string // read order, oldest first (most recently read last)
 }{paths: map[string]fileReadEntry{}}
 
 // MarkFileRead records the observed state of a path after a successful Read.
@@ -32,7 +40,34 @@ func MarkFileRead(path string) {
 	}
 	fileReadState.mu.Lock()
 	fileReadState.paths[path] = fileReadEntry{mtime: info.ModTime(), size: info.Size()}
+	// Move (or append) the path to the end of the recency order.
+	for i, p := range fileReadState.order {
+		if p == path {
+			fileReadState.order = append(fileReadState.order[:i], fileReadState.order[i+1:]...)
+			break
+		}
+	}
+	fileReadState.order = append(fileReadState.order, path)
 	fileReadState.mu.Unlock()
+}
+
+// RecentReads returns up to n most recently read paths, newest first. It backs
+// the agent's post-compaction restore (Claude Code re-attaches recently read
+// files after compacting so the model keeps its working set).
+func RecentReads(n int) []FileReadRecord {
+	if n <= 0 {
+		return nil
+	}
+	fileReadState.mu.Lock()
+	defer fileReadState.mu.Unlock()
+	var out []FileReadRecord
+	for i := len(fileReadState.order) - 1; i >= 0 && len(out) < n; i-- {
+		p := fileReadState.order[i]
+		if e, ok := fileReadState.paths[p]; ok {
+			out = append(out, FileReadRecord{Path: p, Mtime: e.mtime})
+		}
+	}
+	return out
 }
 
 // CheckFileFresh validates that path may be mutated now. It returns an error
@@ -61,6 +96,12 @@ func CheckFileFresh(path string) error {
 func ForgetFile(path string) {
 	fileReadState.mu.Lock()
 	delete(fileReadState.paths, path)
+	for i, p := range fileReadState.order {
+		if p == path {
+			fileReadState.order = append(fileReadState.order[:i], fileReadState.order[i+1:]...)
+			break
+		}
+	}
 	fileReadState.mu.Unlock()
 }
 
@@ -68,5 +109,6 @@ func ForgetFile(path string) {
 func ClearFileReadState() {
 	fileReadState.mu.Lock()
 	fileReadState.paths = map[string]fileReadEntry{}
+	fileReadState.order = nil
 	fileReadState.mu.Unlock()
 }

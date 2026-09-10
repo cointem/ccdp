@@ -134,7 +134,7 @@ func (a *Agent) runSubagentInner(description, systemPrompt string) (string, erro
 			sctx = context.Background()
 		}
 		go func() {
-			res, err = a.client.Stream(sctx, req, func(delta string) {
+			res, err = a.currentClient().Stream(sctx, req, func(delta string) {
 				text.WriteString(delta)
 				out.WriteString(delta)
 			})
@@ -149,7 +149,7 @@ func (a *Agent) runSubagentInner(description, systemPrompt string) (string, erro
 			return out.String(), fmt.Errorf("subagent LLM error: %v", err)
 		}
 		if res.PromptTokens > 0 || res.CompletionTok > 0 {
-			a.recordUsage(res.PromptTokens, res.CompletionTok, res.CachedTokens)
+			a.recordUsageNoBaseline(res.PromptTokens, res.CompletionTok, res.CachedTokens)
 		}
 
 		var calls []messages.ToolCall

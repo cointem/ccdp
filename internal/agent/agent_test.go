@@ -84,6 +84,24 @@ func (f *fakeLLM) handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasPrefix(step, "truncated:") {
+		// A tool call cut off by the token limit: the call streams fine but
+		// the reply ends with finish_reason "length" (pi's truncated-message
+		// case — the arguments may be incomplete even when they parse).
+		parts := strings.SplitN(step, "|", 2)
+		toolName := strings.TrimPrefix(parts[0], "truncated:")
+		args := ""
+		if len(parts) > 1 {
+			args = parts[1]
+		}
+		argsJSON := buildArgsJSON(args)
+		writeChunk(w, fl, `{"id":"1","object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}`)
+		writeChunk(w, fl, `{"id":"1","object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"`+toolName+`","arguments":`+jsonString(argsJSON)+`}}]},"finish_reason":null}]}`)
+		writeChunk(w, fl, `{"id":"1","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"length"}]}`)
+		writeChunk(w, fl, "[DONE]")
+		return
+	}
+
 	writeChunk(w, fl, `{"id":"1","object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}`)
 	writeChunk(w, fl, `{"id":"1","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}`)
 	writeChunk(w, fl, "[DONE]")

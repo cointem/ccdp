@@ -156,6 +156,11 @@ func (m *Model) renderCmdSuggest() string {
 		sb.WriteString(line)
 		sb.WriteString("\n")
 	}
+	// Hidden matches: a non-selectable hint instead of an overflowing popup.
+	if m.cmdSugMore > 0 {
+		sb.WriteString("  " + styleCmdSug.Render(fmt.Sprintf("… +%d more (继续输入过滤)", m.cmdSugMore)))
+		sb.WriteString("\n")
+	}
 	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder(), true, false, false, false).
 		BorderForeground(lipgloss.Color("62")).
 		Padding(0, 1).
@@ -250,6 +255,22 @@ func renderItem(it *logItem) string {
 			style = styleToolErr
 			badge = "✗ denied"
 		}
+		// Re-apply the intended coloring after sanitization: the tool-name
+		// line and, when present, the command/path/args meta line are styled;
+		// the tool output itself stays plain.
+		lines := strings.SplitN(text, "\n", 3)
+		switch {
+		case it.toolMeta && len(lines) >= 2:
+			if len(lines) == 3 {
+				text = styleToolRun.Render(lines[0]) + "\n" + styleStatus.Render(lines[1]) + "\n" + lines[2]
+			} else {
+				text = styleToolRun.Render(lines[0]) + "\n" + styleStatus.Render(lines[1])
+			}
+		case len(lines) == 2:
+			text = styleToolRun.Render(lines[0]) + "\n" + lines[1]
+		default:
+			text = styleToolRun.Render(text)
+		}
 		return style.Render(badge + "\n" + text)
 
 	case "error":
@@ -266,29 +287,36 @@ func renderItem(it *logItem) string {
 	}
 }
 
-// renderToolText produces the display body of a tool entry.
-func renderToolText(name string, args map[string]any, status, output string) string {
+// renderToolText produces the plain-text display body of a tool entry. It
+// reports whether the second line is the command/path/args meta line, so
+// renderItem can color those lines itself after sanitization (styles baked in
+// here would be stripped by sanitizeANSI and never reach the terminal).
+func renderToolText(name string, args map[string]any, status, output string) (string, bool) {
 	var sb strings.Builder
-	sb.WriteString(styleToolRun.Render(name))
+	sb.WriteString(name)
 	sb.WriteString("\n")
+	meta := false
 	if cmd, ok := args["command"].(string); ok {
-		sb.WriteString(styleStatus.Render("$ " + cmd))
+		sb.WriteString("$ " + cmd)
 		sb.WriteString("\n")
+		meta = true
 	} else if p, ok := args["file_path"].(string); ok {
-		sb.WriteString(styleStatus.Render("📄 " + p))
+		sb.WriteString("📄 " + p)
 		sb.WriteString("\n")
+		meta = true
 	} else if len(args) > 0 {
 		// Compact one-line summary for other argument shapes.
 		summary, err := json.Marshal(args)
 		if err == nil && len(summary) <= 120 {
-			sb.WriteString(styleStatus.Render(string(summary)))
+			sb.WriteString(string(summary))
 			sb.WriteString("\n")
+			meta = true
 		}
 	}
 	if output != "" {
 		sb.WriteString(strings.TrimRight(output, "\n"))
 	}
-	return sb.String()
+	return sb.String(), meta
 }
 
 func shortID(id string) string {

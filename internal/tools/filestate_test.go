@@ -114,3 +114,41 @@ func TestWriteOverwriteRequiresRead(t *testing.T) {
 		t.Fatalf("overwrite after read failed: %v", err)
 	}
 }
+
+func TestRecentReadsRecencyOrder(t *testing.T) {
+	freshCtx(t)
+	a := filepath.Join(t.TempDir(), "a.txt")
+	b := filepath.Join(t.TempDir(), "b.txt")
+	c := filepath.Join(t.TempDir(), "c.txt")
+	for _, p := range []string{a, b, c} {
+		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		MarkFileRead(p)
+	}
+
+	// Newest first, bounded by n.
+	recs := RecentReads(2)
+	if len(recs) != 2 || recs[0].Path != c || recs[1].Path != b {
+		t.Fatalf("RecentReads(2) = %v", recs)
+	}
+
+	// Re-reading moves a path to the front of the recency order.
+	MarkFileRead(a)
+	recs = RecentReads(3)
+	if recs[0].Path != a || recs[2].Path != b {
+		t.Fatalf("re-read did not refresh recency: %v", recs)
+	}
+
+	// Forgetting drops the path entirely.
+	ForgetFile(c)
+	recs = RecentReads(10)
+	if len(recs) != 2 {
+		t.Fatalf("forgotten path still tracked: %v", recs)
+	}
+	for _, r := range recs {
+		if r.Path == c {
+			t.Fatal("forgotten path returned by RecentReads")
+		}
+	}
+}

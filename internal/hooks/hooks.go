@@ -32,12 +32,14 @@ package hooks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -358,6 +360,17 @@ func (m *Manager) runOne(ctx context.Context, command string, timeout time.Durat
 	)
 	cmd.Env = append(cmd.Env, m.opts.Env...)
 	cmd.Stdin = strings.NewReader(string(payload))
+	// Run the hook in its own process group so the timeout kill takes down
+	// grandchildren too (`npm run dev &` inside a hook would otherwise hold
+	// stdout open and cmd.Output would block past the timeout forever).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && killErr != syscall.ESRCH {
+			return killErr
+		}
+		return os.ErrProcessDone
+	}
+	cmd.WaitDelay = 5 * time.Second
 
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -365,7 +378,10 @@ func (m *Manager) runOne(ctx context.Context, command string, timeout time.Durat
 	if cctx.Err() != nil {
 		return Output{}, false, fmt.Errorf("hook %q timed out", command)
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, exec.ErrWaitDelay) && !errors.Is(err, os.ErrClosed) {
+		// ErrWaitDelay / os.ErrClosed mean the hook exited but grandchildren
+		// kept its pipes open until WaitDelay force-closed them — the hook
+		// itself succeeded, so its (partial) output stands.
 		ee, ok := err.(*exec.ExitError)
 		if !ok {
 			return Output{}, false, fmt.Errorf("hook %q: %w", command, err)

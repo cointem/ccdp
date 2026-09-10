@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -67,6 +68,17 @@ const ProtocolVersion = "2024-11-05"
 // startupTimeout bounds the initialize + tools/list handshake per server.
 const startupTimeout = 10 * time.Second
 
+// maxLineLen caps one JSON-RPC frame on the wire (stdio line or SSE data
+// line). Large tool results legitimately reach several MB on a single line;
+// a too-small cap trips bufio.ErrTooLong and kills the whole connection with
+// no recovery path, so it is deliberately generous.
+const maxLineLen = 32 * 1024 * 1024
+
+// ssePostTimeout bounds one HTTP POST to the SSE messages endpoint. The write
+// helpers do not thread a context, so without this bound a hung endpoint would
+// hold writeMu forever and freeze every subsequent write.
+const ssePostTimeout = 120 * time.Second
+
 // Client is one MCP server connection over stdio.
 type Client struct {
 	name string
@@ -81,10 +93,20 @@ type Client struct {
 	stdin  io.WriteCloser
 	closed chan struct{} // closed when the process exits or Close is called
 
+	// closeOnce guards the closed-channel close + pending drain + onClose
+	// notification so every death path (process exit, SSE stream end, explicit
+	// Close) funnels through fireClosed exactly once.
+	closeOnce sync.Once
+	closeMu   sync.Mutex // serializes Close's kill/wait against concurrent calls
+	waited    bool       // cmd.Wait already done (guarded by closeMu)
+	onClose   func()     // fired once when the connection dies (Claude Code's MCP reconnect hook point)
+
 	// SSE transport state.
 	sseClient    *http.Client
 	messagesURL  string
 	sseTransport bool
+	sseCtx       context.Context    // live while the SSE stream is open; aborted by sseCancel
+	sseCancel    context.CancelFunc // cancels sseCtx (startSSE error paths and Close)
 
 	tools []ToolDef // cached after a successful tools/list
 
@@ -99,6 +121,43 @@ func (c *Client) SetChangeListener(fn func()) {
 	c.mu.Lock()
 	c.onChange = fn
 	c.mu.Unlock()
+}
+
+// SetCloseListener registers a callback invoked exactly once when the
+// connection dies — process exit, SSE stream end, or Close. The manager uses
+// it to unregister the dead server's tools instead of leaving the model
+// calling into a void (Claude Code's closeTransportAndRejectPending idea).
+func (c *Client) SetCloseListener(fn func()) {
+	c.mu.Lock()
+	c.onClose = fn
+	c.mu.Unlock()
+}
+
+// fireClosed is the single death path: drop every pending entry (waiters wake
+// through their select on c.closed with a "server exited" error), close the
+// lifecycle channel and notify the close listener. Idempotent via closeOnce.
+//
+// Pending channels are deliberately NOT closed: dispatchRaw pops a channel
+// under c.mu and sends after unlocking, so closing here could race into
+// "send on closed channel" and panic the whole process. Deleting the entries
+// is enough — a late response finds no pending entry and is dropped.
+func (c *Client) fireClosed() {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		for id := range c.pending {
+			delete(c.pending, id)
+		}
+		fn := c.onClose
+		c.mu.Unlock()
+		select {
+		case <-c.closed:
+		default:
+			close(c.closed)
+		}
+		if fn != nil {
+			fn()
+		}
+	})
 }
 
 // NewClient creates an unstarted client.
@@ -364,21 +423,38 @@ func (c *Client) startSSE(ctx context.Context) error {
 	}
 	c.sseTransport = true
 	c.sseClient = &http.Client{}
+	c.mu.Lock()
+	c.sseCtx, c.sseCancel = context.WithCancel(ctx)
+	c.mu.Unlock()
+	// A Close racing with startup must not leave the stream running.
+	select {
+	case <-c.closed:
+		c.sseCancel()
+		return fmt.Errorf("mcp %s: sse start aborted: client closed", c.name)
+	default:
+	}
 
 	sseURL := strings.TrimRight(c.cfg.BaseURL, "/")
 	// A trailing /sse is the conventional endpoint; the configured URL may
 	// already be the full /sse path.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sseURL, nil)
+	req, err := http.NewRequestWithContext(c.sseCtx, http.MethodGet, sseURL, nil)
 	if err != nil {
+		c.sseCancel()
+		c.fireClosed()
 		return fmt.Errorf("mcp %s: sse request: %w", c.name, err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := c.sseClient.Do(req)
 	if err != nil {
+		c.sseCancel()
+		c.fireClosed()
 		return fmt.Errorf("mcp %s: sse connect: %w", c.name, err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		c.sseCancel()
+		c.fireClosed()
 		return fmt.Errorf("mcp %s: sse status %s", c.name, resp.Status)
 	}
 
@@ -390,12 +466,18 @@ func (c *Client) startSSE(ctx context.Context) error {
 
 	select {
 	case c.messagesURL = <-messagesCh:
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-c.sseCtx.Done():
+		c.sseCancel()
+		c.fireClosed()
+		return fmt.Errorf("mcp %s: sse stream canceled: %w", c.name, c.sseCtx.Err())
 	case <-time.After(startupTimeout):
+		c.sseCancel()
+		c.fireClosed()
 		return fmt.Errorf("mcp %s: sse endpoint event timeout", c.name)
 	}
 	if c.messagesURL == "" {
+		c.sseCancel()
+		c.fireClosed()
 		return fmt.Errorf("mcp %s: sse endpoint event missing", c.name)
 	}
 
@@ -440,7 +522,7 @@ func (c *Client) sseReadLoop(body io.ReadCloser, messagesCh chan string, done ch
 	defer body.Close()
 
 	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineLen)
 	var event, data strings.Builder
 	flush := func() {
 		e := strings.TrimSpace(event.String())
@@ -476,19 +558,16 @@ func (c *Client) sseReadLoop(body io.ReadCloser, messagesCh chan string, done ch
 		}
 	}
 	flush()
+	if err := scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			log.Printf("mcp %s: sse line exceeded %d bytes; dropping connection", c.name, maxLineLen)
+		} else {
+			log.Printf("mcp %s: sse read: %v", c.name, err)
+		}
+	}
 
 	// Stream ended (server restart): fail pending calls.
-	select {
-	case <-c.closed:
-	default:
-		close(c.closed)
-	}
-	c.mu.Lock()
-	for id, ch := range c.pending {
-		close(ch)
-		delete(c.pending, id)
-	}
-	c.mu.Unlock()
+	c.fireClosed()
 }
 
 // dispatchRaw routes a JSON-RPC frame to its pending caller. Server-initiated
@@ -512,14 +591,12 @@ func (c *Client) dispatchRaw(line []byte) {
 	}
 	if msg.Method != "" {
 		// Server-initiated request (sampling, roots, ping…): reply with a
-		// JSON-RPC error instead of silently ignoring it.
-		var id int
-		if err := json.Unmarshal(msg.ID, &id); err != nil {
-			return
-		}
+		// JSON-RPC error instead of silently ignoring it. The ID is echoed
+		// verbatim — JSON-RPC allows string IDs and the server matches the
+		// reply by exact value.
 		body, err := json.Marshal(map[string]any{
 			"jsonrpc": "2.0",
-			"id":      id,
+			"id":      msg.ID,
 			"error": map[string]any{
 				"code":    -32601,
 				"message": "method not supported by ccdp client: " + msg.Method,
@@ -530,6 +607,9 @@ func (c *Client) dispatchRaw(line []byte) {
 		}
 		return
 	}
+	// Response: matched by numeric ID (our own requests always use ints). A
+	// non-numeric ID can never be one of ours (e.g. a server using string
+	// IDs), so drop it silently rather than guessing.
 	var id int
 	if err := json.Unmarshal(msg.ID, &id); err != nil {
 		return
@@ -545,34 +625,42 @@ func (c *Client) dispatchRaw(line []byte) {
 	}
 }
 
-// Close terminates the server process and wakes every pending caller.
+// Close terminates the server process and wakes every pending caller. It is
+// safe to call multiple times and concurrently with a spontaneous death: even
+// when the process already exited on its own (fireClosed already ran), Close
+// still closes stdin, kills and Waits so no zombie child or leaked fds remain.
 func (c *Client) Close() error {
-	select {
-	case <-c.closed:
-		return nil
-	default:
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	c.fireClosed() // idempotent
+	c.mu.Lock()
+	cancel := c.sseCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel() // abort the SSE stream; its read loop closes the body
 	}
-	close(c.closed)
 	var err error
-	if c.cmd != nil {
+	if c.cmd != nil && !c.waited {
+		// Closing stdin first unblocks any in-flight stdin.Write before the
+		// kill. readLoop is deliberately not joined: Wait reaps the child and
+		// closes the stdout pipe, and a final line racing with the kill may be
+		// dropped — an acceptable trade-off at shutdown.
+		if c.stdin != nil {
+			_ = c.stdin.Close()
+		}
 		if c.cmd.Process != nil {
 			_ = c.cmd.Process.Kill()
 		}
 		err = c.cmd.Wait()
+		c.waited = true
 	}
-	c.mu.Lock()
-	for id, ch := range c.pending {
-		close(ch)
-		delete(c.pending, id)
-	}
-	c.mu.Unlock()
 	return err
 }
 
 // readLoop forwards response frames to their pending callers.
 func (c *Client) readLoop(stdout io.Reader) {
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineLen)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -582,18 +670,15 @@ func (c *Client) readLoop(stdout io.Reader) {
 		// tools/list_changed) are handled in dispatchRaw as well.
 		c.dispatchRaw([]byte(line))
 	}
-	// Process exited; fail pending calls.
-	select {
-	case <-c.closed:
-	default:
-		close(c.closed)
+	if err := scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			log.Printf("mcp %s: stdout line exceeded %d bytes; dropping connection", c.name, maxLineLen)
+		} else {
+			log.Printf("mcp %s: stdout read: %v", c.name, err)
+		}
 	}
-	c.mu.Lock()
-	for id, ch := range c.pending {
-		close(ch)
-		delete(c.pending, id)
-	}
-	c.mu.Unlock()
+	// Process exited: fail pending calls and notify the manager.
+	c.fireClosed()
 }
 
 // request performs a JSON-RPC request and decodes the result or error.
@@ -691,45 +776,80 @@ func (c *Client) write(body []byte) error {
 	default:
 	}
 	if c.sseTransport {
-		req, err := http.NewRequest(http.MethodPost, c.messagesURL, bytes.NewReader(body))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		resp, err := c.sseClient.Do(req)
-		if err != nil {
-			return fmt.Errorf("mcp %s: sse post: %w", c.name, err)
-		}
-		// Streamable HTTP may return an SSE response or an empty 200.
-		if resp.StatusCode >= 300 {
-			return fmt.Errorf("mcp %s: sse post status %s", c.name, resp.Status)
-		}
-		// Some servers reply synchronously with a JSON-RPC message.
-		if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
-			go func() {
-				defer resp.Body.Close()
-				sc := bufio.NewScanner(resp.Body)
-				sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-				var data strings.Builder
-				for sc.Scan() {
-					line := strings.TrimSpace(sc.Text())
-					if strings.HasPrefix(line, "data:") {
-						data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-						data.WriteString("\n")
-						c.dispatchRaw([]byte(strings.TrimSpace(data.String())))
-						data.Reset()
-					}
-				}
-			}()
-		} else {
-			resp.Body.Close()
-		}
-		return nil
+		return c.writeSSE(body)
 	}
 	buf := append(body, '\n')
 	if _, err := c.stdin.Write(buf); err != nil {
 		return fmt.Errorf("mcp %s: write: %w", c.name, err)
+	}
+	return nil
+}
+
+// writeSSE POSTs one JSON-RPC frame to the messages endpoint. The POST is
+// bounded by ssePostTimeout and by the connection context (sseCtx, canceled on
+// Close), so a hung server can never hold writeMu indefinitely. A
+// text/event-stream body is drained in the background (it dies with the POST
+// context or on Close); a plain application/json body is a synchronous
+// JSON-RPC response and must be dispatched, not dropped.
+func (c *Client) writeSSE(body []byte) error {
+	c.mu.Lock()
+	parent := c.sseCtx
+	c.mu.Unlock()
+	if parent == nil {
+		parent = context.Background()
+	}
+	// cancel is NOT deferred: the background drain below outlives this call
+	// and must keep its context alive until the body has been consumed.
+	ctx, cancel := context.WithTimeout(parent, ssePostTimeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.messagesURL, bytes.NewReader(body))
+	if err != nil {
+		cancel()
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := c.sseClient.Do(req)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("mcp %s: sse post: %w", c.name, err)
+	}
+	if resp.StatusCode >= 300 {
+		resp.Body.Close()
+		cancel()
+		return fmt.Errorf("mcp %s: sse post status %s", c.name, resp.Status)
+	}
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		// Streamable HTTP: the response body is itself an SSE stream feeding
+		// more JSON-RPC frames; drain it in the background. The body read is
+		// bounded by ctx, so the goroutine cannot leak past the POST deadline.
+		go func() {
+			defer cancel()
+			defer resp.Body.Close()
+			sc := bufio.NewScanner(resp.Body)
+			sc.Buffer(make([]byte, 0, 64*1024), maxLineLen)
+			for sc.Scan() {
+				line := strings.TrimSpace(sc.Text())
+				if !strings.HasPrefix(line, "data:") {
+					continue
+				}
+				if data := strings.TrimSpace(strings.TrimPrefix(line, "data:")); data != "" {
+					c.dispatchRaw([]byte(data))
+				}
+			}
+		}()
+		return nil
+	}
+	// Plain JSON response: read it (bounded to 1MB) and route it through the
+	// normal dispatcher — the body holds a single JSON-RPC response object,
+	// which is exactly dispatchRaw's input contract.
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	cancel()
+	if err != nil {
+		return fmt.Errorf("mcp %s: sse post body: %w", c.name, err)
+	}
+	if raw = bytes.TrimSpace(raw); len(raw) > 0 {
+		c.dispatchRaw(raw)
 	}
 	return nil
 }
