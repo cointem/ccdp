@@ -14,10 +14,8 @@ func TestCommandToolRunsWithArgsOnStdin(t *testing.T) {
 		`cat /dev/stdin | python3 -c "import json,sys; print('hello ' + json.load(sys.stdin).get('name',''))"`,
 		nil,
 	)
-	ctx := &Context{
-		WorkingDir: dir,
-		Args:       map[string]any{"name": "world"},
-	}
+	ctx := scopedTestContext(t, dir)
+	ctx.Args = map[string]any{"name": "world"}
 	out, err := tool.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -30,7 +28,8 @@ func TestCommandToolRunsWithArgsOnStdin(t *testing.T) {
 func TestCommandToolFailureReported(t *testing.T) {
 	dir := t.TempDir()
 	tool := NewCommandTool("fail", "always fails", "exit 3", nil)
-	ctx := &Context{WorkingDir: dir, Args: map[string]any{}}
+	ctx := scopedTestContext(t, dir)
+	ctx.Args = map[string]any{}
 	out, err := tool.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run should not error, got %v", err)
@@ -43,11 +42,9 @@ func TestCommandToolFailureReported(t *testing.T) {
 func TestCommandToolTimeout(t *testing.T) {
 	dir := t.TempDir()
 	tool := NewCommandTool("sleeper", "sleeps", "sleep 5", nil)
-	ctx := &Context{
-		WorkingDir: dir,
-		Args:       map[string]any{},
-		Timeout:    50 * time.Millisecond, // much shorter than the 5s sleep
-	}
+	ctx := scopedTestContext(t, dir)
+	ctx.Args = map[string]any{}
+	ctx.Timeout = 50 * time.Millisecond // much shorter than the 5s sleep
 	out, err := tool.Run(ctx)
 	if err != nil {
 		t.Fatalf("timeout should return output, got %v", err)

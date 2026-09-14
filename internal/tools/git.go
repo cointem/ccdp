@@ -1,11 +1,11 @@
 package tools
 
 import (
-	"context"
 	"fmt"
-	"os/exec"
+	"os"
 	"strings"
-	"time"
+
+	"ccdp/internal/execution"
 )
 
 // gitMaxOutput caps a single git tool's returned text.
@@ -14,33 +14,52 @@ const gitMaxOutput = 32000
 // runGit executes git in the workspace directory with a timeout and returns
 // the combined output and exit code.
 func runGit(ctx *Context, args ...string) (string, int, error) {
-	timeout := ctx.Timeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
+	if err := ctx.checkResources(); err != nil {
+		return "", -1, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(cctx, "git", args...)
-	cmd.Dir = ctx.WorkingDir
-
-	out := &strings.Builder{}
-	cmd.Stdout = out
-	cmd.Stderr = out
-
-	err := cmd.Run()
-	code := 0
-	if cctx.Err() == context.DeadlineExceeded {
-		return out.String() + "\n[git command timed out]", -1, nil
+	argv := append([]string{"git"}, args...)
+	readOnly := len(args) > 0 && (args[0] == "status" || args[0] == "diff" || args[0] == "log")
+	if readOnly {
+		hardened, err := execution.ReadOnlyGitArgv(argv)
+		if err != nil {
+			return "", -1, err
+		}
+		argv = hardened
 	}
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else {
-			return out.String(), code, fmt.Errorf("git: %w", err)
+	rawParts := argv
+	raw := strings.Join(rawParts, " ")
+	// Check the human-readable command before quoting argv. This preserves the
+	// strict network/destructive-command classification for git while the
+	// actual execution still passes each argument safely through the shell.
+	if ctx.Sandbox != nil {
+		if err := ctx.Sandbox.CommandPolicy(raw); err != nil {
+			return "", -1, err
 		}
 	}
-	return out.String(), code, nil
+	parts := make([]string, 0, len(rawParts))
+	for _, arg := range rawParts {
+		parts = append(parts, execution.QuoteArg(arg))
+	}
+	env := execution.SanitizedEnvironmentFor(execution.EnvironmentGit, os.Environ())
+	if readOnly {
+		env = execution.ReadOnlyGitEnvironment(env)
+	}
+	res, err := execution.Run(execution.Request{
+		Context:     ctx.Context,
+		Command:     strings.Join(parts, " "),
+		Dir:         ctx.WorkingDir,
+		Timeout:     ctx.Timeout,
+		Sandbox:     ctx.Sandbox,
+		Env:         env,
+		OutputLimit: ctx.outputLimit(),
+	})
+	if err != nil {
+		return res.Output, -1, fmt.Errorf("git: %w", err)
+	}
+	if res.TimedOut {
+		return res.Output + "\n[git command timed out]", -1, nil
+	}
+	return res.Output, res.ExitCode, nil
 }
 
 // truncateGit caps output at gitMaxOutput with an explicit marker.
@@ -135,6 +154,9 @@ func (t *GitDiffTool) Run(ctx *Context) (string, error) {
 		args = append(args, "--cached")
 	}
 	if base := StringArg(ctx.Args, "base", ""); base != "" {
+		if err := validateGitRevision(base); err != nil {
+			return "", err
+		}
 		args = append(args, base)
 	}
 	if BoolArg(ctx.Args, "stat", false) {
@@ -148,6 +170,16 @@ func (t *GitDiffTool) Run(ctx *Context) (string, error) {
 		return fmt.Sprintf("git %s (exit %d): no changes", strings.Join(args, " "), code), nil
 	}
 	return fmt.Sprintf("git %s (exit %d)\n%s", strings.Join(args, " "), code, truncateGit(out)), nil
+}
+
+func validateGitRevision(value string) error {
+	if strings.HasPrefix(value, "-") {
+		return fmt.Errorf("GitDiff: base must be a revision, not an option %q", value)
+	}
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return fmt.Errorf("GitDiff: base contains a prohibited control character")
+	}
+	return nil
 }
 
 // ---------- GitLog ----------
@@ -186,7 +218,10 @@ func (t *GitLogTool) Parameters() map[string]any {
 }
 
 func (t *GitLogTool) Run(ctx *Context) (string, error) {
-	n := IntArg(ctx.Args, "count", 20)
+	n, err := IntArgChecked(ctx.Args, "count", 20)
+	if err != nil {
+		return "", fmt.Errorf("GitLog: %w", err)
+	}
 	if n < 1 {
 		n = 1
 	}

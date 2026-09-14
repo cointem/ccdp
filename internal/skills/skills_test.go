@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func writeSkill(t *testing.T, dir, name, fm, body string) string {
@@ -121,5 +123,101 @@ func TestNoFrontmatterFallsBack(t *testing.T) {
 	}
 	if sk.Description != "" {
 		t.Errorf("expected empty description, got %q", sk.Description)
+	}
+}
+
+func TestReadBoundedRejectsFIFOWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "SKILL.md")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, _, err = readBounded(path, 32)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("readBounded FIFO error = %v, want regular-file error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readBounded blocked on FIFO")
+	}
+}
+
+func TestLoadMarksOversizedSkill(t *testing.T) {
+	user := t.TempDir()
+	body := strings.Repeat("x", DefaultMaxSkillFileBytes+32)
+	writeSkill(t, user, "large", "name: large\ndescription: bounded\n", body)
+
+	s := NewStore()
+	s.Load(user)
+	sk, ok := s.Get("large")
+	if !ok {
+		t.Fatal("oversized skill was not loaded")
+	}
+	if !strings.Contains(sk.Body, "skill truncated") {
+		t.Fatalf("oversized skill body lacks truncation marker")
+	}
+}
+
+func TestLoadCheckedRejectsOversizedSkill(t *testing.T) {
+	user := t.TempDir()
+	skillDir := writeSkill(t, user, "large", "name: large\ndescription: bounded\n", strings.Repeat("x", DefaultMaxSkillFileBytes+1))
+
+	err := NewStore().LoadChecked(user)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), filepath.Join(skillDir, "SKILL.md")) {
+		t.Fatalf("oversized skill error = %v, want path and limit", err)
+	}
+}
+
+func TestLoadCheckedSurfacesPresentFIFO(t *testing.T) {
+	user := t.TempDir()
+	skillDir := filepath.Join(user, "fifo")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(skillDir, "SKILL.md"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	var err error
+	go func() {
+		err = NewStore().LoadChecked(user)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("LoadChecked FIFO error = %v, want regular-file error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LoadChecked blocked on FIFO")
+	}
+}
+
+func TestLoadCheckedSurfacesFIFOUserDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "skills")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	var err error
+	go func() {
+		err = NewStore().LoadChecked(path)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a directory") {
+			t.Fatalf("LoadChecked FIFO directory error = %v, want directory error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LoadChecked blocked on FIFO directory")
 	}
 }

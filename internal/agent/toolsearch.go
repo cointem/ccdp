@@ -90,6 +90,9 @@ func (t *toolSearchTool) Run(ctx *tools.Context) (string, error) {
 		fmt.Fprintf(&sb, "Name: %s\nDescription: %s\nSchema:\n  %s", n, tool.Description(), schema)
 		// Make the discovered tool available for the rest of the session.
 		t.ag.markDiscovered(n)
+		if err := t.ag.persistToolDiscovery(n); err != nil {
+			return "", err
+		}
 	}
 	return sb.String(), nil
 }
@@ -113,20 +116,6 @@ func (a *Agent) isDiscovered(name string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.discovered[name]
-}
-
-// availableTools renders the "Available tools" section for the system prompt:
-// inline tools plus a note about ToolSearch for the rest.
-func (a *Agent) availableTools() string {
-	inline := a.inlineToolNames()
-	var sb strings.Builder
-	sb.WriteString("# Available tools\n")
-	if len(inline) > 0 {
-		sb.WriteString("Available directly: " + strings.Join(inline, ", ") + "\n")
-	}
-	sb.WriteString("Other tools (MCP servers, custom tools) are not listed inline; ")
-	sb.WriteString("call ToolSearch to discover their schemas on demand.\n")
-	return sb.String()
 }
 
 // inlineToolNames returns the names of tools injected directly (all non-deferred).

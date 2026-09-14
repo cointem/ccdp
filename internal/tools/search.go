@@ -2,11 +2,15 @@ package tools
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
+
+	"ccdp/internal/sandbox"
 )
 
 // ---------- Glob ----------
@@ -43,16 +47,20 @@ func (t *GlobTool) Parameters() map[string]any {
 }
 
 func (t *GlobTool) Run(ctx *Context) (string, error) {
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
 	pattern := StringArg(ctx.Args, "pattern", "")
 	if pattern == "" {
 		return "", fmt.Errorf("Glob: missing pattern")
 	}
-	base, err := ctx.ResolveRead(StringArg(ctx.Args, "path", ""))
-	if err != nil {
-		return "", err
-	}
-	if base == "" {
-		base = ctx.WorkingDir
+	base := ctx.WorkingDir
+	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
+		var err error
+		base, err = ctx.ResolveRead(rawPath)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	fullPattern := pattern
@@ -82,7 +90,7 @@ func (t *GlobTool) Run(ctx *Context) (string, error) {
 	for _, m := range matches {
 		fmt.Fprintf(&sb, "  %s\n", m)
 	}
-	return sb.String(), nil
+	return boundedToolString(ctx, sb.String()), nil
 }
 
 // globWalk implements a simple ** glob walk over the base directory.
@@ -146,6 +154,9 @@ func (t *GrepTool) Parameters() map[string]any {
 }
 
 func (t *GrepTool) Run(ctx *Context) (string, error) {
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
 	pattern := StringArg(ctx.Args, "pattern", "")
 	if pattern == "" {
 		return "", fmt.Errorf("Grep: missing pattern")
@@ -154,12 +165,13 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Grep: bad regex: %w", err)
 	}
-	base, err := ctx.ResolveRead(StringArg(ctx.Args, "path", ""))
-	if err != nil {
-		return "", err
-	}
-	if base == "" {
-		base = ctx.WorkingDir
+	base := ctx.WorkingDir
+	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
+		var err error
+		base, err = ctx.ResolveRead(rawPath)
+		if err != nil {
+			return "", err
+		}
 	}
 	glob := StringArg(ctx.Args, "glob", "")
 
@@ -182,12 +194,29 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 		if globRE != nil && !globRE.MatchString(info.Name()) && !globRE.MatchString(path) {
 			return nil
 		}
-		// Skip binary-ish and large files quickly.
-		if info.Size() > 2*1024*1024 {
+		// Skip binary-ish and large files quickly. Read through a bounded
+		// reader; os.ReadFile would allocate the whole file before limits apply.
+		if info.Size() > int64(ctx.readLimit()) {
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		readPath := path
+		if ctx.Sandbox != nil {
+			readPath, err = ctx.Sandbox.ResolveRead(path)
+			if err != nil {
+				return nil
+			}
+		}
+		flags := os.O_RDONLY
+		if ctx.Sandbox != nil && ctx.Sandbox.CurrentMode() == sandbox.ModeStrict {
+			flags |= syscall.O_NOFOLLOW
+		}
+		f, err := os.OpenFile(readPath, flags, 0)
 		if err != nil {
+			return nil
+		}
+		data, err := io.ReadAll(io.LimitReader(f, int64(ctx.readLimit())+1))
+		_ = f.Close()
+		if err != nil || len(data) > ctx.readLimit() {
 			return nil
 		}
 		lines := strings.Split(string(data), "\n")
@@ -207,7 +236,7 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 		return nil
 	})
 
-	return fmt.Sprintf("%d match(es):\n%s", count, sb.String()), nil
+	return boundedToolString(ctx, fmt.Sprintf("%d match(es):\n%s", count, sb.String())), nil
 }
 
 // translateGlob converts a simple glob into a regex for matching file names.
@@ -257,12 +286,16 @@ func (t *LSTool) Parameters() map[string]any {
 }
 
 func (t *LSTool) Run(ctx *Context) (string, error) {
-	dir, err := ctx.ResolveRead(StringArg(ctx.Args, "path", ""))
-	if err != nil {
+	if err := ctx.checkResources(); err != nil {
 		return "", err
 	}
-	if dir == "" {
-		dir = ctx.WorkingDir
+	dir := ctx.WorkingDir
+	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
+		var err error
+		dir, err = ctx.ResolveRead(rawPath)
+		if err != nil {
+			return "", err
+		}
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -289,5 +322,5 @@ func (t *LSTool) Run(ctx *Context) (string, error) {
 		}
 		fmt.Fprintf(&sb, "%s %10d  %s  %s\n", marker, info.Size(), info.ModTime().Format("2006-01-02 15:04"), e.Name())
 	}
-	return sb.String(), nil
+	return boundedToolString(ctx, sb.String()), nil
 }

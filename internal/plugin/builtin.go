@@ -29,6 +29,7 @@ func (p *toolsPlugin) Init(ctx *Context) error {
 		tools.NewLSTool(),
 		tools.NewTodoWriteTool(),
 		tools.NewTaskTool(),
+		tools.NewAgentTool(),
 		tools.NewReadSkillTool(),
 		tools.NewGitStatusTool(),
 		tools.NewGitDiffTool(),
@@ -40,7 +41,8 @@ func (p *toolsPlugin) Init(ctx *Context) error {
 		tools.NewProcessStopTool(),
 	}
 	if p.enableWeb {
-		builtins = append(builtins, tools.NewWebFetchTool(), tools.NewWebSearchTool())
+		ctx.Tools.RegisterIn("web", tools.NewWebFetchTool())
+		ctx.Tools.RegisterIn("web", tools.NewWebSearchTool())
 	}
 	for _, t := range builtins {
 		ctx.Tools.RegisterIn("builtin", t)
@@ -59,14 +61,46 @@ func NewProviderPlugin(p llm.Provider) Plugin {
 	return &providerPlugin{provider: p}
 }
 
-type providerPlugin struct{ provider llm.Provider }
+// NewHTTPProviderPlugin registers the built-in compatible HTTP adapter while
+// retaining the model's endpoint/key fingerprint as a generated route. This
+// keeps a reload from reusing a stale adapter, while generic plugin providers
+// continue to use explicit routes through NewProviderPlugin.
+func NewHTTPProviderPlugin(p llm.Provider, model, endpoint, apiKey string) Plugin {
+	return &providerPlugin{provider: p, defaultRoute: true, model: model, endpoint: endpoint, apiKey: apiKey}
+}
+
+type providerPlugin struct {
+	provider     llm.Provider
+	dispose      func()
+	defaultRoute bool
+	model        string
+	endpoint     string
+	apiKey       string
+}
 
 func (p *providerPlugin) Name() string       { return "default-provider" }
 func (p *providerPlugin) Requires() []string { return nil }
 func (p *providerPlugin) Init(ctx *Context) error {
-	ctx.Models.Register(p.provider)
-	ctx.Models.Route(p.provider.Name(), p.provider.Name())
+	if p.provider == nil || p.provider.Name() == "" {
+		return nil
+	}
+	p.dispose = ctx.Models.Register(p.provider)
+	if p.defaultRoute {
+		model := p.model
+		if model == "" {
+			model = p.provider.Name()
+		}
+		ctx.Models.RouteDefault(model, p.provider.Name(), p.endpoint, p.apiKey)
+	} else {
+		ctx.Models.Route(p.provider.Name(), p.provider.Name())
+	}
 	return nil
 }
 
-func (p *providerPlugin) Deinit() error { return nil }
+func (p *providerPlugin) Deinit() error {
+	if p.dispose != nil {
+		p.dispose()
+		p.dispose = nil
+	}
+	return nil
+}

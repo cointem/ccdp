@@ -8,12 +8,25 @@
 package workspace
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
+	"unicode/utf8"
+)
+
+// Instruction limits are deliberately independent of the model context
+// window.  Instructions are discovered from files outside the session log,
+// so an unexpectedly large AGENTS.md must not turn prompt construction into
+// an unbounded read or allocation.
+const (
+	DefaultMaxInstructionFileBytes = 256 << 10
+	DefaultMaxInstructionsBytes    = 512 << 10
 )
 
 // Info is a snapshot of a workspace.
@@ -118,12 +131,10 @@ func Scan(root string, maxFiles int) (*Info, error) {
 		}
 		rel = filepath.ToSlash(rel)
 
-		// Apply skip rules against the first path segment where applicable.
-		first := rel
-		if i := strings.Index(rel, "/"); i > 0 {
-			first = rel[:i]
-		}
-		if alwaysSkip[first] {
+		// Apply skip rules to every path component. Dependency/build folders
+		// can occur below package roots (for example packages/app/node_modules),
+		// and checking only the first component would descend into them.
+		if hasAlwaysSkippedComponent(rel, alwaysSkip) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -185,6 +196,15 @@ func Scan(root string, maxFiles int) (*Info, error) {
 	}
 	info.FileCount = nonDir
 	return info, nil
+}
+
+func hasAlwaysSkippedComponent(rel string, alwaysSkip map[string]bool) bool {
+	for _, component := range strings.Split(rel, "/") {
+		if alwaysSkip[component] {
+			return true
+		}
+	}
+	return false
 }
 
 // detectGit finds the nearest .git directory and current branch.
@@ -351,9 +371,54 @@ Write guidance for ccdp (or any coding agent) working in this repository.
 // project chain (git-root AGENTS.md → workspace AGENTS.md → workspace
 // .ccdp/AGENTS.md, project-specific wins).
 func LoadInstructions(root string) string {
+	instructions, _ := loadInstructionsBounded(root, DefaultMaxInstructionsBytes, false)
+	return instructions
+}
+
+// LoadInstructionsBounded is LoadInstructions with an explicit total output
+// bound.  Each source file is read with a separate bound before it is added to
+// the aggregate, and an oversized file is represented by a deterministic
+// marker rather than silently disappearing.  The returned string is always at
+// most maxBytes bytes (when maxBytes > 0).
+func LoadInstructionsBounded(root string, maxBytes int) string {
+	instructions, _ := loadInstructionsBounded(root, maxBytes, false)
+	return instructions
+}
+
+// LoadInstructionsChecked is the error-returning form used by callers that
+// need to distinguish an absent optional instruction file from an invalid
+// present input (for example, a FIFO or directory at AGENTS.md). Missing
+// candidates discovered during the normal lookup remain optional and are
+// skipped. Oversized regular files are rejected with the offending path and
+// limit instead of being silently admitted into the required prompt.
+func LoadInstructionsChecked(root string) (string, error) {
+	return LoadInstructionsBoundedChecked(root, DefaultMaxInstructionsBytes)
+}
+
+// LoadInstructionsBoundedChecked is LoadInstructionsBounded with errors from
+// present instruction candidates surfaced to the caller. The legacy helpers
+// intentionally retain their best-effort string-only API; this checked path
+// rejects both per-file and aggregate output overflow.
+func LoadInstructionsBoundedChecked(root string, maxBytes int) (string, error) {
+	return loadInstructionsBounded(root, maxBytes, true)
+}
+
+func loadInstructionsBounded(root string, maxBytes int, strict bool) (string, error) {
+	if maxBytes <= 0 {
+		return "", fmt.Errorf("workspace: invalid instruction output limit")
+	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("workspace: resolve root: %w", err)
+	}
+	if strict {
+		rootInfo, err := os.Stat(abs)
+		if err != nil {
+			return "", fmt.Errorf("workspace: stat root %q: %w", abs, err)
+		}
+		if !rootInfo.IsDir() {
+			return "", fmt.Errorf("workspace: root %q is not a directory", abs)
+		}
 	}
 	gitRoot, isRepo, _ := detectGit(abs)
 
@@ -368,19 +433,110 @@ func LoadInstructions(root string) string {
 	files = append(files, filepath.Join(abs, ProjectInstructionFile))
 
 	var sb strings.Builder
+	used := 0
 	seen := map[string]bool{}
 	for _, f := range files {
+		if !strict && used >= maxBytes {
+			break
+		}
 		if seen[f] {
 			continue
 		}
 		seen[f] = true
-		data, err := os.ReadFile(f)
-		if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+		data, truncated, err := readBounded(f, DefaultMaxInstructionFileBytes)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if !strict {
+				continue
+			}
+			// Preserve candidates already read for a checked caller while
+			// surfacing the offending path. Legacy callers continue past this
+			// candidate through the best-effort branch above.
+			return strings.TrimSpace(sb.String()), fmt.Errorf("workspace: read instructions %q: %w", f, err)
+		}
+		if truncated && strict {
+			return strings.TrimSpace(sb.String()), fmt.Errorf("workspace: instructions %q exceeds %d bytes", f, DefaultMaxInstructionFileBytes)
+		}
+		if len(strings.TrimSpace(string(data))) == 0 {
 			continue
 		}
-		fmt.Fprintf(&sb, "### Instructions from %s\n%s\n\n", f, strings.TrimSpace(string(data)))
+		content := strings.TrimSpace(string(data))
+		if truncated {
+			content += fmt.Sprintf("\n\n…[instructions truncated at %d bytes]", DefaultMaxInstructionFileBytes)
+		}
+		piece := fmt.Sprintf("### Instructions from %s\n%s\n\n", f, content)
+		if len(piece) > maxBytes-used {
+			if strict {
+				return strings.TrimSpace(sb.String()), fmt.Errorf("workspace: instructions %q exceed aggregate limit %d bytes", f, maxBytes)
+			}
+			piece = truncateUTF8(piece, maxBytes-used)
+		}
+		if piece == "" {
+			break
+		}
+		sb.WriteString(piece)
+		used += len(piece)
+		if !strict && used >= maxBytes {
+			break
+		}
 	}
-	return strings.TrimSpace(sb.String())
+	return strings.TrimSpace(sb.String()), nil
+}
+
+// readBounded reads at most maxBytes+1 bytes so the caller can distinguish an
+// exact-size file from one that exceeded the limit.  It intentionally avoids
+// os.ReadFile, whose allocation is based on an attacker-controlled file size.
+func readBounded(path string, maxBytes int) ([]byte, bool, error) {
+	if maxBytes <= 0 {
+		return nil, false, fmt.Errorf("workspace: invalid read limit")
+	}
+	// Stat before opening: opening a FIFO for reading can block until another
+	// process writes it.  Instructions are regular-file inputs; reject special
+	// files before the open and re-check after opening to close the replacement
+	// race between the two operations.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("workspace: %s is not a regular file", path)
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	openedInfo, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if !openedInfo.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("workspace: %s is not a regular file", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(data) > maxBytes {
+		return data[:maxBytes], true, nil
+	}
+	return data, false, nil
+}
+
+func truncateUTF8(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
 }
 
 // InitInstructionsFile writes the AGENTS.md template into the workspace root

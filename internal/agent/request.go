@@ -2,7 +2,9 @@ package agent
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,9 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"ccdp/internal/config"
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
-	"ccdp/internal/tools"
+	"ccdp/internal/session"
 	"ccdp/internal/workspace"
 )
 
@@ -24,63 +27,288 @@ var imageExts = map[string]bool{
 // markdownImageRe matches ![alt](path) image references.
 var markdownImageRe = regexp.MustCompile(`!\[[^\]]*\]\(([^)]+)\)`)
 
+const (
+	maxImageBytes      = 20 * 1024 * 1024
+	maxAttachmentBytes = 40 * 1024 * 1024
+)
+
 // imageContentParts turns a user message into multi-modal content parts when it
 // references local images via markdown (![alt](path)). Returns nil when there
 // are no images, in which case the caller sends the plain text.
 func (a *Agent) imageContentParts(text string) []llm.ContentPart {
-	matches := markdownImageRe.FindAllStringSubmatchIndex(text, -1)
-	if len(matches) == 0 {
+	a.mu.Lock()
+	workspaceDir := a.cfg.Workspace
+	a.mu.Unlock()
+	return imageContentPartsAt(workspaceDir, text)
+}
+
+func imageContentPartsAt(workspaceDir, text string) []llm.ContentPart {
+	parts, _, hasImage, _ := imageContentPartsAtBudget(workspaceDir, text, maxAttachmentBytes)
+	if !hasImage {
 		return nil
 	}
-	var parts []llm.ContentPart
+	return parts
+}
+
+// freezeImageAttachmentsAt captures each readable local image exactly once at
+// input admission. Failed references remain ordinary markdown and are not
+// retried from a later, possibly different file version.
+func freezeImageAttachmentsAt(workspaceDir, text string) ([]messages.ImageAttachment, error) {
+	matches := markdownImageRe.FindAllStringSubmatchIndex(text, -1)
+	attachments := make([]messages.ImageAttachment, 0, len(matches))
+	var used int64
+	for _, match := range matches {
+		path := strings.TrimSpace(text[match[2]:match[3]])
+		data, mediaType, err := imageBytesAtBudget(workspaceDir, path, maxAttachmentBytes-used)
+		if err != nil {
+			return nil, fmt.Errorf("capture image %q: %w", path, err)
+		}
+		attachments = append(attachments, messages.ImageAttachment{Path: path, MediaType: mediaType, Data: data})
+		used += int64(len(data))
+	}
+	return attachments, nil
+}
+
+func (a *Agent) freezeImageAttachments(text string) ([]messages.ImageAttachment, error) {
+	a.mu.Lock()
+	workspaceDir := a.cfg.Workspace
+	a.mu.Unlock()
+	return freezeImageAttachmentsAt(workspaceDir, text)
+}
+
+// imageContentPartsAtBudget expands local image references while preserving
+// failed references as ordinary text. The byte budget is checked from stat
+// metadata before reading and io.LimitReader caps the allocation if a file
+// grows between stat and read. used is the number of bytes actually attached.
+func imageContentPartsAtBudget(workspaceDir, text string, budget int64) (parts []llm.ContentPart, used int64, hasImage bool, firstErr error) {
+	matches := markdownImageRe.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return nil, 0, false, nil
+	}
 	last := 0
 	for _, m := range matches {
 		// Text between the previous marker and this one.
 		if m[0] > last {
 			parts = append(parts, llm.ContentPart{Type: "text", Text: text[last:m[0]]})
 		}
-		path := text[m[2]:m[3]]
-		if part := a.imagePart(path); part != nil {
+		marker := text[m[0]:m[1]]
+		path := strings.TrimSpace(text[m[2]:m[3]])
+		part, size, err := imagePartAtBudget(workspaceDir, path, budget-used)
+		if err == nil && part != nil {
 			parts = append(parts, *part)
+			used += size
+			hasImage = true
+		} else {
+			// Keep the original markdown in the model-visible input. A missing,
+			// oversized, or unreadable image must never disappear silently.
+			parts = append(parts, llm.ContentPart{Type: "text", Text: marker})
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 		last = m[1]
 	}
 	if last < len(text) {
 		parts = append(parts, llm.ContentPart{Type: "text", Text: text[last:]})
 	}
-	// Only useful if at least one image actually loaded.
-	for _, p := range parts {
-		if p.ImageURL != nil {
-			return parts
-		}
-	}
-	return nil
+	return parts, used, hasImage, firstErr
 }
 
 // imagePart loads a local image into an image_url data part, or nil.
 func (a *Agent) imagePart(path string) *llm.ContentPart {
-	ext := strings.ToLower(filepath.Ext(path))
-	if !imageExts[ext] {
+	a.mu.Lock()
+	workspaceDir := a.cfg.Workspace
+	a.mu.Unlock()
+	return imagePartAt(workspaceDir, path)
+}
+
+func imagePartAt(workspaceDir, path string) *llm.ContentPart {
+	part, _, err := imagePartAtBudget(workspaceDir, path, maxImageBytes)
+	if err != nil {
 		return nil
 	}
-	abs := path
-	if !filepath.IsAbs(abs) {
-		abs = filepath.Join(a.cfg.Workspace, abs)
+	return part
+}
+
+func imagePartAtBudget(workspaceDir, path string, budget int64) (*llm.ContentPart, int64, error) {
+	data, mime, err := imageBytesAtBudget(workspaceDir, path, budget)
+	if err != nil {
+		return nil, 0, err
 	}
-	data, err := os.ReadFile(abs)
-	if err != nil || len(data) > 20*1024*1024 {
-		return nil
-	}
-	mime := map[string]string{
-		".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-		".gif": "image/gif", ".webp": "image/webp",
-	}[ext]
 	return &llm.ContentPart{
 		Type: "image_url",
 		ImageURL: &struct {
 			URL string `json:"url"`
 		}{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)},
+	}, int64(len(data)), nil
+}
+
+func imageBytesAtBudget(workspaceDir, path string, budget int64) ([]byte, string, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	if !imageExts[ext] {
+		return nil, "", fmt.Errorf("unsupported image extension %q", ext)
 	}
+	abs := path
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(workspaceDir, abs)
+	}
+	root, err := filepath.Abs(workspaceDir)
+	if err != nil {
+		return nil, "", err
+	}
+	abs, err = filepath.Abs(abs)
+	if err != nil {
+		return nil, "", err
+	}
+	rel, err := filepath.Rel(root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, "", fmt.Errorf("image path escapes workspace")
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, "", err
+	}
+	abs, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, "", err
+	}
+	rel, err = filepath.Rel(root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, "", fmt.Errorf("image path escapes workspace")
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, "", err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, "", fmt.Errorf("image %q is not a regular file", path)
+	}
+	if info.Size() > maxImageBytes {
+		return nil, "", fmt.Errorf("image %q exceeds per-file limit", path)
+	}
+	if budget <= 0 || info.Size() > budget {
+		return nil, "", fmt.Errorf("image %q exceeds total attachment limit", path)
+	}
+	file, err := os.Open(abs)
+	if err != nil {
+		return nil, "", err
+	}
+	defer file.Close()
+	readLimit := int64(maxImageBytes)
+	if budget < readLimit {
+		readLimit = budget
+	}
+	// Include one sentinel byte so a file that grows after Stat is rejected,
+	// while never allocating beyond the remaining total attachment budget.
+	data, err := io.ReadAll(io.LimitReader(file, readLimit+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) > maxImageBytes {
+		return nil, "", fmt.Errorf("image %q exceeds per-file limit", path)
+	}
+	if int64(len(data)) > budget {
+		return nil, "", fmt.Errorf("image %q exceeds total attachment limit", path)
+	}
+	mime := map[string]string{
+		".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+		".gif": "image/gif", ".webp": "image/webp",
+	}[ext]
+	return data, mime, nil
+}
+
+func (a *Agent) frozenImageBytes(attachment messages.ImageAttachment) ([]byte, error) {
+	if attachment.BlobHash == "" {
+		return append([]byte(nil), attachment.Data...), nil
+	}
+	p := a.persistenceHandle()
+	if p == nil {
+		return nil, errors.New("agent: image artifact store is unavailable")
+	}
+	artifacts, err := p.requestArtifacts()
+	if err != nil {
+		return nil, err
+	}
+	return artifacts.Read(session.BlobRef{Hash: attachment.BlobHash, Size: attachment.BlobSize, MediaType: attachment.MediaType}, maxImageBytes)
+}
+
+func imageMediaType(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// imageContentPartsForMessage uses frozen attachment bytes for canonical
+// messages. Legacy messages without ImagesFrozen retain the compatibility
+// path-based expansion behavior.
+func (a *Agent) imageContentPartsForMessage(workspaceDir string, message messages.Message, budget int64) (parts []llm.ContentPart, used int64, hasImage bool, firstErr error) {
+	if !message.ImagesFrozen {
+		return imageContentPartsAtBudget(workspaceDir, message.Content, budget)
+	}
+	matches := markdownImageRe.FindAllStringSubmatchIndex(message.Content, -1)
+	if len(matches) == 0 {
+		return []llm.ContentPart{{Type: "text", Text: message.Content}}, 0, false, nil
+	}
+	last := 0
+	attachmentIndex := 0
+	for _, match := range matches {
+		if match[0] > last {
+			parts = append(parts, llm.ContentPart{Type: "text", Text: message.Content[last:match[0]]})
+		}
+		marker := message.Content[match[0]:match[1]]
+		path := strings.TrimSpace(message.Content[match[2]:match[3]])
+		found := -1
+		for i := attachmentIndex; i < len(message.ImageAttachments); i++ {
+			if message.ImageAttachments[i].Path == path || message.ImageAttachments[i].Path == "" {
+				found = i
+				break
+			}
+		}
+		if found < 0 {
+			parts = append(parts, llm.ContentPart{Type: "text", Text: marker})
+			if firstErr == nil {
+				firstErr = fmt.Errorf("frozen image %q has no captured attachment", path)
+			}
+			last = match[1]
+			continue
+		}
+		attachmentIndex = found + 1
+		attachment := message.ImageAttachments[found]
+		data, err := a.frozenImageBytes(attachment)
+		if err == nil && (budget-used) > 0 && int64(len(data)) <= budget-used {
+			mediaType := attachment.MediaType
+			if mediaType == "" {
+				mediaType = imageMediaType(path)
+			}
+			parts = append(parts, llm.ContentPart{Type: "image_url", ImageURL: &struct {
+				URL string `json:"url"`
+			}{URL: "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)}})
+			used += int64(len(data))
+			hasImage = true
+		} else {
+			parts = append(parts, llm.ContentPart{Type: "text", Text: marker})
+			if err == nil {
+				err = fmt.Errorf("image %q exceeds total attachment limit", path)
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		last = match[1]
+	}
+	if last < len(message.Content) {
+		parts = append(parts, llm.ContentPart{Type: "text", Text: message.Content[last:]})
+	}
+	return parts, used, hasImage, firstErr
 }
 
 // planReadOnlyTools is the tool set the model may call while in plan mode.
@@ -91,7 +319,7 @@ var planReadOnlyTools = map[string]bool{
 	"TodoWrite": true, "WebSearch": true, "WebFetch": true,
 	"GitStatus": true, "GitDiff": true, "GitLog": true,
 	"Task": true, "ToolSearch": true, "ReadSkill": true,
-	"EnterPlanMode": true, "ExitPlanMode": true,
+	"EnterPlanMode": true, "ExitPlanMode": true, "AskUserQuestion": true,
 }
 
 // PlanModeInstructions is appended to the system prompt while plan mode is on.
@@ -104,78 +332,90 @@ You are in PLAN MODE. Do NOT execute anything yet.
   WebFetch, GitStatus, GitDiff, GitLog, Task) to investigate before planning.
 - Do NOT call any tool that modifies files, runs builds or tests with side
   effects, touches git history, or makes network calls.
+- Use AskUserQuestion for structured clarification when requirements are ambiguous.
 - End your reply with the plan only. The user will approve it before execution.`
 
-// buildRequest assembles the API request from the current history, the tool
-// schemas and the system prompt. The system prompt is a stable base (cached by
-// providers) followed by per-turn dynamic sections, mirroring Claude Code's
-// static + dynamic sections and Codex's environment context.
-func (a *Agent) buildRequest() llm.CompletionRequest {
-	sys := a.cfg.SystemPrompt
-
-	// Environment + session context (Codex's environment_context idea). The
-	// date is fixed per session so the prompt prefix stays cache-stable.
+// buildRequestSnapshotWithPrompt builds the request from one immutable step
+// snapshot. Instructions, skills, and tool definitions are bounded values
+// captured by beginStepChecked before provider preparation; this function
+// never falls back to reading mutable files or extension state for them.
+func (a *Agent) buildRequestSnapshotWithPrompt(cfg config.Config, model string, history []messages.Message, sessionID string, sessionStartAt time.Time, plan bool, modelSwitch string, interrupted bool, instructions, skillsSection string, frozenTools []llm.ToolDef) llm.CompletionRequest {
+	if sessionID == "" {
+		sessionID = a.SessionID()
+	}
+	if sessionStartAt.IsZero() {
+		sessionStartAt = time.Now()
+	}
+	sys := cfg.SystemPrompt
 	sys += fmt.Sprintf("\n\n# Environment\n- Date: %s\n- Timezone: %s\n- OS: %s\n- Shell: %s",
-		a.sessionStartAt.Format("2006-01-02 15:04:05"), time.Local.String(), runtime.GOOS, shellName())
+		sessionStartAt.Format("2006-01-02 15:04:05"), time.Local.String(), runtime.GOOS, shellName())
 	sys += fmt.Sprintf("\n- Workspace: %s\n- Permission mode: %s\n- Session: %s",
-		a.cfg.Workspace, a.perms.CurrentMode(), a.sessionID)
-
-	// Model switch instruction (Codex's ModelSwitchInstructions) — injected
-	// once, then cleared.
-	a.mu.Lock()
-	if a.modelSwitchMsg != "" {
-		sys += "\n\n" + a.modelSwitchMsg
-		a.modelSwitchMsg = ""
+		cfg.Workspace, cfg.PermissionMode, sessionID)
+	if modelSwitch != "" {
+		sys += "\n\n" + modelSwitch
 	}
-	// Interrupted-turn guidance (Codex's INTERRUPTED_GUIDANCE): injected on
-	// the first request after a user interrupt, then cleared.
-	if a.interruptNote {
+	if interrupted {
 		sys += "\n\n# Interrupted turn\nYour previous turn was interrupted by the user. Tools that were\nrunning may have partially executed and their effects may be incomplete.\nBefore continuing, verify the relevant state (re-read files, re-run git\nstatus or tests) rather than assuming the last known state."
-		a.interruptNote = false
 	}
-	a.mu.Unlock()
-
-	if a.inPlanMode() {
+	if plan {
 		sys += "\n\n" + PlanModeInstructions
 	}
-
-	// Project instructions (AGENTS.md): user-level, git root, workspace.
-	if instructions := workspace.LoadInstructions(a.cfg.Workspace); instructions != "" {
+	if instructions != "" {
 		sys += "\n\n# Project instructions\n\n" + instructions
 	}
-
-	// Session memory (AutoMem): facts learned earlier in this session. Injected
-	// only when enable_memory is on and the log is non-empty.
-	if a.cfg.MemoryEnabled() {
+	if cfg.MemoryEnabled() {
 		if sec := a.MemorySection(); sec != "" {
 			sys += sec
 		}
 	}
-
-	// Repo map: a compact file inventory so the model can plan tool calls.
-	if info, err := workspace.CachedScan(a.cfg.Workspace, false); err == nil && info != nil {
+	if info, err := workspace.CachedScan(cfg.Workspace, false); err == nil && info != nil {
+		a.mu.Lock()
 		a.wsInfo = info
+		a.mu.Unlock()
 		sys += "\n\n# Repository layout\n\n" + info.RepoMap(120)
 	}
-
-	// Skill index (name + description only; bodies load via ReadSkill).
-	if sec := a.skills.SkillsSection(); sec != "" {
-		sys += sec
+	if skillsSection != "" {
+		sys += skillsSection
 	}
-
-	// Active task list (Claude Code's scratchpad) — stable per session.
-	if sec := tools.TodoSection(a.cfg.SessionDir); sec != "" {
+	if sec := a.todoSection(); sec != "" {
 		sys += "\n\n" + sec
 	}
+	sys += "\n\n" + availableToolsFromDefs(frozenTools)
+	return a.buildRequestFromConfig(cfg, model, sys, history, plan, frozenTools)
+}
 
-	// Dynamic tool availability (never hardcodes the tool list).
-	sys += "\n\n" + a.availableTools()
-
-	req := a.buildRequestFrom(sys, a.history)
-	if a.inPlanMode() {
-		req.Tools = filterReadOnlyTools(req.Tools)
+func availableToolsFromDefs(defs []llm.ToolDef) string {
+	names := make([]string, 0, len(defs))
+	for _, def := range defs {
+		if name := strings.TrimSpace(def.Function.Name); name != "" {
+			names = append(names, name)
+		}
 	}
-	return req
+	var sb strings.Builder
+	sb.WriteString("# Available tools\n")
+	if len(names) > 0 {
+		sb.WriteString("Available directly: " + strings.Join(names, ", ") + "\n")
+	}
+	return sb.String()
+}
+
+func (a *Agent) todoSection() string {
+	a.mu.Lock()
+	resources := a.resources
+	a.mu.Unlock()
+	if resources == nil || resources.Todos == nil {
+		return ""
+	}
+	return resources.Todos.Section()
+}
+
+func cloneToolDefs(src []llm.ToolDef) []llm.ToolDef {
+	dst := make([]llm.ToolDef, len(src))
+	for i, def := range src {
+		dst[i] = def
+		dst[i].Function.Parameters = cloneMap(def.Function.Parameters)
+	}
+	return dst
 }
 
 // shellName returns the user's shell for the environment section.
@@ -190,36 +430,40 @@ func shellName() string {
 func filterReadOnlyTools(tools []llm.ToolDef) []llm.ToolDef {
 	out := make([]llm.ToolDef, 0, len(tools))
 	for _, t := range tools {
-		if planReadOnlyTools[t.Function.Name] {
+		if t.PlanAllowed {
 			out = append(out, t)
 		}
 	}
 	return out
 }
 
-// buildRequestFrom assembles an API request from a caller-provided system
-// prompt and history. The main loop and sub-agent loops share this path so the
-// wire format stays identical everywhere.
-func (a *Agent) buildRequestFrom(sys string, history []messages.Message) llm.CompletionRequest {
+func (a *Agent) buildRequestFromConfig(cfg config.Config, model, sys string, history []messages.Message, plan bool, frozenTools []llm.ToolDef) llm.CompletionRequest {
 	// Hard guarantee: never put an unpaired tool_call / tool message on the
 	// wire, whatever a history rewrite left behind (providers 400).
 	history = sanitizeToolPairs(history)
 	msgs := make([]llm.ChatMessage, 0, len(history)+1)
 	msgs = append(msgs, llm.ChatMessage{Role: "system", Content: sys})
+	var imageBytes int64
 
 	for _, m := range history {
 		switch m.Role {
 		case messages.RoleSystem:
 			msgs = append(msgs, llm.ChatMessage{Role: "system", Content: m.Content})
 		case messages.RoleUser:
-			// Multi-modal: attach local images referenced as ![alt](path).
-			if parts := a.imageContentParts(m.Content); len(parts) > 0 {
+			// Multi-modal: canonical inputs use their frozen attachment blobs;
+			// legacy messages retain path-based compatibility expansion.
+			parts, used, hasImage, _ := a.imageContentPartsForMessage(cfg.Workspace, m, maxAttachmentBytes-imageBytes)
+			if hasImage && len(parts) > 0 {
+				imageBytes += used
 				msgs = append(msgs, llm.ChatMessage{Role: "user", Content: parts})
 				continue
 			}
 			msgs = append(msgs, llm.ChatMessage{Role: "user", Content: m.Content})
 		case messages.RoleAssistant:
 			cm := llm.ChatMessage{Role: "assistant", Content: m.Content}
+			if isDeepSeekModel(cfg, model) {
+				cm.ReasoningContent = m.ReasoningContent
+			}
 			if len(m.ToolCalls) > 0 {
 				cm.ToolCalls = wireToolCalls(m.ToolCalls)
 			}
@@ -233,31 +477,26 @@ func (a *Agent) buildRequestFrom(sys string, history []messages.Message) llm.Com
 		}
 	}
 
-	// Tool schemas (Codex: inject every turn; cheap with prompt caching).
-	// Deferred tools are excluded until the model discovers them via ToolSearch.
-	schemas := a.toolSchemas()
-	tools := make([]llm.ToolDef, 0, len(schemas))
-	for _, s := range schemas {
-		tools = append(tools, llm.ToolDef{
-			Type: "function",
-			Function: llm.FuncDef{
-				Name:        s["function"].(map[string]any)["name"].(string),
-				Description: s["function"].(map[string]any)["description"].(string),
-				Parameters:  s["function"].(map[string]any)["parameters"].(map[string]any),
-			},
-		})
-	}
+	// Tool schemas are part of the same frozen step snapshot as the provider
+	// binding and history. Never re-read the registry after admission.
+	toolDefs := cloneToolDefs(frozenTools)
 
 	req := llm.CompletionRequest{
 		// The active model follows fallback switches and /model: the model
 		// name must match the endpoint the request is sent to.
-		Model:    a.activeModelSnapshot(),
-		Messages: msgs,
-		Tools:    tools,
-		Stream:   true,
+		Model:           model,
+		ReasoningEffort: cfg.ReasoningEffort,
+		Verbosity:       cfg.Verbosity,
+		Messages:        msgs,
+		Tools:           toolDefs,
+		Stream:          true,
 	}
-	if a.cfg.MaxReplyTokens > 0 {
-		req.MaxTokens = intPtr(a.cfg.MaxReplyTokens)
+	applyGenerationRequest(cfg, &req)
+	if cfg.MaxReplyTokens > 0 {
+		req.MaxTokens = intPtr(cfg.MaxReplyTokens)
+	}
+	if plan {
+		req.Tools = filterReadOnlyTools(req.Tools)
 	}
 	return req
 }
@@ -275,8 +514,8 @@ func wireToolCalls(calls []messages.ToolCall) []llm.ToolCall {
 }
 
 // sanitizeToolPairs repairs tool_call↔tool-result pairing after any history
-// rewrite (compact, dropOldestToolResults, /remove, /rewind, fork, resume of
-// an older snapshot). OpenAI-compatible endpoints reject requests where an
+// rewrite (compact, /remove, /rewind, fork, resume of an older snapshot).
+// OpenAI-compatible endpoints reject requests where an
 // assistant tool_calls message is not followed by a tool result for every
 // call id, or where a tool message has no preceding call — a single dangling
 // pair fails EVERY subsequent request and deadlocks the session.
@@ -320,7 +559,7 @@ func sanitizeToolPairs(hist []messages.Message) []messages.Message {
 		for _, tc := range m.ToolCalls {
 			if !answered[tc.ID] {
 				out = append(out, messages.NewToolResult(tc,
-					"not executed: the tool result was lost in a history rewrite. Re-issue the call if still needed.", true))
+					"tool result unavailable after a history rewrite; execution state is unknown. Do not re-issue automatically.", true))
 			}
 		}
 		i = j
@@ -331,12 +570,18 @@ func sanitizeToolPairs(hist []messages.Message) []messages.Message {
 // truncateResult caps a tool result at maxChars, appending a marker when
 // content was cut so the model knows the result was truncated.
 func truncateResult(s string, maxChars int) string {
+	if maxChars <= 0 {
+		return ""
+	}
 	if len(s) <= maxChars {
 		return s
 	}
-	cut := s[:maxChars]
-	return cut + fmt.Sprintf("\n…[output truncated at %d chars, %d more available]",
-		maxChars, len(s)-maxChars)
+	marker := fmt.Sprintf("\n…[output truncated at %d chars, %d more available]", maxChars, len(s)-maxChars)
+	if len(marker) >= maxChars {
+		return truncateUTF8Bytes(s, maxChars)
+	}
+	cut := truncateUTF8Bytes(s, maxChars-len(marker))
+	return cut + marker
 }
 
 // describeHistory returns a human-readable outline of the conversation

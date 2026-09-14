@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -195,16 +196,84 @@ func TestDisallowedOverridesAdditional(t *testing.T) {
 	}
 }
 
+func TestProtectedRuntimeDirCannotBeWrittenInAnyMode(t *testing.T) {
+	workspace := t.TempDir()
+	protected := filepath.Join(workspace, ".ccdp")
+	if err := os.MkdirAll(protected, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []Mode{ModeConfine, ModeStrict, ModeNone} {
+		s := New(workspace, mode)
+		s.AddDir(protected)
+		s.AddProtectedDir(protected)
+		if _, err := s.ResolveWrite(filepath.Join(protected, "settings.json")); err == nil {
+			t.Fatalf("mode %s allowed write into protected runtime dir", mode)
+		}
+	}
+}
+
+func TestProtectedControlFileHardlinkCannotBeWritten(t *testing.T) {
+	workspace := t.TempDir()
+	protected := filepath.Join(workspace, ".ccdp")
+	if err := os.MkdirAll(protected, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	control := filepath.Join(protected, "settings.json")
+	if err := os.WriteFile(control, []byte(`{"mode":"default"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(workspace, "settings-alias.json")
+	if err := os.Link(control, alias); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	s := New(workspace, ModeConfine)
+	s.AddProtectedDir(protected)
+	if _, err := s.ResolveWrite(alias); err == nil {
+		t.Fatal("protected control file hardlink was accepted for write")
+	}
+}
+
 func TestCheckInteractive(t *testing.T) {
 	for _, bad := range []string{"vim main.go", "git rebase -i HEAD~3", "top", "read x"} {
 		if err := CheckInteractive(bad); err == nil {
 			t.Errorf("expected interactive block for %q", bad)
 		}
 	}
-	for _, ok := range []string{"go build ./...", "git status", "echo hi"} {
+	for _, ok := range []string{"go build ./...", "git status", "git read-tree HEAD", "echo hi"} {
 		if err := CheckInteractive(ok); err != nil {
 			t.Errorf("expected allow for %q: %v", ok, err)
 		}
+	}
+}
+
+func TestStrictProfileShellSelectorExceptionIsExact(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin strict profile only")
+	}
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not available")
+	}
+	s := New(t.TempDir(), ModeStrict)
+	s.AddDisallowedDir("/private/var")
+	profile, err := s.Profile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `(allow file-read* (require-all (literal "/private/var/select/sh")`
+	if !strings.Contains(profile, want) {
+		t.Fatalf("strict profile lacks exact shell selector read exception: %s", profile)
+	}
+	if strings.Contains(profile, `(allow file-read* (subpath "/private/var"`) {
+		t.Fatal("strict profile granted a broad /private/var read subtree")
+	}
+	for _, root := range [...]string{"/bin", "/usr/bin", "/sbin", "/usr/sbin"} {
+		want := fmt.Sprintf(`(allow file-read-metadata file-test-existence (require-all (subpath "%s")`, root)
+		if !strings.Contains(profile, want) {
+			t.Fatalf("strict profile lacks narrow PATH lookup rule for %s: %s", root, profile)
+		}
+	}
+	if strings.Contains(profile, `(allow file-read* (subpath "/usr/bin"`) || strings.Contains(profile, `(allow file-read* (subpath "/sbin"`) {
+		t.Fatal("strict profile granted broad data reads for a system executable root")
 	}
 }
 

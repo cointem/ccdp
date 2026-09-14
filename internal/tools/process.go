@@ -2,22 +2,28 @@ package tools
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"ccdp/internal/execution"
+	"ccdp/internal/sandbox"
 )
 
 // Interactive process tools let the agent drive long-running or interactive
-// subprocesses (REPLs, dev servers, test watchers) across multiple tool calls:
-// start a process, feed it stdin lines, read its output, stop it. This is the
-// missing half of Bash: commands that never return within a tool timeout.
+// subprocesses (REPLs, dev servers, test watchers) across multiple tool calls.
 
 // maxProcOutput caps the buffered output per process (old lines are dropped).
 const maxProcOutput = 512 * 1024
+
+const maxProcessWait = 30 * time.Second
 
 // managedProcess is one running subprocess with its stdin pipe and a bounded
 // output buffer.
@@ -32,26 +38,101 @@ type managedProcess struct {
 	done    chan struct{}
 }
 
-// ProcessManager owns all background processes started this session.
+// ProcessManager owns all background processes started by one Resources
+// owner. Handles include a manager scope tag, so an integer returned by one
+// session is rejected by every other manager even if both have a local id 1.
 type ProcessManager struct {
-	mu    sync.Mutex
-	next  int
-	procs map[int]*managedProcess
+	mu        sync.Mutex
+	owner     string
+	scope     uint32
+	next      uint32
+	procs     map[int]*managedProcess
+	closed    bool
+	closeErr  error
+	closeDone chan struct{}
 }
 
-var processStore = &ProcessManager{procs: map[int]*managedProcess{}}
+var processScopeSequence atomic.Uint32
+
+func setProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
+		}
+		return os.ErrProcessDone
+	}
+	cmd.WaitDelay = 3 * time.Second
+}
+
+// NewProcessManager creates an empty owner-scoped process manager.
+func NewProcessManager(owner string) *ProcessManager {
+	scope := processScopeSequence.Add(1) & 0x7fffffff
+	if scope == 0 {
+		scope = 1
+	}
+	return &ProcessManager{owner: owner, scope: scope, procs: map[int]*managedProcess{}, closeDone: make(chan struct{})}
+}
+
+// Owner returns the immutable scope identifier.
+func (m *ProcessManager) Owner() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.owner
+}
+
+// CheckOpen verifies that the manager can still admit a process operation.
+func (m *ProcessManager) CheckOpen() error {
+	if m == nil {
+		return fmt.Errorf("process: nil manager")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return fmt.Errorf("process manager for %q is closed", m.owner)
+	}
+	return nil
+}
+
+// Start launches a long-running process. The command must already have passed
+// sandbox/execution policy checks; ProcessStartTool calls sandbox.PrepareCommand
+// immediately before this method.
+func (m *ProcessManager) Start(command, dir string) (int, error) {
+	id, _, err := m.startContext(context.Background(), command, dir)
+	return id, err
+}
 
 func (m *ProcessManager) start(command, dir string) (int, *managedProcess, error) {
+	return m.startContext(context.Background(), command, dir)
+}
+
+func (m *ProcessManager) startContext(ctx context.Context, command, dir string) (int, *managedProcess, error) {
+	if m == nil {
+		return 0, nil, fmt.Errorf("ProcessStart: nil process manager")
+	}
 	if strings.TrimSpace(command) == "" {
 		return 0, nil, fmt.Errorf("ProcessStart: empty command")
+	}
+	if err := m.CheckOpen(); err != nil {
+		return 0, nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/sh"
 	}
-	cmd := exec.Command(shell, "-c", command)
+	cmd := exec.CommandContext(ctx, shell, "-c", command)
 	cmd.Dir = dir
-	cmd.Env = os.Environ()
+	cmd.Env = execution.SanitizedEnvironmentFor(execution.EnvironmentCommand, os.Environ())
+	setProcessGroup(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -59,13 +140,16 @@ func (m *ProcessManager) start(command, dir string) (int, *managedProcess, error
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdin.Close()
 		return 0, nil, fmt.Errorf("ProcessStart: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		_ = stdin.Close()
 		return 0, nil, fmt.Errorf("ProcessStart: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
 		return 0, nil, fmt.Errorf("ProcessStart: %w", err)
 	}
 
@@ -74,10 +158,8 @@ func (m *ProcessManager) start(command, dir string) (int, *managedProcess, error
 		stdin: stdin,
 		done:  make(chan struct{}),
 	}
-	// Drain both streams concurrently: draining them sequentially deadlocks
-	// when a process writes only to stderr — stdout never reaches EOF until
-	// the process exits, the pipe goroutine never reaches stderr, the 64KB
-	// stderr pipe fills, and the blocked process never exits.
+	// Drain both streams concurrently: draining them sequentially can deadlock
+	// when a process writes only to stderr.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -89,46 +171,61 @@ func (m *ProcessManager) start(command, dir string) (int, *managedProcess, error
 		mp.pipe(stderr)
 	}()
 	go func() {
-		defer close(mp.done)
+		waitErr := cmd.Wait()
 		wg.Wait()
-		mp.err = cmd.Wait()
 		mp.mu.Lock()
+		mp.err = waitErr
 		mp.exited = true
 		mp.mu.Unlock()
+		close(mp.done)
 	}()
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		_, _, _ = mp.stop()
+		return 0, nil, fmt.Errorf("process manager for %q is closed", m.owner)
+	}
 	m.next++
-	id := m.next
+	local := m.next
+	id := int((uint64(m.scope) << 32) | uint64(local))
 	m.procs[id] = mp
 	m.mu.Unlock()
 	return id, mp, nil
 }
 
-// pipe drains one output stream into the bounded buffer.
+// pipe drains one output stream into a bounded buffer.
 func (mp *managedProcess) pipe(r io.Reader) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		mp.mu.Lock()
-		mp.buf = append(mp.buf, line...)
-		mp.buf = append(mp.buf, '\n')
-		if len(mp.buf) > maxProcOutput {
-			oldLen := len(mp.buf)
-			mp.buf = append([]byte(nil), mp.buf[oldLen-maxProcOutput:]...)
-			// Shift readPos by the number of dropped bytes (computed before
-			// truncation) so unread output stays contiguous — no bytes are
-			// silently skipped and newly written lines are still returned.
-			if dropped := oldLen - maxProcOutput; dropped > 0 {
-				mp.readPos -= dropped
-				if mp.readPos < 0 {
-					mp.readPos = 0
-				}
+	br := bufio.NewReaderSize(r, 64*1024)
+	for {
+		fragment, err := br.ReadSlice('\n')
+		if len(fragment) > 0 {
+			mp.appendOutput(fragment)
+		}
+		if err != nil && err != bufio.ErrBufferFull {
+			return
+		}
+	}
+}
+
+func (mp *managedProcess) appendOutput(fragment []byte) {
+	if len(fragment) == 0 {
+		return
+	}
+	mp.mu.Lock()
+	mp.buf = append(mp.buf, fragment...)
+	if len(mp.buf) > maxProcOutput {
+		oldLen := len(mp.buf)
+		mp.buf = append([]byte(nil), mp.buf[oldLen-maxProcOutput:]...)
+		// Keep unread bytes contiguous after dropping old output.
+		if dropped := oldLen - maxProcOutput; dropped > 0 {
+			mp.readPos -= dropped
+			if mp.readPos < 0 {
+				mp.readPos = 0
 			}
 		}
-		mp.mu.Unlock()
 	}
+	mp.mu.Unlock()
 }
 
 // read returns output since the last read (bounded), plus exit state.
@@ -140,10 +237,19 @@ func (mp *managedProcess) read() (string, bool, error) {
 	return out, mp.exited, mp.err
 }
 
-// waitRead blocks until new output arrives, the process exits, or wait elapses,
-// then returns what is available. A short default wait avoids empty reads right
-// after a ProcessWrite.
+// waitRead blocks until new output arrives, the process exits, or wait elapses.
 func (mp *managedProcess) waitRead(wait time.Duration) (string, bool, error) {
+	return mp.waitReadContext(context.Background(), wait)
+}
+
+// waitReadContext is the cancellable form used by ProcessOutput. A caller's
+// interrupt must reclaim the wait promptly even when it requested the maximum
+// 30-second observation window; the process itself remains session-owned and
+// is not terminated by this per-call cancellation.
+func (mp *managedProcess) waitReadContext(ctx context.Context, wait time.Duration) (string, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	deadline := time.Now().Add(wait)
 	for {
 		mp.mu.Lock()
@@ -154,13 +260,34 @@ func (mp *managedProcess) waitRead(wait time.Duration) (string, bool, error) {
 			return mp.read()
 		}
 		select {
+		case <-ctx.Done():
+			return mp.read()
+		default:
+		}
+		interval := 50 * time.Millisecond
+		if remaining := time.Until(deadline); remaining < interval {
+			interval = remaining
+		}
+		if interval <= 0 {
+			return mp.read()
+		}
+		timer := time.NewTimer(interval)
+		select {
 		case <-mp.done:
-		case <-time.After(50 * time.Millisecond):
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return mp.read()
+		case <-timer.C:
 		}
 	}
 }
 
-// write feeds one line (or block) to the process stdin.
+// write feeds one block to the process stdin.
 func (mp *managedProcess) write(input string) error {
 	if _, err := mp.stdin.Write([]byte(input)); err != nil {
 		return fmt.Errorf("ProcessWrite: %w", err)
@@ -168,21 +295,98 @@ func (mp *managedProcess) write(input string) error {
 	return nil
 }
 
-// stop terminates the process and returns the remaining output + exit state.
+// stop terminates the process and returns remaining output + exit state.
 func (mp *managedProcess) stop() (string, bool, error) {
+	if mp == nil {
+		return "", true, nil
+	}
 	_ = mp.stdin.Close()
 	if mp.cmd.Process != nil {
-		_ = mp.cmd.Process.Signal(os.Interrupt)
+		_ = syscall.Kill(-mp.cmd.Process.Pid, syscall.SIGINT)
 	}
 	select {
 	case <-mp.done:
 	case <-time.After(2 * time.Second):
 		if mp.cmd.Process != nil {
-			_ = mp.cmd.Process.Kill()
+			_ = syscall.Kill(-mp.cmd.Process.Pid, syscall.SIGKILL)
 		}
-		<-mp.done
+		select {
+		case <-mp.done:
+		case <-time.After(4 * time.Second):
+			return mp.read()
+		}
 	}
 	return mp.read()
+}
+
+// Close stops every process owned by this manager and rejects future starts.
+// It is idempotent; all calls return the same first close result.
+func (m *ProcessManager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	if m.closed {
+		done := m.closeDone
+		m.mu.Unlock()
+		<-done
+		m.mu.Lock()
+		err := m.closeErr
+		m.mu.Unlock()
+		return err
+	}
+	m.closed = true
+	procs := make([]*managedProcess, 0, len(m.procs))
+	for _, mp := range m.procs {
+		procs = append(procs, mp)
+	}
+	m.procs = map[int]*managedProcess{}
+	m.mu.Unlock()
+	for _, mp := range procs {
+		// A signal/exit status from an intentionally stopped background
+		// process is not a Close failure. Close's contract is resource
+		// reclamation; the process result is available through ProcessStop.
+		_, _, _ = mp.stop()
+	}
+	m.mu.Lock()
+	m.closeErr = nil
+	close(m.closeDone)
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *ProcessManager) belongs(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return uint64(pid)>>32 == uint64(m.scope)
+}
+
+// Get returns a live process by a handle created by this manager.
+func (m *ProcessManager) Get(pid int) (*managedProcess, error) {
+	if m == nil {
+		return nil, fmt.Errorf("process: nil manager")
+	}
+	if !m.belongs(pid) {
+		return nil, fmt.Errorf("process handle %d belongs to another session", pid)
+	}
+	m.mu.Lock()
+	mp, ok := m.procs[pid]
+	m.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("no process %d (has it been stopped?)", pid)
+	}
+	return mp, nil
+}
+
+// Remove forgets a stopped process handle.
+func (m *ProcessManager) Remove(pid int) {
+	if m == nil || !m.belongs(pid) {
+		return
+	}
+	m.mu.Lock()
+	delete(m.procs, pid)
+	m.mu.Unlock()
 }
 
 // ---------- ProcessStart ----------
@@ -221,37 +425,52 @@ func (t *ProcessStartTool) Parameters() map[string]any {
 }
 
 func (t *ProcessStartTool) Run(ctx *Context) (string, error) {
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
+	if ctx.Context != nil {
+		select {
+		case <-ctx.Context.Done():
+			return "", ctx.Context.Err()
+		default:
+		}
+	}
 	command := StringArg(ctx.Args, "command", "")
-	if ctx.Sandbox != nil {
-		// Sandbox command policy (strict mode blocks workspace escapes + network).
-		if err := ctx.Sandbox.CommandPolicy(command); err != nil {
-			return "", err
-		}
+	if strings.TrimSpace(command) == "" {
+		return "", fmt.Errorf("ProcessStart: empty command")
 	}
-	cmdline := command
-	if ctx.Sandbox != nil {
-		// Resource limits (ulimit prefix) and, on macOS with strict mode, a
-		// sandbox-exec profile wrap the command — mirroring BashTool so the
-		// background process can't bypass the sandbox.
-		if p := ctx.Sandbox.Prefix(); p != "" {
-			cmdline = p + " " + cmdline
-		}
-		if wrapped := ctx.Sandbox.WrapCommand(cmdline); wrapped != "" {
-			cmdline = wrapped
-		}
+	if err := sandbox.CheckInteractive(command); err != nil {
+		return "", err
 	}
-	id, mp, err := processStore.start(cmdline, ctx.WorkingDir)
+	prepared, err := prepareCommand(ctx, command)
 	if err != nil {
 		return "", err
 	}
-	// Give the process a moment to print its banner, then surface it.
+	m, err := ctx.processManager()
+	if err != nil {
+		return "", err
+	}
+	// ProcessStart creates a session-owned long-lived process. The current tool
+	// invocation may be canceled as soon as this step completes, so binding the
+	// child to ctx.Context would kill a valid REPL/dev server at every boundary.
+	// Resources.Close cancels OwnerContext and then closes the manager, retaining
+	// the explicit session lifetime and shutdown semantics.
+	ownerCtx := context.Background()
+	if ctx.Resources != nil {
+		ownerCtx = ctx.Resources.OwnerContext()
+	}
+	id, mp, err := m.startContext(ownerCtx, prepared, ctx.WorkingDir)
+	if err != nil {
+		return "", err
+	}
+	// Give the process a moment to print its banner, then surface it. The
+	// manager remains asynchronous and owns the process after this call.
 	time.Sleep(300 * time.Millisecond)
 	out, _, _ := mp.read()
 	if out != "" {
 		out = "\nInitial output:\n" + out
 	}
-	return fmt.Sprintf("Started process %d (%q).%s\nUse ProcessWrite to send input, ProcessOutput to read output, ProcessStop to end it.",
-		id, command, out), nil
+	return boundedProcessResult(ctx, fmt.Sprintf("Started process %d (%q).%s\nUse ProcessWrite to send input, ProcessOutput to read output, ProcessStop to end it.", id, command, out)), nil
 }
 
 // ---------- ProcessWrite ----------
@@ -288,9 +507,22 @@ func (t *ProcessWriteTool) Parameters() map[string]any {
 }
 
 func (t *ProcessWriteTool) Run(ctx *Context) (string, error) {
-	pid := IntArg(ctx.Args, "pid", 0)
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
+	pid, err := IntArgChecked(ctx.Args, "pid", 0)
+	if err != nil {
+		return "", fmt.Errorf("ProcessWrite: %w", err)
+	}
 	input := StringArg(ctx.Args, "input", "")
-	mp, err := processStore.get(pid)
+	if len(input) > ctx.processInputLimit() {
+		return "", fmt.Errorf("ProcessWrite: input is %d bytes, exceeds limit %d", len(input), ctx.processInputLimit())
+	}
+	m, err := ctx.processManager()
+	if err != nil {
+		return "", err
+	}
+	mp, err := m.Get(pid)
 	if err != nil {
 		return "", err
 	}
@@ -327,7 +559,7 @@ func (t *ProcessOutputTool) Parameters() map[string]any {
 			},
 			"wait_ms": map[string]any{
 				"type":        "integer",
-				"description": "Optional milliseconds to wait for new output (default 1500).",
+				"description": "Optional milliseconds to wait for new output (default 1500, maximum 30000).",
 			},
 		},
 		"required": []string{"pid"},
@@ -335,16 +567,32 @@ func (t *ProcessOutputTool) Parameters() map[string]any {
 }
 
 func (t *ProcessOutputTool) Run(ctx *Context) (string, error) {
-	pid := IntArg(ctx.Args, "pid", 0)
-	wait := IntArg(ctx.Args, "wait_ms", 1500)
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
+	pid, err := IntArgChecked(ctx.Args, "pid", 0)
+	if err != nil {
+		return "", fmt.Errorf("ProcessOutput: %w", err)
+	}
+	wait, err := IntArgChecked(ctx.Args, "wait_ms", 1500)
+	if err != nil {
+		return "", fmt.Errorf("ProcessOutput: %w", err)
+	}
 	if wait < 0 {
 		wait = 0
 	}
-	mp, err := processStore.get(pid)
+	if wait > int(maxProcessWait/time.Millisecond) {
+		return "", fmt.Errorf("ProcessOutput: wait_ms exceeds maximum %d", int(maxProcessWait/time.Millisecond))
+	}
+	m, err := ctx.processManager()
 	if err != nil {
 		return "", err
 	}
-	out, exited, perr := mp.waitRead(time.Duration(wait) * time.Millisecond)
+	mp, err := m.Get(pid)
+	if err != nil {
+		return "", err
+	}
+	out, exited, perr := mp.waitReadContext(ctx.Context, time.Duration(wait)*time.Millisecond)
 	var sb strings.Builder
 	sb.WriteString(out)
 	if exited {
@@ -356,7 +604,7 @@ func (t *ProcessOutputTool) Run(ctx *Context) (string, error) {
 	} else {
 		fmt.Fprintf(&sb, "\n[process %d still running]\n", pid)
 	}
-	return sb.String(), nil
+	return boundedProcessResult(ctx, sb.String()), nil
 }
 
 // ---------- ProcessStop ----------
@@ -388,13 +636,23 @@ func (t *ProcessStopTool) Parameters() map[string]any {
 }
 
 func (t *ProcessStopTool) Run(ctx *Context) (string, error) {
-	pid := IntArg(ctx.Args, "pid", 0)
-	mp, err := processStore.get(pid)
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
+	pid, err := IntArgChecked(ctx.Args, "pid", 0)
+	if err != nil {
+		return "", fmt.Errorf("ProcessStop: %w", err)
+	}
+	m, err := ctx.processManager()
+	if err != nil {
+		return "", err
+	}
+	mp, err := m.Get(pid)
 	if err != nil {
 		return "", err
 	}
 	out, exited, perr := mp.stop()
-	processStore.remove(pid)
+	m.Remove(pid)
 	var sb strings.Builder
 	sb.WriteString(out)
 	status := "stopped"
@@ -404,38 +662,27 @@ func (t *ProcessStopTool) Run(ctx *Context) (string, error) {
 		status = "failed: " + perr.Error()
 	}
 	fmt.Fprintf(&sb, "\n[process %d %s]\n", pid, status)
-	return sb.String(), nil
+	return boundedProcessResult(ctx, sb.String()), nil
 }
 
-// get returns a live process by id.
-func (m *ProcessManager) get(pid int) (*managedProcess, error) {
-	m.mu.Lock()
-	mp, ok := m.procs[pid]
-	m.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("no process %d (has it been stopped?)", pid)
+func boundedProcessResult(ctx *Context, value string) string {
+	limit := ctx.outputLimit()
+	if len(value) <= limit {
+		return value
 	}
-	return mp, nil
+	if limit <= len("\n…[tool output truncated]") {
+		return value[:limit]
+	}
+	marker := "\n…[tool output truncated]"
+	return value[:limit-len(marker)] + marker
 }
 
-// remove forgets a stopped process.
-func (m *ProcessManager) remove(pid int) {
-	m.mu.Lock()
-	delete(m.procs, pid)
-	m.mu.Unlock()
-}
-
-// ProcessStopAll terminates every process the session started. Called when
-// the agent shuts down so background REPLs/servers never outlive it.
-func ProcessStopAll() {
-	processStore.mu.Lock()
-	procs := make([]*managedProcess, 0, len(processStore.procs))
-	for _, mp := range processStore.procs {
-		procs = append(procs, mp)
+func prepareCommand(ctx *Context, command string) (string, error) {
+	if ctx == nil {
+		return "", fmt.Errorf("execution: nil context")
 	}
-	processStore.procs = map[int]*managedProcess{}
-	processStore.mu.Unlock()
-	for _, mp := range procs {
-		_, _, _ = mp.stop()
+	if ctx.Sandbox == nil {
+		return command, nil
 	}
+	return sandbox.PrepareCommand(ctx.Sandbox, command)
 }

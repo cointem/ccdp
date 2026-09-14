@@ -5,10 +5,14 @@ import (
 	"strings"
 )
 
-// TaskTool launches independent sub-agents to complete delegated subtasks
-// (Claude Code's Task tool). With the "agents" parameter a batch of sub-agents
-// runs concurrently, each with its own system prompt and history while sharing
-// the parent's tools, sandbox and permissions. Results come back in input order.
+// TaskTool launches independent child sessions to complete delegated subtasks
+// (Claude Code's Task tool). Each child runs its own loop, history and session
+// resources under a frozen snapshot of the parent's effective configuration,
+// permissions and admitted tools. With the "agents" parameter, a bounded
+// parent-level slot pool runs children concurrently and returns results in
+// input order; child lifecycle hooks run per item. Mutable project hooks, MCP
+// startup and memory are not inherited. Interactive approvals remain subject
+// to inherited hard policy; nested delegation is unavailable.
 type TaskTool struct{}
 
 // NewTaskTool creates the Task tool.
@@ -17,23 +21,29 @@ func NewTaskTool() *TaskTool { return &TaskTool{} }
 func (t *TaskTool) Name() string { return "Task" }
 
 func (t *TaskTool) Description() string {
-	return `Delegate self-contained subtasks to independent sub-agents that run their own
-agent loops with your tools, sandbox and permissions. Use this to parallelize
-work: e.g. research, draft, or verify pieces of a large task while you continue
-the main thread.
+	return `Delegate self-contained subtasks to independent child sessions that run their own
+agent loops with a frozen snapshot of the effective configuration, permissions,
+and explicitly admitted tools. Use this to parallelize work: e.g. research,
+draft, or verify pieces of a large task while you continue the main thread.
 
 - For a single subtask pass "description".
 - To fan out N independent pieces of work in parallel, pass "agents": an array
   of {"description": ..., "system_prompt": ...} objects. All agents run
-  concurrently and their final answers are returned in order.
-Keep each delegation focused and self-contained. Sub-agents cannot ask the user
-anything; they work within the permissions they inherit.`
+  concurrently up to the parent session's child-slot limit, and their final
+  answers are returned in order.
+- wait_policy="join" (default) waits for completion. wait_policy="notify"
+  returns session/run IDs immediately and sends a completion input later.
+- Use Agent to list/read/wait/control children, including sending followups.
+Keep each delegation focused and self-contained. Children cannot launch another
+Task or control sibling agents. Approvals require an interactive human channel;
+headless calls requiring approval are denied. Hard inherited denies always apply.`
 }
 
 func (t *TaskTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"wait_policy": map[string]any{"type": "string", "enum": []string{"join", "notify"}, "description": "join waits for results (default); notify returns child/run IDs and delivers completion in a later parent input."},
 			"description": map[string]any{
 				"type":        "string",
 				"description": "The task a single sub-agent should accomplish, in enough detail to work independently.",
@@ -69,8 +79,15 @@ func (t *TaskTool) Parameters() map[string]any {
 }
 
 func (t *TaskTool) Run(ctx *Context) (string, error) {
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
 	if ctx.Subagent == nil && ctx.Subagents == nil {
 		return "", fmt.Errorf("Task: sub-agents are not available in this session")
+	}
+	policy := StringArg(ctx.Args, "wait_policy", "join")
+	if policy != "join" && policy != "notify" {
+		return "", fmt.Errorf("Task: wait_policy must be join or notify")
 	}
 
 	// Batch mode: fan out N parallel sub-agents.
@@ -89,6 +106,7 @@ func (t *TaskTool) Run(ctx *Context) (string, error) {
 				return "", fmt.Errorf("Task: agents[%d].description is required", i)
 			}
 			tasks = append(tasks, SubagentTask{
+				WaitPolicy:   policy,
 				Description:  desc,
 				SystemPrompt: StringArg(obj, "system_prompt", ""),
 			})
@@ -98,16 +116,43 @@ func (t *TaskTool) Run(ctx *Context) (string, error) {
 			return "", err
 		}
 		var sb strings.Builder
-		for _, r := range results {
-			fmt.Fprintf(&sb, "── sub-agent %d: %s ──\n", r.Index+1, r.Description)
-			if r.Error != "" {
-				fmt.Fprintf(&sb, "ERROR: %s\n", r.Error)
+		limit := ctx.outputLimit()
+		truncated := false
+		appendOutput := func(value string) {
+			if truncated {
+				return
+			}
+			if limit <= 0 || len(value) <= limit-sb.Len() {
+				sb.WriteString(value)
+				return
+			}
+			marker := "\n…[tool output truncated]"
+			if limit <= sb.Len() {
+				truncated = true
+				return
+			}
+			remaining := limit - sb.Len()
+			if remaining <= len(marker) {
+				sb.WriteString(value[:remaining])
 			} else {
-				sb.WriteString(strings.TrimSpace(r.Output))
-				sb.WriteString("\n")
+				sb.WriteString(value[:remaining-len(marker)])
+				sb.WriteString(marker)
+			}
+			truncated = true
+		}
+		for _, r := range results {
+			appendOutput(fmt.Sprintf("── sub-agent %d: %s ──\n", r.Index+1, r.Description))
+			if r.SessionID != "" {
+				appendOutput(fmt.Sprintf("session=%s run=%s\n", r.SessionID, r.RunID))
+			}
+			if r.Error != "" {
+				appendOutput(fmt.Sprintf("ERROR: %s\n", r.Error))
+			} else {
+				appendOutput(strings.TrimSpace(r.Output))
+				appendOutput("\n")
 			}
 		}
-		return strings.TrimRight(sb.String(), "\n"), nil
+		return boundedToolString(ctx, strings.TrimRight(sb.String(), "\n")), nil
 	}
 
 	// Single mode.
@@ -119,5 +164,22 @@ func (t *TaskTool) Run(ctx *Context) (string, error) {
 		return "", fmt.Errorf("Task: description is required")
 	}
 	system := StringArg(ctx.Args, "system_prompt", "")
-	return ctx.Subagent(description, system)
+	if policy == "notify" {
+		if ctx.Subagents == nil {
+			return "", fmt.Errorf("Task: background delegation unavailable")
+		}
+		results, err := ctx.Subagents([]SubagentTask{{Description: description, SystemPrompt: system, WaitPolicy: policy}})
+		if err != nil {
+			return "", err
+		}
+		if results[0].Error != "" {
+			return "", fmt.Errorf("%s", results[0].Error)
+		}
+		return boundedToolString(ctx, results[0].Output), nil
+	}
+	out, err := ctx.Subagent(description, system)
+	if err != nil {
+		return "", err
+	}
+	return boundedToolString(ctx, out), nil
 }

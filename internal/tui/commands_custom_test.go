@@ -4,9 +4,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
-	"ccdp/internal/agent"
+	tea "github.com/charmbracelet/bubbletea"
+
+	"ccdp/internal/protocol"
 )
 
 func TestLoadCustomCommands(t *testing.T) {
@@ -45,34 +49,68 @@ func TestLoadCustomCommands(t *testing.T) {
 	}
 
 	// Expansion: $ARGUMENTS and positional args.
-	ctrl := make(chan agent.Control, 4)
-	m := &Model{customCmds: cmds, ctrl: ctrl}
+	client := &recordingClient{snapshot: protocol.SessionView{SessionID: "test-session"}}
+	m := &Model{customCmds: cmds, client: client, sessionID: "test-session"}
 	cc := m.findCustomCommand("review")
 	if cc == nil {
 		t.Fatal("review command not found")
 	}
-	m.runCustomCommand(cc, []string{"auth.go"})
-	select {
-	case c := <-ctrl:
-		if c.Type != agent.ControlUserMessage {
-			t.Fatalf("expected user message control, got %v", c.Type)
-		}
-		if !strings.Contains(c.Text, "PROJECT review auth.go.") {
-			t.Errorf("$ARGUMENTS not expanded: %q", c.Text)
-		}
-		if !strings.Contains(c.Text, "(custom command /review from project scope)") {
-			t.Errorf("missing provenance header: %q", c.Text)
-		}
-	default:
-		t.Fatal("no control message sent")
+	applyCustomCommandTeaCmd(t, m, m.runCustomCommand(cc, []string{"auth.go"}))
+	if len(client.submits) != 1 {
+		t.Fatalf("expected one protocol input, got %d", len(client.submits))
+	}
+	c := client.submits[0]
+	if !strings.Contains(c.Input.Text, "PROJECT review auth.go.") {
+		t.Errorf("$ARGUMENTS not expanded: %q", c.Input.Text)
+	}
+	if !strings.Contains(c.Input.Text, "(custom command /review from project scope)") {
+		t.Errorf("missing provenance header: %q", c.Input.Text)
 	}
 
 	// Positional args: $1/$2.
 	dep := m.findCustomCommand("deploy")
-	m.runCustomCommand(dep, []string{"staging", "v2"})
-	c := <-ctrl
-	if !strings.Contains(c.Text, "Deploy to staging with v2.") {
-		t.Errorf("positional args not expanded: %q", c.Text)
+	applyCustomCommandTeaCmd(t, m, m.runCustomCommand(dep, []string{"staging", "v2"}))
+	c = client.submits[len(client.submits)-1]
+	if !strings.Contains(c.Input.Text, "Deploy to staging with v2.") {
+		t.Errorf("positional args not expanded: %q", c.Input.Text)
+	}
+}
+
+func TestExpandCustomCommandDoesNotReexpandArguments(t *testing.T) {
+	cmd := customCommand{name: "echo", source: "project"}
+	got := expandCustomCommand(cmd, []string{"$2", "literal $1"}, []byte(
+		"all=$ARGUMENTS first=$1 second=$2"))
+	want := "(custom command /echo from project scope)\n\nall=$2 literal $1 first=$2 second=literal $1"
+	if got != want {
+		t.Fatalf("non-recursive expansion = %q, want %q", got, want)
+	}
+}
+
+func applyCustomCommandTeaCmd(t *testing.T, m *Model, cmd tea.Cmd) {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("custom command returned no read command")
+	}
+	model, next := m.Update(cmd())
+	*m = modelValue(t, model)
+	if next == nil {
+		t.Fatal("custom command read did not schedule submit")
+	}
+	model, _ = m.Update(next())
+	*m = modelValue(t, model)
+}
+
+func TestBoundedCustomCommandRejectsFIFO(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked.md")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("FIFO unavailable: %v", err)
+	}
+	started := time.Now()
+	if _, err := readCustomCommand(path); err == nil || !strings.Contains(err.Error(), "regular") {
+		t.Fatalf("readCustomCommand FIFO error = %v, want regular-file rejection", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("FIFO check blocked for %s", elapsed)
 	}
 }
 

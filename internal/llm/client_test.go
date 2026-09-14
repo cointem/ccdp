@@ -2,6 +2,8 @@ package llm
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -77,6 +79,33 @@ func TestStreamRetriesBeforeAnyDelta(t *testing.T) {
 	}
 	if res.Text != "ok" || got.String() != "ok" {
 		t.Errorf("unexpected text %q / callbacks %q", res.Text, got.String())
+	}
+}
+
+func TestStreamCondensesJSONHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{
+  "error": {
+    "message": "You didn't provide an API key.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": null
+  }
+}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(Config{BaseURL: srv.URL, Model: "m", MaxRetries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Stream(context.Background(), CompletionRequest{Model: "m"}, nil)
+	if err == nil {
+		t.Fatal("expected unauthorized error")
+	}
+	if got := err.Error(); got != "llm: 401 Unauthorized: You didn't provide an API key." {
+		t.Fatalf("unexpected error text: %q", got)
 	}
 }
 
@@ -163,6 +192,39 @@ func TestEstimateTokensWeights(t *testing.T) {
 	// 2-byte runes ≈ ½ token/char.
 	if got := EstimateTokens(strings.Repeat("é", 100)); got != 50 {
 		t.Errorf("2-byte 100 chars = %d tokens, want 50", got)
+	}
+}
+
+func TestClientCapabilitiesExposeConfiguredAdmissionLimits(t *testing.T) {
+	c, err := NewClient(Config{BaseURL: "https://provider.example/v1", Model: "m", ContextWindow: 4096, MaxOutputTokens: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps, ok := ProviderCapabilitiesOf(c)
+	if !ok || caps.ContextWindow != 4096 || caps.MaxOutputTokens != 512 || !caps.ToolCalling || !caps.Images || !caps.SystemRole {
+		t.Fatalf("client capabilities = %#v, described=%v", caps, ok)
+	}
+}
+
+func TestNewClientOneAttemptDisablesInternalRetries(t *testing.T) {
+	c, err := NewClient(Config{BaseURL: "https://provider.example/v1", Model: "m", OneAttempt: true, MaxRetries: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.maxRetries != 0 {
+		t.Fatalf("one-attempt client maxRetries=%d, want 0", c.maxRetries)
+	}
+}
+
+func TestRetryAfterPreservesTransientClassification(t *testing.T) {
+	base := errors.New("temporary gateway failure")
+	err := &RetryableError{Err: base, RetryAfter: 250 * time.Millisecond}
+	delay, ok := RetryAfter(fmt.Errorf("request failed: %w", err))
+	if !ok || delay != 250*time.Millisecond {
+		t.Fatalf("RetryAfter = %s/%v, want 250ms/true", delay, ok)
+	}
+	if !errors.Is(err, base) {
+		t.Fatal("retryable error did not preserve its cause")
 	}
 }
 

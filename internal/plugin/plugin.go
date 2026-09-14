@@ -14,6 +14,7 @@
 package plugin
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"sort"
 	"strings"
@@ -355,34 +356,96 @@ func joinErrs(errs []string) string {
 // provider for the configured model through this registry.
 type ModelRegistry struct {
 	mu        sync.RWMutex
-	providers map[string]llm.Provider // provider name -> provider
-	routes    map[string]string       // model -> provider name
+	providers map[string]providerEntry // provider name -> provider
+	routes    map[string]routeEntry    // model -> provider registration
+	nextToken uint64
+	frozen    bool
+}
+
+type providerEntry struct {
+	provider llm.Provider
+	token    uint64
+}
+
+type routeEntry struct {
+	provider string
+	token    uint64
+	kind     string
+	endpoint string
+	keyHash  [32]byte
 }
 
 // NewModelRegistry builds an empty registry.
 func NewModelRegistry() *ModelRegistry {
-	return &ModelRegistry{providers: map[string]llm.Provider{}, routes: map[string]string{}}
+	return &ModelRegistry{providers: map[string]providerEntry{}, routes: map[string]routeEntry{}}
 }
 
 // Register adds a provider under its own Name and returns a disposer.
 func (r *ModelRegistry) Register(p llm.Provider) func() {
-	if p == nil {
+	if r == nil || p == nil || p.Name() == "" {
 		return func() {}
 	}
 	r.mu.Lock()
-	r.providers[p.Name()] = p
+	if r.frozen {
+		r.mu.Unlock()
+		return func() {}
+	}
+	r.nextToken++
+	token := r.nextToken
+	name := p.Name()
+	r.providers[name] = providerEntry{provider: p, token: token}
+	// Re-registration replaces a provider in place. Existing model aliases
+	// continue to follow that provider name, but point at the new registration
+	// token so an old disposer cannot remove the replacement.
+	for model, route := range r.routes {
+		if route.provider == name {
+			route.token = token
+			r.routes[model] = route
+		}
+	}
 	r.mu.Unlock()
-	return func() { r.Unregister(p.Name()) }
+	// A disposer is tied to this exact registration token. If the same
+	// provider name was subsequently replaced, the old plugin must not remove
+	// the replacement (the ABA bug in the previous name-only disposer).
+	var once sync.Once
+	return func() {
+		once.Do(func() { r.unregisterToken(name, token) })
+	}
 }
 
 // Unregister removes a provider and its model routes.
 func (r *ModelRegistry) Unregister(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.frozen {
+		return
+	}
+	entry, ok := r.providers[name]
+	if !ok {
+		return
+	}
 	delete(r.providers, name)
-	for m, pn := range r.routes {
-		if pn == name {
+	for m, route := range r.routes {
+		if route.provider == name && route.token == entry.token {
 			delete(r.routes, m)
+		}
+	}
+}
+
+func (r *ModelRegistry) unregisterToken(name string, token uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.frozen {
+		return
+	}
+	entry, ok := r.providers[name]
+	if !ok || entry.token != token {
+		return
+	}
+	delete(r.providers, name)
+	for model, route := range r.routes {
+		if route.provider == name && route.token == token {
+			delete(r.routes, model)
 		}
 	}
 }
@@ -391,34 +454,122 @@ func (r *ModelRegistry) Unregister(name string) {
 func (r *ModelRegistry) Route(model, provider string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.providers[provider]; ok {
-		r.routes[model] = provider
+	if r.frozen {
+		return
+	}
+	if entry, ok := r.providers[provider]; ok {
+		r.routes[model] = routeEntry{provider: provider, token: entry.token, kind: "explicit"}
 	}
 }
 
-// Resolve returns the provider serving the given model: the explicit route, or
-// the sole registered provider, or nil.
-func (r *ModelRegistry) Resolve(model string) llm.Provider {
+// RouteDefault maps a model to an adapter created from the model's own
+// endpoint/key configuration. Endpoint and a one-way key fingerprint let a
+// later reload replace a stale adapter without classifying providers by Go
+// concrete type. The credential itself is never retained by the registry.
+func (r *ModelRegistry) RouteDefault(model, provider, endpoint, apiKey string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.frozen {
+		return
+	}
+	if entry, ok := r.providers[provider]; ok {
+		r.routes[model] = routeEntry{provider: provider, token: entry.token, kind: "http", endpoint: endpoint, keyHash: sha256.Sum256([]byte(apiKey))}
+	}
+}
+
+// ResolveDefault returns an adapter only when its frozen endpoint and
+// credential fingerprint still match. It is intentionally separate from
+// ResolveRoute, which resolves explicit plugin routes regardless of HTTP
+// configuration.
+func (r *ModelRegistry) ResolveDefault(model, endpoint, apiKey string) (llm.Provider, bool) {
+	if r == nil {
+		return nil, false
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if pn, ok := r.routes[model]; ok {
-		if p, ok := r.providers[pn]; ok {
-			return p
-		}
+	route, ok := r.routes[model]
+	if !ok || route.kind != "http" || route.endpoint != endpoint || route.keyHash != sha256.Sum256([]byte(apiKey)) {
+		return nil, false
 	}
-	if len(r.providers) == 1 {
-		for _, p := range r.providers {
-			return p
-		}
+	entry, ok := r.providers[route.provider]
+	if !ok || entry.token != route.token {
+		return nil, false
 	}
-	if p, ok := r.providers[model]; ok {
-		return p
-	}
-	return nil
+	return entry.provider, true
 }
+
+// ResolveRouteInfo resolves a model route without hiding its origin. The kind
+// and endpoint are needed by the agent to distinguish a generated HTTP route
+// from an explicit plugin route when a model's endpoint/key configuration is
+// reloaded. A stale generated route must not be reused for the new connection.
+func (r *ModelRegistry) ResolveRouteInfo(model string) (llm.Provider, string, string, bool) {
+	if r == nil {
+		return nil, "", "", false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if route, ok := r.routes[model]; ok {
+		if entry, exists := r.providers[route.provider]; exists && entry.token == route.token {
+			return entry.provider, route.kind, route.endpoint, true
+		}
+	}
+	if entry, ok := r.providers[model]; ok {
+		return entry.provider, "explicit", "", true
+	}
+	return nil, "", "", false
+}
+
+// ResolveRoute resolves only an explicit model route (or a provider registered
+// under the model's exact name). It never applies the legacy sole-provider
+// fallback. Agent request preparation uses this method whenever a model has a
+// configured endpoint so a different model cannot accidentally inherit another
+// provider's URL or credentials.
+func (r *ModelRegistry) ResolveRoute(model string) (llm.Provider, bool) {
+	p, _, _, ok := r.ResolveRouteInfo(model)
+	return p, ok
+}
+
+// Clone returns a mutable point-in-time copy of the registry. Provider
+// implementations themselves are intentionally shared; registration and route
+// metadata are copied so a child can evolve its catalog independently.
+func (r *ModelRegistry) Clone() *ModelRegistry {
+	if r == nil {
+		return NewModelRegistry()
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	clone := &ModelRegistry{
+		providers: make(map[string]providerEntry, len(r.providers)),
+		routes:    make(map[string]routeEntry, len(r.routes)),
+		nextToken: r.nextToken,
+	}
+	for name, entry := range r.providers {
+		clone.providers[name] = entry
+	}
+	for model, route := range r.routes {
+		clone.routes[model] = route
+	}
+	return clone
+}
+
+// Freeze returns an immutable snapshot suitable for child/guardian work. A
+// frozen registry still resolves providers but ignores later registrations,
+// routes, and unregister calls; the child therefore cannot observe catalog
+// churn in its parent while a request is being prepared.
+func (r *ModelRegistry) Freeze() *ModelRegistry {
+	clone := r.Clone()
+	clone.frozen = true
+	return clone
+}
+
+// Frozen is an alias for Freeze for callers that prefer noun-style naming.
+func (r *ModelRegistry) Frozen() *ModelRegistry { return r.Freeze() }
 
 // Names returns provider names in sorted order.
 func (r *ModelRegistry) Names() []string {
+	if r == nil {
+		return nil
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.providers))
@@ -481,6 +632,25 @@ func (g *GoHooks) AddPreTool(h PreToolHook) func() {
 			}
 		}
 	}
+}
+
+// SnapshotPreTool returns an immutable copy of the currently registered
+// pre-tool decisions. Runtime child construction uses this at a frozen step
+// boundary; post observers and lifecycle callbacks are intentionally not part
+// of the child contract.
+func (g *GoHooks) SnapshotPreTool() []PreToolHook {
+	if g == nil {
+		return nil
+	}
+	g.mu.RLock()
+	out := make([]PreToolHook, 0, len(g.pre))
+	for _, node := range g.pre {
+		if node != nil && node.h != nil {
+			out = append(out, node.h)
+		}
+	}
+	g.mu.RUnlock()
+	return out
 }
 
 // AddPostTool registers a post-tool hook and returns a disposer.

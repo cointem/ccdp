@@ -15,7 +15,8 @@ func (t *enterPlanModeTool) Name() string { return "EnterPlanMode" }
 
 func (t *enterPlanModeTool) Description() string {
 	return `Enter plan mode: stop executing and switch to producing a plan first. While
-plan mode is active you may only use read-only tools to investigate. Finish by
+plan mode is active use read-only tools to investigate and AskUserQuestion to
+clarify requirements. Finish by
 calling ExitPlanMode with the proposed plan so the user can approve it before
 any changes are made. Call this when the user asks for a plan, or when the task
 is complex and you should propose an approach before executing.`
@@ -26,7 +27,9 @@ func (t *enterPlanModeTool) Parameters() map[string]any {
 }
 
 func (t *enterPlanModeTool) Run(ctx *tools.Context) (string, error) {
-	t.ag.setPlanMode(true)
+	if err := t.ag.setPlanMode(true); err != nil {
+		return "", err
+	}
 	t.ag.emitStatus("entered plan mode (via EnterPlanMode)")
 	return `Plan mode is now active. Investigate with read-only tools, then call
 ExitPlanMode with your proposed plan for approval.`, nil
@@ -66,7 +69,9 @@ func (t *exitPlanModeTool) Run(ctx *tools.Context) (string, error) {
 	}
 	t.ag.emitStatus("submitted plan for approval…")
 	if t.ag.requestPlanApproval(plan) {
-		t.ag.setPlanMode(false)
+		if err := t.ag.setPlanMode(false); err != nil {
+			return "", err
+		}
 		return "Plan approved. Plan mode is off — execute the plan now, step by step, and verify each step.", nil
 	}
 	return "Plan not approved. Remain in plan mode: revise the plan based on the feedback, then call ExitPlanMode again.", nil

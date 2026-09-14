@@ -17,14 +17,59 @@ import (
 
 // Config holds the connection settings for the LLM provider.
 type Config struct {
-	BaseURL    string // e.g. https://api.openai.com/v1 or a compatible gateway
-	APIKey     string
-	Model      string
-	Timeout    time.Duration // overall request timeout
-	HTTPClient *http.Client
-	MaxRetries int           // transient-error retries (default 3)
-	RetryDelay time.Duration // base backoff delay (default 500ms, doubles each retry)
-	Debug      bool          // print request summaries to stderr
+	BaseURL string // e.g. https://api.openai.com/v1 or a compatible gateway
+	APIKey  string
+	Model   string
+	// ContextWindow and MaxOutputTokens are operator/provider limits used by
+	// request admission. Zero means the adapter does not publish that limit.
+	ContextWindow   int
+	MaxOutputTokens int
+	Timeout         time.Duration // overall request timeout
+	HTTPClient      *http.Client
+	MaxRetries      int           // transient-error retries (default 3)
+	RetryDelay      time.Duration // base backoff delay (default 500ms, doubles each retry)
+	// OneAttempt disables the adapter's internal retry loop. Runtime callers
+	// that journal one provider invocation per attempt use this mode so a
+	// transient HTTP failure is returned to the owning loop instead of being
+	// hidden inside a single Stream call. Direct clients retain the historical
+	// MaxRetries default when OneAttempt is false.
+	OneAttempt bool
+	Debug      bool // print request summaries to stderr
+}
+
+// RetryableError marks a provider failure that may be retried by the owning
+// runtime. The HTTP adapter uses this marker for transient transport/status
+// failures. RetryAfter is an optional server hint; it is retained on the
+// error so a journaled one-attempt caller can apply the same bounded delay
+// that the direct Client loop would have used.
+type RetryableError struct {
+	Err        error
+	RetryAfter time.Duration
+}
+
+func (e *RetryableError) Error() string {
+	if e == nil || e.Err == nil {
+		return "llm: retryable provider error"
+	}
+	return e.Err.Error()
+}
+
+func (e *RetryableError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// RetryAfter reports whether err is a transient provider failure and returns
+// its optional server-provided delay. It follows wrapped errors so callers
+// can add context without losing the retry classification.
+func RetryAfter(err error) (time.Duration, bool) {
+	var retryable *RetryableError
+	if !errors.As(err, &retryable) || retryable == nil {
+		return 0, false
+	}
+	return retryable.RetryAfter, true
 }
 
 // Provider is the model abstraction behind the plugin ModelRegistry (the pi
@@ -63,7 +108,9 @@ func NewClient(cfg Config) (*Client, error) {
 		httpc = &http.Client{Timeout: cfg.Timeout}
 	}
 	maxRetries := cfg.MaxRetries
-	if maxRetries <= 0 {
+	if cfg.OneAttempt {
+		maxRetries = 0
+	} else if maxRetries <= 0 {
 		maxRetries = 3
 	}
 	retryDelay := cfg.RetryDelay
@@ -82,6 +129,26 @@ func (c *Client) DebugLog(format string, a ...any) {
 
 // Name reports the configured model; it satisfies the Provider interface.
 func (c *Client) Name() string { return c.cfg.Model }
+
+// Endpoint reports the adapter's resolved base URL for diagnostics and
+// request manifests. It never exposes the API key.
+func (c *Client) Endpoint() string { return c.baseURL }
+
+// Capabilities describes the OpenAI-compatible wire surface implemented by
+// this adapter.  It is intentionally conservative about optional reasoning
+// and usage extensions: the adapter accepts those fields when present, while
+// the request admission contract only requires the core chat capabilities.
+func (c *Client) Capabilities() Capabilities {
+	return Capabilities{
+		ToolCalling:     true,
+		Images:          true,
+		ContextWindow:   c.cfg.ContextWindow,
+		MaxOutputTokens: c.cfg.MaxOutputTokens,
+		Reasoning:       true,
+		SystemRole:      true,
+		Usage:           true,
+	}
+}
 
 // StreamResult is the final outcome of a streaming call.
 type StreamResult struct {
@@ -168,13 +235,13 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		if ctx.Err() != nil {
 			return StreamResult{}, false, false, 0, ctx.Err()
 		}
-		return StreamResult{}, true, false, 0, fmt.Errorf("llm: request failed: %w", err)
+		return StreamResult{}, true, false, 0, &RetryableError{Err: fmt.Errorf("llm: request failed: %w", err)}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		msg := fmt.Sprintf("llm: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+		msg := providerHTTPError(resp.Status, raw)
 		// 429 / 5xx are transient; other 4xx are not.
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		// Honor the provider's Retry-After (seconds or HTTP-date).
@@ -188,7 +255,11 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 				}
 			}
 		}
-		return StreamResult{}, retryable, false, after, errors.New(msg)
+		statusErr := errors.New(msg)
+		if retryable {
+			statusErr = &RetryableError{Err: statusErr, RetryAfter: after}
+		}
+		return StreamResult{}, retryable, false, after, statusErr
 	}
 
 	// A 200 without an SSE content-type is not a stream: gateways return
@@ -304,9 +375,30 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 	}
 
 	if err := scanner.Err(); err != nil {
-		return result, true, emitted, 0, fmt.Errorf("llm: read stream: %w", err)
+		return result, true, emitted, 0, &RetryableError{Err: fmt.Errorf("llm: read stream: %w", err)}
 	}
 	return result, false, emitted, 0, nil
+}
+
+// providerHTTPError extracts the useful message from OpenAI-compatible JSON
+// error envelopes. Dumping the full indented response into a narrow terminal
+// wastes most of the viewport and obscures the actionable part.
+func providerHTTPError(status string, raw []byte) string {
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &envelope) == nil && envelope.Error.Message != "" {
+		return fmt.Sprintf("llm: %s: %s", status, envelope.Error.Message)
+	}
+	body := strings.TrimSpace(string(raw))
+	if body == "" {
+		body = "empty response"
+	}
+	return fmt.Sprintf("llm: %s: %s", status, body)
 }
 
 // nonStreamError builds a descriptive error for a 200 response that is not an

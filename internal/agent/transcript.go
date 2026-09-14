@@ -1,0 +1,333 @@
+package agent
+
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"unicode/utf8"
+
+	"ccdp/internal/protocol"
+	"ccdp/internal/session"
+)
+
+const transcriptWindow = 256
+const transcriptTextLimit = 16 << 10
+
+func toolTranscriptID(turn, step, call string) string {
+	if step == "" {
+		return "tool:" + turn + ":" + call
+	}
+	return "tool:" + turn + ":" + step + ":" + call
+}
+
+// The compatibility event protocol uses numeric turn/step IDs; durable
+// journal IDs carry prefixes. Normalize only at this adapter boundary.
+func toolEventTranscriptID(ev protocol.EventView) string {
+	turn, step := string(ev.TurnID), string(ev.StepID)
+	if _, err := strconv.ParseUint(turn, 10, 64); err == nil {
+		turn = "turn-" + turn
+	}
+	if _, err := strconv.ParseUint(step, 10, 64); err == nil {
+		step = "step-" + step
+	}
+	call := string(ev.CallID)
+	if ev.Tool != nil {
+		call = string(ev.Tool.ID)
+	}
+	return toolTranscriptID(turn, step, call)
+}
+
+// The projection is fed at commit/publication, not through a lossy Watch.
+// Its mutex never calls back into Agent or persistence.
+type transcriptState struct {
+	index  map[string]uint64
+	before uint64
+	window int
+	mu     sync.Mutex
+	items  []protocol.TranscriptItem
+	more   bool
+	liveID string
+	serial uint64
+}
+
+func clipTranscript(s string) (string, bool) {
+	if len(s) <= transcriptTextLimit {
+		return s, false
+	}
+	n := transcriptTextLimit
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n], true
+}
+
+func (t *transcriptState) put(item protocol.TranscriptItem) {
+	if t.index != nil {
+		ordinal := t.index[item.ID]
+		if ordinal == 0 {
+			ordinal = uint64(len(t.index)) + 1
+			t.index[item.ID] = ordinal
+		}
+		if t.before > 0 && ordinal >= t.before {
+			return
+		}
+		if len(t.items) > 0 && ordinal < t.index[t.items[0].ID] {
+			return
+		}
+	}
+	var clipped bool
+	item.Text, clipped = clipTranscript(item.Text)
+	item.Truncated = item.Truncated || clipped
+	item.Args = append(json.RawMessage(nil), item.Args...)
+	if len(item.Args) > transcriptTextLimit {
+		item.Args = nil
+		item.Truncated = true
+	}
+	for i := range t.items {
+		if t.items[i].ID == item.ID {
+			t.items[i] = item
+			return
+		}
+	}
+	t.items = append(t.items, item)
+	window := t.window
+	if window <= 0 {
+		window = transcriptWindow
+	}
+	if len(t.items) > window {
+		t.items = append([]protocol.TranscriptItem(nil), t.items[len(t.items)-window:]...)
+		t.more = true
+	}
+}
+
+func (t *transcriptState) snapshot() ([]protocol.TranscriptItem, bool) {
+	if t == nil {
+		return nil, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	items := append([]protocol.TranscriptItem(nil), t.items...)
+	for i := range items {
+		items[i].Args = append(json.RawMessage(nil), items[i].Args...)
+	}
+	return items, t.more
+}
+
+func (t *transcriptState) facts(events []session.Event) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, fact := range events {
+		switch fact.Type() {
+		case session.EventTypeInputQueued, session.EventTypeInputCancelled, session.EventTypeAssistantCommitted, session.EventTypeToolStarted, session.EventTypeToolFinished, session.EventTypeTurnFinished, session.EventTypeConversationReset:
+		default:
+			continue
+		}
+		// Normalize through the sealed codec to handle both live values and replay pointers.
+		b, err := json.Marshal(fact)
+		if err != nil {
+			continue
+		}
+		switch fact.Type() {
+		case session.EventTypeConversationReset:
+			if t.index == nil {
+				t.items = nil
+				t.more = false
+				t.liveID = ""
+			}
+		case session.EventTypeInputQueued:
+			var e session.InputQueued
+			if json.Unmarshal(b, &e) != nil {
+				continue
+			}
+			id := e.MessageID
+			if id == "" {
+				id = inputMessageID(e.InputID)
+			}
+			t.put(protocol.TranscriptItem{ID: id, Kind: "user", Text: e.Text, Status: "queued"})
+		case session.EventTypeInputCancelled:
+			var e session.InputCancelled
+			if json.Unmarshal(b, &e) != nil {
+				continue
+			}
+			for _, item := range t.items {
+				if item.ID == inputMessageID(e.InputID) {
+					item.Status = "cancelled"
+					t.put(item)
+					break
+				}
+			}
+		case session.EventTypeAssistantCommitted:
+			var e session.AssistantCommitted
+			if json.Unmarshal(b, &e) != nil {
+				continue
+			}
+			var text strings.Builder
+			for _, block := range e.Message.Content {
+				if block.Kind == session.ContentText {
+					text.WriteString(block.Text)
+				}
+			}
+			previousID := ""
+			if t.liveID != "" && e.Message.Role == "assistant" {
+				previousID = t.liveID
+				for i := range t.items {
+					if t.items[i].ID == t.liveID {
+						t.items[i].ID = e.Message.MessageID
+					}
+				}
+				t.liveID = ""
+			}
+			if text.Len() > 0 {
+				t.put(protocol.TranscriptItem{ID: e.Message.MessageID, PreviousID: previousID, Kind: e.Message.Role, TurnID: protocol.TurnID(e.TurnID), Text: text.String(), Status: "completed"})
+			}
+			for _, block := range e.Message.Content {
+				if block.ToolCall != nil {
+					call := block.ToolCall
+					t.put(protocol.TranscriptItem{ID: toolTranscriptID(e.TurnID, e.StepID, call.CallID), Kind: "tool", TurnID: protocol.TurnID(e.TurnID), StepID: protocol.StepID(e.StepID), CallID: protocol.CallID(call.CallID), Tool: call.ToolID, Args: call.Arguments, Status: "queued"})
+				}
+				if block.ToolResult != nil {
+					result := block.ToolResult
+					id := toolTranscriptID(e.TurnID, e.StepID, result.CallID)
+					item := protocol.TranscriptItem{ID: id, Kind: "tool", TurnID: protocol.TurnID(e.TurnID), CallID: protocol.CallID(result.CallID), Text: result.Text, Status: result.Status}
+					found := false
+					for _, old := range t.items {
+						if old.ID == id {
+							found = true
+							if old.Status == "queued" {
+								old.Text, old.Status = result.Text, result.Status
+								old.Truncated = result.Blob != nil
+								t.put(old)
+							}
+							break
+						}
+					}
+					if !found {
+						t.put(item)
+					}
+				}
+			}
+		case session.EventTypeToolStarted:
+			var e session.ToolStarted
+			if json.Unmarshal(b, &e) != nil {
+				continue
+			}
+			t.put(protocol.TranscriptItem{ID: toolTranscriptID(e.TurnID, e.StepID, e.Call.CallID), Kind: "tool", TurnID: protocol.TurnID(e.TurnID), StepID: protocol.StepID(e.StepID), CallID: protocol.CallID(e.Call.CallID), Tool: e.Call.ToolID, Args: e.Call.Arguments, Status: "running"})
+		case session.EventTypeToolFinished:
+			var e session.ToolFinished
+			if json.Unmarshal(b, &e) != nil {
+				continue
+			}
+			id := toolTranscriptID(e.TurnID, e.StepID, e.CallID)
+			item := protocol.TranscriptItem{ID: id, Kind: "tool", CallID: protocol.CallID(e.CallID), TurnID: protocol.TurnID(e.TurnID)}
+			for _, old := range t.items {
+				if old.ID == id {
+					item = old
+					break
+				}
+			}
+			item.Text, item.Status = e.Result.Text, e.Status
+			item.Truncated = e.RawOutput != nil && e.RawOutput.Size > int64(len(item.Text)) || e.Result.Blob != nil
+			if item.Text == "" {
+				item.Text = e.Error
+			}
+			t.put(item)
+		case session.EventTypeTurnFinished:
+			var e session.TurnFinished
+			if json.Unmarshal(b, &e) != nil {
+				continue
+			}
+			if t.liveID != "" {
+				for i := range t.items {
+					if t.items[i].ID == t.liveID {
+						t.items[i].Status = "interrupted"
+					}
+				}
+				t.liveID = ""
+			}
+			if e.Error != "" {
+				t.put(protocol.TranscriptItem{ID: "error:" + e.TurnID, Kind: "error", Text: e.Error, TurnID: protocol.TurnID(e.TurnID), Status: e.Outcome})
+			}
+		}
+	}
+}
+
+func (t *transcriptState) event(ev protocol.EventView) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch ev.Kind {
+	case protocol.EventStream:
+		if t.liveID == "" {
+			t.serial++
+			t.liveID = fmt.Sprintf("stream:%s:%d", ev.TurnID, t.serial)
+		}
+		item := protocol.TranscriptItem{ID: t.liveID, Kind: "assistant", TurnID: ev.TurnID, Status: "streaming"}
+		for _, old := range t.items {
+			if old.ID == item.ID {
+				item = old
+				break
+			}
+		}
+		if !item.Truncated {
+			item.Text += ev.Text
+		}
+		t.put(item)
+	case protocol.EventToolProgress:
+		if ev.Tool == nil {
+			return
+		}
+		id := toolEventTranscriptID(ev)
+		for _, old := range t.items {
+			if old.ID == id && old.Status == "running" {
+				if !old.Truncated {
+					old.Text += ev.Tool.Output
+				}
+				t.put(old)
+				return
+			}
+		}
+	}
+}
+
+// Attach an owned, cumulative preview to a live event. A subscriber opening
+// halfway through a message can upsert by ID without duplicating the prefix.
+func (t *transcriptState) eventItem(ev protocol.EventView) *protocol.TranscriptItem {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	id := ""
+	if ev.Kind == protocol.EventStream {
+		id = t.liveID
+	}
+	if ev.Tool != nil {
+		id = toolEventTranscriptID(ev)
+	}
+	if id == "" {
+		return nil
+	}
+	for _, item := range t.items {
+		if item.ID == id {
+			copy := item
+			copy.Args = append(json.RawMessage(nil), item.Args...)
+			return &copy
+		}
+	}
+	return nil
+}
+
+func transcriptFromRecords(records []session.Record) *transcriptState {
+	t := &transcriptState{}
+	for _, record := range records {
+		t.facts([]session.Event{record.Event})
+	}
+	return t
+}

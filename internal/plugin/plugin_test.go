@@ -226,27 +226,27 @@ func (f *fakeProvider) Stream(context.Context, llm.CompletionRequest, func(strin
 	return llm.StreamResult{}, nil
 }
 
-func TestModelRegistryResolve(t *testing.T) {
+func TestModelRegistryResolveRoute(t *testing.T) {
 	r := NewModelRegistry()
 	a := &fakeProvider{name: "p-a"}
 	b := &fakeProvider{name: "p-b"}
 	r.Register(a)
 	r.Register(b)
 	// No route and two providers → ambiguous → nil.
-	if p := r.Resolve("model-x"); p != nil {
-		t.Fatal("expected nil for ambiguous resolve")
+	if p, ok := r.ResolveRoute("model-x"); ok || p != nil {
+		t.Fatal("expected no route for ambiguous resolve")
 	}
 	r.Route("model-x", "p-b")
-	if p := r.Resolve("model-x"); p != b {
+	if p, ok := r.ResolveRoute("model-x"); !ok || p != b {
 		t.Fatal("expected routed provider p-b")
 	}
 	r.Unregister("p-b")
-	// The model route was removed; the sole remaining provider becomes the fallback.
-	if p := r.Resolve("model-x"); p != a {
-		t.Fatal("expected sole provider fallback after removal")
+	// The model route was removed; no implicit sole-provider fallback is allowed.
+	if p, ok := r.ResolveRoute("model-x"); ok || p != nil {
+		t.Fatal("expected no route after unregistering p-b")
 	}
-	if p := r.Resolve("p-a"); p != a {
-		t.Fatal("expected sole remaining provider")
+	if p, ok := r.ResolveRoute("p-a"); !ok || p != a {
+		t.Fatal("expected exact provider-name route")
 	}
 }
 
@@ -259,6 +259,52 @@ func TestModelRegistryDisposer(t *testing.T) {
 	dispose()
 	if len(r.Names()) != 0 {
 		t.Fatal("provider should be gone after dispose")
+	}
+}
+
+func TestModelRegistryDisposerDoesNotRemoveReplacement(t *testing.T) {
+	r := NewModelRegistry()
+	first := &fakeProvider{name: "same"}
+	second := &fakeProvider{name: "same"}
+	oldDispose := r.Register(first)
+	r.Route("alias", "same")
+	newDispose := r.Register(second)
+	oldDispose()
+	if got, ok := r.ResolveRoute("alias"); !ok || got != second {
+		t.Fatalf("old disposer removed replacement route: provider=%v ok=%v", got, ok)
+	}
+	newDispose()
+	if got, ok := r.ResolveRoute("alias"); ok || got != nil {
+		t.Fatalf("replacement disposer left route: provider=%v ok=%v", got, ok)
+	}
+}
+
+func TestModelRegistryFreezeKeepsOldProvider(t *testing.T) {
+	r := NewModelRegistry()
+	first := &fakeProvider{name: "same"}
+	r.Register(first)
+	r.Route("alias", "same")
+	frozen := r.Freeze()
+	second := &fakeProvider{name: "same"}
+	r.Register(second)
+	if got, ok := frozen.ResolveRoute("alias"); !ok || got != first {
+		t.Fatalf("frozen registry changed after replacement: provider=%v ok=%v", got, ok)
+	}
+	if got, ok := r.ResolveRoute("alias"); !ok || got != second {
+		t.Fatalf("live registry did not follow replacement: provider=%v ok=%v", got, ok)
+	}
+}
+
+func TestModelRegistryDefaultRouteMatchesConnection(t *testing.T) {
+	r := NewModelRegistry()
+	p := &fakeProvider{name: "model"}
+	r.Register(p)
+	r.RouteDefault("model", "model", "https://a.example/v1", "key-a")
+	if got, ok := r.ResolveDefault("model", "https://a.example/v1", "key-a"); !ok || got != p {
+		t.Fatalf("expected matching default route: provider=%v ok=%v", got, ok)
+	}
+	if got, ok := r.ResolveDefault("model", "https://b.example/v1", "key-b"); ok || got != nil {
+		t.Fatalf("stale default route reused: provider=%v ok=%v", got, ok)
 	}
 }
 

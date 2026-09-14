@@ -15,6 +15,13 @@ func TestSanitizeANSI(t *testing.T) {
 		{"title \x1b]0;evil\x07here", "title here"},
 		{"cursor \x1b[2J\x1b[Hclear", "cursor clear"},
 		{"two-byte \x1bMesc", "two-byte esc"},
+		{"save \x1b7cursor\x1b8 restore", "save cursor restore"},
+		{"dcs \x1bPpayload\x1b\\safe", "dcs safe"},
+		{"unfinished \x1b]0;title", "unfinished "},
+		{"trailing escape\x1b", "trailing escape"},
+		{"c1 \x9b2Jsafe", "c1 safe"},
+		{"other\x01\x0b\x0c\x7fcontrols", "othercontrols"},
+		{"\t中文 e\u0301 👨‍👩‍👧‍👦\n", "\t中文 e\u0301 👨‍👩‍👧‍👦\n"},
 		{"", ""},
 		// C0 control characters that can spoof the display.
 		{"line1\rline2", "line1line2"},

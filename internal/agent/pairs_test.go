@@ -47,7 +47,7 @@ func TestSanitizeToolPairsDropsOrphanResults(t *testing.T) {
 	if got[1].Role != messages.RoleAssistant || len(got[1].ToolCalls) != 1 {
 		t.Errorf("message 1 = (%s, %d calls), want assistant keeping its call", got[1].Role, len(got[1].ToolCalls))
 	}
-	if got[2].ToolCallID != "1" || !strings.Contains(got[2].Content, "not executed") {
+	if got[2].ToolCallID != "1" || !strings.Contains(got[2].Content, "execution state is unknown") {
 		t.Errorf("message 2 = (%s, %q), want synthetic result for call 1", got[2].Role, got[2].Content)
 	}
 	if got[3].Role != messages.RoleAssistant || got[3].Content != "done" {
@@ -71,8 +71,8 @@ func TestSanitizeToolPairsFillsMissingResults(t *testing.T) {
 	if got[3].ToolCallID != "1" {
 		t.Errorf("message 3 tool_call_id = %q, want synthetic result for call 1", got[3].ToolCallID)
 	}
-	if !strings.Contains(got[3].Content, "not executed") {
-		t.Errorf("synthetic result content = %q, want 'not executed' guidance", got[3].Content)
+	if !strings.Contains(got[3].Content, "execution state is unknown") {
+		t.Errorf("synthetic result content = %q, want unknown-state guidance", got[3].Content)
 	}
 }
 

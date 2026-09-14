@@ -9,12 +9,24 @@
 package skills
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
+	"unicode/utf8"
+)
+
+// Skill files are extension-provided input, not trusted bounded metadata.
+// Limit reads before allocation so a malformed SKILL.md cannot consume an
+// arbitrary amount of memory while the session is being constructed.
+const (
+	DefaultMaxSkillFileBytes   = 256 << 10
+	DefaultMaxSkillsIndexBytes = 128 << 10
 )
 
 // Skill is one loaded skill.
@@ -47,16 +59,26 @@ func NewStore() *Store {
 // Load scans userDir and each project dir for skills and populates the store.
 // Project skills override user skills; within projects, earlier dirs win.
 func (s *Store) Load(userDir string, projectDirs ...string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	_ = s.load(userDir, false, projectDirs...)
+}
 
+// LoadChecked is the error-returning form of Load. Missing SKILL.md files are
+// optional during directory discovery and remain ignored; a present special
+// file, oversized body, or other read failure is returned so a caller that
+// selected or trusted that input can surface the problem instead of silently
+// dropping it. The store is swapped only after a complete successful scan.
+func (s *Store) LoadChecked(userDir string, projectDirs ...string) error {
+	return s.load(userDir, true, projectDirs...)
+}
+
+func (s *Store) load(userDir string, strict bool, projectDirs ...string) error {
 	dirs := make([]string, 0, len(projectDirs)+1)
 	dirs = append(dirs, userDir)
 	dirs = append(dirs, projectDirs...)
 
 	seen := map[string]bool{}
-	s.skills = s.skills[:0]
-	s.byName = map[string]Skill{}
+	loadedSkills := make([]Skill, 0)
+	loadedByName := make(map[string]Skill)
 
 	// De-duplication is first-come-first-served, so process earlier project
 	// dirs first (the first project dir wins the slot) and the user dir last
@@ -69,9 +91,31 @@ func (s *Store) Load(userDir string, projectDirs ...string) {
 		if dir == "" {
 			continue
 		}
+		dirInfo, err := os.Stat(dir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if !strict {
+				continue
+			}
+			return fmt.Errorf("skills: stat directory %q: %w", dir, err)
+		}
+		if !dirInfo.IsDir() {
+			if !strict {
+				continue
+			}
+			return fmt.Errorf("skills: %q is not a directory", dir)
+		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if !strict {
+				continue
+			}
+			return fmt.Errorf("skills: read directory %q: %w", dir, err)
 		}
 		for _, e := range entries {
 			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
@@ -79,11 +123,24 @@ func (s *Store) Load(userDir string, projectDirs ...string) {
 			}
 			dirName := e.Name()
 			md := filepath.Join(dir, dirName, "SKILL.md")
-			data, err := os.ReadFile(md)
+			data, truncated, err := readBounded(md, DefaultMaxSkillFileBytes)
 			if err != nil {
-				continue
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				if !strict {
+					continue
+				}
+				return fmt.Errorf("skills: read %q: %w", md, err)
 			}
-			sk := parse(string(data), dirName, filepath.Join(dir, dirName), dir == userDir)
+			if truncated && strict {
+				return fmt.Errorf("skills: %q exceeds %d bytes", md, DefaultMaxSkillFileBytes)
+			}
+			content := string(data)
+			if truncated {
+				content += fmt.Sprintf("\n\n…[skill truncated at %d bytes]", DefaultMaxSkillFileBytes)
+			}
+			sk := parse(content, dirName, filepath.Join(dir, dirName), dir == userDir)
 			if sk.Name == "" || sk.Body == "" {
 				continue
 			}
@@ -92,11 +149,16 @@ func (s *Store) Load(userDir string, projectDirs ...string) {
 				continue
 			}
 			seen[sk.Name] = true
-			s.skills = append(s.skills, sk)
-			s.byName[sk.Name] = sk
+			loadedSkills = append(loadedSkills, sk)
+			loadedByName[sk.Name] = sk
 		}
 	}
-	sort.Slice(s.skills, func(i, j int) bool { return s.skills[i].Name < s.skills[j].Name })
+	sort.Slice(loadedSkills, func(i, j int) bool { return loadedSkills[i].Name < loadedSkills[j].Name })
+	s.mu.Lock()
+	s.skills = loadedSkills
+	s.byName = loadedByName
+	s.mu.Unlock()
+	return nil
 }
 
 // All returns the loaded skills sorted by name.
@@ -118,17 +180,89 @@ func (s *Store) Get(name string) (Skill, bool) {
 
 // SkillsSection renders the skill index for the system prompt.
 func (s *Store) SkillsSection() string {
+	return s.SkillsSectionBounded(DefaultMaxSkillsIndexBytes)
+}
+
+// SkillsSectionBounded renders the cheap skill index with a hard byte cap.
+// Skill bodies are loaded into the store with DefaultMaxSkillFileBytes; only
+// names/descriptions are included here, while ReadSkill applies its own tool
+// output bound when a body is requested.
+func (s *Store) SkillsSectionBounded(maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
 	all := s.All()
 	if len(all) == 0 {
 		return ""
 	}
 	var sb strings.Builder
 	sb.WriteString("\nAvailable skills (call ReadSkill with the exact name to load one):\n")
+	if sb.Len() >= maxBytes {
+		return truncateUTF8(sb.String(), maxBytes)
+	}
 	for _, sk := range all {
 		desc := strings.ReplaceAll(sk.Description, "\n", " ")
-		fmt.Fprintf(&sb, "  - %s: %s\n", sk.Name, desc)
+		line := fmt.Sprintf("  - %s: %s\n", sk.Name, desc)
+		remaining := maxBytes - sb.Len()
+		if len(line) > remaining {
+			if remaining > 0 {
+				sb.WriteString(truncateUTF8(line, remaining))
+			}
+			break
+		}
+		sb.WriteString(line)
 	}
 	return sb.String()
+}
+
+func truncateUTF8(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+func readBounded(path string, maxBytes int) ([]byte, bool, error) {
+	if maxBytes <= 0 {
+		return nil, false, fmt.Errorf("skills: invalid read limit")
+	}
+	// A skill is a file-backed input, not a stream.  Check before opening so a
+	// FIFO cannot block session construction, then check the opened descriptor
+	// as well in case the path was replaced between the checks.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("skills: %s is not a regular file", path)
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	openedInfo, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if !openedInfo.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("skills: %s is not a regular file", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(data) > maxBytes {
+		return data[:maxBytes], true, nil
+	}
+	return data, false, nil
 }
 
 // parse splits frontmatter and body from a SKILL.md file.

@@ -36,6 +36,9 @@ func (t *ReadSkillTool) Parameters() map[string]any {
 }
 
 func (t *ReadSkillTool) Run(ctx *Context) (string, error) {
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
 	name := StringArg(ctx.Args, "name", "")
 	if name == "" {
 		return "", fmt.Errorf("ReadSkill: name is required")
@@ -52,5 +55,5 @@ func (t *ReadSkillTool) Run(ctx *Context) (string, error) {
 		}
 		return "", fmt.Errorf("ReadSkill: no skill %q (available: %s)", name, strings.Join(names, ", "))
 	}
-	return fmt.Sprintf("# Skill: %s (source: %s)\n\n%s", sk.Name, sk.Source, sk.Body), nil
+	return boundedToolString(ctx, fmt.Sprintf("# Skill: %s (source: %s)\n\n%s", sk.Name, sk.Source, sk.Body)), nil
 }

@@ -1,9 +1,8 @@
 package agent
 
 import (
+	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"ccdp/internal/messages"
 )
@@ -19,40 +18,50 @@ func (a *Agent) resetOutputBudget() {
 // with a preview + path, so the model can re-read them (Claude Code's
 // toolResultStorage). Small results pass through truncated as before.
 func (a *Agent) maybePersistResult(tc messages.ToolCall, out string) string {
-	if len(out) <= a.cfg.MaxResultSizeChars {
-		return truncateResult(out, a.cfg.MaxResultSizeChars)
+	a.mu.Lock()
+	maxChars := a.cfg.MaxResultSizeChars
+	a.mu.Unlock()
+	if maxChars <= 0 {
+		maxChars = toolJournalMaxText
 	}
-	dir := filepath.Join(a.cfg.SessionDir, "outputs")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return truncateResult(out, a.cfg.MaxResultSizeChars)
+	if len(out) <= maxChars {
+		return truncateResult(out, maxChars)
 	}
-	path := filepath.Join(dir, tc.ID+".txt")
-	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
-		return truncateResult(out, a.cfg.MaxResultSizeChars)
+	// The typed journal is the sole owner of complete tool output. This
+	// compatibility path uses the same scoped artifact store and therefore
+	// cannot create a session-shared outputs directory in memory or on disk.
+	p := a.persistenceHandle()
+	if p == nil {
+		return truncateResult(out, maxChars)
 	}
-	preview := truncateResult(out, a.cfg.MaxResultSizeChars/2)
-	return fmt.Sprintf("%s\n\n[Full output: %d chars saved to %s — read it with Read if you need the rest]",
-		preview, len(out), path)
+	ref, err := p.putBlob(context.Background(), []byte(out), "text/plain; charset=utf-8")
+	if err != nil || ref == nil {
+		return truncateResult(out, maxChars)
+	}
+	preview := truncateResult(out, maxChars/2)
+	return fmt.Sprintf("%s\n\n[Full output retained in session artifact %s (%d bytes)]",
+		preview, ref.Hash, ref.Size)
 }
 
 // clipAggregate enforces the per-turn aggregate tool-result budget: once the
 // combined delivered characters exceed the cap, remaining results are clipped
 // to a short preview.
 func (a *Agent) clipAggregate(out string) string {
+	a.mu.Lock()
 	cap := a.cfg.MaxToolOutputCharsPerTurn
+	a.mu.Unlock()
 	if cap <= 0 {
 		return out
 	}
 	a.mu.Lock()
 	used := a.outputBudget
-	a.outputBudget += len(out)
-	a.mu.Unlock()
-	if used >= cap {
-		head := out
-		if len(head) > 2000 {
-			head = head[:2000]
-		}
-		return head + "\n…[aggregate tool output budget exceeded; result clipped]"
+	remaining := cap - used
+	if remaining > 0 {
+		clipped := truncateResult(out, remaining)
+		a.outputBudget += len(clipped)
+		a.mu.Unlock()
+		return clipped
 	}
-	return out
+	a.mu.Unlock()
+	return "…[aggregate tool output budget exhausted; result omitted]"
 }

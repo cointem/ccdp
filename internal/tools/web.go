@@ -50,6 +50,9 @@ func (t *WebFetchTool) Parameters() map[string]any {
 }
 
 func (t *WebFetchTool) Run(ctx *Context) (string, error) {
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
 	raw := StringArg(ctx.Args, "url", "")
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
@@ -59,7 +62,10 @@ func (t *WebFetchTool) Run(ctx *Context) (string, error) {
 		return "", fmt.Errorf("WebFetch: URL %q has no host", raw)
 	}
 
-	maxChars := IntArg(ctx.Args, "max_chars", 8000)
+	maxChars, err := IntArgChecked(ctx.Args, "max_chars", 8000)
+	if err != nil {
+		return "", fmt.Errorf("WebFetch: %w", err)
+	}
 	if maxChars < 256 {
 		maxChars = 256
 	}
@@ -79,7 +85,7 @@ func (t *WebFetchTool) Run(ctx *Context) (string, error) {
 	if text == "" {
 		return "WebFetch: page returned no readable text", nil
 	}
-	return text, nil
+	return boundedToolString(ctx, text), nil
 }
 
 // ---------- WebSearch ----------
@@ -118,11 +124,17 @@ func (t *WebSearchTool) Parameters() map[string]any {
 }
 
 func (t *WebSearchTool) Run(ctx *Context) (string, error) {
+	if err := ctx.checkResources(); err != nil {
+		return "", err
+	}
 	q := StringArg(ctx.Args, "query", "")
 	if strings.TrimSpace(q) == "" {
 		return "", fmt.Errorf("WebSearch: empty query")
 	}
-	max := IntArg(ctx.Args, "max_results", 5)
+	max, err := IntArgChecked(ctx.Args, "max_results", 5)
+	if err != nil {
+		return "", fmt.Errorf("WebSearch: %w", err)
+	}
 	if max < 1 {
 		max = 1
 	}
@@ -145,7 +157,7 @@ func (t *WebSearchTool) Run(ctx *Context) (string, error) {
 	for i, r := range results {
 		fmt.Fprintf(&sb, "\n%d. %s\n   %s\n   %s\n", i+1, r.Title, r.URL, r.Snippet)
 	}
-	return sb.String(), nil
+	return boundedToolString(ctx, sb.String()), nil
 }
 
 // searchResult is one parsed search hit.
@@ -256,6 +268,9 @@ func checkExternalRedirect(req *http.Request, via []*http.Request) error {
 // httpGet performs a GET with a timeout, an SSRF address check (initial URL
 // and every redirect hop) and a browser-ish user agent.
 func httpGet(ctx context.Context, u string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := validateExternalURL(u); err != nil {
 		return nil, err
 	}

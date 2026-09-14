@@ -3,8 +3,12 @@ package hooks
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	"ccdp/internal/sandbox"
 )
 
 func TestPreToolUseDecision(t *testing.T) {
@@ -63,6 +67,21 @@ func TestUserPromptSubmitBlock(t *testing.T) {
 	}
 }
 
+func TestHooksDoNotInheritLoginShell(t *testing.T) {
+	t.Setenv("SHELL", "/definitely/not/a/shell")
+	dir := t.TempDir()
+	m := NewManager(Config{
+		EventUserPromptSubmit: []HookSpec{
+			{Command: `input=$(cat); case "$input" in *portable*) printf '{"decision":"block"}';; esac`},
+		},
+	}, Options{Workspace: dir, Mode: "default"})
+
+	out := m.UserPromptSubmit(context.Background(), "portable hook")
+	if out.Decision != DecisionBlock {
+		t.Fatalf("hook inherited login shell instead of POSIX sh: %+v", out)
+	}
+}
+
 func TestNoHooks(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(nil, Options{Workspace: dir, Mode: "default"})
@@ -71,6 +90,15 @@ func TestNoHooks(t *testing.T) {
 	}
 	if out := m.PreToolUse(context.Background(), "Bash", nil); out.Decision != DecisionNone {
 		t.Error("no hooks should produce no decision")
+	}
+}
+
+func TestSetContextRefreshesHookPayload(t *testing.T) {
+	m := NewManager(nil, Options{SessionID: "old", Workspace: "/old", Mode: "default"})
+	m.SetContext("new", "/new", "acceptEdits")
+	in := m.baseInput(EventPreToolUse)
+	if in.SessionID != "new" || in.CWD != "/new" || in.PermissionMode != "acceptEdits" {
+		t.Fatalf("stale hook context: %+v", in)
 	}
 }
 
@@ -117,6 +145,74 @@ func TestExitOneNonBlocking(t *testing.T) {
 	if out.Reason == "" {
 		t.Error("failure should be recorded for diagnostics")
 	}
+}
+
+func TestStrictObserverHookFailureRemainsBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(Config{
+		EventPostToolUse: []HookSpec{{Command: `false`}},
+	}, Options{Workspace: dir, Mode: "default", Sandbox: sandbox.New(dir, sandbox.ModeStrict), FailClosed: true})
+	out := m.PostToolUse(context.Background(), "Read", nil, "ok")
+	if out.Decision != DecisionNone {
+		t.Fatalf("observer failure must not veto a completed tool: %+v", out)
+	}
+	if out.Reason == "" {
+		t.Fatal("observer failure should remain visible for diagnostics")
+	}
+}
+
+func TestStrictDecisionHookFailureFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(Config{
+		EventPreToolUse: []HookSpec{{Command: `false`}},
+	}, Options{Workspace: dir, Mode: "default", Sandbox: sandbox.New(dir, sandbox.ModeStrict), FailClosed: true})
+	out := m.PreToolUse(context.Background(), "Read", nil)
+	if out.Decision != DecisionDeny {
+		t.Fatalf("decision hook failure must fail closed: %+v", out)
+	}
+	if out.Reason == "" {
+		t.Fatal("fail-closed decision should include a reason")
+	}
+}
+
+func TestConcurrentSetContextAndRunUseOneOptionsSnapshot(t *testing.T) {
+	w1 := t.TempDir()
+	w2 := t.TempDir()
+	// The hook accepts exactly the two complete snapshots below. If Run read
+	// SessionID, Workspace and Mode independently while SetContext updated
+	// them, a mixed tuple would be reported as a deny.
+	command := fmt.Sprintf(`input=$(cat)
+if printf '%%s' "$input" | grep -Fq '"session_id":"s1","cwd":"%s","permission_mode":"default"' || printf '%%s' "$input" | grep -Fq '"session_id":"s2","cwd":"%s","permission_mode":"plan"'; then
+  printf '{"additionalContext":"ok"}'
+else
+  printf '{"decision":"deny","reason":"mixed hook options snapshot"}'
+fi`, w1, w2)
+	m := NewManager(Config{EventPreToolUse: []HookSpec{{Command: command}}}, Options{
+		SessionID: "s1", Workspace: w1, Mode: "default",
+	})
+	stop := make(chan struct{})
+	var setter sync.WaitGroup
+	setter.Add(1)
+	go func() {
+		defer setter.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			m.SetContext("s1", w1, "default")
+			m.SetContext("s2", w2, "plan")
+		}
+	}()
+	for i := 0; i < 20; i++ {
+		out := m.PreToolUse(context.Background(), "Read", nil)
+		if out.Decision == DecisionDeny {
+			t.Fatalf("Run observed a mixed mutable hook context: %+v", out)
+		}
+	}
+	close(stop)
+	setter.Wait()
 }
 
 func TestMatcherFiltersByToolName(t *testing.T) {

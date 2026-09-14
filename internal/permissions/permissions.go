@@ -48,6 +48,31 @@ const (
 	DecisionAsk   Decision = "ask"
 )
 
+// Effect describes the observable capability required by a tool invocation.
+// Unknown is intentionally not treated as read-only; custom and MCP tools
+// must opt into a narrower capability through runtime registration.
+type Effect string
+
+const (
+	EffectRead     Effect = "read"
+	EffectWrite    Effect = "write"
+	EffectNetwork  Effect = "network"
+	EffectProcess  Effect = "process"
+	EffectDelegate Effect = "delegate"
+	EffectPlan     Effect = "plan"
+	EffectUnknown  Effect = "unknown"
+)
+
+// ExecutionMode is the workflow dimension. It is separate from Mode (the
+// permission/approval policy) so plan cannot be accidentally implemented as a
+// second mutable permission mode.
+type ExecutionMode string
+
+const (
+	ExecutionModeExecute ExecutionMode = "execute"
+	ExecutionModePlan    ExecutionMode = "plan"
+)
+
 // Policy is the persistent, config-file-supplied rule set.
 type Policy struct {
 	AlwaysAllow []string `json:"always_allow"`
@@ -66,6 +91,18 @@ type Manager struct {
 	denyMap  map[string]bool // session "never allow" rememberances
 }
 
+// Snapshot is an immutable copy of a session permission manager.  Child
+// runtimes use it at construction time so remembered approvals/denials are
+// retained without sharing the parent's mutable approval maps or lock.
+// Callers must treat the returned slices/maps as private to the snapshot.
+type Snapshot struct {
+	Mode     Mode
+	Policy   Policy
+	AllowAll bool
+	AllowMap map[string]bool
+	DenyMap  map[string]bool
+}
+
 // NewManager builds a permission manager.
 func NewManager(mode Mode, policy Policy) *Manager {
 	return &Manager{
@@ -74,6 +111,53 @@ func NewManager(mode Mode, policy Policy) *Manager {
 		allowMap: map[string]bool{},
 		denyMap:  map[string]bool{},
 	}
+}
+
+// Snapshot returns a deep, credential-free copy of the current policy and
+// session decisions.  It deliberately captures the remembered decisions as
+// well as the configured rules: a child may inherit a decision already made,
+// but it must never be able to mutate the parent's manager.
+func (m *Manager) Snapshot() Snapshot {
+	if m == nil {
+		return Snapshot{}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s := Snapshot{
+		Mode:     m.Mode,
+		Policy:   Policy{AlwaysAllow: append([]string(nil), m.Policy.AlwaysAllow...), AlwaysDeny: append([]string(nil), m.Policy.AlwaysDeny...)},
+		AllowAll: m.AllowAll,
+		AllowMap: make(map[string]bool, len(m.allowMap)),
+		DenyMap:  make(map[string]bool, len(m.denyMap)),
+	}
+	for k, v := range m.allowMap {
+		s.AllowMap[k] = v
+	}
+	for k, v := range m.denyMap {
+		s.DenyMap[k] = v
+	}
+	return s
+}
+
+// NewManagerFromSnapshot constructs an independent manager from a frozen
+// snapshot.  The resulting manager can be safely changed by a child runtime
+// without affecting the source session.
+func NewManagerFromSnapshot(s Snapshot) *Manager {
+	m := NewManager(s.Mode, s.Policy)
+	m.AllowAll = s.AllowAll
+	for k, v := range s.AllowMap {
+		m.allowMap[k] = v
+	}
+	for k, v := range s.DenyMap {
+		m.denyMap[k] = v
+	}
+	return m
+}
+
+// Clone returns an independent copy of the manager, including its
+// session-scoped remembered decisions.
+func (m *Manager) Clone() *Manager {
+	return NewManagerFromSnapshot(m.Snapshot())
 }
 
 // SetMode switches the permission mode at runtime.
@@ -86,7 +170,21 @@ func (m *Manager) SetMode(mode Mode) {
 // SetPolicy replaces the persistent rule set at runtime (settings reload).
 func (m *Manager) SetPolicy(p Policy) {
 	m.mu.Lock()
-	m.Policy = p
+	m.Policy = Policy{
+		AlwaysAllow: append([]string(nil), p.AlwaysAllow...),
+		AlwaysDeny:  append([]string(nil), p.AlwaysDeny...),
+	}
+	m.mu.Unlock()
+}
+
+// SetAllowAll updates bypass mode under the manager lock. Bypass skips normal
+// approval prompts but never bypasses HardDeny or plan capability limits.
+func (m *Manager) SetAllowAll(allow bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.AllowAll = allow
 	m.mu.Unlock()
 }
 
@@ -124,27 +222,29 @@ func CommandKey(command string) string { return "command:" + command }
 // outrank even a session-remembered allow, so a "remember for this session"
 // decision can never bypass always_deny.
 func (m *Manager) Check(toolName string, args map[string]any) (Decision, string) {
+	if m == nil {
+		return DecisionDeny, "permission manager is nil"
+	}
+	if denied, reason := m.HardDeny(toolName, args); denied {
+		return DecisionDeny, reason
+	}
 	m.mu.RLock()
 	mode, allowAll := m.Mode, m.AllowAll
 	policy := m.Policy
-	_, deniedSession := m.denyMap[SessionKey(toolName, args)]
 	_, allowedSession := m.allowMap[SessionKey(toolName, args)]
 	m.mu.RUnlock()
-
-	if allowAll || mode == ModeBypass {
-		return DecisionAllow, "bypass mode"
-	}
 
 	// Rules are matched against the canonical invocation descriptor
 	// ("Bash:<cmd>", "Write:<path>"), not the session-rememberance key form.
 	invocation := describeInvocation(toolName, args)
-	for _, deny := range policy.AlwaysDeny {
-		if ruleMatches(deny, toolName, invocation) {
-			return DecisionDeny, fmt.Sprintf("denied by always_deny rule %q", deny)
+	// Plan is an execution capability cap, not an approval setting. Evaluate it
+	// before allow rules and bypass so an allow hook/rule cannot turn plan into
+	// execute mode. Existing ModePlan behavior is retained for compatibility;
+	// new runtimes should use ExecutionMode + PlanAllows.
+	if mode == ModePlan {
+		if ok, reason := PlanAllows(toolName, args); !ok {
+			return DecisionAsk, reason
 		}
-	}
-	if deniedSession {
-		return DecisionDeny, "denied by session rule"
 	}
 	for _, allow := range policy.AlwaysAllow {
 		if ruleMatches(allow, toolName, invocation) {
@@ -153,6 +253,9 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 	}
 	if allowedSession {
 		return DecisionAllow, "allowed by session rule"
+	}
+	if allowAll || mode == ModeBypass {
+		return DecisionAllow, "bypass mode"
 	}
 
 	// Tool-specific classification.
@@ -176,7 +279,7 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 		}
 	case "Read", "Glob", "Grep", "LS", "TodoWrite",
 		"GitStatus", "GitDiff", "GitLog",
-		"ToolSearch", "ReadSkill", "EnterPlanMode", "ExitPlanMode":
+		"ToolSearch", "ReadSkill", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion":
 		return DecisionAllow, "read-only tool"
 	case "GitCommit":
 		// Mutates history; bypass mode alone skips the gate.
@@ -184,6 +287,16 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 			return DecisionAllow, "bypass mode"
 		}
 		return DecisionAsk, "GitCommit requires approval (mutates repository history)"
+	case "Agent":
+		switch StringArg(args, "action", "") {
+		case "list", "read", "output", "wait":
+			return DecisionAllow, "read-only child observation"
+		default:
+			if mode == ModePlan {
+				return DecisionDeny, "child control is unavailable in plan mode"
+			}
+			return DecisionAllow, "control within an existing delegated session; child policy remains enforced"
+		}
 	case "WebFetch", "WebSearch":
 		// Network access is a side effect; ask outside bypass mode.
 		if mode == ModeBypass {
@@ -194,6 +307,114 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 
 	// Unknown tool: ask to be safe.
 	return DecisionAsk, fmt.Sprintf("unknown tool %q", toolName)
+}
+
+// HardDeny reports a denial that no ordinary allow, bypass mode or approval
+// hook may override. It is intentionally narrow so runtime can run it as the
+// first admission check for custom tools and hooks.
+func (m *Manager) HardDeny(toolName string, args map[string]any) (bool, string) {
+	if m == nil {
+		return true, "permission manager is nil"
+	}
+	m.mu.RLock()
+	policy := m.Policy
+	_, deniedSession := m.denyMap[SessionKey(toolName, args)]
+	m.mu.RUnlock()
+	invocation := describeInvocation(toolName, args)
+	for _, deny := range policy.AlwaysDeny {
+		if ruleMatches(deny, toolName, invocation) {
+			return true, fmt.Sprintf("denied by always_deny rule %q", deny)
+		}
+	}
+	if deniedSession {
+		return true, "denied by session rule"
+	}
+	if toolName == "Bash" {
+		command := strings.TrimSpace(StringArg(args, "command", ""))
+		for _, pat := range denyPatterns {
+			if pat.re.MatchString(command) {
+				return true, fmt.Sprintf("dangerous command pattern: %s", pat.desc)
+			}
+		}
+	}
+	return false, ""
+}
+
+// CheckDenial is the decision-shaped form of HardDeny for runtimes that use
+// Decision values throughout their admission pipeline.
+func (m *Manager) CheckDenial(toolName string, args map[string]any) (Decision, string) {
+	if denied, reason := m.HardDeny(toolName, args); denied {
+		return DecisionDeny, reason
+	}
+	return DecisionAllow, "no hard deny"
+}
+
+// IsHardDenied is a compact bool-only helper for hooks and adapters.
+func (m *Manager) IsHardDenied(toolName string, args map[string]any) bool {
+	denied, _ := m.HardDeny(toolName, args)
+	return denied
+}
+
+// InvocationEffects returns the conservative effects of a built-in tool.
+// Custom/MCP tools should supply EffectUnknown unless their registration has
+// independently verified a narrower capability.
+func InvocationEffects(toolName string, args map[string]any) []Effect {
+	switch toolName {
+	case "Agent":
+		switch StringArg(args, "action", "") {
+		case "list", "read", "output", "wait":
+			return []Effect{EffectRead}
+		default:
+			return []Effect{EffectDelegate}
+		}
+	case "Read", "Glob", "Grep", "LS", "GitStatus", "GitDiff", "GitLog", "ToolSearch", "ReadSkill":
+		return []Effect{EffectRead}
+	case "TodoWrite", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion":
+		return []Effect{EffectPlan}
+	case "Write", "Edit", "GitCommit":
+		return []Effect{EffectWrite}
+	case "Bash", "ProcessStart", "ProcessWrite", "ProcessOutput", "ProcessStop":
+		return []Effect{EffectProcess}
+	case "WebFetch", "WebSearch":
+		return []Effect{EffectNetwork}
+	case "Task":
+		return []Effect{EffectDelegate}
+	default:
+		return []Effect{EffectUnknown}
+	}
+}
+
+// PlanAllows enforces the default plan capability cap. It is deliberately
+// independent of allow/deny rules: a runtime may apply a narrower cap, but it
+// cannot widen this default for an unclassified/custom capability.
+func PlanAllows(toolName string, args map[string]any) (bool, string) {
+	effects := InvocationEffects(toolName, args)
+	for _, effect := range effects {
+		switch effect {
+		case EffectRead, EffectPlan:
+			continue
+		case EffectNetwork:
+			return false, fmt.Sprintf("%s is not available in plan mode without an explicit network workflow", toolName)
+		case EffectWrite, EffectProcess, EffectDelegate, EffectUnknown:
+			return false, fmt.Sprintf("%s requires execute capability and is not available in plan mode", toolName)
+		}
+	}
+	return true, "read-only/plan capability"
+}
+
+// CheckExecution applies an explicit workflow mode while retaining this
+// Manager's permission policy. Runtime should call HardDeny first (or rely on
+// this method's first step), then use the returned decision for approval.
+func (m *Manager) CheckExecution(mode ExecutionMode, toolName string, args map[string]any) (Decision, string) {
+	if denied, reason := m.HardDeny(toolName, args); denied {
+		return DecisionDeny, reason
+	}
+	if mode == ExecutionModePlan {
+		if ok, reason := PlanAllows(toolName, args); !ok {
+			return DecisionAsk, reason
+		}
+	}
+	return m.Check(toolName, args)
 }
 
 func (m *Manager) checkBash(mode Mode, command string) (Decision, string) {
@@ -345,6 +566,20 @@ func hasDangerousOperator(s string) bool {
 	for _, op := range []string{">", ">>", "|", ";", "&&", "||", "$(", "`", "\n"} {
 		if strings.Contains(s, op) {
 			return true
+		}
+	}
+	// find is syntactically a read command, but these primaries execute a
+	// mutation or an arbitrary child command. They must not inherit the
+	// read-only first-token allowlist. Keep this token check conservative and
+	// exact so names such as "-delete-old" are not rejected accidentally.
+	if firstToken(s) == "find" {
+		for _, token := range strings.Fields(s) {
+			token = strings.Trim(token, "\"'")
+			switch token {
+			case "-delete", "-exec", "-execdir", "-ok", "-okdir",
+				"-fls", "-fprint", "-fprint0", "-fprintf":
+				return true
+			}
 		}
 	}
 	return false

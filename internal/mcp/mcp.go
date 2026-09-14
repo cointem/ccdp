@@ -18,11 +18,17 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"ccdp/internal/execution"
+	"ccdp/internal/sandbox"
 )
 
 // ServerConfig describes how to launch one MCP server (config.json
@@ -74,6 +80,11 @@ const startupTimeout = 10 * time.Second
 // no recovery path, so it is deliberately generous.
 const maxLineLen = 32 * 1024 * 1024
 
+// maxMCPStderr bounds diagnostics retained from a long-lived server. Stderr
+// is useful for troubleshooting but must not provide an unbounded memory sink
+// for a misbehaving child process.
+const maxMCPStderr = 64 * 1024
+
 // ssePostTimeout bounds one HTTP POST to the SSE messages endpoint. The write
 // helpers do not thread a context, so without this bound a hung endpoint would
 // hold writeMu forever and freeze every subsequent write.
@@ -81,17 +92,19 @@ const ssePostTimeout = 120 * time.Second
 
 // Client is one MCP server connection over stdio.
 type Client struct {
-	name string
-	cfg  ServerConfig
+	name    string
+	cfg     ServerConfig
+	sandbox *sandbox.Sandbox
 
 	mu      sync.Mutex
 	nextID  int
 	pending map[int]chan json.RawMessage
 	writeMu sync.Mutex // serializes stdin writes
 
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	closed chan struct{} // closed when the process exits or Close is called
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	procCancel context.CancelFunc
+	closed     chan struct{} // closed when the process exits or Close is called
 
 	// closeOnce guards the closed-channel close + pending drain + onClose
 	// notification so every death path (process exit, SSE stream end, explicit
@@ -113,6 +126,14 @@ type Client struct {
 	// onChange fires after the tool list changes at runtime
 	// (notifications/tools/list_changed), so the manager can re-register.
 	onChange func()
+
+	// refreshMu coalesces a burst of tools/list_changed notifications into one
+	// in-flight refresh plus at most one follow-up. A server must not be able
+	// to create an unbounded goroutine storm by emitting notifications faster
+	// than tools/list can complete.
+	refreshMu      sync.Mutex
+	refreshRunning bool
+	refreshPending bool
 }
 
 // SetChangeListener registers a callback invoked when the server's tool list
@@ -170,6 +191,17 @@ func NewClient(name string, cfg ServerConfig) *Client {
 	}
 }
 
+// SetSandbox binds future stdio starts to the manager's current execution
+// policy. A running client is not mutated: refresh creates a new generation.
+func (c *Client) SetSandbox(sb *sandbox.Sandbox) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.sandbox = sb
+	c.mu.Unlock()
+}
+
 // Name returns the server name.
 func (c *Client) Name() string { return c.name }
 
@@ -185,28 +217,52 @@ func (c *Client) Tools() []ToolDef {
 // Start launches the server (stdio process or SSE endpoint) and performs the
 // MCP handshake: initialize → notifications/initialized → tools/list.
 func (c *Client) Start(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if strings.EqualFold(c.cfg.Transport, "sse") {
 		return c.startSSE(ctx)
 	}
-	cmd := exec.Command(c.cfg.Command, c.cfg.Args...)
-	cmd.Env = append(os.Environ(), envSlice(c.cfg.Env)...)
+	c.mu.Lock()
+	sb := c.sandbox
+	c.mu.Unlock()
+	// The caller's context bounds preparation/handshake, not the lifetime of
+	// the long-lived MCP process. Manager.Close owns procCancel after startup.
+	procCtx, procCancel := context.WithCancel(context.Background())
+	cmd, err := execution.StartArgv(execution.StartRequest{
+		Context: procCtx,
+		Argv:    append([]string{c.cfg.Command}, c.cfg.Args...),
+		Env:     mcpEnvironment(c.cfg.Env),
+		Sandbox: sb,
+	})
+	if err != nil {
+		procCancel()
+		return fmt.Errorf("mcp %s: prepare process: %w", c.name, err)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		procCancel()
 		return fmt.Errorf("mcp %s: stdin: %w", c.name, err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		procCancel()
 		return fmt.Errorf("mcp %s: stdout: %w", c.name, err)
 	}
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
+	stderr := &boundedBuffer{limit: maxMCPStderr}
+	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
+		procCancel()
 		return fmt.Errorf("mcp %s: start %s: %w", c.name, c.cfg.Command, err)
 	}
 	c.cmd = cmd
 	c.stdin = stdin
+	c.procCancel = procCancel
 
 	go c.readLoop(stdout)
 
@@ -219,11 +275,11 @@ func (c *Client) Start(ctx context.Context) error {
 		"clientInfo":      map[string]any{"name": "ccdp", "version": "0.2.0"},
 	}); err != nil {
 		_ = c.Close()
-		return fmt.Errorf("mcp %s: initialize: %w", c.name, err)
+		return fmt.Errorf("mcp %s: initialize: %w%s", c.name, err, mcpDiagnosticSuffix(stderr, c.cfg))
 	}
 	if err := c.notify("notifications/initialized", map[string]any{}); err != nil {
 		_ = c.Close()
-		return fmt.Errorf("mcp %s: initialized: %w", c.name, err)
+		return fmt.Errorf("mcp %s: initialized: %w%s", c.name, err, mcpDiagnosticSuffix(stderr, c.cfg))
 	}
 
 	var list struct {
@@ -231,7 +287,7 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 	if err := c.requestJSON(ctx, "tools/list", map[string]any{}, &list); err != nil {
 		_ = c.Close()
-		return fmt.Errorf("mcp %s: tools/list: %w", c.name, err)
+		return fmt.Errorf("mcp %s: tools/list: %w%s", c.name, err, mcpDiagnosticSuffix(stderr, c.cfg))
 	}
 	c.mu.Lock()
 	c.tools = list.Tools
@@ -317,6 +373,37 @@ func (c *Client) refreshTools() {
 	if fn != nil {
 		fn()
 	}
+}
+
+// scheduleRefresh runs one tools/list refresh at a time and coalesces any
+// notifications observed while that request is in flight. The pending bit is
+// deliberately a single bit: all notifications mean the same thing (the
+// current list may have changed), so retaining every event has no value.
+func (c *Client) scheduleRefresh() {
+	if c == nil {
+		return
+	}
+	c.refreshMu.Lock()
+	if c.refreshRunning {
+		c.refreshPending = true
+		c.refreshMu.Unlock()
+		return
+	}
+	c.refreshRunning = true
+	c.refreshMu.Unlock()
+	go func() {
+		for {
+			c.refreshTools()
+			c.refreshMu.Lock()
+			if !c.refreshPending {
+				c.refreshRunning = false
+				c.refreshMu.Unlock()
+				return
+			}
+			c.refreshPending = false
+			c.refreshMu.Unlock()
+		}
+	}()
 }
 
 // Resources lists the resources advertised by the server (resources/list).
@@ -465,7 +552,16 @@ func (c *Client) startSSE(ctx context.Context) error {
 	go c.sseReadLoop(resp.Body, messagesCh, done)
 
 	select {
-	case c.messagesURL = <-messagesCh:
+	case endpoint := <-messagesCh:
+		messagesURL, resolveErr := resolveSSEEndpoint(c.cfg.BaseURL, endpoint)
+		if resolveErr != nil {
+			c.sseCancel()
+			c.fireClosed()
+			return fmt.Errorf("mcp %s: sse endpoint: %w", c.name, resolveErr)
+		}
+		c.mu.Lock()
+		c.messagesURL = messagesURL
+		c.mu.Unlock()
 	case <-c.sseCtx.Done():
 		c.sseCancel()
 		c.fireClosed()
@@ -475,13 +571,45 @@ func (c *Client) startSSE(ctx context.Context) error {
 		c.fireClosed()
 		return fmt.Errorf("mcp %s: sse endpoint event timeout", c.name)
 	}
-	if c.messagesURL == "" {
+	c.mu.Lock()
+	messagesURLSet := c.messagesURL != ""
+	c.mu.Unlock()
+	if !messagesURLSet {
 		c.sseCancel()
 		c.fireClosed()
 		return fmt.Errorf("mcp %s: sse endpoint event missing", c.name)
 	}
 
 	return c.handshake(ctx)
+}
+
+// resolveSSEEndpoint resolves the endpoint advertised by an SSE server
+// against the configured stream URL. MCP servers commonly advertise a
+// relative path (for example "/messages"); passing that raw path to
+// http.NewRequest would fail or accidentally target the wrong host.
+func resolveSSEEndpoint(base, endpoint string) (string, error) {
+	baseURL, err := url.Parse(strings.TrimSpace(base))
+	if err != nil {
+		return "", fmt.Errorf("invalid base URL: %w", err)
+	}
+	if baseURL.Scheme != "http" && baseURL.Scheme != "https" || baseURL.Host == "" {
+		return "", fmt.Errorf("base URL must be an http(s) URL")
+	}
+	endpointURL, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil {
+		return "", fmt.Errorf("invalid endpoint URL: %w", err)
+	}
+	resolved := baseURL.ResolveReference(endpointURL)
+	if resolved.Scheme != "http" && resolved.Scheme != "https" || resolved.Host == "" {
+		return "", fmt.Errorf("endpoint must resolve to an http(s) URL")
+	}
+	// The configured SSE origin is the trust boundary. A server-controlled
+	// endpoint must not redirect the client to another host (or scheme), where
+	// future transport headers/credentials could be disclosed.
+	if !strings.EqualFold(resolved.Scheme, baseURL.Scheme) || !strings.EqualFold(resolved.Host, baseURL.Host) {
+		return "", fmt.Errorf("endpoint crosses the configured SSE origin")
+	}
+	return resolved.String(), nil
 }
 
 // handshake runs initialize + initialized + tools/list once the transport is up.
@@ -585,7 +713,7 @@ func (c *Client) dispatchRaw(line []byte) {
 		// Server notification.
 		switch msg.Method {
 		case "notifications/tools/list_changed":
-			go c.refreshTools()
+			c.scheduleRefresh()
 		}
 		return
 	}
@@ -635,11 +763,14 @@ func (c *Client) Close() error {
 	c.fireClosed() // idempotent
 	c.mu.Lock()
 	cancel := c.sseCancel
+	procCancel := c.procCancel
+	c.procCancel = nil
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel() // abort the SSE stream; its read loop closes the body
 	}
 	var err error
+	intentionalStop := false
 	if c.cmd != nil && !c.waited {
 		// Closing stdin first unblocks any in-flight stdin.Write before the
 		// kill. readLoop is deliberately not joined: Wait reaps the child and
@@ -649,10 +780,22 @@ func (c *Client) Close() error {
 			_ = c.stdin.Close()
 		}
 		if c.cmd.Process != nil {
-			_ = c.cmd.Process.Kill()
+			if killErr := c.cmd.Process.Kill(); killErr == nil {
+				intentionalStop = true
+			}
 		}
 		err = c.cmd.Wait()
 		c.waited = true
+	}
+	if procCancel != nil {
+		procCancel()
+	}
+	if err != nil && intentionalStop {
+		// A process that already observed its context cancellation can report
+		// exec's synthetic cancel/kill error even though it was intentionally
+		// reaped successfully. A caller that needs the child's exit status can
+		// inspect ProcessState before invoking Close.
+		return nil
 	}
 	return err
 }
@@ -854,11 +997,116 @@ func (c *Client) writeSSE(body []byte) error {
 	return nil
 }
 
-// envSlice flattens extra env vars for the child process.
-func envSlice(extra map[string]string) []string {
-	var out []string
-	for k, v := range extra {
-		out = append(out, k+"="+v)
+// boundedBuffer implements io.Writer for child diagnostics. It reports all
+// input as consumed so an MCP process can never block on stderr after the
+// retained diagnostic window fills; only the most recent limit bytes are
+// kept, which preserves the useful failure tail of a noisy server.
+type boundedBuffer struct {
+	mu        sync.Mutex
+	buf       []byte
+	limit     int
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if b == nil {
+		return len(p), nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit <= 0 {
+		b.limit = maxMCPStderr
+	}
+	if len(p) >= b.limit {
+		b.buf = append(b.buf[:0], p[len(p)-b.limit:]...)
+		b.truncated = true
+		return len(p), nil
+	}
+	if remaining := b.limit - len(b.buf); len(p) > remaining {
+		drop := len(p) - remaining
+		b.buf = append(b.buf[drop:], p...)
+		b.truncated = true
+	} else {
+		b.buf = append(b.buf, p...)
+	}
+	if len(b.buf) > b.limit {
+		b.buf = append([]byte(nil), b.buf[len(b.buf)-b.limit:]...)
+		b.truncated = true
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := string(b.buf)
+	if b.truncated {
+		out += "\n[…MCP stderr truncated…]"
+	}
+	return out
+}
+
+var (
+	mcpURLUserInfoPattern = regexp.MustCompile(`(?i)(https?://)[^/\s@]+@`)
+	mcpBearerPattern      = regexp.MustCompile(`(?i)(\bbearer\s+)[^\s,;]+`)
+)
+
+// mcpDiagnosticSuffix returns a bounded, redacted stderr suffix suitable for
+// a startup/handshake error. Diagnostics are deliberately not logged from the
+// background read loop: MCP servers may print credentials or private URLs.
+func mcpDiagnosticSuffix(stderr *boundedBuffer, cfg ServerConfig) string {
+	if stderr == nil {
+		return ""
+	}
+	diagnostic := strings.TrimSpace(stderr.String())
+	if diagnostic == "" {
+		return ""
+	}
+	// Configured MCP environment is an explicit capability, but its values are
+	// still secrets from the model's point of view. Redact every non-empty
+	// configured value before returning diagnostics rather than trying to infer
+	// whether a custom variable name is sensitive.
+	for _, value := range cfg.Env {
+		if value != "" {
+			diagnostic = strings.ReplaceAll(diagnostic, value, "<redacted>")
+		}
+	}
+	diagnostic = mcpURLUserInfoPattern.ReplaceAllString(diagnostic, `${1}<redacted>@`)
+	diagnostic = mcpBearerPattern.ReplaceAllString(diagnostic, `${1}<redacted>`)
+	const diagnosticLimit = 4 * 1024
+	if len(diagnostic) > diagnosticLimit {
+		diagnostic = "…" + diagnostic[len(diagnostic)-diagnosticLimit:]
+	}
+	return " (stderr: " + diagnostic + ")"
+}
+
+// mcpEnvironment removes inherited provider credentials while preserving
+// explicit server-local environment from config. Explicit MCP env is a
+// deliberate capability of that server, not an accidental leak from the
+// host process.
+func mcpEnvironment(extra map[string]string) []string {
+	values := map[string]string{}
+	for _, entry := range execution.SanitizedEnvironmentFor(execution.EnvironmentMCP, os.Environ()) {
+		key, value := entry, ""
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key, value = entry[:i], entry[i+1:]
+		}
+		values[key] = value
+	}
+	for key, value := range extra {
+		values[key] = value
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, key+"="+values[key])
 	}
 	return out
 }

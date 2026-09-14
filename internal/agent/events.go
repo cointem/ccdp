@@ -9,7 +9,7 @@ package agent
 
 import (
 	"ccdp/internal/permissions"
-	"ccdp/internal/sandbox"
+	"ccdp/internal/protocol"
 )
 
 // EventType enumerates what the agent can tell the UI.
@@ -34,16 +34,17 @@ const (
 	EventSandboxChanged                   // sandbox mode changed
 	EventPlan                             // a plan is ready for approval (Plan Mode)
 	EventPlanModeChanged                  // plan mode was toggled
-	EventSessionChanged                   // the agent switched to another session (fork/resume)
+	EventQuestion
+	EventSessionChanged // the agent switched to another session (fork/resume)
 )
 
 // Usage is the accumulated token and cost accounting for the session.
 type Usage struct {
-	InputTokens  int
-	OutputTokens int
-	CachedTokens int // prompt tokens served from provider cache
-	Cost         float64
-	TurnCount    int
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	CachedTokens int     `json:"cached_tokens"` // prompt tokens served from provider cache
+	Cost         float64 `json:"cost"`
+	TurnCount    int     `json:"turn_count"`
 }
 
 // ToolEvent describes one tool invocation for the UI.
@@ -61,6 +62,10 @@ type ApprovalRequest struct {
 	Tool    string
 	Command string
 	Reason  string
+	// journalID is the occurrence-scoped durable identity. ID remains the
+	// compatibility/UI call ID so older control clients can answer a prompt;
+	// durable ApprovalResolved facts use journalID instead.
+	journalID string
 }
 
 // PlanRequest is issued in plan mode when the model has produced an execution
@@ -72,51 +77,15 @@ type PlanRequest struct {
 
 // Event is everything the agent emits to the UI.
 type Event struct {
-	Type     EventType
-	Text     string
-	Tool     *ToolEvent
-	Approval *ApprovalRequest
-	Plan     *PlanRequest
-	PlanMode bool
-	Mode     permissions.Mode
-	Usage    *Usage
-}
-
-// ControlType enumerates what the UI can tell the agent.
-type ControlType int
-
-const (
-	ControlUserMessage ControlType = iota
-	ControlApproval
-	ControlInterrupt
-	ControlClearHistory
-	ControlCompactNow
-	ControlSetMode
-	ControlStop       // abort the current turn entirely
-	ControlRemove     // remove the last N messages from history
-	ControlRewind     // keep the first N messages, drop the rest
-	ControlSetSandbox // switch the sandbox mode
-	ControlSetPlan    // toggle plan mode on/off
-	ControlPlanResp   // answer a plan approval request
-	ControlFork       // branch a new session from message Count (-1 = full copy)
-)
-
-// Control is an instruction from the UI to the agent.
-type Control struct {
-	Type        ControlType
-	Text        string // user message text for ControlUserMessage
-	ApprovalID  string // which pending approval this responds to
-	Approve     bool   // true = allow, false = deny
-	Remember    bool   // remember the decision for this session
-	Mode        permissions.Mode
-	SandboxMode sandbox.Mode
-	Count       int    // number of messages for ControlRemove / ControlRewind
-	PlanID      string // pending plan request this answers
-	PlanApprove bool   // true = approve the plan and execute, false = reject
-	PlanOn      bool   // desired plan-mode state for ControlSetPlan
-}
-
-// controlForApproval builds a Control that answers a pending approval.
-func controlForApproval(id string, approve, remember bool) Control {
-	return Control{Type: ControlApproval, ApprovalID: id, Approve: approve, Remember: remember}
+	Question  *protocol.QuestionRequest
+	Type      EventType
+	Text      string
+	TurnID    string // explicit turn identity for terminal/error events
+	MessageID string // stable history identity for EventUserMsg de-duplication
+	Tool      *ToolEvent
+	Approval  *ApprovalRequest
+	Plan      *PlanRequest
+	PlanMode  bool
+	Mode      permissions.Mode
+	Usage     *Usage
 }

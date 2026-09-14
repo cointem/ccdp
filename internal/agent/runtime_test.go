@@ -2,16 +2,23 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ccdp/internal/checkpoint"
 	"ccdp/internal/config"
+	"ccdp/internal/hooks"
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
-	"ccdp/internal/tools"
+	"ccdp/internal/permissions"
+	"ccdp/internal/protocol"
+	"ccdp/internal/sandbox"
+	"ccdp/internal/session"
 )
 
 // truncateForLog shortens a message for test failure dumps.
@@ -32,8 +39,7 @@ func newRuntimeAgent(t *testing.T) *Agent {
 	cfg.Workspace = dir
 	cfg.SessionDir = dir + "/sessions"
 	events := make(chan Event, 256)
-	ctrl := make(chan Control, 16)
-	ag, err := New(&cfg, events, ctrl)
+	ag, err := New(&cfg, events)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -88,14 +94,18 @@ func TestInterruptNoteInjectedOnce(t *testing.T) {
 	ag.interruptNote = true
 	ag.mu.Unlock()
 
-	req := ag.buildRequest()
+	firstStep := ag.beginStep()
+	req := ag.buildRequestForStep(firstStep)
+	releaseStepLease(firstStep)
 	sys, _ := req.Messages[0].Content.(string)
 	if !strings.Contains(sys, "Interrupted turn") {
 		t.Error("interrupted-turn guidance missing from system prompt")
 	}
 
 	// Second request must not repeat it.
-	req = ag.buildRequest()
+	secondStep := ag.beginStep()
+	req = ag.buildRequestForStep(secondStep)
+	releaseStepLease(secondStep)
 	sys, _ = req.Messages[0].Content.(string)
 	if strings.Contains(sys, "Interrupted turn") {
 		t.Error("interrupted-turn guidance should be injected only once")
@@ -144,7 +154,9 @@ func TestRequestApprovalConcurrentSerialized(t *testing.T) {
 	ag.mu.Unlock()
 
 	answer := func(ev Event) {
-		ag.handle(Control{Type: ControlApproval, ApprovalID: ev.Approval.ID, Approve: true})
+		submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("approve")), SessionID: protocol.SessionID(ag.SessionID()),
+			Type:     protocol.CommandApproveTool,
+			Approval: &protocol.ApproveTool{ApprovalID: ev.Approval.ID, Approve: true}})
 	}
 
 	type verdict struct {
@@ -230,7 +242,9 @@ func TestRequestApprovalCacheReplaysDecision(t *testing.T) {
 			}
 			if ev.Type == EventApproval && ev.Approval != nil {
 				modals++
-				ag.handle(Control{Type: ControlApproval, ApprovalID: ev.Approval.ID, Approve: true})
+				submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("approve")), SessionID: protocol.SessionID(ag.SessionID()),
+					Type:     protocol.CommandApproveTool,
+					Approval: &protocol.ApproveTool{ApprovalID: ev.Approval.ID, Approve: true}})
 			}
 		case <-deadline:
 			t.Fatal("timed out waiting for the approval modal")
@@ -271,10 +285,10 @@ func TestTruncatedToolCallsVoided(t *testing.T) {
 		"truncated:Bash|command=echo should-not-run",
 		"text:done",
 	}}
-	ag, events, ctrl := newTestAgent(t, f)
+	ag, events := newTestAgent(t, f)
 	go ag.Run()
 
-	ctrl <- Control{Type: ControlUserMessage, Text: "run it"}
+	submitTestInput(t, ag, "run it")
 
 	saw := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
 		return ev.Type == EventToolResult && ev.Tool != nil && ev.Tool.Status == "denied"
@@ -316,12 +330,12 @@ func TestSteerQueuedMessageInjected(t *testing.T) {
 		"tool:Bash|command=sleep 0.4",
 		"text:done",
 	}}
-	ag, events, ctrl := newTestAgent(t, f)
+	ag, events := newTestAgent(t, f)
 	go ag.Run()
 
-	ctrl <- Control{Type: ControlUserMessage, Text: "first message"}
+	submitTestInput(t, ag, "first message")
 	time.Sleep(100 * time.Millisecond) // the turn is now inside the Bash call
-	ctrl <- Control{Type: ControlUserMessage, Text: "steered message"}
+	submitTestInput(t, ag, "steered message")
 
 	drainUntil(t, events, 10*time.Second, func(ev Event) bool {
 		return ev.Type == EventTurnDone
@@ -350,19 +364,19 @@ func TestSteerQueuedMessageInjected(t *testing.T) {
 	}
 }
 
-// TestForkBranchesSession pins the session-branch behavior: the new session
-// carries history[:keep] plus a branch note, records lineage, and leaves the
-// source session file untouched.
+// TestForkBranchesSession pins the session-branch behavior: Fork creates and
+// persists a child carrying history[:keep] plus a branch note, while leaving
+// the live source Agent and its session-scoped resources untouched.
 func TestForkBranchesSession(t *testing.T) {
 	f := &fakeLLM{script: []string{
 		"tool:Bash|command=echo one",
 		"text:final answer for the first turn",
 		"text:a branch summary of the abandoned direction",
 	}}
-	ag, events, ctrl := newTestAgent(t, f)
+	ag, events := newTestAgent(t, f)
 	go ag.Run()
 
-	ctrl <- Control{Type: ControlUserMessage, Text: "try direction A"}
+	submitTestInput(t, ag, "try direction A")
 	drainUntil(t, events, 10*time.Second, func(ev Event) bool {
 		return ev.Type == EventTurnDone
 	})
@@ -383,30 +397,27 @@ func TestForkBranchesSession(t *testing.T) {
 	}
 	oldCount := len(oldSnap.History)
 
-	ctrl <- Control{Type: ControlFork, Count: 1} // keep [user1], drop the tool round
-	drainUntil(t, events, 15*time.Second, func(ev Event) bool {
-		return ev.Type == EventSessionChanged
-	})
-
-	newID := ag.SessionID()
+	oldPersistence := ag.persistenceHandle()
+	oldResources := ag.resources
+	oldHistory := ag.History()
+	newID, err := ag.Fork(1) // keep [user1], drop the tool round
+	if err != nil {
+		t.Fatalf("fork: %v", err)
+	}
 	if newID == oldID {
-		t.Fatal("fork did not switch the session id")
+		t.Fatal("fork reused the source session id")
 	}
-	if parent, point := ag.Lineage(); parent != oldID || point != 1 {
-		t.Fatalf("lineage = (%q, %d), want (%q, 1)", parent, point, oldID)
+	if ag.SessionID() != oldID {
+		t.Fatalf("fork changed source session id to %q", ag.SessionID())
 	}
-
-	ag.mu.Lock()
-	hist := append([]messages.Message(nil), ag.history...)
-	ag.mu.Unlock()
-	if len(hist) != 2 { // branch-note + user1
-		t.Fatalf("branched history should be note+user (2), got %d: %v", len(hist), hist)
+	if parent, point := ag.Lineage(); parent != "" || point != 0 {
+		t.Fatalf("source lineage changed to (%q, %d)", parent, point)
 	}
-	if hist[0].Role != messages.RoleSystem || !strings.Contains(hist[0].Content, "branched from session "+oldID) {
-		t.Fatalf("expected branch note first, got %q", hist[0].Content)
+	if ag.persistenceHandle() != oldPersistence || ag.resources != oldResources {
+		t.Fatal("fork replaced source persistence or resources")
 	}
-	if !strings.Contains(hist[0].Content, "branch summary") {
-		t.Fatalf("expected the abandoned-direction summary in the note, got %q", hist[0].Content)
+	if got := ag.History(); len(got) != len(oldHistory) {
+		t.Fatalf("source history changed from %d to %d messages", len(oldHistory), len(got))
 	}
 
 	snap, err := LoadSession(ag.SessionDir(), newID)
@@ -415,6 +426,24 @@ func TestForkBranchesSession(t *testing.T) {
 	}
 	if snap.ParentID != oldID || snap.BranchPoint != 1 {
 		t.Fatalf("snapshot lineage = (%q, %d)", snap.ParentID, snap.BranchPoint)
+	}
+	if len(snap.History) != 2 { // branch-note + user1
+		t.Fatalf("branched history should be note+user (2), got %d: %v", len(snap.History), snap.History)
+	}
+	if snap.History[0].Role != messages.RoleSystem || !strings.Contains(snap.History[0].Content, "branched from session "+oldID) {
+		t.Fatalf("expected branch note first, got %q", snap.History[0].Content)
+	}
+	if !strings.Contains(snap.History[0].Content, "branch summary") {
+		t.Fatalf("expected the abandoned-direction summary in the note, got %q", snap.History[0].Content)
+	}
+	// The child writer is closed before Fork returns and can be opened by the
+	// later explicit OpenSession/Resume path.
+	childWriter, err := session.OpenJSONLStore(ag.SessionDir(), newID)
+	if err != nil {
+		t.Fatalf("child writer remains locked: %v", err)
+	}
+	if err := childWriter.Close(); err != nil {
+		t.Fatal(err)
 	}
 	// The source session file keeps its full history.
 	after, err := LoadSession(ag.SessionDir(), oldID)
@@ -440,9 +469,8 @@ func TestPostCompactFileAttachments(t *testing.T) {
 	if err := os.WriteFile(dir+"/fresh.go", []byte(fresh), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tools.MarkFileRead(dir + "/old.go")
-	tools.MarkFileRead(dir + "/fresh.go")
-	t.Cleanup(tools.ClearFileReadState)
+	ag.resources.Files.MarkFileRead(dir + "/old.go")
+	ag.resources.Files.MarkFileRead(dir + "/fresh.go")
 
 	// fresh.go is still referenced by the kept tail → skipped; old.go attached.
 	tail := []messages.Message{{
@@ -473,10 +501,24 @@ func TestPostCompactFileAttachments(t *testing.T) {
 func TestPendingInboxPersisted(t *testing.T) {
 	ag := newRuntimeAgent(t)
 
-	// Queue messages as if the user typed them while a turn was running.
+	// Admit messages through the typed command path while a turn is running.
+	// The test must not hand-edit the compatibility pendingMsgs projection:
+	// InputQueued facts are the durable source of truth for resume.
 	ag.mu.Lock()
-	ag.pendingMsgs = []string{"queued one", "queued two"}
+	ag.busy = true
 	ag.mu.Unlock()
+	// Usage is a typed durable projection now; do not seed it by mutating the
+	// live compatibility field, because Save intentionally flushes the cache
+	// without reconciling arbitrary in-memory edits back into the event log.
+	if err := ag.persistenceHandle().persistUsage(Usage{InputTokens: 12, OutputTokens: 3, Cost: 0.75, TurnCount: 2}); err != nil {
+		t.Fatalf("persist usage fixture: %v", err)
+	}
+	for i, text := range []string{"queued one", "queued two", "queued three"} {
+		cmd := protocol.NewSubmitInput(protocol.CommandID(fmt.Sprintf("pending-command-%d", i)), protocol.SessionID(ag.SessionID()), protocol.InputID(fmt.Sprintf("pending-input-%d", i)), text, protocol.InputFollowup)
+		if receipt := ag.applyCommand(cmd); receipt.Rejected() {
+			t.Fatalf("submit pending input %q: %+v", text, receipt)
+		}
+	}
 
 	if err := ag.Save(); err != nil {
 		t.Fatalf("save: %v", err)
@@ -485,13 +527,13 @@ func TestPendingInboxPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if len(snap.Pending) != 2 || snap.Pending[0] != "queued one" {
+	if len(snap.Pending) != 3 || snap.Pending[0] != "queued one" {
 		t.Fatalf("snapshot pending = %v", snap.Pending)
 	}
 
-	// Resume restores the inbox.
-	snap.Pending = append(snap.Pending, "queued three")
-	resumed, err := Resume(ag.cfg, snap, ag.events, ag.ctrl)
+	// Release the original writer before opening the resumed handle.
+	ag.Close()
+	resumed, err := Resume(ag.cfg, snap, make(chan Event, 16))
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -501,5 +543,214 @@ func TestPendingInboxPersisted(t *testing.T) {
 	resumed.mu.Unlock()
 	if len(got) != 3 || got[2] != "queued three" {
 		t.Fatalf("resumed pending inbox = %v", got)
+	}
+	if gotUsage := resumed.Usage(); gotUsage.Cost != 0.75 || gotUsage.TurnCount != 2 {
+		t.Fatalf("resumed usage = %+v", gotUsage)
+	}
+}
+
+func TestResumeRestoresWorkspaceAndModel(t *testing.T) {
+	current := t.TempDir()
+	restored := t.TempDir()
+	cfg := config.Default()
+	cfg.Workspace = current
+	cfg.SessionDir = filepath.Join(current, "sessions")
+	snap := &SessionSnapshot{
+		ID:        "restore-context",
+		CreatedAt: time.Now(),
+		Workspace: restored,
+		Model:     "restored-model",
+		Usage:     Usage{Cost: 1.25, TurnCount: 4},
+	}
+	ag, err := Resume(&cfg, snap, make(chan Event, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ag.Close()
+	if ag.cfg.Workspace != restored || ag.cfg.Model != "restored-model" {
+		t.Fatalf("restored context = %q/%q", ag.cfg.Workspace, ag.cfg.Model)
+	}
+	if ag.Usage().Cost != 1.25 {
+		t.Fatalf("restored usage = %+v", ag.Usage())
+	}
+}
+
+func TestApprovalResponsesMustMatchPendingID(t *testing.T) {
+	ag := newRuntimeAgent(t)
+	approvalCh := make(chan approvalAnswer, 1)
+	planCh := make(chan bool, 1)
+	ag.mu.Lock()
+	ag.pendingApproval = &ApprovalRequest{ID: "approval-new"}
+	ag.approvalResp = approvalCh
+	ag.pendingPlan = &PlanRequest{ID: "plan-new"}
+	ag.planResp = planCh
+	ag.mu.Unlock()
+
+	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("stale-approval")), SessionID: protocol.SessionID(ag.SessionID()),
+		Type: protocol.CommandApproveTool, Approval: &protocol.ApproveTool{ApprovalID: "approval-old", Approve: true}})
+	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("stale-plan")), SessionID: protocol.SessionID(ag.SessionID()),
+		Type: protocol.CommandApprovePlan, Plan: &protocol.ApprovePlan{PlanID: "plan-old", Approve: true}})
+	select {
+	case <-approvalCh:
+		t.Fatal("stale approval was accepted")
+	default:
+	}
+	select {
+	case <-planCh:
+		t.Fatal("stale plan response was accepted")
+	default:
+	}
+
+	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("approval")), SessionID: protocol.SessionID(ag.SessionID()),
+		Type: protocol.CommandApproveTool, Approval: &protocol.ApproveTool{ApprovalID: "approval-new", Approve: true}})
+	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("plan")), SessionID: protocol.SessionID(ag.SessionID()),
+		Type: protocol.CommandApprovePlan, Plan: &protocol.ApprovePlan{PlanID: "plan-new", Approve: true}})
+	if ans := <-approvalCh; !ans.approve {
+		t.Fatal("matching approval was not accepted")
+	}
+	if ok := <-planCh; !ok {
+		t.Fatal("matching plan response was not accepted")
+	}
+}
+
+func TestUsageCostAccumulatesAtPerCallModelPrice(t *testing.T) {
+	ag := newRuntimeAgent(t)
+	ag.cfg.Pricing = map[string]config.Pricing{
+		"cheap": {Input: 1, Output: 2},
+		"dear":  {Input: 10, Output: 20},
+	}
+	ag.mu.Lock()
+	ag.activeModel = "cheap"
+	ag.mu.Unlock()
+	ag.recordUsageNoBaseline(1_000_000, 500_000, 0)
+	ag.mu.Lock()
+	ag.activeModel = "dear"
+	ag.mu.Unlock()
+	ag.recordUsageNoBaseline(1_000_000, 500_000, 0)
+	if got, want := ag.Usage().Cost, 22.0; got != want {
+		t.Fatalf("mixed-model cost = %v, want %v", got, want)
+	}
+}
+
+func TestResumeRebindsCheckpointStore(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Workspace = dir
+	cfg.SessionDir = filepath.Join(dir, "sessions")
+	sessionID := "resume-checkpoints"
+	recordDir := filepath.Join(cfg.SessionDir, "checkpoints", sessionID)
+	if err := os.MkdirAll(recordDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	records := []checkpoint.Record{{ID: "ck-existing", Summary: "existing", SHA: "deadbeef", CreatedAt: time.Now()}}
+	data, _ := json.Marshal(records)
+	if err := os.WriteFile(filepath.Join(recordDir, "records.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan Event, 64)
+	ag, err := Resume(&cfg, &SessionSnapshot{ID: sessionID, CreatedAt: time.Now()}, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ag.Close()
+	if got := ag.CheckpointList(); len(got) != 1 || got[0].ID != "ck-existing" {
+		t.Fatalf("resumed checkpoints = %+v", got)
+	}
+}
+
+func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
+	ag := newRuntimeAgent(t)
+	settingsDir := filepath.Join(ag.cfg.Workspace, ".ccdp")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(settingsDir, "settings.json")
+	first := `{"permission_mode":"bypassPermissions","always_allow":["Bash:make build"],"hooks":{"PreToolUse":["echo ok"]},"sandbox_mode":"none","enable_web_tools":false}`
+	if err := os.WriteFile(settingsPath, []byte(first), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Executable project settings require an explicit, external trust record;
+	// use a temp store so this test never touches the user's real trust state.
+	trust := config.NewTrustStore(filepath.Join(t.TempDir(), "project-trust.json"))
+	project, err := config.LoadProjectSettings(ag.cfg.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trust.AuthorizeProject(ag.cfg.Workspace, project); err != nil {
+		t.Fatal(err)
+	}
+	ag.mu.Lock()
+	ag.trustStore = trust
+	ag.mu.Unlock()
+	if err := ag.ReloadSettings(); err != nil {
+		t.Fatal(err)
+	}
+	if decision, _ := ag.perms.Check("Bash", map[string]any{"command": "make build"}); decision != permissions.DecisionAllow {
+		t.Fatalf("project allow rule was not loaded: %s", decision)
+	}
+	if len(ag.HooksList()[hooks.EventPreToolUse]) != 1 {
+		t.Fatal("project hook was not loaded")
+	}
+	if ag.PermissionMode() != permissions.ModeDefault || ag.SandboxMode() != sandbox.ModeConfine {
+		t.Fatalf("project attempted to loosen modes: permission=%s sandbox=%s", ag.PermissionMode(), ag.SandboxMode())
+	}
+	if _, ok := ag.registry.Get("WebFetch"); ok {
+		t.Fatal("web tools remained registered after disabling them")
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ag.ReloadSettings(); err != nil {
+		t.Fatal(err)
+	}
+	if decision, _ := ag.perms.Check("Bash", map[string]any{"command": "make build"}); decision != permissions.DecisionAsk {
+		t.Fatalf("removed project allow rule remained active: %s", decision)
+	}
+	if len(ag.HooksList()[hooks.EventPreToolUse]) != 0 {
+		t.Fatal("removed project hook remained active")
+	}
+	if ag.PermissionMode() != permissions.ModeDefault || ag.SandboxMode() != sandbox.ModeConfine {
+		t.Fatalf("removed project modes remained active: permission=%s sandbox=%s", ag.PermissionMode(), ag.SandboxMode())
+	}
+	if _, ok := ag.registry.Get("WebFetch"); !ok {
+		t.Fatal("web tools were not restored after removing the override")
+	}
+}
+
+func TestProjectSettingsLoadedAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	settingsDir := filepath.Join(dir, ".ccdp")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(settingsDir, "settings.json"),
+		[]byte(`{"permission_mode":"acceptEdits","always_deny":["Bash:git push*"],"enable_web_tools":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trust := config.NewTrustStore(filepath.Join(t.TempDir(), "project-trust.json"))
+	project, err := config.LoadProjectSettings(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trust.AuthorizeProject(dir, project); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Workspace = dir
+	cfg.SessionDir = filepath.Join(dir, "sessions")
+	cfg.TrustStore = trust
+	ag, err := New(&cfg, make(chan Event, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ag.Close()
+	if ag.PermissionMode() != permissions.ModeDefault {
+		t.Fatalf("untrusted project loosened startup permission mode = %s", ag.PermissionMode())
+	}
+	if decision, _ := ag.perms.Check("Bash", map[string]any{"command": "git push origin main"}); decision != permissions.DecisionDeny {
+		t.Fatalf("startup deny rule decision = %s", decision)
+	}
+	if _, ok := ag.registry.Get("WebFetch"); ok {
+		t.Fatal("startup web setting was ignored")
 	}
 }

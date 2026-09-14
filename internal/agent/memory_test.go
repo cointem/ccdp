@@ -18,8 +18,7 @@ func newMemoryAgent(t *testing.T) *Agent {
 	cfg.SessionDir = dir + "/sessions"
 	cfg.EnableMemory = config.BoolPtr(true)
 	events := make(chan Event, 64)
-	ctrl := make(chan Control, 16)
-	ag, err := New(&cfg, events, ctrl)
+	ag, err := New(&cfg, events)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -33,8 +32,7 @@ func TestMemoryDisabledRecordsNothing(t *testing.T) {
 	cfg.SessionDir = dir + "/sessions"
 	cfg.EnableMemory = config.BoolPtr(false) // default: off
 	events := make(chan Event, 64)
-	ctrl := make(chan Control, 16)
-	ag, err := New(&cfg, events, ctrl)
+	ag, err := New(&cfg, events)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -73,8 +71,22 @@ func TestRecordMemoryWritesFileAndInjects(t *testing.T) {
 		}
 	}
 
+	// Build through the same checked, frozen step boundary used by a real turn.
+	step, err := ag.beginStepChecked()
+	if err != nil {
+		t.Fatalf("beginStepChecked: %v", err)
+	}
+	req, err := ag.buildRequestForStepChecked(step)
+	releaseStepLease(step)
+	if err != nil {
+		t.Fatalf("buildRequestForStepChecked: %v", err)
+	}
+	// The direct test does not run the turn-finalizer that normally clears this
+	// borrow; release it explicitly so no frozen child view survives the test.
+	ag.mu.Lock()
+	ag.childStep = nil
+	ag.mu.Unlock()
 	// The memory section appears in the system prompt when enabled.
-	req := ag.buildRequest()
 	sys, _ := req.Messages[0].Content.(string)
 	if !strings.Contains(sys, "# Session memory") || !strings.Contains(sys, "refactor the http handler") {
 		t.Errorf("system prompt missing memory section:\n%s", sys)

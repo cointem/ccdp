@@ -1,17 +1,40 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"ccdp/internal/sandbox"
 )
+
+func TestProcessStopTerminatesProcessGroup(t *testing.T) {
+	ctx := scopedTestContext(t, t.TempDir())
+	out, err := NewProcessStartTool().Run(ctxWithArgs(ctx, map[string]any{
+		"command": `sh -c 'trap "" INT; sleep 30 & wait'`,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := extractPID(t, out)
+	start := time.Now()
+	if _, err := NewProcessStopTool().Run(ctxWithArgs(ctx, map[string]any{"pid": pid})); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Fatalf("stopping process tree took %s", elapsed)
+	}
+}
 
 func TestProcessLifecyclePython(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 not available")
 	}
-	ctx := &Context{WorkingDir: t.TempDir()}
+	ctx := scopedTestContext(t, t.TempDir())
 
 	// Start an unbuffered python REPL-like loop.
 	start := NewProcessStartTool()
@@ -54,8 +77,97 @@ func TestProcessLifecyclePython(t *testing.T) {
 	}
 }
 
+func TestProcessStartSurvivesStepCancellationUntilOwnerClose(t *testing.T) {
+	dir := t.TempDir()
+	resources := NewResourcesWithContext("process-owner", filepath.Join(dir, "session"), context.Background())
+	t.Cleanup(func() { _ = resources.Close() })
+
+	stepCtx, cancelStep := context.WithCancel(context.Background())
+	startCtx := resources.Context(stepCtx, dir, nil)
+	startCtx.Args = map[string]any{"command": "sleep 30"}
+	started, err := NewProcessStartTool().Run(startCtx)
+	if err != nil {
+		t.Fatalf("ProcessStart: %v", err)
+	}
+	pid := extractPID(t, started)
+	cancelStep()
+
+	readCtx := resources.Context(context.Background(), dir, nil)
+	readCtx.Args = map[string]any{"pid": pid, "wait_ms": 0}
+	out, err := NewProcessOutputTool().Run(readCtx)
+	if err != nil {
+		t.Fatalf("ProcessOutput after step cancellation: %v", err)
+	}
+	if !strings.Contains(out, "still running") {
+		t.Fatalf("step cancellation killed session-owned process: %q", out)
+	}
+
+	if _, err := NewProcessStopTool().Run(readCtx); err != nil {
+		t.Fatalf("ProcessStop: %v", err)
+	}
+}
+
+func TestProcessOutputWaitHonorsContextCancellation(t *testing.T) {
+	ctx := scopedTestContext(t, t.TempDir())
+	started, err := NewProcessStartTool().Run(ctxWithArgs(ctx, map[string]any{"command": "sleep 30"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := extractPID(t, started)
+	readCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	readToolCtx := *ctx
+	readToolCtx.Context = readCtx
+	readToolCtx.Args = map[string]any{"pid": pid, "wait_ms": 30_000}
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := NewProcessOutputTool().Run(&readToolCtx)
+		done <- runErr
+	}()
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ProcessOutput after cancellation: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("ProcessOutput ignored context cancellation for %s", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ProcessOutput remained blocked after context cancellation")
+	}
+	stopCtx := *ctx
+	stopCtx.Args = map[string]any{"pid": pid}
+	if _, err := NewProcessStopTool().Run(&stopCtx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProcessStartAppliesSandboxLimits(t *testing.T) {
+	ctx := scopedTestContext(t, t.TempDir())
+	ctx.Sandbox = sandbox.New(ctx.WorkingDir, sandbox.ModeConfine)
+	ctx.Sandbox.Limits = &sandbox.Limits{MaxFiles: 64}
+	started, err := NewProcessStartTool().Run(ctxWithArgs(ctx, map[string]any{
+		"command": "printf 'open-files=%s\\n' \"$(ulimit -n)\"",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := extractPID(t, started)
+	if !strings.Contains(started, "open-files=64") {
+		t.Fatalf("ProcessStart did not apply MaxFiles limit: %q", started)
+	}
+	stopCtx := *ctx
+	stopCtx.Args = map[string]any{"pid": pid}
+	if _, err := NewProcessStopTool().Run(&stopCtx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProcessErrors(t *testing.T) {
-	ctx := &Context{WorkingDir: t.TempDir()}
+	ctx := scopedTestContext(t, t.TempDir())
 
 	if _, err := NewProcessStartTool().Run(ctxWithArgs(ctx, map[string]any{"command": "   "})); err == nil {
 		t.Error("expected error for empty command")
@@ -65,6 +177,9 @@ func TestProcessErrors(t *testing.T) {
 	}
 	if _, err := NewProcessOutputTool().Run(ctxWithArgs(ctx, map[string]any{"pid": 999})); err == nil {
 		t.Error("expected error for unknown pid")
+	}
+	if _, err := NewProcessOutputTool().Run(ctxWithArgs(ctx, map[string]any{"pid": 999, "wait_ms": 31_000})); err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Errorf("expected bounded wait_ms rejection, got %v", err)
 	}
 	if _, err := NewProcessStopTool().Run(ctxWithArgs(ctx, map[string]any{"pid": 999})); err == nil {
 		t.Error("expected error for unknown pid")
@@ -117,6 +232,22 @@ func TestProcessTruncationKeepsUnreadContiguous(t *testing.T) {
 	}
 	if mp.readPos != len(mp.buf) {
 		t.Errorf("readPos %d, want %d", mp.readPos, len(mp.buf))
+	}
+}
+
+func TestProcessPipeDrainsUnterminatedLargeFragment(t *testing.T) {
+	mp := &managedProcess{done: make(chan struct{})}
+	// Scanner-based drains stop at their maximum token size and leave the
+	// child blocked on a full pipe. ReadSlice must keep consuming a single
+	// unterminated line while retaining only the bounded tail.
+	payload := strings.Repeat("z", 2*1024*1024)
+	mp.pipe(strings.NewReader(payload))
+	out, _, _ := mp.read()
+	if len(out) != maxProcOutput {
+		t.Fatalf("unterminated output = %d bytes, want %d", len(out), maxProcOutput)
+	}
+	if strings.Trim(out, "z") != "" {
+		t.Fatal("bounded output contained unexpected bytes")
 	}
 }
 

@@ -1,9 +1,9 @@
 # Build artifacts
 /ccdp
-ccdp
 *.exe
 *.test
 *.out
+.gocache/
 
 # Local runtime state (settings, sessions, skills authored locally)
 .ccdp/

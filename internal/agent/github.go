@@ -1,10 +1,16 @@
 package agent
 
 import (
-	"bytes"
+	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"unicode/utf8"
+
+	"ccdp/internal/execution"
+	"ccdp/internal/permissions"
+	"ccdp/internal/sandbox"
 )
 
 // GitHub integration commands (Claude Code's /github, /pr-comments and
@@ -13,24 +19,83 @@ import (
 
 // gitCmd runs git in the workspace and returns combined output + error.
 func (a *Agent) gitCmd(args ...string) (string, error) {
-	var out bytes.Buffer
-	cmd := exec.Command("git", args...)
-	cmd.Dir = a.cfg.Workspace
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	err := cmd.Run()
-	return strings.TrimSpace(out.String()), err
+	return a.localCommand(append([]string{"git"}, args...), false)
 }
 
 // ghCmd runs gh (GitHub CLI) in the workspace and returns combined output.
 func (a *Agent) ghCmd(args ...string) (string, error) {
-	var out bytes.Buffer
-	cmd := exec.Command("gh", args...)
-	cmd.Dir = a.cfg.Workspace
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	err := cmd.Run()
-	return strings.TrimSpace(out.String()), err
+	return a.localCommand(append([]string{"gh"}, args...), true)
+}
+
+func (a *Agent) localCommand(argv []string, network bool) (string, error) {
+	a.mu.Lock()
+	ctx := a.rootCtx
+	a.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return a.localCommandContext(ctx, argv, network)
+}
+
+func (a *Agent) localCommandContext(ctx context.Context, argv []string, network bool) (string, error) {
+	if len(argv) == 0 {
+		return "", fmt.Errorf("empty command")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.mu.Lock()
+	workspace := a.cfg.Workspace
+	sb := a.sandbox
+	perms := a.perms
+	a.mu.Unlock()
+	if !externalCommandReadOnly(argv) {
+		return "", fmt.Errorf("legacy GitHub helper only permits an explicitly read-only command")
+	}
+	command := strings.Join(argv, " ")
+	if perms != nil {
+		if denied, reason := perms.HardDeny("Bash", map[string]any{"command": command}); denied {
+			return "", fmt.Errorf("command denied: %s", reason)
+		}
+		decision, reason := perms.Check("Bash", map[string]any{"command": command})
+		if decision != permissions.DecisionAllow {
+			return "", fmt.Errorf("command requires the typed runtime approval gate: %s", reason)
+		}
+	}
+	if network && sb != nil && sb.CurrentMode() == sandbox.ModeStrict && !sb.NetworkAllowed() {
+		return "", fmt.Errorf("network command denied by strict sandbox")
+	}
+	actualArgv := argv
+	readOnly := externalCommandReadOnly(argv)
+	if readOnly && argv[0] == "git" {
+		hardened, err := execution.ReadOnlyGitArgv(argv)
+		if err != nil {
+			return "", err
+		}
+		actualArgv = hardened
+	}
+	envPurpose := execution.EnvironmentGit
+	if argv[0] == "gh" {
+		// Only this fixed, read-only gh adapter receives GitHub credentials.
+		// Ordinary git and shell commands continue to receive the generic
+		// credential-free environment. The execution boundary owns the exact
+		// GH_TOKEN/GITHUB_TOKEN allowlist.
+		envPurpose = execution.EnvironmentGitHub
+	}
+	env := execution.SanitizedEnvironmentFor(envPurpose, os.Environ())
+	if readOnly && actualArgv[0] == "git" {
+		env = execution.ReadOnlyGitEnvironment(env)
+	}
+	res, err := execution.RunArgv(ctx, actualArgv, execution.Request{Context: ctx, Dir: workspace,
+		Sandbox: sb, Env: env, OutputLimit: 512 * 1024})
+	if err != nil {
+		return strings.TrimSpace(res.Output), err
+	}
+	out := strings.TrimSpace(res.Output)
+	if res.ExitCode != 0 {
+		return out, fmt.Errorf("%s exited %d", argv[0], res.ExitCode)
+	}
+	return out, nil
 }
 
 // currentBranch returns the checked-out branch name, or "" when detached or
@@ -46,35 +111,64 @@ func (a *Agent) currentBranch() string {
 // GitHubStatus reports the integration state: gh availability, origin remote,
 // current branch and whether the branch already has a PR (/github).
 func (a *Agent) GitHubStatus() string {
+	return a.GitHubStatusContext(context.Background())
+}
+
+// GitHubStatusContext is the bounded-query variant used by the protocol
+// report path. It keeps the same read-only argv/permission checks while
+// allowing a caller to cancel a slow `gh` lookup.
+func (a *Agent) GitHubStatusContext(ctx context.Context) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var sb strings.Builder
 
-	if _, err := exec.LookPath("gh"); err != nil {
+	_, ghErr := exec.LookPath("gh")
+	if ghErr != nil {
 		sb.WriteString("gh: not installed — install the GitHub CLI to use /pr-comments and /commit-push-pr\n")
 	} else {
-		ver, _ := a.ghCmd("--version")
-		if first := strings.SplitN(ver, "\n", 2); len(first) > 0 && first[0] != "" {
-			ver = first[0]
+		ver, err := a.localCommandContext(ctx, []string{"gh", "--version"}, true)
+		if err != nil {
+			fmt.Fprintf(&sb, "gh: unavailable — %s\n", commandDiagnostic(ver, err))
+		} else {
+			ver = firstLine(ver)
+			if ver == "" {
+				ver = "available"
+			}
+			fmt.Fprintf(&sb, "gh: %s\n", ver)
 		}
-		fmt.Fprintf(&sb, "gh: %s\n", ver)
 	}
 
-	remote, err := a.gitCmd("remote", "get-url", "origin")
+	remote, err := a.localCommandContext(ctx, []string{"git", "remote", "get-url", "origin"}, false)
 	if err != nil {
-		remote = ""
+		if isMissingRepository(remote) {
+			remote = "(no origin remote)"
+		} else {
+			remote = "error: " + commandDiagnostic(remote, err)
+		}
 	}
 	if remote == "" {
 		remote = "(no origin remote)"
 	}
-	fmt.Fprintf(&sb, "remote: %s\n", remote)
+	fmt.Fprintf(&sb, "remote: %s\n", sanitizeRemoteURL(remote))
 
-	branch := a.currentBranch()
+	branchOutput, branchErr := a.localCommandContext(ctx, []string{"git", "branch", "--show-current"}, false)
+	branch := strings.TrimSpace(branchOutput)
+	if branchErr != nil {
+		branch = ""
+	}
 	if branch == "" {
 		fmt.Fprintf(&sb, "branch: (detached HEAD)\n")
+	} else if ghErr != nil {
+		fmt.Fprintf(&sb, "branch: %s\n", branch)
+		sb.WriteString("pr: unavailable — gh not installed\n")
 	} else {
 		fmt.Fprintf(&sb, "branch: %s\n", branch)
-		url, _ := a.ghCmd("pr", "view", "--json", "url", "--jq", ".url", "--head", branch)
-		if url != "" {
-			fmt.Fprintf(&sb, "pr: %s\n", url)
+		url, urlErr := a.localCommandContext(ctx, []string{"gh", "pr", "view", "--json", "url", "--jq", ".url", "--head", branch}, true)
+		if urlErr != nil {
+			fmt.Fprintf(&sb, "pr: unavailable — %s\n", commandDiagnostic(url, urlErr))
+		} else if url != "" {
+			fmt.Fprintf(&sb, "pr: %s\n", sanitizeRemoteURL(firstLine(url)))
 		} else {
 			sb.WriteString("pr: none yet for this branch — use /commit-push-pr\n")
 		}
@@ -91,55 +185,75 @@ func (a *Agent) PRComments() string {
 	}
 	out, err := a.ghCmd("pr", "view", "--comments", "--head", branch)
 	if err != nil {
-		return fmt.Sprintf("no PR found for branch %s: %s", branch, out)
+		return fmt.Sprintf("GitHub CLI request failed for branch %s: %s", branch, commandDiagnostic(out, err))
 	}
-	if len(out) > 8000 {
-		out = out[:8000] + "\n…[truncated]"
-	}
-	return out
+	return truncateUTF8(out, 8000)
 }
 
-// CommitPushPR commits all changes, pushes the current branch and opens a PR
-// (Claude Code /commit-push-pr). Each step reports its own outcome so partial
-// failures are visible.
-func (a *Agent) CommitPushPR(message string) string {
-	if strings.TrimSpace(message) == "" {
-		message = "work in progress"
+func commandDiagnostic(output string, err error) string {
+	if line := firstLine(output); line != "" {
+		return line
 	}
-	var steps []string
+	if err != nil {
+		if line := firstLine(err.Error()); line != "" {
+			return line
+		}
+	}
+	return "unknown error"
+}
 
-	if out, err := a.gitCmd("add", "-A"); err != nil {
-		return "git add failed: " + out
-	}
-	steps = append(steps, "staged: all changes")
+func isMissingRepository(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "not a git repository") ||
+		strings.Contains(lower, "no such remote") ||
+		strings.Contains(lower, "does not appear to be a git repository")
+}
 
-	if out, err := a.gitCmd("commit", "-m", message); err != nil {
-		steps = append(steps, "commit: "+firstLine(out)+" (tree may be clean)")
-	} else {
-		steps = append(steps, "commit: "+firstLine(out))
+// sanitizeRemoteURL removes URL userinfo before a remote or PR URL reaches a
+// report. It also handles scp-like remotes conservatively by only stripping
+// userinfo from URLs that have an explicit scheme.
+func sanitizeRemoteURL(remote string) string {
+	remote = strings.TrimSpace(remote)
+	// This helper is also used for report placeholders such as "(no origin
+	// remote)" and command diagnostics. Treat non-URL text as text; url.Parse
+	// would otherwise percent-escape it and make a useful diagnostic unreadable.
+	if !strings.Contains(remote, "://") {
+		return remote
 	}
+	if sanitized, err := sanitizeRequestEndpoint(remote); err == nil && sanitized != "" {
+		return sanitized
+	}
+	// A URL-shaped value that cannot be parsed must not be echoed: malformed
+	// credentials or query material are still credentials. Keep the report
+	// useful without retaining any attacker-controlled bytes.
+	return "[redacted-url]"
+}
 
-	branch := a.currentBranch()
-	if branch == "" {
-		steps = append(steps, "push: skipped — not on a branch")
-		return strings.Join(steps, "\n")
+func truncateUTF8(value string, limit int) string {
+	value = strings.ToValidUTF8(value, "�")
+	if limit <= 0 || len(value) <= limit {
+		return value
 	}
-	if out, err := a.gitCmd("push", "-u", "origin", "HEAD"); err != nil {
-		steps = append(steps, "push: failed — "+firstLine(out))
-		return strings.Join(steps, "\n")
+	const suffix = "\n…[truncated]"
+	budget := limit - len(suffix)
+	if budget <= 0 {
+		return validUTF8Prefix(suffix, limit)
 	}
-	steps = append(steps, "push: pushed "+branch+" to origin")
+	return validUTF8Prefix(value, budget) + suffix
+}
 
-	if _, err := exec.LookPath("gh"); err != nil {
-		steps = append(steps, "pr: gh not installed — open the push link to create the PR")
-		return strings.Join(steps, "\n")
+func validUTF8Prefix(value string, limit int) string {
+	if limit <= 0 {
+		return ""
 	}
-	if out, err := a.ghCmd("pr", "create", "--fill", "--head", branch); err != nil {
-		steps = append(steps, "pr: creation failed — "+firstLine(out))
-	} else {
-		steps = append(steps, "pr: "+firstLine(out))
+	if len(value) <= limit {
+		return value
 	}
-	return strings.Join(steps, "\n")
+	cut := limit
+	for cut > 0 && cut < len(value) && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut]
 }
 
 // firstLine returns the first non-empty line of a string.

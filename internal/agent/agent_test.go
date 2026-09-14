@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"ccdp/internal/config"
 	"ccdp/internal/permissions"
+	"ccdp/internal/protocol"
 )
 
 // fakeLLM is a scripted OpenAI-compatible streaming server. Each turn it emits
@@ -140,7 +142,7 @@ func buildArgsJSON(s string) string {
 	return string(b)
 }
 
-func newTestAgent(t *testing.T, f *fakeLLM) (*Agent, <-chan Event, chan Control) {
+func newTestAgent(t *testing.T, f *fakeLLM) (*Agent, <-chan Event) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(f.handler))
 	t.Cleanup(srv.Close)
@@ -155,12 +157,41 @@ func newTestAgent(t *testing.T, f *fakeLLM) (*Agent, <-chan Event, chan Control)
 	cfg.SystemPrompt = "test system prompt"
 
 	events := make(chan Event, 4096)
-	ctrl := make(chan Control, 64)
-	ag, err := New(&cfg, events, ctrl)
+	ag, err := New(&cfg, events)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return ag, events, ctrl
+	t.Cleanup(func() {
+		ag.interrupt()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			ag.mu.Lock()
+			busy := ag.busy
+			ag.mu.Unlock()
+			if !busy {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		ag.Close()
+	})
+	return ag, events
+}
+
+func submitTestCommand(t *testing.T, ag *Agent, cmd protocol.Command) protocol.Receipt {
+	t.Helper()
+	receipt, err := ag.Submit(context.Background(), cmd)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	return receipt
+}
+
+func submitTestInput(t *testing.T, ag *Agent, text string) protocol.Receipt {
+	t.Helper()
+	return submitTestCommand(t, ag, protocol.NewSubmitInput(
+		protocol.CommandID(nextRuntimeID("test-input")), protocol.SessionID(ag.SessionID()),
+		protocol.InputID(nextRuntimeID("test-input-id")), text, protocol.InputSteer))
 }
 
 // drainEvents consumes events until a predicate matches or a timeout passes.
@@ -186,10 +217,10 @@ func TestTurnWithToolCall(t *testing.T) {
 		"tool:Bash|command=echo hello",
 		"text:done",
 	}}
-	ag, events, ctrl := newTestAgent(t, f)
+	ag, events := newTestAgent(t, f)
 	go ag.Run()
 
-	ctrl <- Control{Type: ControlUserMessage, Text: "list the directory"}
+	submitTestInput(t, ag, "list the directory")
 
 	// Expect a tool result carrying the bash output.
 	saw := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
@@ -224,12 +255,14 @@ func TestPermissionDenied(t *testing.T) {
 	f := &fakeLLM{script: []string{
 		"tool:Bash|command=rm -rf /",
 	}}
-	ag, events, ctrl := newTestAgent(t, f)
+	ag, events := newTestAgent(t, f)
 	// Force default mode so the dangerous command is denied.
-	ag.SetPermissionMode(permissions.ModeDefault)
+	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("set-mode")), SessionID: protocol.SessionID(ag.SessionID()),
+		Type:             protocol.CommandSetPermissionPolicy,
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)}}})
 	go ag.Run()
 
-	ctrl <- Control{Type: ControlUserMessage, Text: "delete root"}
+	submitTestInput(t, ag, "delete root")
 
 	saw := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
 		return ev.Type == EventToolResult && ev.Tool != nil && ev.Tool.Status == "denied"
@@ -252,11 +285,13 @@ func TestApprovalGate(t *testing.T) {
 		"tool:Bash|command=npm install",
 		"text:installed",
 	}}
-	ag, events, ctrl := newTestAgent(t, f)
-	ag.SetPermissionMode(permissions.ModeDefault)
+	ag, events := newTestAgent(t, f)
+	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("set-mode")), SessionID: protocol.SessionID(ag.SessionID()),
+		Type:             protocol.CommandSetPermissionPolicy,
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)}}})
 	go ag.Run()
 
-	ctrl <- Control{Type: ControlUserMessage, Text: "install deps"}
+	submitTestInput(t, ag, "install deps")
 
 	// Approval should be requested (npm install is not in the safe allowlist).
 	req := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
@@ -268,7 +303,9 @@ func TestApprovalGate(t *testing.T) {
 	}
 
 	// Approve it (not remembered).
-	ctrl <- Control{Type: ControlApproval, ApprovalID: ap.ID, Approve: true, Remember: false}
+	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("approve")), SessionID: protocol.SessionID(ag.SessionID()),
+		Type:     protocol.CommandApproveTool,
+		Approval: &protocol.ApproveTool{ApprovalID: ap.ID, Approve: true, Remember: false}})
 
 	// Tool should then run successfully.
 	saw := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
@@ -284,11 +321,13 @@ func TestApprovalDeniedRemembered(t *testing.T) {
 		"tool:Bash|command=npm install",
 		"text:done",
 	}}
-	ag, events, ctrl := newTestAgent(t, f)
-	ag.SetPermissionMode(permissions.ModeDefault)
+	ag, events := newTestAgent(t, f)
+	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("set-mode")), SessionID: protocol.SessionID(ag.SessionID()),
+		Type:             protocol.CommandSetPermissionPolicy,
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)}}})
 	go ag.Run()
 
-	ctrl <- Control{Type: ControlUserMessage, Text: "install deps"}
+	submitTestInput(t, ag, "install deps")
 
 	req := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
 		return ev.Type == EventApproval
@@ -296,7 +335,9 @@ func TestApprovalDeniedRemembered(t *testing.T) {
 	ap := req[len(req)-1].Approval
 
 	// Deny and remember ("never allow this command").
-	ctrl <- Control{Type: ControlApproval, ApprovalID: ap.ID, Approve: false, Remember: true}
+	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("deny")), SessionID: protocol.SessionID(ag.SessionID()),
+		Type:     protocol.CommandApproveTool,
+		Approval: &protocol.ApproveTool{ApprovalID: ap.ID, Approve: false, Remember: true}})
 
 	saw := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
 		return ev.Type == EventToolResult && ev.Tool != nil && ev.Tool.Status == "denied"
@@ -316,7 +357,7 @@ func TestApprovalDeniedRemembered(t *testing.T) {
 	f.script = []string{"tool:Bash|command=npm install", "text:done"}
 	f.mu.Unlock()
 
-	ctrl <- Control{Type: ControlUserMessage, Text: "install deps again"}
+	submitTestInput(t, ag, "install deps again")
 	// No approval event should arrive; the tool is denied immediately.
 	deadline := time.After(3 * time.Second)
 	gotApproval := false

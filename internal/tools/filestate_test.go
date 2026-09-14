@@ -6,14 +6,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"ccdp/internal/sandbox"
 )
 
 func freshCtx(t *testing.T) *Context {
 	t.Helper()
 	dir := t.TempDir()
-	t.Cleanup(ClearFileReadState)
-	ClearFileReadState()
-	return &Context{WorkingDir: dir, Args: map[string]any{}}
+	return scopedTestContext(t, dir)
 }
 
 func runTool(t *testing.T, tool Tool, ctx *Context, args map[string]any) (string, error) {
@@ -116,7 +116,7 @@ func TestWriteOverwriteRequiresRead(t *testing.T) {
 }
 
 func TestRecentReadsRecencyOrder(t *testing.T) {
-	freshCtx(t)
+	ctx := freshCtx(t)
 	a := filepath.Join(t.TempDir(), "a.txt")
 	b := filepath.Join(t.TempDir(), "b.txt")
 	c := filepath.Join(t.TempDir(), "c.txt")
@@ -124,25 +124,25 @@ func TestRecentReadsRecencyOrder(t *testing.T) {
 		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		MarkFileRead(p)
+		ctx.Resources.Files.MarkFileRead(p)
 	}
 
 	// Newest first, bounded by n.
-	recs := RecentReads(2)
+	recs := ctx.Resources.Files.RecentReads(2)
 	if len(recs) != 2 || recs[0].Path != c || recs[1].Path != b {
 		t.Fatalf("RecentReads(2) = %v", recs)
 	}
 
 	// Re-reading moves a path to the front of the recency order.
-	MarkFileRead(a)
-	recs = RecentReads(3)
+	ctx.Resources.Files.MarkFileRead(a)
+	recs = ctx.Resources.Files.RecentReads(3)
 	if recs[0].Path != a || recs[2].Path != b {
 		t.Fatalf("re-read did not refresh recency: %v", recs)
 	}
 
 	// Forgetting drops the path entirely.
-	ForgetFile(c)
-	recs = RecentReads(10)
+	ctx.Resources.Files.ForgetFile(c)
+	recs = ctx.Resources.Files.RecentReads(10)
 	if len(recs) != 2 {
 		t.Fatalf("forgotten path still tracked: %v", recs)
 	}
@@ -150,5 +150,146 @@ func TestRecentReadsRecencyOrder(t *testing.T) {
 		if r.Path == c {
 			t.Fatal("forgotten path returned by RecentReads")
 		}
+	}
+}
+
+func TestFreshnessDetectsSameSizeTimestampRestoration(t *testing.T) {
+	ctx := freshCtx(t)
+	path := filepath.Join(ctx.WorkingDir, "fingerprint.txt")
+	original := []byte("alpha\n")
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runTool(t, NewReadTool(), ctx, map[string]any{"file_path": path}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Replace with different bytes of the same length, then restore the old
+	// mtime. Stat-only freshness checks would incorrectly accept this edit.
+	if err := os.WriteFile(path, []byte("omega\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = runTool(t, NewEditTool(), ctx, map[string]any{
+		"file_path": path, "old_string": "alpha", "new_string": "beta",
+	})
+	if err == nil || !strings.Contains(err.Error(), "content changed") {
+		t.Fatalf("expected content fingerprint rejection, got %v", err)
+	}
+}
+
+func TestFreshnessRejectsSmallReadReplacedByHugeSparseFile(t *testing.T) {
+	ctx := freshCtx(t)
+	path := filepath.Join(ctx.WorkingDir, "grew.txt")
+	if err := os.WriteFile(path, []byte("small\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runTool(t, NewReadTool(), ctx, map[string]any{"file_path": path}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep the same path and inode but grow it far beyond the read record. The
+	// freshness gate must reject on the first descriptor stat rather than hash
+	// this replacement's contents.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const hugeSize = int64(2 << 30)
+	if err := f.Truncate(hugeSize); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := runTool(t, NewEditTool(), ctx, map[string]any{
+		"file_path": path, "old_string": "small", "new_string": "changed",
+	}); err == nil || !strings.Contains(err.Error(), "modified since") {
+		t.Fatalf("expected immediate size-change rejection for sparse replacement, got %v", err)
+	}
+}
+
+func TestPartialReadDoesNotClaimCompleteFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.txt")
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", 1<<20)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, snapshot, err := readRangeSnapshot(path, 0, 64*1024, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 64*1024 {
+		t.Fatalf("read %d bytes, want bounded 65536", len(data))
+	}
+	if snapshot.Complete {
+		t.Fatal("partial read was recorded as a complete file fingerprint")
+	}
+
+	ctx := freshCtx(t)
+	ctxPath := filepath.Join(ctx.WorkingDir, "large.txt")
+	if err := os.WriteFile(ctxPath, []byte(strings.Repeat("y", 1<<20)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runTool(t, NewReadTool(), ctx, map[string]any{"file_path": ctxPath, "limit": 64 * 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "partial read") || !strings.Contains(out, "full-file Edit/Write") {
+		t.Fatalf("partial-read warning was not explicit enough: %q", out[:min(len(out), 256)])
+	}
+	if _, err := runTool(t, NewEditTool(), ctx, map[string]any{
+		"file_path": ctxPath, "old_string": "y", "new_string": "z",
+	}); err == nil || !strings.Contains(err.Error(), "only partially read") {
+		t.Fatalf("expected partial-read freshness rejection, got %v", err)
+	}
+}
+
+func TestWriteFileNoFollowRejectsHardlinkDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "protected.json")
+	alias := filepath.Join(dir, "alias.json")
+	original := []byte("protected\n")
+	if err := os.WriteFile(target, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(target, alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileNoFollow(alias, []byte("attacker\n"), 0o644); err == nil {
+		t.Fatal("write through a multiply-linked alias was accepted")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("hardlink target changed after rejected write: %q", got)
+	}
+}
+
+func TestStrictReadAllowsInternalSymlinkWithCanonicalOpen(t *testing.T) {
+	ctx := freshCtx(t)
+	ctx.Sandbox = sandbox.New(ctx.WorkingDir, sandbox.ModeStrict)
+	target := filepath.Join(ctx.WorkingDir, "target.txt")
+	alias := filepath.Join(ctx.WorkingDir, "alias.txt")
+	if err := os.WriteFile(target, []byte("inside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runTool(t, NewReadTool(), ctx, map[string]any{"file_path": alias})
+	if err != nil {
+		t.Fatalf("strict internal symlink read failed: %v", err)
+	}
+	if !strings.Contains(out, "inside") {
+		t.Fatalf("strict symlink read omitted target content: %q", out)
 	}
 }

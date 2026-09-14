@@ -86,6 +86,24 @@ func TestNewlineOperatorBlocksAutoAllow(t *testing.T) {
 	}
 }
 
+func TestFindMutationPrimariesAreNotReadOnly(t *testing.T) {
+	m := NewManager(ModeDefault, Policy{})
+	for _, command := range []string{
+		"find . -delete",
+		"find . -exec rm {} +",
+		"find . -execdir touch marker +",
+		"find . -fprint output.txt",
+		"find . -fprintf output.txt %p",
+	} {
+		if decision, _ := m.Check("Bash", map[string]any{"command": command}); decision == DecisionAllow {
+			t.Errorf("mutating find command was auto-allowed: %q", command)
+		}
+	}
+	if decision, _ := m.Check("Bash", map[string]any{"command": "find . -type f -print"}); decision != DecisionAllow {
+		t.Errorf("read-only find command should remain allowed, got %v", decision)
+	}
+}
+
 func TestGitSafeRejectsOperators(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{})
 	for _, cmd := range []string{"git status; rm -rf x", "git diff > /etc/passwd", "git log && reboot", "git status | sh"} {
@@ -159,4 +177,32 @@ func TestManagerConcurrentAccess(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestClonePreservesRememberedDecisionsWithoutSharingState(t *testing.T) {
+	parent := NewManager(ModeDefault, Policy{
+		AlwaysAllow: []string{"Read"},
+		AlwaysDeny:  []string{"Bash:rm *"},
+	})
+	allowKey := SessionKey("Write", map[string]any{"file_path": "child.txt"})
+	denyKey := SessionKey("Bash", map[string]any{"command": "git push"})
+	parent.RememberAllow(allowKey)
+	parent.RememberDeny(denyKey)
+
+	child := parent.Clone()
+	if got, _ := child.Check("Write", map[string]any{"file_path": "child.txt"}); got != DecisionAllow {
+		t.Fatalf("clone lost remembered allow: %v", got)
+	}
+	if got, _ := child.Check("Bash", map[string]any{"command": "git push"}); got != DecisionDeny {
+		t.Fatalf("clone lost remembered deny: %v", got)
+	}
+
+	child.RememberAllow(SessionKey("Write", map[string]any{"file_path": "other.txt"}))
+	child.SetMode(ModeBypass)
+	if got, _ := parent.Check("Write", map[string]any{"file_path": "other.txt"}); got == DecisionAllow {
+		t.Fatal("child mutation leaked into parent")
+	}
+	if parent.CurrentMode() == ModeBypass {
+		t.Fatal("child mode mutation leaked into parent")
+	}
 }

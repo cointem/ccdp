@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,11 +39,21 @@ func newTestRepo(t *testing.T) string {
 }
 
 func gitCtx(dir string) *Context {
+	resources := NewResources("git:"+dir, filepath.Join(dir, ".ccdp-session"))
 	return &Context{
 		Context:    context.Background(),
 		WorkingDir: dir,
+		SessionDir: resources.SessionDir(),
+		Resources:  resources,
 		Args:       map[string]any{},
 	}
+}
+
+func scopedTestContext(t *testing.T, dir string) *Context {
+	t.Helper()
+	resources := NewResources("test:"+t.Name(), filepath.Join(dir, ".ccdp-session"))
+	t.Cleanup(func() { _ = resources.Close() })
+	return resources.Context(context.Background(), dir, nil)
 }
 
 func TestGitStatusTool(t *testing.T) {
@@ -60,6 +71,28 @@ func TestGitStatusTool(t *testing.T) {
 	}
 }
 
+func TestWriteFileNoFollowRejectsHardlinkTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "control.json")
+	alias := filepath.Join(dir, "workspace-alias.json")
+	if err := os.WriteFile(target, []byte("original\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(target, alias); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	if err := writeFileNoFollow(alias, []byte("changed\n"), 0o600); err == nil {
+		t.Fatal("writeFileNoFollow accepted a multiply-linked target")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "original\n" {
+		t.Fatalf("hard-linked target was modified: %q", data)
+	}
+}
+
 func TestGitDiffTool(t *testing.T) {
 	dir := newTestRepo(t)
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello world\n"), 0o644); err != nil {
@@ -71,6 +104,49 @@ func TestGitDiffTool(t *testing.T) {
 	}
 	if !strings.Contains(out, "+hello world") {
 		t.Errorf("GitDiff output missing change:\n%s", out)
+	}
+}
+
+func TestGitDiffRejectsOptionRevision(t *testing.T) {
+	dir := newTestRepo(t)
+	target := filepath.Join(t.TempDir(), "must-not-exist.diff")
+	ctx := gitCtx(dir)
+	ctx.Args = map[string]any{"base": "--output=" + target}
+	if _, err := NewGitDiffTool().Run(ctx); err == nil {
+		t.Fatal("expected option-shaped diff revision to be rejected")
+	}
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only GitDiff used base as an output-writing option: %v", err)
+	}
+}
+
+func TestGitDiffDoesNotExecuteRepositoryExternalDiff(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	dir := newTestRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("after\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "external-diff-ran")
+	script := filepath.Join(dir, "external-diff.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf unexpected > \"$CCDP_GIT_SENTINEL\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CCDP_GIT_SENTINEL", marker)
+	cmd := exec.Command("git", "config", "diff.external", script)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("configure external diff: %v\n%s", err, out)
+	}
+	output, err := NewGitDiffTool().Run(gitCtx(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only GitDiff executed project-configured command: %v", err)
+	}
+	if !strings.Contains(output, "-hello") || !strings.Contains(output, "+after") {
+		t.Fatalf("read-only built-in diff lost ordinary diff output: %s", output)
 	}
 }
 
@@ -144,5 +220,39 @@ func TestParseDuckDuckGo(t *testing.T) {
 	}
 	if results[0].Title != "Go Docs" || results[1].Snippet != "News from the Go team & more." {
 		t.Errorf("unexpected parse: %+v", results)
+	}
+}
+
+type registryTestTool struct{ name string }
+
+func (t *registryTestTool) Name() string                 { return t.name }
+func (t *registryTestTool) Description() string          { return "test" }
+func (t *registryTestTool) Parameters() map[string]any   { return map[string]any{"type": "object"} }
+func (t *registryTestTool) Run(*Context) (string, error) { return "", nil }
+
+func TestRegistryDisposerDoesNotRemoveReplacement(t *testing.T) {
+	r := NewRegistry()
+	first := &registryTestTool{name: "same"}
+	second := &registryTestTool{name: "same"}
+	disposeFirst := r.RegisterIn("plugin", first)
+	_ = r.RegisterIn("plugin", second)
+	disposeFirst()
+	got, ok := r.Get("same")
+	if !ok || got != second {
+		t.Fatalf("old disposer removed replacement: got=%v ok=%v", got, ok)
+	}
+}
+
+func TestRegistryLeaseRetainsBindingAcrossReplacement(t *testing.T) {
+	r := NewRegistry()
+	old := &registryTestTool{name: "same"}
+	newTool := &registryTestTool{name: "same"}
+	_ = r.RegisterIn("plugin", old)
+	lease := r.Acquire()
+	_ = r.RegisterIn("plugin", newTool)
+	current, _ := r.Get("same")
+	bound, _ := lease.Get("same")
+	if current != newTool || bound != old {
+		t.Fatalf("lease mixed registry generations: current=%v bound=%v", current, bound)
 	}
 }

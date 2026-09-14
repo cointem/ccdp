@@ -1,10 +1,8 @@
 package tui
 
 import (
+	"context"
 	"fmt"
-	"os"
-	"os/exec"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -12,201 +10,242 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"ccdp/internal/agent"
+	"ccdp/internal/commands"
 	"ccdp/internal/permissions"
+	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
-	"ccdp/internal/workspace"
 )
 
 // statuslineTokens are the valid /statusline items.
 var statuslineTokens = map[string]bool{
 	"version": true, "model": true, "mode": true,
 	"session": true, "workspace": true, "cost": true, "context": true,
+	"effort": true,
 }
 
-// commandNames is the sorted list of slash commands, parsed from commandHelp so
-// it can never drift from the documented set. Used by the / autocomplete popup.
-var commandNames = parseCommandNames()
+// commandCatalog is the one source of command metadata. The autocomplete
+// list is derived from it, so command parsing never depends on rendered help.
+var commandCatalog = commands.Default()
 
-func parseCommandNames() []string {
-	seen := map[string]bool{}
-	var names []string
-	for _, line := range strings.Split(commandHelp, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "/") {
-			continue
-		}
-		// A line may hold several commands ("/quit, /exit"); each "/" token
-		// contributes its name, with punctuation stripped ("/config set <k>").
-		for _, tok := range strings.Fields(line) {
-			if !strings.HasPrefix(tok, "/") {
-				continue
-			}
-			name := strings.Trim(tok, "/,|")
-			if name == "" || seen[name] {
-				continue
-			}
-			seen[name] = true
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	return names
-}
-
-// commandHelp is rendered by /help.
-const commandHelp = `ccdp commands
-────────────────────────────────────────
-/help                       show this help
-/clear                      clear conversation history
-/compact                    compact context now
-/cost                       show token usage and estimated cost
-/config                     show runtime configuration
-/config set <k> <v>         change model|mode|sandbox at runtime
-/doctor                     run environment diagnostics
-/permissions                show permission rules
-/permissions <allow|deny|remove> <rule>
-                            manage persistent allow/deny rules
-/memory                     show session memory (AutoMem, enable via enable_memory)
-/memory clear               clear session memory
-/github                     show GitHub integration status
-/pr-comments                fetch review comments on the current PR
-/commit-push-pr <message>   commit, push and open a PR for the current branch
-/reload                     reload .ccdp/settings.json at runtime
-/plugins                    show loaded plugins and LLM providers
-/mcp                        show connected MCP servers, tools, resources, prompts
-/skills                     list available skills
-/mode                       show current permission mode
-/mode <default|acceptEdits|plan|bypassPermissions>
-                            switch permission mode
-/model                      show current model
-/model <name>               switch the active model
-/plan [on|off]              toggle plan mode (propose-then-approve)
-/sandbox                    show current sandbox mode
-/sandbox <confine|strict|none>
-                            switch sandbox mode
-/remove [n]                 remove the last n messages (default 1)
-/rewind [n]                 keep the first n messages; no arg = pick interactively
-/fork [n]                   branch a new session from message n (no arg = full copy);
-                            the abandoned direction is summarized into the new session
-/checkpoint [summary|id]    create a checkpoint, or restore one by id
-/review                     show changes and checkpoints
-/add-dir <dir>              allow the sandbox to touch another directory
-/disallowed-dir <dir>       block a directory in the sandbox
-/export [path]              export the conversation as markdown
-/diff [path…]               show git status and a diff of changes
-/cd <dir>                   change the working directory
-/pwd                        show the current working directory
-/statusline                 show statusline items
-/statusline <items…>        set statusline items (version model mode session workspace cost context)
-/apply <file>               apply a git patch, or send a plan file to the agent
-/git <args...>              run a git command in the workspace (e.g. /git status)
-/save                       save the session to disk
-/sessions                   list saved sessions
-/resume <id>                resume a saved session
-/status                     show session details
-/commands                   list custom slash commands
-/quit, /exit                quit ccdp
-
-Custom commands: markdown files in ~/.ccdp/commands/<name>.md or
-.ccdp/commands/<name>.md become /name; $ARGUMENTS is replaced by the args.
-────────────────────────────────────────
-Keys
-  Enter        send message      Alt+Enter    newline (Ctrl+J works too)
-  ctrl+c       interrupt agent; press twice when idle to quit
-  pgup/pgdn    scroll the conversation
-  ctrl+p/n     input history
-  y/n          approve/deny      a/x  always allow/deny for session
-  esc          clear input / dismiss
-`
+var commandNames = commandCatalog.Names()
 
 // runCommand executes a slash command entered in the input box. Commands that
 // need the tea runtime (e.g. quitting) return a tea.Cmd alongside the model.
 func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
-	fields := strings.Fields(text)
+	fields, err := commands.ParseLine(text)
+	if err != nil {
+		m.pushLog("error", "command parse failed: "+err.Error())
+		return m, nil
+	}
+	if len(fields) == 0 {
+		return m, nil
+	}
 	cmd := strings.ToLower(strings.TrimPrefix(fields[0], "/"))
 	args := fields[1:]
+	if canonical, ok := commandCatalog.Canonical(cmd); ok {
+		cmd = canonical
+	}
+	if m.routing != nil && m.sessionID != m.routing.rootID {
+		switch cmd {
+		case "agents", "agent", "agent-history", "agent-output", "transcript", "parent", "root", "help", "cost", "copy", "stop-tree", "quit":
+		default:
+			m.pushStatus("this command belongs to the main session; use /root first")
+			return m, nil
+		}
+	}
+	if entry, ok := commandCatalog.Lookup(cmd); ok && m.busy && entry.Busy == commands.BusyReject {
+		m.pushStatus("/" + entry.Name + " is unavailable while the agent is busy")
+		return m, nil
+	}
 
 	switch cmd {
+	case "agents":
+		return m, m.loadAgentCatalog(true)
+	case "agent":
+		return m, m.runAgentCommand(args)
+	case "stop-tree":
+		if m.routing == nil {
+			return m, nil
+		}
+		directory, id, commandID := m.routing.directory, protocol.SessionID(m.routing.rootID), nextUICommandID()
+		return m, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			run, err := directory.Control(ctx, protocol.AgentControl{ID: commandID, SessionID: id, Action: "stop_tree"})
+			return agentControlMsg{id: id, run: run, err: err}
+		}
+	case "parent":
+		return m, m.openAgentView(m.parentAgentID())
+	case "root":
+		return m, m.openAgentView("root")
+	case "agent-history":
+		var before uint64
+		if len(args) > 0 {
+			var err error
+			before, err = strconv.ParseUint(args[0], 10, 64)
+			if err != nil {
+				m.pushStatus("usage: /agent-history [before]")
+				return m, nil
+			}
+		}
+		return m, m.loadAgentHistory(before)
+	case "agent-output":
+		if len(args) == 0 {
+			m.pushStatus("usage: /agent-output <item-id> [offset]")
+			return m, nil
+		}
+		var offset int64
+		if len(args) > 1 {
+			var err error
+			offset, err = strconv.ParseInt(args[1], 10, 64)
+			if err != nil || offset < 0 {
+				m.pushStatus("invalid output offset")
+				return m, nil
+			}
+		}
+		return m, m.loadAgentOutput(args[0], offset)
+	case "transcript":
+		if len(args) != 0 {
+			m.pushLog("error", "usage: /transcript (open the full read-only transcript; /agent-output reads one saved output)")
+			return m, nil
+		}
+		return m, m.openTranscriptReader()
 	case "help", "?":
-		m.pushLog("system", commandHelp)
+		m.pushLog("system", commandCatalog.Help())
 
 	case "clear":
-		m.ctrl <- agent.Control{Type: agent.ControlClearHistory}
-		m.items = m.items[:0]
-		m.pushStatus("history cleared")
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandClearConversation}, "history clear submitted")
 
 	case "compact":
-		m.ctrl <- agent.Control{Type: agent.ControlCompactNow}
-		m.pushStatus("compacting…")
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandCompact}, "compacting…")
 
 	case "cost":
-		m.pushLog("system", renderUsage(m.ag.Usage(), m.modelName))
+		m.pushLog("system", renderUsage(m.usage, m.modelName))
+
+	case "copy":
+		if len(args) > 1 {
+			m.pushLog("error", "usage: /copy [message-id] (copies the latest response by default)")
+			return m, nil
+		}
+		if len(args) == 1 {
+			return m, m.copyLatestResponse(args[0])
+		}
+		return m, m.copyLatestResponse()
 
 	case "plugins":
-		extra := m.ag.PluginNames()
-		if pending := m.ag.HostPending(); len(pending) > 0 {
-			extra = append(append([]string{}, extra...), fmt.Sprintf("(pending: %s)", strings.Join(pending, ", ")))
-		}
-		m.pushLog("system", renderPlugins(extra, m.ag.ProviderNames()))
+		return m, m.runQuery(protocol.QueryPlugins, "plugin report requested")
 
 	case "mcp":
-		info := m.ag.MCPInfo()
-		resources := m.ag.MCPResources()
-		prompts := m.ag.MCPPrompts()
-		if len(info) == 0 {
-			m.pushLog("system", "no MCP servers connected — configure mcp_servers in ~/.ccdp/config.json")
-			return m, nil
-		}
-		var sb strings.Builder
-		sb.WriteString("MCP servers:\n")
-		for name, names := range info {
-			if len(names) == 0 {
-				fmt.Fprintf(&sb, "  %s: (no tools advertised)\n", name)
-			} else {
-				fmt.Fprintf(&sb, "  %s tools: %s\n", name, strings.Join(names, ", "))
-			}
-			if rs := resources[name]; len(rs) > 0 {
-				fmt.Fprintf(&sb, "    resources: %s\n", strings.Join(rs, ", "))
-			}
-			if ps := prompts[name]; len(ps) > 0 {
-				fmt.Fprintf(&sb, "    prompts: %s\n", strings.Join(ps, ", "))
-			}
-		}
-		m.pushLog("system", strings.TrimRight(sb.String(), "\n"))
+		return m, m.runQuery(protocol.QueryMCP, "MCP report requested")
 
 	case "init":
-		path, err := workspace.InitInstructionsFile(m.workspace)
-		if err != nil {
-			m.pushLog("error", "init failed: "+err.Error())
+		if len(args) != 0 {
+			m.pushLog("error", "usage: /init")
 			return m, nil
 		}
-		m.pushStatus("wrote " + path + " (edit it with project guidance)")
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandInit, Init: &protocol.InitCommand{}}, "project instructions request submitted")
 
 	case "mode":
 		if len(args) == 0 {
-			m.pushStatus(fmt.Sprintf("current permission mode: %s", m.mode))
-			return m, nil
+			modes := append([]permissions.Mode(nil), permissions.ValidModes...)
+			descriptions := map[permissions.Mode]string{
+				permissions.ModeDefault:     "ask before risky operations",
+				permissions.ModeAcceptEdits: "allow file edits; ask for other risky operations",
+				permissions.ModePlan:        "plan without changing files",
+				permissions.ModeBypass:      "allow operations without approval",
+			}
+			lines := make([]string, len(modes))
+			selected := 0
+			for i, mode := range modes {
+				lines[i] = fmt.Sprintf("%s — %s", mode, descriptions[mode])
+				if mode == m.mode {
+					selected = i
+				}
+			}
+			options := make([]selectorOption, len(modes))
+			pendingMode := ""
+			if m.hasSnapshot && m.snapshot.Pending != nil && m.snapshot.Pending.Permission != nil {
+				pendingMode = m.snapshot.Pending.Permission.Mode
+			}
+			for i, mode := range modes {
+				options[i] = selectorOption{ID: string(mode), Label: string(mode), Description: descriptions[mode],
+					Current: mode == m.mode, Pending: pendingMode != "" && pendingMode == string(mode)}
+			}
+			return m, m.startSelectorAt("Select permission mode", options, selected, true, selectorAction{Kind: selectorMode})
 		}
 		mode, err := permissions.ParseMode(args[0])
 		if err != nil {
 			m.pushLog("error", err.Error())
 			return m, nil
 		}
-		m.ctrl <- agent.Control{Type: agent.ControlSetMode, Mode: mode}
-		m.mode = mode
-		m.pushStatus(fmt.Sprintf("permission mode → %s", mode))
+		policy := m.permissionPolicy()
+		policy.Mode = string(mode)
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
+			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+string(mode))
 
-	case "model":
+	case "effort", "verbosity":
 		if len(args) == 0 {
-			m.pushStatus("model: " + m.modelName)
+			return m, m.startGenerationSelector(cmd)
+		}
+		if len(args) != 1 {
+			m.pushLog("error", "usage: /"+cmd+" <value|default>")
 			return m, nil
 		}
-		m.ag.SetModel(args[0])
-		m.modelName = args[0]
-		m.pushStatus("model → " + args[0])
+		value := args[0]
+		if value == "default" {
+			value = ""
+		}
+		g := &protocol.SetGeneration{}
+		if cmd == "effort" {
+			g.ReasoningEffort = &value
+		} else {
+			g.Verbosity = &value
+		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetGeneration, Generation: g}, cmd+" updated")
+	case "model":
+		if len(args) == 0 {
+			models := m.availableModels()
+			selected := 0
+			currentModel := m.modelName
+			pendingModel := ""
+			if m.hasSnapshot {
+				if m.snapshot.Settings.Model.Model != "" {
+					currentModel = m.snapshot.Settings.Model.Model
+				}
+				if m.snapshot.Pending != nil && m.snapshot.Pending.Model != nil {
+					pendingModel = m.snapshot.Pending.Model.Model
+				}
+			}
+			// A pending binding may be ahead of the provider catalog while a
+			// provider is being opened. Keep it selectable and visibly marked so
+			// the picker reflects the complete confirmed/pending state.
+			for _, model := range []string{currentModel, pendingModel} {
+				if model == "" || containsString(models, model) {
+					continue
+				}
+				models = append(models, model)
+			}
+			for i, model := range models {
+				if model == currentModel {
+					selected = i
+					break
+				}
+			}
+			options := make([]selectorOption, len(models))
+			for i, model := range models {
+				options[i] = selectorOption{ID: model, Label: model, Current: model == currentModel,
+					Pending: pendingModel != "" && model == pendingModel}
+			}
+			return m, m.startSelectorAt("Select model", options, selected, true, selectorAction{Kind: selectorModel})
+		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetModel,
+			Model: &protocol.SetModel{Model: args[0]}}, "model → "+args[0])
 
 	case "plan":
-		on := !m.ag.PlanMode()
+		on := !m.planMode
+		if m.hasSnapshot {
+			on = m.snapshot.Settings.ExecutionMode != protocol.ExecutionModePlan
+		}
 		if len(args) > 0 {
 			switch args[0] {
 			case "on":
@@ -218,26 +257,50 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		m.ctrl <- agent.Control{Type: agent.ControlSetPlan, PlanOn: on}
-		m.planMode = on
+		mode := protocol.ExecutionModeExecute
 		if on {
-			m.pushStatus("plan mode on — next message will produce a plan for approval")
-		} else {
-			m.pushStatus("plan mode off")
+			mode = protocol.ExecutionModePlan
 		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetExecutionMode,
+			ExecutionMode: &protocol.SetExecutionMode{Mode: mode}}, map[bool]string{true: "plan mode on", false: "plan mode off"}[on])
 
 	case "sandbox":
 		if len(args) == 0 {
-			m.pushStatus("sandbox mode: " + string(m.ag.SandboxMode()))
-			return m, nil
+			modes := append([]sandbox.Mode(nil), sandbox.ValidModes...)
+			descriptions := map[sandbox.Mode]string{
+				sandbox.ModeConfine: "confine writes to the workspace",
+				sandbox.ModeStrict:  "confine all file access to the workspace",
+				sandbox.ModeNone:    "disable containment",
+			}
+			current := sandbox.Mode(m.sandboxPolicy().Mode)
+			lines := make([]string, len(modes))
+			selected := 0
+			for i, mode := range modes {
+				lines[i] = fmt.Sprintf("%s — %s", mode, descriptions[mode])
+				if mode == current {
+					selected = i
+				}
+			}
+			options := make([]selectorOption, len(modes))
+			pendingMode := ""
+			if m.hasSnapshot && m.snapshot.Pending != nil && m.snapshot.Pending.Sandbox != nil {
+				pendingMode = m.snapshot.Pending.Sandbox.Mode
+			}
+			for i, mode := range modes {
+				options[i] = selectorOption{ID: string(mode), Label: string(mode), Description: descriptions[mode],
+					Current: mode == current, Pending: pendingMode != "" && pendingMode == string(mode)}
+			}
+			return m, m.startSelectorAt("Select sandbox mode", options, selected, true, selectorAction{Kind: selectorSandbox})
 		}
 		mode, err := sandbox.ParseMode(args[0])
 		if err != nil {
 			m.pushLog("error", err.Error())
 			return m, nil
 		}
-		m.ctrl <- agent.Control{Type: agent.ControlSetSandbox, SandboxMode: mode}
-		m.pushStatus("sandbox mode → " + string(mode))
+		policy := m.sandboxPolicy()
+		policy.Mode = string(mode)
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetSandboxPolicy,
+			SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, "sandbox mode → "+string(mode))
 
 	case "remove":
 		n := 1
@@ -249,14 +312,13 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			}
 			n = v
 		}
-		m.ctrl <- agent.Control{Type: agent.ControlRemove, Count: n}
-		m.pushStatus(fmt.Sprintf("removing last %d message(s)…", n))
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandRemoveMessages,
+			Remove: &protocol.RemoveMessages{Count: n}}, fmt.Sprintf("removing last %d message(s)…", n))
 
 	case "rewind":
 		// No argument → interactive picker over the recent messages.
 		if len(args) == 0 {
-			total := m.ag.MessageCount()
-			previews := m.ag.HistoryPreview(10)
+			total, previews := m.historyPreview()
 			if len(previews) == 0 {
 				m.pushLog("error", "nothing to rewind to")
 				return m, nil
@@ -265,24 +327,23 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			for i, p := range previews {
 				lines[i] = p
 			}
-			m.startPicker("rewind to message", lines, func(sel int) {
-				// sel is 0-based within the last 10; keep = total-10+sel+1.
-				keep := total - len(lines) + sel + 1
+			options := make([]selectorOption, len(lines))
+			for i, line := range lines {
+				keep := total - len(lines) + i + 1
 				if keep < 0 {
 					keep = 0
 				}
-				m.ctrl <- agent.Control{Type: agent.ControlRewind, Count: keep}
-				m.pushStatus(fmt.Sprintf("rewinding to message %d…", keep))
-			})
-			return m, nil
+				options[i] = selectorOption{ID: "keep:" + strconv.Itoa(keep), Label: line}
+			}
+			return m, m.startSelectorAt("Rewind to message", options, len(options)-1, true, selectorAction{Kind: selectorRewind})
 		}
 		n, err := strconv.Atoi(args[0])
 		if err != nil || n < 0 {
 			m.pushLog("error", "usage: /rewind [<n>] (keep the first n messages; no arg picks interactively)")
 			return m, nil
 		}
-		m.ctrl <- agent.Control{Type: agent.ControlRewind, Count: n}
-		m.pushStatus(fmt.Sprintf("rewinding to message %d…", n))
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandRewindConversation,
+			Rewind: &protocol.RewindConversation{Count: n}}, fmt.Sprintf("rewinding to message %d…", n))
 
 	case "fork":
 		// /fork [n] — branch a new session from message n (pi's session tree).
@@ -297,136 +358,143 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			}
 			n = v
 		}
-		m.ctrl <- agent.Control{Type: agent.ControlFork, Count: n}
-		m.pushStatus("forking session…")
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandFork,
+			Fork: &protocol.Fork{Count: n}}, "forking session…")
 
 	case "checkpoint":
-		// With a known checkpoint id: restore. Otherwise: create one with the
-		// given words as the summary.
-		if len(args) > 0 {
-			for _, r := range m.ag.CheckpointList() {
-				if r.ID == args[0] {
-					if err := m.ag.RestoreCheckpoint(args[0]); err != nil {
-						m.pushLog("error", "restore failed: "+err.Error())
-						return m, nil
-					}
-					m.pushStatus("restored checkpoint " + args[0])
-					return m, nil
-				}
-			}
+		action := protocol.CheckpointList
+		var id, summary string
+		switch {
+		case len(args) == 0, len(args) == 1 && strings.EqualFold(args[0], "list"):
+			action = protocol.CheckpointList
+		case strings.EqualFold(args[0], "create"):
+			action = protocol.CheckpointCreate
+			summary = strings.Join(args[1:], " ")
+		case strings.EqualFold(args[0], "restore") && len(args) == 2:
+			action, id = protocol.CheckpointRestore, args[1]
+		default:
+			m.pushLog("error", "usage: /checkpoint [list|create [summary]|restore <id>")
+			return m, nil
 		}
-		summary := "manual checkpoint"
-		if len(args) > 0 {
-			summary = strings.Join(args, " ")
-		}
-		if _, err := m.ag.CreateCheckpoint(summary); err != nil {
-			m.pushLog("error", "checkpoint failed: "+err.Error())
-		} else {
-			m.pushStatus("checkpoint created")
-		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandCheckpoint,
+			Checkpoint: &protocol.CheckpointCommand{Action: action, ID: id, Summary: summary}}, "checkpoint request submitted")
 
 	case "review":
-		return m, m.runReview()
+		m.pushStatus("loading review…")
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandRunWorkflow,
+			Workflow: &protocol.WorkflowCommand{Kind: protocol.WorkflowReview}}, "review workflow submitted")
 
 	case "add-dir":
 		if len(args) == 0 {
 			m.pushLog("error", "usage: /add-dir <directory>")
 			return m, nil
 		}
-		m.ag.AddDirectory(args[0])
-		m.pushStatus("additional directory → " + args[0])
+		policy := m.sandboxPolicy()
+		if !containsString(policy.AdditionalDirectories, args[0]) {
+			policy.AdditionalDirectories = append(policy.AdditionalDirectories, args[0])
+		}
+		if m.client == nil {
+			m.pushLog("error", "/add-dir requires a session protocol")
+			return m, nil
+		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetSandboxPolicy,
+			SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, "additional directory change submitted")
 
 	case "disallowed-dir":
 		if len(args) == 0 {
 			m.pushLog("error", "usage: /disallowed-dir <directory>")
 			return m, nil
 		}
-		m.ag.AddDisallowedDirectory(args[0])
-		m.pushStatus("disallowed directory → " + args[0])
+		policy := m.sandboxPolicy()
+		if !containsString(policy.DisallowedDirectories, args[0]) {
+			policy.DisallowedDirectories = append(policy.DisallowedDirectories, args[0])
+		}
+		if m.client == nil {
+			m.pushLog("error", "/disallowed-dir requires a session protocol")
+			return m, nil
+		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetSandboxPolicy,
+			SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, "disallowed directory change submitted")
 
 	case "export":
-		md := m.ag.ExportMarkdown()
-		path := "ccdp-export-" + m.sessionID + ".md"
+		if len(args) > 1 {
+			m.pushLog("error", "usage: /export [path]")
+			return m, nil
+		}
+		path := ""
 		if len(args) > 0 {
 			path = args[0]
 		}
-		if err := os.WriteFile(path, []byte(md), 0o644); err != nil {
-			m.pushLog("error", "export failed: "+err.Error())
-			return m, nil
-		}
-		m.pushStatus(fmt.Sprintf("exported %d messages to %s", strings.Count(md, "## "), path))
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandExport,
+			Export: &protocol.ExportCommand{Path: path}}, "export request submitted")
 
 	case "diff":
-		m.runDiff(args)
+		m.pushStatus("loading diff…")
+		return m, m.runDiff(args)
 
 	case "cd":
-		if len(args) == 0 {
+		if len(args) != 1 {
 			m.pushLog("error", "usage: /cd <dir>")
 			return m, nil
 		}
-		if err := m.ag.SetWorkspace(args[0]); err != nil {
-			m.pushLog("error", "cd failed: "+err.Error())
-			return m, nil
-		}
-		m.workspace = m.ag.WorkspaceLabel()
-		// Project-scoped custom commands follow the workspace.
-		m.customCmds = loadCustomCommands(m.workspace)
-		m.pushStatus("workspace → " + m.workspace)
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetWorkspace,
+			Workspace: &protocol.WorkspaceCommand{Path: args[0]}}, "workspace change submitted")
 
 	case "pwd":
 		m.pushStatus("workspace: " + m.workspace)
 
 	case "statusline":
 		if len(args) == 0 {
-			m.pushStatus("statusline items: " + strings.Join(m.statusItems, " "))
+			m.pushStatus("statusline extras: " + strings.Join(m.statusItems, " ") + " · model effort context always visible")
 			return m, nil
 		}
 		if args[0] == "default" {
 			m.statusItems = append([]string{}, defaultStatusItems...)
-			m.pushStatus("statusline reset")
+			m.pushStatus("statusline extras reset · model effort context always visible")
 			return m, nil
 		}
 		var items []string
 		for _, a := range args {
 			if !statuslineTokens[a] {
-				m.pushLog("error", fmt.Sprintf("unknown statusline item %q (valid: version model mode session workspace cost context)", a))
+				m.pushLog("error", fmt.Sprintf("unknown statusline item %q (valid: version model mode session workspace cost context effort)", a))
 				return m, nil
 			}
 			items = append(items, a)
 		}
 		m.statusItems = items
-		m.pushStatus("statusline: " + strings.Join(items, " "))
+		m.pushStatus("statusline extras: " + strings.Join(items, " ") + " · model effort context always visible")
 
 	case "skills":
-		names := m.ag.SkillNames()
-		if len(names) == 0 {
-			m.pushLog("system", "no skills — create ~/.ccdp/skills/<name>/SKILL.md or .ccdp/skills/<name>/SKILL.md")
-			return m, nil
-		}
-		m.pushLog("system", "skills: "+strings.Join(names, ", "))
+		return m, m.runQuery(protocol.QuerySkills, "skills report requested")
 
 	case "apply":
 		if len(args) == 0 {
 			m.pushLog("error", "usage: /apply <file.md|file.patch> — applies a plan or git patch to the workspace")
 			return m, nil
 		}
-		m.runApply(args[0])
+		return m, m.runApply(args[0])
 
 	case "git":
 		if len(args) == 0 {
 			m.pushLog("error", "usage: /git <subcommand> [args…], e.g. /git status --short")
 			return m, nil
 		}
+		m.pushStatus("running git…")
 		return m, m.runGit(args)
 
 	case "save":
-		if err := m.ag.Save(); err != nil {
-			m.pushLog("error", "save failed: "+err.Error())
-		} else {
-			m.pushStatus("session saved")
+		if len(args) != 0 {
+			m.pushLog("error", "usage: /save")
+			return m, nil
 		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSaveSession,
+			SaveSession: &protocol.SaveSessionCommand{}}, "session save submitted")
 
 	case "sessions":
+		if m.ag == nil {
+			m.pushLog("error", "/sessions is unavailable through this session protocol")
+			return m, nil
+		}
 		sessions, err := agent.ListSessions(m.ag.SessionDir())
 		if err != nil {
 			m.pushLog("error", err.Error())
@@ -459,46 +527,44 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	case "resume":
 		// No argument → interactive picker over saved sessions.
 		if len(args) == 0 {
-			m.startResumePicker()
-			return m, nil
+			return m, m.startResumePicker()
 		}
-		if err := m.resumeSession(args[0]); err != nil {
-			m.pushLog("error", "resume failed: "+err.Error())
-			return m, nil
-		}
-		m.pushStatus("resumed session " + args[0])
+		return m, m.openResumeSession(args[0])
 
 	case "config":
 		if len(args) == 0 {
-			m.pushLog("system", m.ag.ConfigSummary())
-			return m, nil
+			return m, m.runQuery(protocol.QueryConfig, "configuration report requested")
 		}
 		// /config set <key> <value> — runtime settable keys reuse the existing
 		// commands (model, mode, sandbox); anything else is read-only.
 		if args[0] == "set" && len(args) >= 3 {
 			key, val := args[1], strings.Join(args[2:], " ")
 			switch key {
+			case "effort", "verbosity":
+				return m.runCommand("/" + key + " " + val)
 			case "model":
-				m.ag.SetModel(val)
-				m.modelName = val
-				m.pushStatus("model → " + val)
+				return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetModel,
+					Model: &protocol.SetModel{Model: val}}, "model change submitted")
 			case "mode":
 				mode, err := permissions.ParseMode(val)
 				if err != nil {
 					m.pushLog("error", err.Error())
 					return m, nil
 				}
-				m.ctrl <- agent.Control{Type: agent.ControlSetMode, Mode: mode}
-				m.mode = mode
-				m.pushStatus("permission mode → " + string(mode))
+				policy := m.permissionPolicy()
+				policy.Mode = string(mode)
+				return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
+					PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode change submitted")
 			case "sandbox":
 				mode, err := sandbox.ParseMode(val)
 				if err != nil {
 					m.pushLog("error", err.Error())
 					return m, nil
 				}
-				m.ctrl <- agent.Control{Type: agent.ControlSetSandbox, SandboxMode: mode}
-				m.pushStatus("sandbox mode → " + string(mode))
+				policy := m.sandboxPolicy()
+				policy.Mode = string(mode)
+				return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetSandboxPolicy,
+					SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, "sandbox mode change submitted")
 			default:
 				m.pushLog("error", "/config set supports: model, mode, sandbox (others are read-only)")
 			}
@@ -507,12 +573,11 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		m.pushLog("error", "usage: /config  |  /config set <model|mode|sandbox> <value>")
 
 	case "doctor":
-		m.pushLog("system", m.ag.Doctor())
+		return m, m.runQuery(protocol.QueryDoctor, "diagnostics report requested")
 
 	case "permissions":
 		if len(args) == 0 {
-			m.pushLog("system", m.ag.PermissionsInfo())
-			return m, nil
+			return m, m.runQuery(protocol.QueryPermissions, "permission report requested")
 		}
 		// /permissions allow|deny|remove <rule>
 		switch args[0] {
@@ -522,43 +587,70 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			rule := strings.Join(args[1:], " ")
-			if err := m.ag.AddAlwaysRule(args[0], rule); err != nil {
-				m.pushLog("error", err.Error())
+			if m.client == nil {
+				m.pushLog("error", "/permissions requires a session protocol")
+				return m, nil
 			}
+			policy := m.permissionPolicy()
+			if args[0] == "allow" {
+				if !containsString(policy.AlwaysAllow, rule) {
+					policy.AlwaysAllow = append(policy.AlwaysAllow, rule)
+				}
+			} else if !containsString(policy.AlwaysDeny, rule) {
+				policy.AlwaysDeny = append(policy.AlwaysDeny, rule)
+			}
+			return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
+				PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission rule change submitted")
 		case "remove":
 			if len(args) < 3 {
 				m.pushLog("error", "usage: /permissions remove <allow|deny> <rule>")
 				return m, nil
 			}
 			rule := strings.Join(args[2:], " ")
-			if err := m.ag.RemoveAlwaysRule(args[1], rule); err != nil {
-				m.pushLog("error", err.Error())
+			if m.client == nil {
+				m.pushLog("error", "/permissions requires a session protocol")
+				return m, nil
 			}
+			policy := m.permissionPolicy()
+			if args[1] == "allow" {
+				policy.AlwaysAllow = removeString(policy.AlwaysAllow, rule)
+			} else if args[1] == "deny" {
+				policy.AlwaysDeny = removeString(policy.AlwaysDeny, rule)
+			} else {
+				m.pushLog("error", "usage: /permissions remove <allow|deny> <rule>")
+				return m, nil
+			}
+			return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
+				PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission rule change submitted")
 		default:
 			m.pushLog("error", "usage: /permissions [allow|deny|remove <rule>]")
 		}
 
 	case "memory":
-		if len(args) > 0 && args[0] == "clear" {
-			if err := m.ag.ClearMemory(); err != nil {
-				m.pushLog("error", "clear failed: "+err.Error())
-			} else {
-				m.pushStatus("session memory cleared")
-			}
-			return m, nil
+		if len(args) == 0 {
+			return m, m.runQuery(protocol.QueryMemory, "memory report requested")
 		}
-		text := m.ag.MemoryText()
-		if text == "" {
-			m.pushLog("system", "no session memory yet — set \"enable_memory\": true in ~/.ccdp/config.json to record facts learned each turn")
-			return m, nil
+		if len(args) == 1 && strings.EqualFold(args[0], "clear") {
+			return m, m.submitCommand(protocol.Command{Type: protocol.CommandClearMemory,
+				ClearMemory: &protocol.ClearMemoryCommand{}}, "memory clear submitted")
 		}
-		m.pushLog("system", text)
+		m.pushLog("error", "usage: /memory [clear]")
+		return m, nil
 
 	case "github":
-		m.pushLog("system", m.ag.GitHubStatus())
+		if len(args) != 0 {
+			m.pushLog("error", "usage: /github")
+			return m, nil
+		}
+		return m, m.runQuery(protocol.QueryGitHub, "GitHub status requested")
 
 	case "pr-comments":
-		m.pushLog("system", m.ag.PRComments())
+		if len(args) != 0 {
+			m.pushLog("error", "usage: /pr-comments")
+			return m, nil
+		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandExternal,
+			External: &protocol.ExternalCommand{Program: "gh", Args: []string{"pr", "view", "--comments"}}}, "PR comments requested")
 
 	case "commit-push-pr":
 		msg := strings.Join(args, " ")
@@ -566,24 +658,33 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			m.pushLog("error", "usage: /commit-push-pr <commit message>")
 			return m, nil
 		}
-		m.pushLog("system", m.ag.CommitPushPR(msg))
+		m.pushStatus("committing, pushing and opening PR…")
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandRunWorkflow,
+			Workflow: &protocol.WorkflowCommand{Kind: protocol.WorkflowCommitPushPR, Message: msg}}, "commit/push/PR workflow submitted")
 
 	case "reload":
-		if err := m.ag.ReloadSettings(); err != nil {
-			m.pushLog("error", "reload failed: "+err.Error())
-		} else {
-			m.pushStatus("settings reloaded")
+		if len(args) != 0 {
+			m.pushLog("error", "usage: /reload")
+			return m, nil
 		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandReloadSettings,
+			Reload: &protocol.ReloadCommand{}}, "settings reload submitted")
 
 	case "status":
-		parent, branchPoint := m.ag.Lineage()
-		lineage := ""
-		if parent != "" {
-			lineage = fmt.Sprintf("\nforked from: %s @ message %d", parent, branchPoint)
+		if len(args) != 0 {
+			m.pushLog("error", "usage: /status")
+			return m, nil
 		}
-		m.pushLog("system", fmt.Sprintf(
-			"model: %s\nmode: %s\nplan: %v\nsession: %s\nworkspace: %s\ntrace: %s%s",
-			m.modelName, m.mode, m.ag.PlanMode(), m.sessionID, m.workspace, m.ag.TracePath(), lineage))
+		return m, m.runQuery(protocol.QueryStatus, "status report requested")
+
+	case "trust":
+		if len(args) > 1 || (len(args) == 1 && !strings.EqualFold(args[0], "revoke") && !strings.EqualFold(args[0], "untrust")) {
+			m.pushLog("error", "usage: /trust [revoke]")
+			return m, nil
+		}
+		revoke := len(args) == 1
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandTrustProject,
+			TrustProject: &protocol.TrustProjectCommand{Revoke: revoke}}, "project trust change submitted")
 
 	case "commands":
 		names := m.customCommandNames()
@@ -599,229 +700,65 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	default:
 		// User-defined slash commands (markdown templates).
 		if cc := m.findCustomCommand(cmd); cc != nil {
-			m.runCustomCommand(cc, args)
-			return m, nil
+			return m, m.runCustomCommand(cc, args)
 		}
 		m.pushLog("error", "unknown command /"+cmd+" (try /help)")
 	}
 	return m, nil
 }
 
-// runDiff shows the working tree state (Codex /diff): a compact status, a diff
-// stat, and optionally the full diff for the given paths. Untracked files are
-// listed but not diffed (no baseline exists). The git commands run in a
-// goroutine (tea.Cmd) so a large repository cannot stall the UI loop; the
-// result lands in the log via gitResultMsg.
+// runDiff requests a read-only git diff through the typed external-command
+// protocol. Provider-side policy, sandboxing and execution remain authoritative
+// for workspace data; the TUI never shells out directly.
 func (m *Model) runDiff(paths []string) tea.Cmd {
-	workspace := m.workspace
-	return func() tea.Msg {
-		run := func(name string, args ...string) (string, bool) {
-			out := &strings.Builder{}
-			cmd := exec.Command("git", args...)
-			cmd.Dir = workspace
-			cmd.Stdout = out
-			cmd.Stderr = out
-			if err := cmd.Run(); err != nil {
-				return strings.TrimSpace(out.String()), false
-			}
-			return strings.TrimRight(out.String(), "\n"), true
-		}
-
-		var sb strings.Builder
-		if status, ok := run("status", "status", "--short"); ok && status != "" {
-			sb.WriteString("Changed files:\n")
-			sb.WriteString(status)
-			sb.WriteString("\n")
-		}
-
-		diffArgs := append([]string{"diff", "--stat"}, paths...)
-		if stat, ok := run("diffstat", diffArgs...); ok && stat != "" {
-			sb.WriteString("\nDiff stat:\n")
-			sb.WriteString(stat)
-			sb.WriteString("\n")
-		}
-
-		body := append([]string{"diff"}, paths...)
-		if d, ok := run("diff", body...); ok && d != "" {
-			sb.WriteString("\nDiff:\n")
-			if len(d) > 8000 {
-				d = d[:8000] + "\n…[truncated]"
-			}
-			sb.WriteString(d)
-			sb.WriteString("\n")
-		}
-
-		if sb.Len() == 0 {
-			return gitResultMsg{output: "no changes in the working tree"}
-		}
-		return gitResultMsg{output: strings.TrimRight(sb.String(), "\n")}
+	args := []string{"diff"}
+	if len(paths) > 0 {
+		args = append(args, "--")
+		args = append(args, paths...)
 	}
+	return m.submitCommand(protocol.Command{Type: protocol.CommandExternal,
+		External: &protocol.ExternalCommand{Program: "git", Args: args}}, "diff request submitted")
 }
 
-// runGit executes git locally in the workspace and shows the output. It is a
-// user-driven convenience; the agent's own Git* tools remain the primary path.
-// The command runs in a goroutine (tea.Cmd) and is killed after 120s, so a
-// hung git cannot stall the UI loop; the result lands in the log via
-// gitResultMsg.
+// runGit requests a user-selected workspace operation through the session
+// protocol, preserving normal approval and sandbox policy.
 func (m *Model) runGit(args []string) tea.Cmd {
-	workspace := m.workspace
-	return func() tea.Msg {
-		out := &strings.Builder{}
-		cmd := exec.Command("git", args...)
-		cmd.Dir = workspace
-		cmd.Stdout = out
-		cmd.Stderr = out
-
-		if err := cmd.Start(); err != nil {
-			return gitResultMsg{output: "git: " + err.Error(), isErr: true}
-		}
-		done := make(chan struct{})
-		go func() {
-			_ = cmd.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-		case <-time.After(120 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-			out.WriteString("\n[git command timed out after 120s]")
-		}
-
-		return gitResultMsg{output: "git " + strings.Join(args, " ") + "\n" + strings.TrimRight(out.String(), "\n")}
-	}
-}
-
-// runReview shows the full review surface (Claude Code's /review): changed
-// files, a diff, and any checkpoints the user can restore. The git commands
-// run in a goroutine (tea.Cmd) so a large repository cannot stall the UI
-// loop; the result lands in the log via gitResultMsg.
-func (m *Model) runReview() tea.Cmd {
-	// CheckpointList reads agent state: take it synchronously, before the
-	// background goroutine starts.
-	recs := m.ag.CheckpointList()
-	workspace := m.workspace
-	return func() tea.Msg {
-		run := func(name string, args ...string) (string, bool) {
-			out := &strings.Builder{}
-			cmd := exec.Command("git", args...)
-			cmd.Dir = workspace
-			cmd.Stdout = out
-			cmd.Stderr = out
-			if err := cmd.Run(); err != nil {
-				return strings.TrimSpace(out.String()), false
-			}
-			return strings.TrimRight(out.String(), "\n"), true
-		}
-
-		var sb strings.Builder
-		if status, ok := run("status", "status", "--short"); ok && status != "" {
-			sb.WriteString("Changed files:\n")
-			sb.WriteString(status)
-			sb.WriteString("\n")
-		}
-		if stat, ok := run("diffstat", "diff", "--stat"); ok && stat != "" {
-			sb.WriteString("\nDiff stat:\n")
-			sb.WriteString(stat)
-			sb.WriteString("\n")
-		}
-		if d, ok := run("diff", "diff"); ok && d != "" {
-			sb.WriteString("\nDiff:\n")
-			if len(d) > 8000 {
-				d = d[:8000] + "\n…[truncated]"
-			}
-			sb.WriteString(d)
-			sb.WriteString("\n")
-		}
-
-		if len(recs) > 0 {
-			sb.WriteString("\nCheckpoints (restore with /checkpoint <id>):\n")
-			for _, r := range recs {
-				fmt.Fprintf(&sb, "  %s  %s  %s\n", r.ID, r.CreatedAt.Format("15:04:05"), r.Summary)
-			}
-		}
-
-		if sb.Len() == 0 {
-			return gitResultMsg{output: "working tree clean, no checkpoints"}
-		}
-		return gitResultMsg{output: strings.TrimRight(sb.String(), "\n")}
-	}
+	return m.submitCommand(protocol.Command{Type: protocol.CommandExternal,
+		External: &protocol.ExternalCommand{Program: "git", Args: append([]string(nil), args...)}}, "git request submitted")
 }
 
 // startResumePicker opens the interactive saved-session selector.
-func (m *Model) startResumePicker() {
+func (m *Model) startResumePicker() tea.Cmd {
+	if m.ag == nil {
+		m.pushLog("error", "resume requires an agent session opener")
+		return nil
+	}
 	sessions, err := agent.ListSessions(m.ag.SessionDir())
 	if err != nil || len(sessions) == 0 {
 		m.pushLog("system", "no saved sessions to resume")
-		return
+		return nil
 	}
 	lines := make([]string, 0, len(sessions))
-	ids := make([]string, 0, len(sessions))
-	for i, s := range sessions {
-		if i >= 10 {
-			break
-		}
+	for _, s := range sessions {
 		title := s.Title
 		if title == "" {
 			title = "(no user message)"
 		}
 		lines = append(lines, fmt.Sprintf("%s  %s\n    %s  (%d messages)",
 			s.ID, s.UpdatedAt.Format("2006-01-02 15:04"), title, len(s.History)))
-		ids = append(ids, s.ID)
 	}
-	m.startPicker("resume a session", lines, func(sel int) {
-		if err := m.resumeSession(ids[sel]); err != nil {
-			m.pushLog("error", "resume failed: "+err.Error())
-			return
-		}
-		m.pushStatus("resumed session " + ids[sel])
-	})
+	options := make([]selectorOption, len(sessions))
+	for i, s := range sessions {
+		options[i] = selectorOption{ID: s.ID, Label: lines[i]}
+	}
+	return m.startSelectorAt("Resume a session", options, 0, true, selectorAction{Kind: selectorResume})
 }
 
-// resumeSession loads a saved session into the running agent and refreshes the
-// conversation view.
-func (m *Model) resumeSession(id string) error {
-	if err := m.ag.ResumeSession(id); err != nil {
-		return err
-	}
-	m.sessionID = id
-	m.items = m.items[:0] // the history-changed event would clear it anyway
-	m.pushStatus("resumed session " + id)
-	return nil
-}
-
-// runApply applies a file to the workspace (Codex apply idea): git patches are
-// applied with `git apply`, everything else is sent to the agent as a plan to
-// execute.
-func (m *Model) runApply(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		m.pushLog("error", "apply: "+err.Error())
-		return
-	}
-	content := string(data)
-	trimmed := strings.TrimSpace(content)
-
-	// Heuristic: unified diff / git patch → git apply.
-	if looksLikePatch(trimmed) {
-		cmd := exec.Command("git", "apply", "--whitespace=nowarn", "-")
-		cmd.Dir = m.workspace
-		cmd.Stdin = strings.NewReader(content)
-		out := &strings.Builder{}
-		cmd.Stdout = out
-		cmd.Stderr = out
-		if err := cmd.Run(); err != nil {
-			m.pushLog("error", "git apply failed: "+strings.TrimSpace(out.String()))
-			return
-		}
-		m.pushStatus("applied patch " + path)
-		return
-	}
-
-	// A plan document: hand it to the agent to execute.
-	m.ctrl <- agent.Control{Type: agent.ControlUserMessage, Text: "Execute the plan below, following it step by step.\n\n" + content}
-	m.pushStatus("sent plan " + path + " to the agent")
+// runApply reads a bounded plan/patch file and submits its contents through the
+// session protocol. A path alone never bypasses provider approval policy.
+func (m *Model) runApply(path string) tea.Cmd {
+	return m.submitCommand(protocol.Command{Type: protocol.CommandApply,
+		Apply: &protocol.ApplyCommand{Path: path}}, "apply request submitted")
 }
 
 // looksLikePatch reports whether text looks like a unified diff.
@@ -859,6 +796,81 @@ func renderUsage(u agent.Usage, model string) string {
 	return sb.String()
 }
 
+func (m Model) renderConfig() string {
+	if !m.hasSnapshot {
+		return fmt.Sprintf("model: %s\nmode: %s\nworkspace: %s\nsession: %s\n(no runtime snapshot)", m.modelName, m.mode, m.workspace, m.sessionID)
+	}
+	s := m.snapshot.Settings
+	return fmt.Sprintf("model: %s\nmode: %s\nexecution: %s\nsandbox: %s\nworkspace: %s\nsession: %s\nrevision: %d",
+		s.Model.Model, s.Permission.Mode, s.ExecutionMode, s.Sandbox.Mode, m.workspace, m.sessionID, m.snapshot.Revision.LogSeq)
+}
+
+// exportMarkdown serializes the retained protocol snapshot without reaching
+// through the Agent adapter. Export is a client-side report, so it must remain
+// stable across session swaps and cannot observe a later mutable runtime.
+func exportMarkdown(snapshot protocol.SessionView, workspace string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# ccdp session %s\n\n", snapshot.SessionID)
+	fmt.Fprintf(&b, "- Model: %s\n- Workspace: `%s`\n\n---\n\n",
+		snapshot.Settings.Model.Model, workspace)
+	for _, message := range snapshot.History {
+		role := strings.ToLower(message.Role)
+		switch role {
+		case "user":
+			fmt.Fprintf(&b, "## User\n\n%s\n\n", message.Content)
+		case "assistant":
+			fmt.Fprintf(&b, "## Assistant\n\n%s\n", message.Content)
+			for _, callID := range message.ToolCallIDs {
+				fmt.Fprintf(&b, "\n_→ tool(%s)_\n", callID)
+			}
+			b.WriteString("\n")
+		case "tool":
+			fmt.Fprintf(&b, "### Tool result\n\n```text\n%s\n```\n\n", message.Content)
+		default:
+			if message.Content != "" {
+				fmt.Fprintf(&b, "### %s\n\n%s\n\n", message.Role, message.Content)
+			}
+		}
+	}
+	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+func (m Model) renderPermissions() string {
+	policy := m.permissionPolicy()
+	var b strings.Builder
+	fmt.Fprintf(&b, "permission mode: %s\n", policy.Mode)
+	b.WriteString("always allow:\n")
+	if len(policy.AlwaysAllow) == 0 {
+		b.WriteString("  (none)\n")
+	} else {
+		for _, rule := range policy.AlwaysAllow {
+			b.WriteString("  - " + rule + "\n")
+		}
+	}
+	b.WriteString("always deny:\n")
+	if len(policy.AlwaysDeny) == 0 {
+		b.WriteString("  (none)\n")
+	} else {
+		for _, rule := range policy.AlwaysDeny {
+			b.WriteString("  - " + rule + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m Model) renderStatusReport() string {
+	plan := m.planMode
+	model := m.modelName
+	mode := string(m.mode)
+	if m.hasSnapshot {
+		model = m.snapshot.Settings.Model.Model
+		mode = m.snapshot.Settings.Permission.Mode
+		plan = m.snapshot.Settings.ExecutionMode == protocol.ExecutionModePlan
+	}
+	return fmt.Sprintf("model: %s\nmode: %s\nplan: %v\nsession: %s\nworkspace: %s\nrevision: %d",
+		model, mode, plan, m.sessionID, m.workspace, m.snapshot.Revision.LogSeq)
+}
+
 // renderPlugins formats the loaded plugins and providers for /plugins.
 func renderPlugins(plugins, providers []string) string {
 	var sb strings.Builder
@@ -878,10 +890,8 @@ func renderPlugins(plugins, providers []string) string {
 
 // pushLog appends a message from the local UI (not the agent).
 func (m *Model) pushLog(kind, text string) {
-	m.items = append(m.items, logItem{kind: kind, text: text})
+	m.addReport(logItem{kind: kind, text: text})
 	m.render()
+	m.followOutput = true
 	m.viewport.GotoBottom()
 }
-
-// SessionDir delegates to the agent's session directory.
-func (m *Model) SessionDir() string { return m.ag.SessionDir() }

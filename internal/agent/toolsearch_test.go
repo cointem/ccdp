@@ -19,8 +19,7 @@ func newAgentWithCustomTool(t *testing.T) *Agent {
 		{Name: "my-fmt", Description: "format files", Command: "gofmt"},
 	}
 	events := make(chan Event, 64)
-	ctrl := make(chan Control, 16)
-	ag, err := New(&cfg, events, ctrl)
+	ag, err := New(&cfg, events)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -51,10 +50,26 @@ func TestDeferredToolNotInjected(t *testing.T) {
 		t.Error("ToolSearch should always be injected")
 	}
 
-	// The availability section tells the model how to discover the rest.
-	avail := ag.availableTools()
-	if !strings.Contains(avail, "ToolSearch") || !strings.Contains(avail, "not listed inline") {
-		t.Errorf("availability section malformed: %q", avail)
+	// The actual frozen request advertises only the step's inline definitions;
+	// the deferred custom tool must remain absent until discovery.
+	step, err := ag.beginStepChecked()
+	if err != nil {
+		t.Fatalf("beginStepChecked: %v", err)
+	}
+	req, err := ag.buildRequestForStepChecked(step)
+	releaseStepLease(step)
+	ag.mu.Lock()
+	ag.childStep = nil
+	ag.mu.Unlock()
+	if err != nil {
+		t.Fatalf("buildRequestForStepChecked: %v", err)
+	}
+	sys, _ := req.Messages[0].Content.(string)
+	if !strings.Contains(sys, "# Available tools") || !strings.Contains(sys, "ToolSearch") {
+		t.Errorf("frozen availability section missing ToolSearch: %q", sys)
+	}
+	if strings.Contains(sys, "my-fmt") {
+		t.Errorf("deferred tool leaked into frozen availability section: %q", sys)
 	}
 
 	// Simulate a discovery: mark it and re-check.
@@ -67,6 +82,25 @@ func TestDeferredToolNotInjected(t *testing.T) {
 	}
 	if !found {
 		t.Error("discovered deferred tool should be injected on the next request")
+	}
+
+	// A later step captures the updated discovery state and advertises the
+	// custom schema in the wire request.
+	step, err = ag.beginStepChecked()
+	if err != nil {
+		t.Fatalf("beginStepChecked after discovery: %v", err)
+	}
+	req, err = ag.buildRequestForStepChecked(step)
+	releaseStepLease(step)
+	ag.mu.Lock()
+	ag.childStep = nil
+	ag.mu.Unlock()
+	if err != nil {
+		t.Fatalf("buildRequestForStepChecked after discovery: %v", err)
+	}
+	sys, _ = req.Messages[0].Content.(string)
+	if !strings.Contains(sys, "my-fmt") {
+		t.Errorf("discovered tool missing from frozen availability section: %q", sys)
 	}
 }
 
@@ -113,7 +147,18 @@ func TestBuildRequestSections(t *testing.T) {
 	ag := newAgentWithCustomTool(t)
 	defer ag.Close()
 
-	req := ag.buildRequest()
+	step, err := ag.beginStepChecked()
+	if err != nil {
+		t.Fatalf("beginStepChecked: %v", err)
+	}
+	req, err := ag.buildRequestForStepChecked(step)
+	releaseStepLease(step)
+	if err != nil {
+		t.Fatalf("buildRequestForStepChecked: %v", err)
+	}
+	ag.mu.Lock()
+	ag.childStep = nil
+	ag.mu.Unlock()
 	if len(req.Messages) == 0 {
 		t.Fatal("no messages")
 	}

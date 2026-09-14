@@ -14,13 +14,17 @@
 package sandbox
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
 
 // Mode selects how aggressively the sandbox confines tool access.
@@ -31,6 +35,12 @@ const (
 	ModeStrict  Mode = "strict"  // every file access confined to workspace
 	ModeNone    Mode = "none"    // no containment (Bash-only workflows)
 )
+
+// darwinShellSelectorPath is the macOS path consulted by /bin/sh when the
+// system's selectable shell link is resolved. It is intentionally an exact
+// read exception, not a /private/var subtree grant: strict commands otherwise
+// fail before their configured workspace policy can even be applied.
+const darwinShellSelectorPath = "/private/var/select/sh"
 
 // ValidModes lists selectable sandbox modes.
 var ValidModes = []Mode{ModeConfine, ModeStrict, ModeNone}
@@ -60,6 +70,17 @@ type Sandbox struct {
 	// when they fall inside the workspace or an additional dir. (/disallowed-dir)
 	DisallowedDirs []string
 
+	// ProtectedDirs are runtime-owned control/data roots. Ordinary file tools
+	// cannot write them, even in ModeNone or when an additional directory also
+	// grants the same path. The session owner may still use its own adapters.
+	ProtectedDirs []string
+
+	// ScratchDirs are explicit temporary roots granted to strict subprocesses.
+	// They default to none: granting all of /tmp would let one session read or
+	// overwrite another session's temporary data. Runtime should set an
+	// owner-specific scratch directory when a tool needs one.
+	ScratchDirs []string
+
 	// Limits, when non-zero, are applied to every Bash tool invocation as
 	// shell ulimit prefixes (Codex's rlimit enforcement, userspace flavor).
 	Limits *Limits
@@ -68,7 +89,7 @@ type Sandbox struct {
 	// false, strict mode blocks obvious network clients.
 	AllowNetwork bool
 
-	mu sync.RWMutex // guards Mode, AdditionalDirs and DisallowedDirs
+	mu sync.RWMutex // guards mutable policy fields
 }
 
 // SetMode switches the sandbox mode at runtime (safe for concurrent use).
@@ -83,6 +104,28 @@ func (s *Sandbox) CurrentMode() Mode {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Mode
+}
+
+// SetAllowNetwork changes the network capability used by both userspace
+// checks and the Darwin profile. Keep this behind the sandbox mutex so a
+// policy reload cannot race profile generation.
+func (s *Sandbox) SetAllowNetwork(allow bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.AllowNetwork = allow
+	s.mu.Unlock()
+}
+
+// NetworkAllowed returns the current network capability.
+func (s *Sandbox) NetworkAllowed() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.AllowNetwork
 }
 
 // AddDir grants access to an extra directory at runtime. Relative paths are
@@ -119,11 +162,78 @@ func (s *Sandbox) AddDisallowedDir(dir string) {
 	s.DisallowedDirs = append(s.DisallowedDirs, abs)
 }
 
+// AddProtectedDir marks an owner-controlled directory that ordinary tools may
+// not write. Unlike a disallowed directory, it remains readable in confine
+// mode so diagnostics do not need a second filesystem policy.
+func (s *Sandbox) AddProtectedDir(dir string) {
+	if s == nil {
+		return
+	}
+	abs := s.absDir(dir)
+	if abs == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range s.ProtectedDirs {
+		if d == abs {
+			return
+		}
+	}
+	s.ProtectedDirs = append(s.ProtectedDirs, abs)
+}
+
+// SetScratchDir replaces the explicit temporary roots used by strict process
+// profiles. Relative paths are resolved against the workspace.
+func (s *Sandbox) SetScratchDir(dir string) {
+	if s == nil {
+		return
+	}
+	abs := s.absDir(dir)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if abs == "" {
+		s.ScratchDirs = nil
+		return
+	}
+	s.ScratchDirs = []string{abs}
+}
+
+// AddScratchDir appends an explicit temporary root to strict profiles.
+func (s *Sandbox) AddScratchDir(dir string) {
+	if s == nil {
+		return
+	}
+	abs := s.absDir(dir)
+	if abs == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range s.ScratchDirs {
+		if d == abs {
+			return
+		}
+	}
+	s.ScratchDirs = append(s.ScratchDirs, abs)
+}
+
 func (s *Sandbox) absDir(dir string) string {
 	if dir == "" {
 		return ""
 	}
-	abs, err := filepath.Abs(dir)
+	abs := dir
+	if !filepath.IsAbs(abs) {
+		// /add-dir is workspace-relative, not process-cwd-relative. This is
+		// important when the runtime changes workspace or starts from a GUI
+		// process whose cwd is unrelated to the session.
+		base := s.Workspace
+		if base == "" {
+			base, _ = os.Getwd()
+		}
+		abs = filepath.Join(base, abs)
+	}
+	abs, err := filepath.Abs(abs)
 	if err != nil {
 		return ""
 	}
@@ -250,7 +360,7 @@ func (s *Sandbox) Resolve(p string) (string, error) {
 		if filepath.IsAbs(p) {
 			return filepath.Clean(p), nil
 		}
-		return filepath.Join(".", p), nil
+		return filepath.Join(s.Workspace, p), nil
 	}
 	if p == "" {
 		return "", fmt.Errorf("sandbox: empty path")
@@ -266,17 +376,64 @@ func (s *Sandbox) Resolve(p string) (string, error) {
 // ResolveWrite is like Resolve but additionally enforces write confinement:
 // writes are confined to the workspace in every mode except none.
 func (s *Sandbox) ResolveWrite(p string) (string, error) {
-	if s == nil || s.CurrentMode() == ModeNone {
+	if s == nil {
 		return s.Resolve(p)
 	}
 	abs, err := s.Resolve(p)
 	if err != nil {
 		return "", err
 	}
+	if s.isProtected(abs) {
+		return "", fmt.Errorf("sandbox: write to protected runtime location %s", p)
+	}
+	if s.CurrentMode() == ModeNone {
+		return abs, nil
+	}
 	if !s.InWorkspace(abs) {
 		return "", fmt.Errorf("sandbox: write to %s is outside workspace %s", p, s.Workspace)
 	}
 	return abs, nil
+}
+
+func (s *Sandbox) isProtected(abs string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	protected := append([]string(nil), s.ProtectedDirs...)
+	s.mu.RUnlock()
+	for _, root := range protected {
+		if pathWithin(root, abs) {
+			return true
+		}
+	}
+	// A hard link has no path component for Resolve/InWorkspace to resolve. If
+	// runtime control roots exist, do not permit an existing multiply-linked
+	// regular file to be overwritten through a workspace alias. This is a
+	// conservative write rule: ordinary model files can still be read, while a
+	// control file cannot be modified by first linking it into the workspace.
+	if isMultiplyLinkedRegularFile(abs) && hasExistingProtectedRoot(protected) {
+		return true
+	}
+	return false
+}
+
+func hasExistingProtectedRoot(roots []string) bool {
+	for _, root := range roots {
+		if _, err := os.Lstat(root); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func isMultiplyLinkedRegularFile(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Nlink > 1
 }
 
 // ResolveRead enforces strict-mode read confinement.
@@ -296,6 +453,22 @@ func (s *Sandbox) ResolveRead(p string) (string, error) {
 		return "", fmt.Errorf("sandbox: read of %s is outside workspace %s (strict mode)", p, s.Workspace)
 	}
 	return abs, nil
+}
+
+// StrictBackendError reports why a strict process backend cannot be used.
+// Strict is intentionally Darwin-only; userspace command regexes are not
+// presented as an equivalent security boundary on other platforms.
+func (s *Sandbox) StrictBackendError() error {
+	if s == nil || s.CurrentMode() != ModeStrict {
+		return nil
+	}
+	if runtime.GOOS != "darwin" {
+		return fmt.Errorf("sandbox: strict execution requires the macOS sandbox-exec backend (running on %s)", runtime.GOOS)
+	}
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		return fmt.Errorf("sandbox: strict execution backend /usr/bin/sandbox-exec is unavailable: %w", err)
+	}
+	return nil
 }
 
 // InWorkspace reports whether abs refers to a location inside the workspace or
@@ -328,6 +501,7 @@ func (s *Sandbox) InWorkspace(abs string) bool {
 	// path and its resolved form must land inside the same additional dir.
 	s.mu.RLock()
 	additional := append([]string(nil), s.AdditionalDirs...)
+	additional = append(additional, s.ScratchDirs...)
 	s.mu.RUnlock()
 	for _, d := range additional {
 		if pathWithin(d, abs) && pathWithin(d, resolved) {
@@ -378,7 +552,7 @@ func (s *Sandbox) CommandPolicy(command string) error {
 
 	// Network clients are blocked in strict mode unless explicitly allowed
 	// (set sandbox_allow_network: true in config).
-	if !s.AllowNetwork {
+	if !s.NetworkAllowed() {
 		for _, pat := range networkPatterns {
 			if pat.re.MatchString(c) {
 				return fmt.Errorf("sandbox: command %q blocked in strict mode (%s); enable sandbox_allow_network to permit", c, pat.desc)
@@ -403,33 +577,203 @@ func (s *Sandbox) CommandPolicy(command string) error {
 	return nil
 }
 
+// Profile returns the Darwin SBPL profile for the current strict policy.
+// Explicitly disallowed directories are emitted before any allow roots and
+// are also repeated after them; this keeps the deny precedence obvious to
+// readers and robust across seatbelt rule-order differences.
+func (s *Sandbox) Profile() (string, error) {
+	if s == nil || s.CurrentMode() != ModeStrict {
+		return "", nil
+	}
+	if err := s.StrictBackendError(); err != nil {
+		return "", err
+	}
+	s.mu.RLock()
+	workspace := s.Workspace
+	additional := append([]string(nil), s.AdditionalDirs...)
+	disallowed := append([]string(nil), s.DisallowedDirs...)
+	protected := append([]string(nil), s.ProtectedDirs...)
+	scratch := append([]string(nil), s.ScratchDirs...)
+	allowNetwork := s.AllowNetwork
+	s.mu.RUnlock()
+	if workspace == "" {
+		return "", fmt.Errorf("sandbox: strict profile has no workspace root")
+	}
+	workspace = canonicalRoot(workspace)
+	additional = canonicalRoots(additional)
+	disallowed = canonicalRoots(disallowed)
+	protected = canonicalRoots(protected)
+	scratch = canonicalRoots(scratch)
+
+	var b strings.Builder
+	b.WriteString("(version 1)\n")
+	// Start from the system runtime profile rather than `allow default`: this
+	// gives shell/dyld the narrow system read rules it needs without granting
+	// arbitrary user-data access.
+	b.WriteString("(deny default)\n(import \"system.sb\")\n")
+	// Keep an explicit deny for every protected root. The allow rules below also
+	// carry require-not predicates, so a root allow can never accidentally
+	// re-admit a disallowed subtree even if a future seatbelt rule is reordered.
+	for _, d := range disallowed {
+		fmt.Fprintf(&b, "(deny file-read* file-write* (subpath %s))\n", sbplQuote(d))
+	}
+	for _, d := range protected {
+		fmt.Fprintf(&b, "(deny file-write* (subpath %s))\n", sbplQuote(d))
+	}
+	// /bin/sh resolves through this one system selector on macOS. Keep the
+	// exception read-only, exact, and subject to user disallowed roots so a
+	// caller cannot turn a control-path deny into a broad /private/var allow.
+	fmt.Fprintf(&b, "(allow file-read* (require-all (literal %s)%s))\n", sbplQuote(darwinShellSelectorPath), sbplDenyPredicates(disallowed))
+	// PATH lookup for an executable such as `sh` needs only directory metadata
+	// and existence checks. Permit those checks in the fixed system executable
+	// roots, while deliberately withholding file-read-data and subjecting every
+	// root to the configured disallow list. This keeps bare command lookup
+	// usable under strict mode without turning the system roots into data-read
+	// or user-data capabilities.
+	for _, root := range [...]string{"/bin", "/usr/bin", "/sbin", "/usr/sbin"} {
+		fmt.Fprintf(&b, "(allow file-read-metadata file-test-existence (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
+	}
+	writeDenied := append(append([]string(nil), disallowed...), protected...)
+	// Workspace and explicitly added roots are the only user-data roots. A
+	// separate temporary root is available for shell scratch files.
+	for _, root := range append([]string{workspace}, additional...) {
+		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
+		fmt.Fprintf(&b, "(allow file-write* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(writeDenied))
+	}
+	for _, root := range scratch {
+		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
+		fmt.Fprintf(&b, "(allow file-write* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(writeDenied))
+	}
+	// Keep process execution available to normal commands while the file and
+	// network capabilities remain governed by this profile.
+	b.WriteString("(allow process-fork)\n(allow process-exec)\n")
+	if allowNetwork {
+		// The network capability is intentionally explicit. `network*` is a
+		// broad shorthand whose condition semantics vary across macOS releases;
+		// exact inbound/outbound actions make the true path auditable and match
+		// the platform seatbelt policy.
+		b.WriteString("(allow network-outbound)\n(allow network-inbound)\n")
+	} else {
+		// `(deny default)` already denies network actions. Do not add a broad
+		// allow followed by a deny: seatbelt rule ordering and the meaning of
+		// the `network*` shorthand vary across macOS releases. The only network
+		// exception inherited here is the system.sb syslog socket, which is not
+		// an outbound Internet capability.
+	}
+	return b.String(), nil
+}
+
+func canonicalRoot(path string) string {
+	if path == "" {
+		return ""
+	}
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
+}
+
+func canonicalRoots(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	seen := map[string]bool{}
+	for _, p := range paths {
+		p = canonicalRoot(p)
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func sbplQuote(path string) string {
+	return `"` + strings.ReplaceAll(strings.ReplaceAll(path, `\`, `\\`), `"`, `\"`) + `"`
+}
+
+func sbplDenyPredicates(disallowed []string) string {
+	var b strings.Builder
+	for _, d := range disallowed {
+		fmt.Fprintf(&b, " (require-not (subpath %s))", sbplQuote(d))
+	}
+	return b.String()
+}
+
+// PrepareCommand performs policy checks and returns a command ready for
+// execution. Strict mode always requires a working Darwin backend; callers
+// must not fall back to userspace regex checks after this function errors.
+func PrepareCommand(s *Sandbox, command string) (string, error) {
+	return PrepareCommandContext(context.Background(), s, command)
+}
+
+// PrepareCommandContext is PrepareCommand with a caller-owned cancellation
+// boundary for the profile compile probe. The probe must never wait forever on
+// a broken sandbox-exec installation.
+func PrepareCommandContext(ctx context.Context, s *Sandbox, command string) (string, error) {
+	if s == nil {
+		return command, nil
+	}
+	if err := s.CommandPolicy(command); err != nil {
+		return "", err
+	}
+	// Apply configured resource limits only after validating the original
+	// command. Prefixing before CommandPolicy would hide anchored destructive
+	// command patterns behind `ulimit … &&`.
+	if prefix := s.Prefix(); prefix != "" {
+		command = prefix + " " + command
+	}
+	if s.CurrentMode() != ModeStrict {
+		return command, nil
+	}
+	profile, err := s.Profile()
+	if err != nil {
+		return "", err
+	}
+	// Compile the profile before returning a command. sandbox-exec otherwise
+	// reports a malformed profile as an ordinary child exit code, which would
+	// look like a command failure rather than an unavailable security backend.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	probe := exec.CommandContext(probeCtx, "/usr/bin/sandbox-exec", "-p", profile, "--", "/bin/sh", "-c", "true")
+	if out, err := probe.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("sandbox: strict profile could not be loaded: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return "sandbox-exec -p " + shellQuote(profile) + " -- /bin/sh -c " + shellQuote(command), nil
+}
+
 // WrapCommand returns a sandbox-exec wrapped command line when strict mode is
 // active on macOS and the sandbox-exec utility exists; "" otherwise. The whole
 // command line — including any ulimit prefix — is handed to a /bin/sh -c inside
 // the sandboxed process, so shell operators (`;`, `&&`, …) cannot split
 // execution into a part that runs outside the profile. The profile confines
-// file writes to the workspace, allows reads broadly, permits localhost, and
-// denies other network activity.
+// file writes to the workspace, allows reads broadly, and denies network
+// access unless AllowNetwork is explicitly enabled.
 func (s *Sandbox) WrapCommand(cmdline string) string {
 	if s == nil || s.CurrentMode() != ModeStrict || cmdline == "" {
 		return ""
 	}
-	if runtime.GOOS != "darwin" {
-		return ""
+	profile, err := s.Profile()
+	if err != nil {
+		// Deprecated callers historically interpreted an empty string as “do
+		// not wrap” and then ran cmdline directly. Return a command that fails
+		// closed instead, so an unavailable strict backend can never silently
+		// become an unsandboxed invocation.
+		return "/usr/bin/false # ccdp: strict sandbox unavailable"
 	}
-	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
-		return "" // not available; rely on the userspace checks
-	}
-	profile := fmt.Sprintf(`(version 1)
-(allow default)
-(deny network*)
-(allow network* (remote ip "localhost:*") (remote unix-socket))
-(allow file-read*)
-(deny file-write*)
-(allow file-write* (subpath %q) (subpath "/private/tmp") (subpath "/tmp"))
-(deny process-fork)
-(allow process-fork (literal "/bin/sh") (literal "/bin/zsh") (literal "/bin/bash"))`, s.Workspace)
+	// Do not preflight here: this legacy string API cannot return the probe
+	// error. The returned sandbox-exec command still fails closed if the host
+	// refuses to apply the profile; callers with an error channel must use
+	// PrepareCommand/WrapCommandChecked.
 	return "sandbox-exec -p " + shellQuote(profile) + " -- /bin/sh -c " + shellQuote(cmdline)
+}
+
+// WrapCommandChecked is the migration-safe form of WrapCommand. New code
+// should prefer PrepareCommand directly so backend errors remain actionable.
+func (s *Sandbox) WrapCommandChecked(cmdline string) (string, error) {
+	return PrepareCommand(s, cmdline)
 }
 
 // shellQuote single-quotes a string for safe shell embedding.
@@ -444,7 +788,9 @@ var interactivePatterns = []struct {
 	desc string
 }{
 	{regexp.MustCompile(`(?i)\b(vim|vimdiff|nvim|vi|nano|emacs|pico|less)\b`), "interactive editor/pager"},
-	{regexp.MustCompile(`(?i)\b(read|more)\b`), "interactive input"},
+	// Match the shell `read` builtin as a command token, not git plumbing such
+	// as `git read-tree` (where the hyphen is part of the subcommand).
+	{regexp.MustCompile(`(?i)(^|[\s;&|])read(?:[\s;&|]|$)`), "interactive input"},
 	{regexp.MustCompile(`(?i)\b(top|htop|btop)\b`), "interactive process monitor"},
 	{regexp.MustCompile(`git\s+(rebase\s+-i|add\s+-p|commit\s+--amend\s+-i|clean\s+-i)`), "interactive git"},
 	{regexp.MustCompile(`(?i)\b(ssh)\b\s.*-t\b`), "interactive ssh"},

@@ -1,19 +1,21 @@
 package agent
 
 import (
+	"ccdp/internal/protocol"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"time"
 )
 
-// traceRec is one JSONL line in the session trace file. The trace is the raw
-// event log of a session, useful for debugging and replay (Codex writes a
-// comparable trace per session).
+// traceRec is one JSONL line in the diagnostics stream. It is deliberately
+// not a source for restoring business state; the typed session store is the
+// only replay authority.
 type traceRec struct {
-	TS   string `json:"ts"`
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Question *protocol.QuestionRequest `json:"question,omitempty"`
+	TS       string                    `json:"ts"`
+	Type     string                    `json:"type"`
+	Text     string                    `json:"text,omitempty"`
 
 	Tool     *ToolEvent       `json:"tool,omitempty"`
 	Approval *ApprovalRequest `json:"approval,omitempty"`
@@ -55,6 +57,8 @@ func eventTypeName(t EventType) string {
 		return "history_changed"
 	case EventSandboxChanged:
 		return "sandbox"
+	case EventQuestion:
+		return "question"
 	case EventPlan:
 		return "plan"
 	case EventPlanModeChanged:
@@ -63,15 +67,18 @@ func eventTypeName(t EventType) string {
 	return "unknown"
 }
 
-// openTrace creates the session trace file.
+// openTrace creates the per-session diagnostics stream.  Older versions wrote
+// <root>/<id>.trace.jsonl; new diagnostics live below the same session scope as
+// events and never participate in List/Resume replay.
 func (a *Agent) openTrace() {
-	if a.cfg.SessionDir == "" {
+	if a.cfg.SessionDir == "" || a.cfg.NoSessionPersistence {
 		return
 	}
-	if err := os.MkdirAll(a.cfg.SessionDir, 0o755); err != nil {
+	path := a.TracePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return
 	}
-	f, err := os.OpenFile(filepath.Join(a.cfg.SessionDir, a.sessionID+".trace.jsonl"),
+	f, err := os.OpenFile(path,
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return
@@ -91,6 +98,8 @@ func (a *Agent) writeTrace(ev Event) {
 		rec.Tool = ev.Tool
 	case ev.Approval != nil:
 		rec.Approval = ev.Approval
+	case ev.Question != nil:
+		rec.Question = ev.Question
 	case ev.Plan != nil:
 		rec.Plan = ev.Plan
 	case ev.Usage != nil:
@@ -123,10 +132,11 @@ func (a *Agent) closeTrace() {
 	a.traceMu.Unlock()
 }
 
-// TracePath returns the trace file path for this session.
+// TracePath returns the diagnostics path for this session.  It is retained as
+// a compatibility accessor for hooks/tests; restore never reads this file.
 func (a *Agent) TracePath() string {
 	if a.cfg.SessionDir == "" || a.sessionID == "" {
 		return ""
 	}
-	return filepath.Join(a.cfg.SessionDir, a.sessionID+".trace.jsonl")
+	return filepath.Join(a.cfg.SessionDir, a.sessionID, "diagnostics.jsonl")
 }

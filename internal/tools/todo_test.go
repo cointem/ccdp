@@ -9,12 +9,15 @@ import (
 
 func TestTodoPersistsAcrossStores(t *testing.T) {
 	dir := t.TempDir()
-	ctx := &Context{SessionDir: dir, Args: map[string]any{
+	resources := NewResources("todo-test", dir)
+	t.Cleanup(func() { _ = resources.Close() })
+	ctx := resources.Context(nil, dir, nil)
+	ctx.Args = map[string]any{
 		"todos": []any{
 			map[string]any{"content": "step one", "status": "in_progress", "priority": "high"},
 			map[string]any{"content": "step two"},
 		},
-	}}
+	}
 
 	tool := NewTodoWriteTool()
 	if _, err := tool.Run(ctx); err != nil {
@@ -28,13 +31,17 @@ func TestTodoPersistsAcrossStores(t *testing.T) {
 	}
 
 	// A fresh store (simulating a restart) reads it back.
-	sec := TodoSection(dir)
+	restarted := NewTodoStore("todo-restart", dir)
+	t.Cleanup(restarted.Close)
+	sec := restarted.Section()
 	if !strings.Contains(sec, "step one") || !strings.Contains(sec, "# Task list") {
 		t.Errorf("section missing todos: %q", sec)
 	}
 
 	// Different session dirs are isolated.
-	if other := TodoSection(t.TempDir()); other != "" {
-		t.Errorf("unrelated session should have no todos, got %q", other)
+	other := NewTodoStore("todo-other", t.TempDir())
+	t.Cleanup(other.Close)
+	if section := other.Section(); section != "" {
+		t.Errorf("unrelated session should have no todos, got %q", section)
 	}
 }

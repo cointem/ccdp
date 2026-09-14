@@ -26,13 +26,35 @@ type ToolCall struct {
 	Arguments map[string]any `json:"arguments"`
 }
 
+// ImageAttachment is an immutable snapshot of a local image referenced by a
+// user message. Data is kept only in memory; when the message crosses the
+// session boundary BlobHash/BlobSize identify the content-addressed copy.
+// Path is retained for diagnostics, never as the source of truth for a later
+// request.
+type ImageAttachment struct {
+	Path      string `json:"path,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	BlobHash  string `json:"blob_hash,omitempty"`
+	BlobSize  int64  `json:"blob_size,omitempty"`
+	Data      []byte `json:"-"`
+}
+
 // Message is a single entry in the conversation history.
 type Message struct {
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	// ID is stable for the lifetime of a message and is used by session
+	// projections/UI resync.  Legacy JSON may omit it; the persistence adapter
+	// assigns one when a message first enters the new log.
+	ID         string     `json:"id,omitempty"`
 	Role       Role       `json:"role"`
 	Content    string     `json:"content,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
+	// ImageAttachments are captured when a canonical user input is admitted.
+	// ImagesFrozen prevents a later request from re-reading a changed path.
+	ImageAttachments []ImageAttachment `json:"image_attachments,omitempty"`
+	ImagesFrozen     bool              `json:"images_frozen,omitempty"`
 
 	// TokenCount is an estimate used for compaction decisions. It is not
 	// persisted (recomputed on load).

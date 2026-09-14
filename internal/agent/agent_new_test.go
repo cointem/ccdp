@@ -19,8 +19,7 @@ func newAgentForTest(t *testing.T) *Agent {
 	cfg.SessionDir = filepath.Join(dir, "sessions")
 
 	events := make(chan Event, 64)
-	ctrl := make(chan Control, 16)
-	ag, err := New(&cfg, events, ctrl)
+	ag, err := New(&cfg, events)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

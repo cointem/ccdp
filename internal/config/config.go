@@ -9,15 +9,20 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
+	"ccdp/internal/atomicfile"
 	"ccdp/internal/hooks"
 	"ccdp/internal/mcp"
 	"ccdp/internal/permissions"
+	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 )
 
@@ -49,7 +54,9 @@ Follow the loop: understand → plan → act → verify.
 
 - Before acting, make sure you actually understand the request. If it is
   genuinely ambiguous, ask ONE clarifying question instead of guessing. Do not
-  ask questions you can answer yourself by reading the code.
+  ask questions you can answer yourself by reading the code. Use AskUserQuestion
+  for structured choices and free-text clarification, including in plan mode.
+  Answers clarify requirements; they do not approve tool execution.
 - Read before you write. Never propose changes to code you have not read. Use
   Read on the specific files and line ranges first.
 - Prefer small, verifiable changes over sweeping rewrites. After every
@@ -165,10 +172,12 @@ reason about what is actually visible before acting on them.
 
 // Config is the resolved runtime configuration.
 type Config struct {
-	APIKey    string `json:"api_key"`
-	BaseURL   string `json:"base_url"`
-	Model     string `json:"model"`
-	Workspace string `json:"workspace"` // working directory for the agent
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	Verbosity       string `json:"verbosity,omitempty"`
+	APIKey          string `json:"api_key"`
+	BaseURL         string `json:"base_url"`
+	Model           string `json:"model"`
+	Workspace       string `json:"workspace"` // working directory for the agent
 
 	// Providers is a table of named model providers (Codex's
 	// [model_providers]). A model is served by the provider that lists it; the
@@ -267,6 +276,16 @@ type Config struct {
 	Pricing map[string]Pricing `json:"pricing"`
 
 	SessionDir string `json:"session_dir"` // where sessions are persisted
+
+	// Runtime metadata is deliberately excluded from JSON.
+	sourcePath  string
+	provenance  *provenanceState
+	projectRoot string
+	// TrustStore is an optional injected trust service. It is intentionally
+	// excluded from JSON: a project settings file must never be able to choose
+	// where its own executable-settings authorization is stored. When nil,
+	// callers use DefaultTrustStore at the application boundary.
+	TrustStore *TrustStore `json:"-"`
 }
 
 // Pricing is per-model token cost, USD per million tokens.
@@ -308,10 +327,9 @@ func DefaultPricing() map[string]Pricing {
 	}
 }
 
-// Default returns the built-in default configuration.
-func Default() Config {
+func defaultConfig() Config {
 	home, _ := os.UserHomeDir()
-	cfg := Config{
+	return Config{
 		BaseURL:            "https://api.openai.com/v1",
 		Model:              "gpt-5.4-mini",
 		Workspace:          ".",
@@ -330,20 +348,124 @@ func Default() Config {
 		Providers:          map[string]ProviderConfig{},
 		Pricing:            DefaultPricing(),
 		SessionDir:         filepath.Join(home, ".ccdp", "sessions"),
+		sourcePath:         filepath.Join(home, ".ccdp", "config.json"),
+		provenance:         newProvenance(),
 	}
-	if env := os.Getenv("CCDP_API_KEY"); env != "" {
-		cfg.APIKey = env
-	}
-	if env := os.Getenv("CCDP_BASE_URL"); env != "" {
-		cfg.BaseURL = env
-	}
-	if env := os.Getenv("CCDP_MODEL"); env != "" {
-		cfg.Model = env
-	}
-	if env := os.Getenv("CCDP_PERMISSION_MODE"); env != "" {
-		cfg.PermissionMode = env
-	}
+}
+
+// Default returns the built-in defaults with environment overrides applied.
+func Default() Config {
+	cfg := defaultConfig()
+	applyEnv(&cfg)
 	return cfg
+}
+
+func applyEnv(cfg *Config) {
+	_ = applyEnvChecked(cfg)
+}
+
+// applyEnvChecked applies environment overrides with presence semantics and
+// reports malformed values. Default intentionally keeps its historical
+// best-effort behavior, while file-backed loading must fail closed instead of
+// silently running with a different policy than the operator requested.
+func applyEnvChecked(cfg *Config) error {
+	var errs []error
+	apply := func(name string, fn func(string) error) {
+		if err := applyEnvValue(cfg, name, fn); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	// Environment variables are intentionally presence based. This preserves
+	// an explicit empty/false/zero value when a caller deliberately supplies
+	// one, while retaining source information for successfully parsed values.
+	apply("CCDP_API_KEY", func(v string) error { cfg.APIKey = v; return nil })
+	apply("CCDP_BASE_URL", func(v string) error { cfg.BaseURL = v; return nil })
+	apply("CCDP_REASONING_EFFORT", func(v string) error { cfg.ReasoningEffort = v; return nil })
+	apply("CCDP_VERBOSITY", func(v string) error { cfg.Verbosity = v; return nil })
+	apply("CCDP_MODEL", func(v string) error { cfg.Model = v; return nil })
+	apply("CCDP_PERMISSION_MODE", func(v string) error { cfg.PermissionMode = v; return nil })
+	apply("CCDP_WORKSPACE", func(v string) error { cfg.Workspace = v; return nil })
+	apply("CCDP_SANDBOX_MODE", func(v string) error { cfg.SandboxMode = v; return nil })
+	apply("CCDP_MAX_TURNS", func(v string) error {
+		n, err := parseEnvInt("CCDP_MAX_TURNS", v)
+		if err == nil {
+			cfg.MaxTurns = n
+		}
+		return err
+	})
+	apply("CCDP_MAX_BUDGET_USD", func(v string) error {
+		n, err := parseEnvFloat("CCDP_MAX_BUDGET_USD", v)
+		if err == nil {
+			cfg.MaxBudgetUSD = n
+		}
+		return err
+	})
+	apply("CCDP_MAX_REPLY_TOKENS", func(v string) error {
+		n, err := parseEnvInt("CCDP_MAX_REPLY_TOKENS", v)
+		if err == nil {
+			cfg.MaxReplyTokens = n
+		}
+		return err
+	})
+	apply("CCDP_ENABLE_WEB_TOOLS", func(v string) error {
+		b, err := parseEnvBool("CCDP_ENABLE_WEB_TOOLS", v)
+		if err == nil {
+			cfg.EnableWebTools = BoolPtr(b)
+		}
+		return err
+	})
+	apply("CCDP_ENABLE_GUARDIAN", func(v string) error {
+		b, err := parseEnvBool("CCDP_ENABLE_GUARDIAN", v)
+		if err == nil {
+			cfg.EnableGuardian = BoolPtr(b)
+		}
+		return err
+	})
+	apply("CCDP_ENABLE_MEMORY", func(v string) error {
+		b, err := parseEnvBool("CCDP_ENABLE_MEMORY", v)
+		if err == nil {
+			cfg.EnableMemory = BoolPtr(b)
+		}
+		return err
+	})
+	return errors.Join(errs...)
+}
+
+func applyEnvValue(cfg *Config, name string, apply func(string) error) error {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return nil
+	}
+	if err := apply(value); err != nil {
+		return err
+	}
+	field := strings.TrimPrefix(strings.ToLower(name), "ccdp_")
+	cfg.markSource(field, SourceEnvironment, "env:"+name, false)
+	return nil
+}
+
+func parseEnvInt(name, value string) (int, error) {
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be an integer: %w", name, err)
+	}
+	return n, nil
+}
+
+func parseEnvFloat(name, value string) (float64, error) {
+	n, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a number: %w", name, err)
+	}
+	return n, nil
+}
+
+func parseEnvBool(name, value string) (bool, error) {
+	b, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("config: %s must be true or false: %w", name, err)
+	}
+	return b, nil
 }
 
 // ConfigPath returns the user config file location.
@@ -359,7 +481,8 @@ func Load() (Config, error) {
 
 // LoadFrom reads the config file at path (if present) and merges over defaults.
 func LoadFrom(path string) (Config, error) {
-	cfg := Default()
+	cfg := defaultConfig()
+	cfg.sourcePath = path
 
 	data, err := os.ReadFile(path)
 	if err == nil {
@@ -367,9 +490,16 @@ func LoadFrom(path string) (Config, error) {
 		if err := json.Unmarshal(data, &fileCfg); err != nil {
 			return cfg, fmt.Errorf("config: parse %s: %w", path, err)
 		}
-		merge(&cfg, &fileCfg)
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return cfg, fmt.Errorf("config: parse %s: %w", path, err)
+		}
+		applyConfigFields(&cfg, &fileCfg, raw, SourceUserFile, path, true)
 	} else if !os.IsNotExist(err) {
 		return cfg, fmt.Errorf("config: read %s: %w", path, err)
+	}
+	if err := applyEnvChecked(&cfg); err != nil {
+		return cfg, err
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -378,122 +508,11 @@ func LoadFrom(path string) (Config, error) {
 	return cfg, nil
 }
 
-func merge(dst, src *Config) {
-	if src.APIKey != "" {
-		dst.APIKey = src.APIKey
-	}
-	if src.BaseURL != "" {
-		dst.BaseURL = src.BaseURL
-	}
-	if src.Model != "" {
-		dst.Model = src.Model
-	}
-	if src.Workspace != "" {
-		dst.Workspace = src.Workspace
-	}
-	if src.PermissionMode != "" {
-		dst.PermissionMode = src.PermissionMode
-	}
-	if len(src.AlwaysAllow) > 0 {
-		dst.AlwaysAllow = src.AlwaysAllow
-	}
-	if len(src.AlwaysDeny) > 0 {
-		dst.AlwaysDeny = src.AlwaysDeny
-	}
-	if src.SystemPrompt != "" {
-		dst.SystemPrompt = src.SystemPrompt
-	}
-	if src.ContextWindow > 0 {
-		dst.ContextWindow = src.ContextWindow
-	}
-	if src.CompactThreshold > 0 {
-		dst.CompactThreshold = src.CompactThreshold
-	}
-	if src.MaxResultSizeChars > 0 {
-		dst.MaxResultSizeChars = src.MaxResultSizeChars
-	}
-	if src.KeepAfterCompact > 0 {
-		dst.KeepAfterCompact = src.KeepAfterCompact
-	}
-	if src.BashTimeoutSeconds > 0 {
-		dst.BashTimeoutSeconds = src.BashTimeoutSeconds
-	}
-	if src.MaxTurns > 0 {
-		dst.MaxTurns = src.MaxTurns
-	}
-	if src.MaxBudgetUSD > 0 {
-		dst.MaxBudgetUSD = src.MaxBudgetUSD
-	}
-	if src.MaxReplyTokens > 0 {
-		dst.MaxReplyTokens = src.MaxReplyTokens
-	}
-	if src.FallbackModel != "" {
-		dst.FallbackModel = src.FallbackModel
-	}
-	if src.MaxToolOutputCharsPerTurn > 0 {
-		dst.MaxToolOutputCharsPerTurn = src.MaxToolOutputCharsPerTurn
-	}
-	// Tri-state booleans: the pointer is nil when the file didn't set the key,
-	// so an explicit false overrides the default (nil = "unset", not false).
-	dst.EnableGuardian = src.EnableGuardian
-	dst.EnableMemory = src.EnableMemory
-	if src.SessionDir != "" {
-		dst.SessionDir = src.SessionDir
-	}
-	if src.SandboxMode != "" {
-		dst.SandboxMode = src.SandboxMode
-	}
-	if src.MaxParallelTools > 0 {
-		dst.MaxParallelTools = src.MaxParallelTools
-	}
-	if len(src.Hooks) > 0 {
-		if dst.Hooks == nil {
-			dst.Hooks = hooks.Config{}
-		}
-		for ev, cmds := range src.Hooks {
-			dst.Hooks[ev] = cmds
-		}
-	}
-	if src.EnableWebTools != nil {
-		dst.EnableWebTools = src.EnableWebTools
-	}
-	if len(src.Tools) > 0 {
-		dst.Tools = src.Tools
-	}
-	if len(src.AdditionalDirectories) > 0 {
-		dst.AdditionalDirectories = src.AdditionalDirectories
-	}
-	if len(src.DisallowedDirectories) > 0 {
-		dst.DisallowedDirectories = src.DisallowedDirectories
-	}
-	if len(src.MCPServers) > 0 {
-		if dst.MCPServers == nil {
-			dst.MCPServers = map[string]mcp.ServerConfig{}
-		}
-		for n, s := range src.MCPServers {
-			dst.MCPServers[n] = s
-		}
-	}
-	if len(src.Providers) > 0 {
-		if dst.Providers == nil {
-			dst.Providers = map[string]ProviderConfig{}
-		}
-		for n, p := range src.Providers {
-			dst.Providers[n] = p
-		}
-	}
-	if len(src.Pricing) > 0 {
-		if dst.Pricing == nil {
-			dst.Pricing = map[string]Pricing{}
-		}
-		for m, p := range src.Pricing {
-			dst.Pricing[m] = p
-		}
-	}
-}
-
 // Validate checks the config for usable values.
 func (c *Config) Validate() error {
+	if err := protocol.ValidateGeneration(c.ReasoningEffort, c.Verbosity); err != nil {
+		return err
+	}
 	if c.BaseURL == "" {
 		return fmt.Errorf("config: base_url is required (set CCDP_BASE_URL or ~/.ccdp/config.json)")
 	}
@@ -590,17 +609,40 @@ func (c *Config) BashTimeout() time.Duration {
 	return time.Duration(c.BashTimeoutSeconds) * time.Second
 }
 
-// Save persists the config file (creating the parent directory).
-func (c *Config) Save() error {
-	path := ConfigPath()
+// SavePermissionRules updates only always_allow and always_deny in the source
+// file. Resolved defaults and environment values must never be materialized as
+// a side effect of the /permissions command.
+func (c *Config) SavePermissionRules() error {
+	path := c.sourcePath
+	if path == "" {
+		path = ConfigPath()
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(c, "", "  ")
+	raw := map[string]json.RawMessage{}
+	if old, readErr := os.ReadFile(path); readErr == nil {
+		if err := json.Unmarshal(old, &raw); err != nil {
+			return fmt.Errorf("config: parse %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(readErr) {
+		return fmt.Errorf("config: read %s: %w", path, readErr)
+	}
+	allow, err := json.Marshal(c.AlwaysAllow)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	deny, err := json.Marshal(c.AlwaysDeny)
+	if err != nil {
+		return err
+	}
+	raw["always_allow"] = allow
+	raw["always_deny"] = deny
+	data, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicfile.WriteFile(path, data, 0o600)
 }
 
 // CostFor computes the USD cost of a token usage for the given model,
@@ -634,6 +676,24 @@ func (c *Config) Sandbox() *sandbox.Sandbox {
 	for _, d := range c.DisallowedDirectories {
 		s.AddDisallowedDir(d)
 	}
+	// Session logs, blobs, and control metadata are owner resources rather
+	// than ordinary workspace files. They remain available to the persistence
+	// layer, but file/process tools cannot use the workspace sandbox to tamper
+	// with another session's durable state when SessionDir is nested here.
+	if c.SessionDir != "" {
+		s.AddDisallowedDir(c.SessionDir)
+		s.AddProtectedDir(c.SessionDir)
+	}
+	// Configuration, project instructions, and trust metadata are application
+	// control state. They are never ordinary model-writable files, including
+	// when the user selected the unrestricted compatibility sandbox mode.
+	s.AddProtectedDir(ProjectSettingsDir(c.Workspace))
+	if source := c.SourcePath(); source != "" {
+		s.AddProtectedDir(source)
+	}
+	if c.TrustStore != nil && c.TrustStore.Path != "" {
+		s.AddProtectedDir(c.TrustStore.Path)
+	}
 	return s
 }
 
@@ -644,12 +704,36 @@ func ProjectSettingsDir(ws string) string {
 }
 
 // LoadProjectSettings reads the per-project settings files and merges them
-// (settings.local.json overrides settings.json). Workspace-scoped keys are
-// limited to what a project may influence: permission mode, always_allow,
-// always_deny, hooks, sandbox mode and web tools. It never changes the API
-// key, model or base URL (those stay under the user's control).
+// (settings.local.json overrides settings.json). The result is deliberately
+// marked untrusted: executable hooks, custom commands and MCP servers are
+// ignored by ApplyProjectSettings until the user explicitly authorizes the
+// normalized project root and its executable-config fingerprint in a
+// TrustStore. This default prevents merely checking out a repository from
+// gaining process/network capabilities.
 func LoadProjectSettings(ws string) (Config, error) {
-	var proj Config
+	return loadProjectSettings(ws, nil)
+}
+
+// LoadProjectSettingsTrusted is the explicit opt-in path used by a CLI trust
+// command or a caller that already owns an external TrustStore. A changed
+// executable project setting invalidates the stored approval automatically.
+func LoadProjectSettingsTrusted(ws string, store *TrustStore) (Config, error) {
+	return loadProjectSettings(ws, store)
+}
+
+func loadProjectSettings(ws string, store *TrustStore) (Config, error) {
+	proj := defaultConfig()
+	proj.sourcePath = ""
+	proj.projectRoot = filepath.Clean(ws)
+	proj.ensureProvenance()
+	// Project settings are not a complete config. Start with no executable
+	// entries and only fill values that are present in the files below.
+	proj.APIKey, proj.BaseURL, proj.Model, proj.Workspace = "", "", "", ""
+	proj.Providers = map[string]ProviderConfig{}
+	proj.Pricing = map[string]Pricing{}
+	proj.Hooks = hooks.Config{}
+	proj.MCPServers = map[string]mcp.ServerConfig{}
+	proj.EnableWebTools = nil
 	for _, name := range []string{"settings.json", "settings.local.json"} {
 		p := filepath.Join(ProjectSettingsDir(ws), name)
 		data, err := os.ReadFile(p)
@@ -663,36 +747,167 @@ func LoadProjectSettings(ws string) (Config, error) {
 		if err := json.Unmarshal(data, &s); err != nil {
 			return proj, fmt.Errorf("config: parse %s: %w", p, err)
 		}
-		mergeProject(&proj, &s)
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return proj, fmt.Errorf("config: parse %s: %w", p, err)
+		}
+		source := SourceProject
+		if name == "settings.local.json" {
+			source = SourceProjectLocal
+		}
+		applyConfigFields(&proj, &s, raw, source, p, false)
+	}
+	trusted := false
+	if store != nil {
+		ok, _, err := store.Check(ws, proj)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return proj, err
+		}
+		trusted = ok
+	}
+	fingerprint, fpErr := ProjectExecutableFingerprint(ws, proj)
+	if fpErr == nil {
+		proj.provenance.setProject(filepath.Clean(ws), trusted, fingerprint)
+		for _, field := range []string{"hooks", "tools", "mcp_servers"} {
+			if proj.IsExplicit(field) {
+				proj.provenance.set(field, FieldProvenance{Source: proj.SourceOf(field), Explicit: true,
+					Trusted: trusted, Path: proj.SourceReport().Fields[field].Path, Fingerprint: fingerprint})
+			}
+		}
 	}
 	return proj, nil
 }
 
-// mergeProject merges only the workspace-scoped settings.
-func mergeProject(dst, src *Config) {
-	if src.PermissionMode != "" {
+// ApplyProjectSettings overlays the safe subset of project settings. It is the
+// only supported application entry point; callers cannot accidentally opt into
+// executable project settings by forgetting a trust argument. A project may
+// add denies and tighten sandbox/workflow policy, but cannot remove user
+// denies, add allows while untrusted, enable bypass, or enable executable
+// hooks/commands/MCP without a matching external trust record.
+func ApplyProjectSettings(dst, src *Config) {
+	applyProjectSettings(dst, src)
+}
+
+func applyProjectSettings(dst, src *Config) {
+	if dst == nil || src == nil {
+		return
+	}
+	srcReport := src.SourceReport()
+	// Preserve the evidence on the effective snapshot even when every
+	// executable field is rejected by a higher-precedence environment/CLI
+	// override. This lets diagnostics explain both the checkout and the
+	// decision that kept its values out of the runtime config.
+	if srcReport.ProjectTrusted {
+		dst.ensureProvenance()
+		dst.provenance.setProject(srcReport.ProjectRoot, true, srcReport.ProjectFingerprint)
+	}
+	// Denials are cumulative across trust boundaries. The project cannot use an
+	// empty list to revoke a user denial.
+	if src.IsExplicit("always_deny") {
+		dst.AlwaysDeny = appendUniqueStrings(dst.AlwaysDeny, src.AlwaysDeny...)
+		dst.markSource("always_deny", src.SourceOf("always_deny"), srcReport.Fields["always_deny"].Path, false)
+	}
+	if src.IsExplicit("permission_mode") && projectOverrideAllowed(dst, "permission_mode") && projectModeTightens(dst.PermissionMode, src.PermissionMode) {
 		dst.PermissionMode = src.PermissionMode
+		dst.markSource("permission_mode", src.SourceOf("permission_mode"), srcReport.Fields["permission_mode"].Path, srcReport.ProjectTrusted)
 	}
-	if len(src.AlwaysAllow) > 0 {
-		dst.AlwaysAllow = src.AlwaysAllow
-	}
-	if len(src.AlwaysDeny) > 0 {
-		dst.AlwaysDeny = src.AlwaysDeny
-	}
-	if src.SandboxMode != "" {
+	if src.IsExplicit("sandbox_mode") && projectOverrideAllowed(dst, "sandbox_mode") && sandboxTightens(dst.SandboxMode, src.SandboxMode) {
 		dst.SandboxMode = src.SandboxMode
+		dst.markSource("sandbox_mode", src.SourceOf("sandbox_mode"), srcReport.Fields["sandbox_mode"].Path, srcReport.ProjectTrusted)
 	}
-	if len(src.Hooks) > 0 {
-		if dst.Hooks == nil {
-			dst.Hooks = hooks.Config{}
+	if src.IsExplicit("enable_web_tools") && projectOverrideAllowed(dst, "enable_web_tools") && src.EnableWebTools != nil {
+		// Disabling network-facing web tools is always safe. Enabling them from
+		// an untrusted checkout is not an implicit trust grant.
+		if !*src.EnableWebTools || srcReport.ProjectTrusted {
+			dst.EnableWebTools = BoolPtr(*src.EnableWebTools)
+			dst.markSource("enable_web_tools", src.SourceOf("enable_web_tools"), srcReport.Fields["enable_web_tools"].Path, srcReport.ProjectTrusted)
 		}
-		for ev, cmds := range src.Hooks {
-			dst.Hooks[ev] = cmds
+	}
+	trusted := srcReport.ProjectTrusted
+	if trusted {
+		if src.IsExplicit("always_allow") && projectOverrideAllowed(dst, "always_allow") {
+			dst.AlwaysAllow = appendUniqueStrings(dst.AlwaysAllow, src.AlwaysAllow...)
+			dst.markSource("always_allow", src.SourceOf("always_allow"), srcReport.Fields["always_allow"].Path, true)
+		}
+		if src.IsExplicit("hooks") && projectOverrideAllowed(dst, "hooks") {
+			dst.Hooks = cloneHooks(src.Hooks)
+			dst.markSource("hooks", src.SourceOf("hooks"), srcReport.Fields["hooks"].Path, true)
+		}
+		if src.IsExplicit("tools") && projectOverrideAllowed(dst, "tools") {
+			dst.Tools = cloneTools(src.Tools)
+			dst.markSource("tools", src.SourceOf("tools"), srcReport.Fields["tools"].Path, true)
+		}
+		if src.IsExplicit("mcp_servers") && projectOverrideAllowed(dst, "mcp_servers") {
+			dst.MCPServers = cloneMCPServers(src.MCPServers)
+			dst.markSource("mcp_servers", src.SourceOf("mcp_servers"), srcReport.Fields["mcp_servers"].Path, true)
 		}
 	}
-	if src.EnableWebTools != nil {
-		dst.EnableWebTools = src.EnableWebTools
+}
+
+func projectOverrideAllowed(dst *Config, field string) bool {
+	if dst == nil {
+		return false
 	}
+	source := dst.SourceOf(field)
+	return source != SourceEnvironment && source != SourceCLI
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	seen := make(map[string]struct{}, len(dst)+len(values))
+	out := append([]string(nil), dst...)
+	for _, v := range out {
+		seen[v] = struct{}{}
+	}
+	for _, v := range values {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func cloneTools(src []ToolSpec) []ToolSpec {
+	out := append([]ToolSpec(nil), src...)
+	for i := range out {
+		out[i].InputSchema = cloneAnyMap(out[i].InputSchema)
+	}
+	return out
+}
+
+func projectModeTightens(base, project string) bool {
+	if project == "" || project == string(permissions.ModeBypass) {
+		return false
+	}
+	if base == "" {
+		base = string(permissions.ModeDefault)
+	}
+	// Plan is always a cap. Outside plan, only a transition toward the safer
+	// default is accepted; acceptEdits cannot be enabled by a checkout.
+	if project == string(permissions.ModePlan) {
+		return base != string(permissions.ModePlan)
+	}
+	if base == string(permissions.ModeBypass) || base == string(permissions.ModeAcceptEdits) {
+		return project == string(permissions.ModeDefault)
+	}
+	return false
+}
+
+func sandboxTightens(base, project string) bool {
+	rank := func(v string) int {
+		switch v {
+		case "strict":
+			return 3
+		case "confine":
+			return 2
+		case "none":
+			return 1
+		default:
+			return 0
+		}
+	}
+	return project != "" && rank(project) > rank(base)
 }
 
 // BoolPtr returns a pointer to b (helper for tri-state config booleans: a nil

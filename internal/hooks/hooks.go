@@ -30,17 +30,18 @@
 package hooks
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
+
+	"ccdp/internal/execution"
+	"ccdp/internal/sandbox"
 )
 
 // Event names, mirroring Claude Code's hook event identifiers.
@@ -179,6 +180,13 @@ type Options struct {
 	Mode      string
 	Timeout   time.Duration
 	Env       []string // extra environment variables
+	Sandbox   *sandbox.Sandbox
+	// FailClosed turns execution, timeout, and malformed-output errors in
+	// decision-affecting events into a deny. Observers keep historical
+	// best-effort behavior when it is false.
+	FailClosed bool
+	// OutputLimit bounds one hook's stdout/stderr admission.
+	OutputLimit int
 }
 
 // NewManager builds a hook manager from a config.
@@ -191,6 +199,9 @@ func NewManager(cfg Config, opts Options) *Manager {
 		// 10min which lets a stuck hook freeze the whole turn.
 		opts.Timeout = 60 * time.Second
 	}
+	if opts.OutputLimit <= 0 {
+		opts.OutputLimit = 64 * 1024
+	}
 	return &Manager{cfg: cfg, opts: opts}
 }
 
@@ -201,11 +212,32 @@ func (m *Manager) Update(cfg Config) {
 	m.cfg = cfg
 }
 
+// SetContext refreshes the mutable session values included in hook payloads.
+// Agent state can change at runtime through /mode, /cd, /resume and /fork.
+func (m *Manager) SetContext(sessionID, workspace, mode string) {
+	m.mu.Lock()
+	m.opts.SessionID = sessionID
+	m.opts.Workspace = workspace
+	m.opts.Mode = mode
+	m.mu.Unlock()
+}
+
 // SetTranscript records the session transcript path exposed to hooks.
 func (m *Manager) SetTranscript(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.path = path
+}
+
+// SetSandbox updates the execution boundary for subsequent hooks. Existing
+// hook invocations own their context and cannot observe a policy swap midway.
+func (m *Manager) SetSandbox(sb *sandbox.Sandbox) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.opts.Sandbox = sb
+	m.mu.Unlock()
 }
 
 // Has reports whether any hook is configured for the event.
@@ -236,13 +268,23 @@ func (m *Manager) List() map[string][]string {
 func (m *Manager) baseInput(event string) Input {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return baseInputFrom(m.opts, m.path, event)
+}
+
+func baseInputFrom(opts Options, transcriptPath, event string) Input {
 	return Input{
-		SessionID:      m.opts.SessionID,
-		TranscriptPath: m.path,
-		CWD:            m.opts.Workspace,
-		PermissionMode: m.opts.Mode,
+		SessionID:      opts.SessionID,
+		TranscriptPath: transcriptPath,
+		CWD:            opts.Workspace,
+		PermissionMode: opts.Mode,
 		HookEventName:  event,
 	}
+}
+
+func cloneHookOptions(opts Options) Options {
+	clone := opts
+	clone.Env = append([]string(nil), opts.Env...)
+	return clone
 }
 
 // matcherCache caches compiled matcher regexes (matchers are static config).
@@ -291,13 +333,14 @@ func (m *Manager) Run(ctx context.Context, event string, mutate func(*Input)) Ou
 	}
 	m.mu.RLock()
 	specs := append([]HookSpec(nil), m.cfg[event]...)
-	timeout := m.opts.Timeout
+	opts := cloneHookOptions(m.opts)
+	transcriptPath := m.path
 	m.mu.RUnlock()
 	if len(specs) == 0 {
 		return Output{}
 	}
 
-	in := m.baseInput(event)
+	in := baseInputFrom(opts, transcriptPath, event)
 	if mutate != nil {
 		mutate(&in)
 	}
@@ -307,14 +350,17 @@ func (m *Manager) Run(ctx context.Context, event string, mutate func(*Input)) Ou
 		if !matcherMatches(spec.Matcher, in.ToolName) {
 			continue
 		}
-		hookTimeout := timeout
+		hookTimeout := opts.Timeout
 		if spec.Timeout > 0 {
 			hookTimeout = time.Duration(spec.Timeout) * time.Second
 		}
-		res, blocked, err := m.runOne(ctx, spec.Command, hookTimeout, in)
+		res, blocked, err := m.runOne(ctx, spec.Command, hookTimeout, in, opts)
 		if err != nil {
-			// Non-blocking error: record it and keep the chain going
-			// (Claude Code semantics — only exit code 2 blocks).
+			if hookFailClosed(opts, event) {
+				return Output{Decision: DecisionDeny, Reason: fmt.Sprintf("hook %q failed closed: %v", spec.Command, err)}
+			}
+			// Observer hooks retain best-effort behavior. Decision-affecting
+			// hooks are fail-closed when the runtime opts into safety mode.
 			if out.Reason == "" {
 				out.Reason = fmt.Sprintf("hook %q failed: %v", spec.Command, err)
 			}
@@ -343,74 +389,69 @@ func (m *Manager) Run(ctx context.Context, event string, mutate func(*Input)) Ou
 
 // runOne executes a single hook command and parses its JSON output. The
 // second return reports an exit code 2 (blocking) outcome.
-func (m *Manager) runOne(ctx context.Context, command string, timeout time.Duration, in Input) (Output, bool, error) {
+func (m *Manager) runOne(ctx context.Context, command string, timeout time.Duration, in Input, opts Options) (Output, bool, error) {
 	payload, err := json.Marshal(in)
 	if err != nil {
 		return Output{}, false, fmt.Errorf("hooks: marshal input: %w", err)
 	}
 
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(cctx, "sh", "-c", command)
-	cmd.Dir = m.opts.Workspace
-	cmd.Env = append(os.Environ(),
-		"CCDP_PROJECT_DIR="+m.opts.Workspace,
-		"CCDP_SESSION_ID="+m.opts.SessionID,
-	)
-	cmd.Env = append(cmd.Env, m.opts.Env...)
-	cmd.Stdin = strings.NewReader(string(payload))
-	// Run the hook in its own process group so the timeout kill takes down
-	// grandchildren too (`npm run dev &` inside a hook would otherwise hold
-	// stdout open and cmd.Output would block past the timeout forever).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && killErr != syscall.ESRCH {
-			return killErr
-		}
-		return os.ErrProcessDone
+	env := hookEnvironment(opts)
+	res, err := execution.Run(execution.Request{
+		Context: ctx, Command: command, Dir: opts.Workspace, Timeout: timeout,
+		Input: bytes.NewReader(payload), Env: env, Sandbox: opts.Sandbox,
+		OutputLimit: opts.OutputLimit,
+		// Hook commands are a portable configuration contract, not an
+		// interactive terminal session. Keep their POSIX shell semantics stable
+		// across users whose login shell may be fish, nushell, or something else.
+		Shell: "/bin/sh",
+	})
+	if err != nil {
+		return Output{}, false, fmt.Errorf("hook %q: %w", command, err)
 	}
-	cmd.WaitDelay = 5 * time.Second
-
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	outBytes, err := cmd.Output()
-	if cctx.Err() != nil {
+	if res.TimedOut {
 		return Output{}, false, fmt.Errorf("hook %q timed out", command)
 	}
-	if err != nil && !errors.Is(err, exec.ErrWaitDelay) && !errors.Is(err, os.ErrClosed) {
-		// ErrWaitDelay / os.ErrClosed mean the hook exited but grandchildren
-		// kept its pipes open until WaitDelay force-closed them — the hook
-		// itself succeeded, so its (partial) output stands.
-		ee, ok := err.(*exec.ExitError)
-		if !ok {
-			return Output{}, false, fmt.Errorf("hook %q: %w", command, err)
-		}
-		if ee.ExitCode() == 2 {
-			// Blocking: stderr is fed back as the reason (Claude semantics).
-			reason := strings.TrimSpace(stderr.String())
+	if res.ExitCode != 0 {
+		if res.ExitCode == 2 {
+			reason := strings.TrimSpace(res.Stderr)
 			if reason == "" {
 				reason = "blocked by hook (exit code 2)"
 			}
 			return Output{Decision: DecisionDeny, Reason: reason}, true, nil
 		}
-		msg := strings.TrimSpace(stderr.String())
+		msg := strings.TrimSpace(res.Stderr)
 		if msg == "" {
-			msg = fmt.Sprintf("exit %d", ee.ExitCode())
+			msg = fmt.Sprintf("exit %d", res.ExitCode)
 		}
 		return Output{}, false, fmt.Errorf("hook %q: %s", command, msg)
 	}
 
 	out := Output{}
-	trimmed := strings.TrimSpace(string(outBytes))
+	trimmed := strings.TrimSpace(res.Stdout)
 	if trimmed == "" {
 		return out, false, nil
 	}
-	// Hooks may emit non-JSON noise; only structured output is honored.
+	// A decision hook emitting non-JSON output is a failed contract. The
+	// caller may still choose best-effort observer semantics, but fail-closed
+	// runtimes will turn this into a deny rather than silently allowing.
 	if err := json.Unmarshal([]byte(trimmed), &out); err != nil {
-		return Output{}, false, nil
+		return Output{}, false, fmt.Errorf("hook %q returned invalid JSON: %w", command, err)
 	}
 	return out, false, nil
+}
+
+func hookFailClosed(opts Options, event string) bool {
+	return opts.FailClosed && (event == EventPreToolUse || event == EventUserPromptSubmit || event == EventPreCompact)
+}
+
+func hookEnvironment(opts Options) []string {
+	// Do not pass provider credentials or common secret-bearing values to a
+	// project hook. The hook may receive explicit non-secret variables through
+	// Options.Env, but the same filter is applied to those additions.
+	entries := append(append([]string(nil), os.Environ()...), opts.Env...)
+	out := execution.SanitizedEnvironmentFor(execution.EnvironmentCommand, entries)
+	out = append(out, "CCDP_PROJECT_DIR="+opts.Workspace, "CCDP_SESSION_ID="+opts.SessionID)
+	return out
 }
 
 // PreToolUse runs the PreToolUse hooks for a tool call and returns the verdict.

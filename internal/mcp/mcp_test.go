@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -107,6 +110,138 @@ func TestClientLifecycle(t *testing.T) {
 	}
 }
 
+func TestBoundedMCPStderr(t *testing.T) {
+	b := &boundedBuffer{limit: 16}
+	input := strings.Repeat("x", 64)
+	n, err := b.Write([]byte(input))
+	if err != nil || n != len(input) {
+		t.Fatalf("bounded stderr Write = (%d, %v), want all input consumed", n, err)
+	}
+	out := b.String()
+	if !strings.HasPrefix(out, strings.Repeat("x", 16)) || !strings.Contains(out, "stderr truncated") {
+		t.Fatalf("bounded stderr = %q", out)
+	}
+}
+
+func TestMCPDiagnosticRedactsConfiguredSecretsAndLimitsTail(t *testing.T) {
+	b := &boundedBuffer{limit: 16 * 1024}
+	_, _ = b.Write([]byte(strings.Repeat("noise ", 2000) + "fatal token=s3cr3t Authorization: Bearer opaque https://user:pass@example.test/path"))
+	diagnostic := mcpDiagnosticSuffix(b, ServerConfig{Env: map[string]string{"MCP_SECRET": "s3cr3t"}})
+	if !strings.Contains(diagnostic, "fatal") || !strings.Contains(diagnostic, "stderr") {
+		t.Fatalf("diagnostic omitted useful bounded failure text: %q", diagnostic)
+	}
+	for _, secret := range []string{"s3cr3t", "opaque", "user:pass"} {
+		if strings.Contains(diagnostic, secret) {
+			t.Fatalf("diagnostic leaked %q: %q", secret, diagnostic)
+		}
+	}
+	if len(diagnostic) > 4*1024+32 { // suffix and marker overhead
+		t.Fatalf("diagnostic exceeded bounded tail: %d", len(diagnostic))
+	}
+}
+
+func TestResolveSSEEndpoint(t *testing.T) {
+	tests := []struct {
+		base, endpoint, want string
+	}{
+		{"http://example.test/sse", "/messages", "http://example.test/messages"},
+		{"https://example.test/mcp/sse", "../messages", "https://example.test/messages"},
+		{"http://example.test/mcp/", "messages", "http://example.test/mcp/messages"},
+	}
+	for _, tt := range tests {
+		got, err := resolveSSEEndpoint(tt.base, tt.endpoint)
+		if err != nil || got != tt.want {
+			t.Errorf("resolveSSEEndpoint(%q, %q) = %q, %v; want %q", tt.base, tt.endpoint, got, err, tt.want)
+		}
+	}
+	if _, err := resolveSSEEndpoint("file:///tmp/mcp", "/messages"); err == nil {
+		t.Fatal("accepted non-http base URL")
+	}
+	if _, err := resolveSSEEndpoint("https://example.test/sse", "//attacker.test/messages"); err == nil {
+		t.Fatal("accepted cross-origin protocol-relative SSE endpoint")
+	}
+}
+
+func TestToolsListChangedStormUsesOneRefreshWorkerAndCloses(t *testing.T) {
+	w := &refreshWriter{}
+	c := NewClient("storm", ServerConfig{})
+	c.stdin = nopWriteCloser{w}
+	var changes atomic.Int32
+	c.SetChangeListener(func() { changes.Add(1) })
+
+	// Hold the first refresh at its response boundary, then send a large burst
+	// of notifications. The coalescing worker should perform only one follow-up
+	// refresh after the first response, rather than one goroutine per event.
+	c.scheduleRefresh()
+	id := waitPendingRequest(t, c)
+	for i := 0; i < 1000; i++ {
+		c.dispatchRaw([]byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`))
+	}
+	respondPending(t, c, id)
+	id = waitPendingRequestAfter(t, c, id)
+	respondPending(t, c, id)
+	waitRefreshIdle(t, c)
+	w.mu.Lock()
+	calls := w.calls
+	w.mu.Unlock()
+	if calls != 2 || changes.Load() != 2 {
+		t.Fatalf("notification storm caused %d refresh writes and %d callbacks, want 2/2", calls, changes.Load())
+	}
+
+	// A refresh blocked in requestJSON must also terminate when the client is
+	// closed; this is the lifetime half of the storm bound.
+	c2 := NewClient("storm-close", ServerConfig{})
+	c2.stdin = nopWriteCloser{&refreshWriter{}}
+	c2.scheduleRefresh()
+	_ = waitPendingRequest(t, c2)
+	if err := c2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitRefreshIdle(t, c2)
+}
+
+func waitPendingRequest(t *testing.T, c *Client) int {
+	return waitPendingRequestAfter(t, c, 0)
+}
+
+func waitPendingRequestAfter(t *testing.T, c *Client, previous int) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		for id := range c.pending {
+			if id != previous {
+				c.mu.Unlock()
+				return id
+			}
+		}
+		c.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("refresh did not issue a pending tools/list request")
+	return 0
+}
+
+func respondPending(t *testing.T, c *Client, id int) {
+	t.Helper()
+	c.dispatchRaw([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"tools":[]}}`, id)))
+}
+
+func waitRefreshIdle(t *testing.T, c *Client) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.refreshMu.Lock()
+		running := c.refreshRunning
+		c.refreshMu.Unlock()
+		if !running {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("coalesced refresh worker remained running")
+}
+
 func TestManagerRegisterTools(t *testing.T) {
 	if os.Getenv(fakeServerEnv) == "1" {
 		runFakeServer()
@@ -149,10 +284,146 @@ func TestManagerRegisterTools(t *testing.T) {
 	}
 }
 
+func TestManagerStartCheckedRollsBackAllCandidates(t *testing.T) {
+	m := NewManager()
+	err := m.StartChecked(context.Background(), map[string]ServerConfig{
+		"broken":          {Command: "/definitely/not/a/real/mcp-server"},
+		"missing-command": {},
+	})
+	if err == nil {
+		t.Fatal("StartChecked succeeded with an invalid candidate")
+	}
+	if got := m.Names(); len(got) != 0 {
+		t.Fatalf("failed candidate partially published: %v", got)
+	}
+	m.Close()
+}
+
+func TestManagerRefreshKeepsOldStepBindingAlive(t *testing.T) {
+	if os.Getenv(fakeServerEnv) == "1" {
+		runFakeServer()
+		return
+	}
+	server := ServerConfig{Command: os.Args[0], Args: []string{"-test.run=TestManagerRefreshKeepsOldStepBindingAlive"}, Env: map[string]string{fakeServerEnv: "1"}}
+	m := NewManager()
+	if err := m.StartChecked(context.Background(), map[string]ServerConfig{"fake": server}); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	reg := tools.NewRegistry()
+	m.RegisterTools(reg)
+	step := m.AcquireStep(reg)
+	old, ok := step.Tools.Get("echo")
+	if !ok {
+		t.Fatal("old step lost echo binding")
+	}
+	if err := m.Refresh(context.Background(), map[string]ServerConfig{"fake": server}); err != nil {
+		t.Fatal(err)
+	}
+	current, ok := reg.Get("echo")
+	if !ok || current == old {
+		t.Fatal("refresh did not publish a new binding")
+	}
+	if out, err := old.Run(&tools.Context{Context: context.Background(), Args: map[string]any{"text": "old"}}); err != nil || out != "echo:old" {
+		t.Fatalf("old binding failed before step close: out=%q err=%v", out, err)
+	}
+	step.Close()
+	if _, err := old.Run(&tools.Context{Context: context.Background(), Args: map[string]any{"text": "closed"}}); err == nil {
+		t.Fatal("retired MCP client remained usable after step lease close")
+	}
+}
+
+func TestManagerPrepareAbortDoesNotPublishCandidate(t *testing.T) {
+	if os.Getenv(fakeServerEnv) == "1" {
+		runFakeServer()
+		return
+	}
+	server := ServerConfig{Command: os.Args[0], Args: []string{"-test.run=TestManagerPrepareAbortDoesNotPublishCandidate"}, Env: map[string]string{fakeServerEnv: "1"}}
+	m := NewManager()
+	if err := m.StartChecked(context.Background(), map[string]ServerConfig{"fake": server}); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	reg := tools.NewRegistry()
+	m.RegisterTools(reg)
+	old, ok := reg.Get("echo")
+	if !ok {
+		t.Fatal("initial echo binding missing")
+	}
+	candidate, err := m.PrepareRefresh(context.Background(), map[string]ServerConfig{"fake": server}, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current, ok := reg.Get("echo"); !ok || current != old {
+		t.Fatalf("prepare published candidate: current=%T old=%T", current, old)
+	}
+	if err := candidate.Abort(); err != nil {
+		t.Fatalf("abort candidate: %v", err)
+	}
+	if current, ok := reg.Get("echo"); !ok || current != old {
+		t.Fatalf("abort changed active binding: current=%T old=%T", current, old)
+	}
+}
+
+func TestManagerStartsSSEWithoutCommand(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "event: endpoint\ndata: %s/messages\n\n", srv.URL)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			return
+		}
+		var req rpcMessage
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(req.ID) == 0 {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		var result any = map[string]any{}
+		if req.Method == "tools/list" {
+			result = map[string]any{"tools": []map[string]any{{
+				"name": "sse_echo", "description": "echo", "inputSchema": map[string]any{"type": "object"},
+			}}}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+	}))
+	defer srv.Close()
+
+	m := NewManager()
+	m.Start(context.Background(), map[string]ServerConfig{
+		"remote": {Transport: "sse", BaseURL: srv.URL},
+	})
+	defer m.Close()
+	if names := m.Names(); len(names) != 1 || names[0] != "remote" {
+		t.Fatalf("SSE server without command was skipped: %v", names)
+	}
+	if got := m.ToolNames()["remote"]; len(got) != 1 || got[0] != "sse_echo" {
+		t.Fatalf("SSE tools = %v", got)
+	}
+}
+
 // nopWriteCloser adapts an io.Writer to io.WriteCloser for stdin fakes.
 type nopWriteCloser struct{ io.Writer }
 
 func (nopWriteCloser) Close() error { return nil }
+
+type refreshWriter struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (w *refreshWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.calls++
+	w.mu.Unlock()
+	return len(p), nil
+}
 
 // TestFireClosedDispatchRace hammers dispatchRaw against fireClosed. dispatch
 // pops a pending channel under the lock and sends after unlocking, so a

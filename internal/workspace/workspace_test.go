@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestGitignoreMatch(t *testing.T) {
@@ -53,18 +55,22 @@ func TestScanAndRepoMap(t *testing.T) {
 	}
 	must(os.MkdirAll(filepath.Join(dir, "src"), 0o755))
 	must(os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755))
+	must(os.MkdirAll(filepath.Join(dir, "packages", "app", "node_modules"), 0o755))
+	must(os.MkdirAll(filepath.Join(dir, "packages", "app", "src"), 0o755))
 	must(os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0o644))
 	must(os.WriteFile(filepath.Join(dir, "src", "util.go"), []byte("package src\n"), 0o644))
 	must(os.WriteFile(filepath.Join(dir, "README.md"), []byte("# hi\n"), 0o644))
 	must(os.WriteFile(filepath.Join(dir, "node_modules", "x.js"), []byte("x\n"), 0o644))
+	must(os.WriteFile(filepath.Join(dir, "packages", "app", "node_modules", "deep.js"), []byte("x\n"), 0o644))
+	must(os.WriteFile(filepath.Join(dir, "packages", "app", "src", "keep.go"), []byte("package app\n"), 0o644))
 	must(os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("*.log\n"), 0o644))
 
 	info, err := Scan(dir, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.FileCount != 3 {
-		t.Fatalf("FileCount = %d, want 3 (node_modules ignored)", info.FileCount)
+	if info.FileCount != 4 {
+		t.Fatalf("FileCount = %d, want 4 (nested node_modules ignored)", info.FileCount)
 	}
 
 	// Ensure the repo map lists all visible files (grouped by directory).
@@ -76,6 +82,12 @@ func TestScanAndRepoMap(t *testing.T) {
 	}
 	if contains(rm, "node_modules") {
 		t.Errorf("repo map should exclude node_modules\n%s", rm)
+	}
+	if contains(rm, "deep.js") {
+		t.Errorf("repo map should exclude nested node_modules\n%s", rm)
+	}
+	if !contains(rm, "keep.go") {
+		t.Errorf("repo map lost non-skipped nested source\n%s", rm)
 	}
 }
 
@@ -133,5 +145,101 @@ func TestLoadInstructionsIncludesUserLevel(t *testing.T) {
 	}
 	if !strings.Contains(out, "user rules") || !strings.Contains(out, "project rules") {
 		t.Errorf("missing level: %q", out)
+	}
+}
+
+func TestReadBoundedRejectsFIFOWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "AGENTS.md")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, _, err = readBounded(path, 32)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("readBounded FIFO error = %v, want regular-file error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readBounded blocked on FIFO")
+	}
+}
+
+func TestReadBoundedReportsOversizedInstructions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "AGENTS.md")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, truncated, err := readBounded(path, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "0123" || !truncated {
+		t.Fatalf("readBounded = %q, truncated=%v; want first 4 bytes and true", data, truncated)
+	}
+}
+
+func TestLoadInstructionsCheckedSurfacesPresentFIFO(t *testing.T) {
+	home := t.TempDir()
+	workspaceRoot := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(workspaceRoot, InstructionFile)
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = LoadInstructionsChecked(workspaceRoot)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("LoadInstructionsChecked FIFO error = %v, want regular-file error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LoadInstructionsChecked blocked on FIFO")
+	}
+}
+
+func TestLoadInstructionsCheckedRejectsOversizedFile(t *testing.T) {
+	home := t.TempDir()
+	workspaceRoot := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(workspaceRoot, InstructionFile)
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", DefaultMaxInstructionFileBytes+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadInstructionsChecked(workspaceRoot)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), path) {
+		t.Fatalf("oversized instruction error = %v, want path and limit", err)
+	}
+}
+
+func TestLoadInstructionsCheckedRejectsAggregateOverflow(t *testing.T) {
+	home := t.TempDir()
+	workspaceRoot := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(workspaceRoot, InstructionFile)
+	if err := os.WriteFile(path, []byte("required instructions"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadInstructionsBoundedChecked(workspaceRoot, 8)
+	if err == nil || !strings.Contains(err.Error(), "aggregate limit") || !strings.Contains(err.Error(), path) {
+		t.Fatalf("aggregate overflow error = %v, want path and limit", err)
+	}
+}
+
+func TestLoadInstructionsCheckedSurfacesMissingRoot(t *testing.T) {
+	_, err := LoadInstructionsChecked(filepath.Join(t.TempDir(), "missing-workspace"))
+	if err == nil || !strings.Contains(err.Error(), "stat root") {
+		t.Fatalf("missing root error = %v, want stat-root error", err)
 	}
 }

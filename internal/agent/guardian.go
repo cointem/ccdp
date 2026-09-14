@@ -50,7 +50,10 @@ func (a *Agent) guardianCheck(tc messages.ToolCall) error {
 	prompt := fmt.Sprintf("Approve or reject this tool call:\n\nTool: %s\nArguments: %s\n\nReturn the JSON verdict only.",
 		tc.Name, string(args))
 
-	out, err := a.runSubagent(prompt, GuardianSystem)
+	// Guardian is a distinct child purpose. Do not route this through the Task
+	// callback: the child constructor applies a strict read-only allowlist and
+	// disables recursive guardian/Task execution.
+	out, err := a.runGuardianChild(prompt)
 	if err != nil {
 		a.emitStatus("guardian review failed (%v) — proceeding", err)
 		return nil

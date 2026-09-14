@@ -7,11 +7,12 @@ import "encoding/json"
 // of content parts (for tool-bearing messages we always use strings for the
 // tool role, matching the OpenAI convention).
 type ChatMessage struct {
-	Role       string     `json:"role"`
-	Content    any        `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	Role             string     `json:"role"`
+	Content          any        `json:"content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Name             string     `json:"name,omitempty"`
 }
 
 // ToolCall is a streaming-assembled tool call.
@@ -54,6 +55,11 @@ func (a ArgumentsJSON) String() string { return string(a) }
 type ToolDef struct {
 	Type     string  `json:"type"`
 	Function FuncDef `json:"function"`
+	// PlanAllowed is runtime metadata derived from the concrete registered
+	// implementation. It is intentionally omitted from provider JSON: a tool
+	// name alone must never grant plan-mode capability when a plugin/custom
+	// implementation shadows that name.
+	PlanAllowed bool `json:"-"`
 }
 
 // FuncDef is the JSON Schema-ish definition of a function.
@@ -121,14 +127,21 @@ type APIError struct {
 }
 
 // CompletionRequest is the full request body for Chat Completions.
+type ThinkingConfig struct {
+	Type string `json:"type"`
+}
+
 type CompletionRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	Tools       []ToolDef     `json:"tools,omitempty"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	TopP        *float64      `json:"top_p,omitempty"`
-	MaxTokens   *int          `json:"max_tokens,omitempty"`
-	Stream      bool          `json:"stream"`
+	Thinking        *ThinkingConfig `json:"thinking,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	Verbosity       string          `json:"verbosity,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []ChatMessage   `json:"messages"`
+	Tools           []ToolDef       `json:"tools,omitempty"`
+	Temperature     *float64        `json:"temperature,omitempty"`
+	TopP            *float64        `json:"top_p,omitempty"`
+	MaxTokens       *int            `json:"max_tokens,omitempty"`
+	Stream          bool            `json:"stream"`
 }
 
 // UnmarshalArgs parses raw JSON arguments from a tool call delta.

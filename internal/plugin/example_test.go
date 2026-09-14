@@ -125,8 +125,9 @@ func TestExternalPluginExtension(t *testing.T) {
 		t.Fatalf("external tool run: %q, %v", out, err)
 	}
 
-	// The provider is resolvable through the ModelRegistry.
-	if p := ctx.Models.Resolve("some-model"); p == nil || p.Name() != "example-llm" {
+	// The provider is resolvable through an explicit model route.
+	ctx.Models.Route("some-model", "example-llm")
+	if p, ok := ctx.Models.ResolveRoute("some-model"); !ok || p == nil || p.Name() != "example-llm" {
 		t.Fatalf("expected example provider, got %v", p)
 	}
 
