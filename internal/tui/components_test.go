@@ -18,9 +18,6 @@ type captureClipboard struct {
 
 type contextBlockingClipboard struct{}
 
-func (contextBlockingClipboard) WriteAll(string) error {
-	return errors.New("legacy path should not be used")
-}
 func (contextBlockingClipboard) WriteAllContext(ctx context.Context, _ string) error {
 	<-ctx.Done()
 	return ctx.Err()
@@ -32,7 +29,7 @@ func inlineTestModel() *Model {
 	return m
 }
 
-func (c *captureClipboard) WriteAll(text string) error {
+func (c *captureClipboard) WriteAllContext(_ context.Context, text string) error {
 	c.text = text
 	return c.err
 }
@@ -62,8 +59,8 @@ func TestScrollStateClampsAndKeepsSelectionVisible(t *testing.T) {
 func TestPickerSanitizesANSIInTitleAndOptions(t *testing.T) {
 	m := sugModel()
 	m.width, m.height = 80, 20
-	m.startSelectorAt("Pick \x1b]52;c;secret\a", []selectorOption{{ID: "one", Label: "safe \x1b[2Jentry"}}, 0, false, selectorAction{Kind: selectorModel})
-	out := m.renderPicker()
+	m.startSelectorAt("Pick \x1b]52;c;secret\a", []SelectorOption{{ID: "one", Label: "safe \x1b[2Jentry"}}, 0, false, selectorAction{Kind: selectorModel})
+	out := m.renderInlineSurface()
 	if strings.ContainsRune(out, '\x1b') || strings.ContainsRune(out, '\a') {
 		t.Fatalf("picker leaked terminal controls: %q", out)
 	}
@@ -71,52 +68,55 @@ func TestPickerSanitizesANSIInTitleAndOptions(t *testing.T) {
 		t.Fatalf("picker lost sanitized option text: %q", out)
 	}
 	m.picker.inline = true
-	out = m.renderInlinePicker()
+	out = m.renderInlineSurface()
 	if strings.ContainsRune(out, '\x1b') || strings.ContainsRune(out, '\a') {
 		t.Fatalf("inline picker leaked terminal controls: %q", out)
 	}
 }
 
-func TestInlineBaselineRemainsVisibleUntilFirstFlush(t *testing.T) {
+func TestManagedHistoryRemainsVisibleAfterFlush(t *testing.T) {
 	m := inlineTestModel()
 	m.width, m.height = 80, 24
-	m.items = []logItem{{kind: "assistant", messageID: "old", text: "old answer"}}
+	m.items = []historyCell{{kind: "assistant", messageID: "old", text: "old answer"}}
 	m.inline.forgetAll()
 	m.inline.prime(m.items)
 	m.inline.showInitialFrame()
-	if got := m.inlineBody(); !strings.Contains(got, "old answer") {
+	m.layout()
+	if got := m.View(); !strings.Contains(got, "old answer") {
 		t.Fatalf("initial managed frame hid existing history: %q", got)
 	}
-	m.items = append(m.items, logItem{kind: "user", messageID: "new", text: "new prompt"})
+	m.items = append(m.items, historyCell{kind: "user", messageID: "new", text: "new prompt"})
 	m.turnDone = false
-	if cmd := m.flushInline(); cmd == nil {
+	if cmd := planTestHistory(m); cmd == nil {
 		t.Fatal("new complete user unit should be queued to native scrollback")
 	}
-	if got := m.inlineBody(); strings.Contains(got, "old answer") {
-		t.Fatalf("baseline remained in managed frame after flush: %q", got)
+	m.layout()
+	if got := m.View(); !strings.Contains(got, "old answer") {
+		t.Fatalf("visible history disappeared after flush: %q", got)
 	}
 }
 
 func TestInlineInitialHistoryIsFullyCommittedBeforeTailDrops(t *testing.T) {
 	m := inlineTestModel()
 	m.width, m.height = 80, 24
-	m.items = make([]logItem, 48)
+	m.items = make([]historyCell, 48)
 	for i := range m.items {
-		m.items[i] = logItem{kind: "assistant", messageID: "history-" + strconv.Itoa(i), text: "history line " + strconv.Itoa(i)}
+		m.items[i] = historyCell{kind: "assistant", messageID: "history-" + strconv.Itoa(i), text: "history line " + strconv.Itoa(i)}
 	}
 	m.inline.forgetAll()
 	m.inline.prime(m.items)
 	m.inline.showInitialFrame()
-	if got := m.inlineBody(); !strings.Contains(got, "history line 47") || strings.Contains(got, "history line 0") {
+	m.layout()
+	if got := m.View(); !strings.Contains(got, "history line 47") || strings.Contains(got, "history line 0") {
 		t.Fatalf("initial live frame should show only the bounded tail: %q", got)
 	}
-	if cmd := m.flushInline(); cmd == nil {
+	if cmd := planTestHistory(m); cmd == nil {
 		t.Fatal("initial history was not sent to native scrollback")
 	}
 	if len(m.inline.printed) != len(m.items) {
 		t.Fatalf("committed %d of %d initial history items", len(m.inline.printed), len(m.items))
 	}
-	if cmd := m.flushInline(); cmd != nil {
+	if cmd := planTestHistory(m); cmd != nil {
 		t.Fatal("initial history was emitted twice")
 	}
 }
@@ -128,58 +128,19 @@ func TestInlineStableIDsDoNotCollapseEqualText(t *testing.T) {
 	m.inline.prime(nil)
 	m.inline.showBaseline = false
 	m.turnDone = true
-	m.items = []logItem{
+	m.items = []historyCell{
 		{kind: "assistant", messageID: "a-1", text: "same answer"},
 		{kind: "assistant", messageID: "a-2", text: "same answer"},
 	}
-	if cmd := m.flushInline(); cmd == nil {
+	if cmd := planTestHistory(m); cmd == nil {
 		t.Fatal("first equal-text batch should be emitted")
 	}
-	if cmd := m.flushInline(); cmd != nil {
+	if cmd := planTestHistory(m); cmd != nil {
 		t.Fatal("replaying equal-text batch with stable IDs emitted twice")
 	}
-	m.items = append(m.items, logItem{kind: "assistant", messageID: "a-3", text: "same answer"})
-	if cmd := m.flushInline(); cmd == nil {
+	m.items = append(m.items, historyCell{kind: "assistant", messageID: "a-3", text: "same answer"})
+	if cmd := planTestHistory(m); cmd == nil {
 		t.Fatal("a distinct stable ID must be emitted even with equal content")
-	}
-}
-
-func TestInlineLegacyStreamBridgesOnlyOneStableMessage(t *testing.T) {
-	m := inlineTestModel()
-	m.width, m.height = 80, 24
-	m.inline.forgetAll()
-	m.inline.prime(nil)
-	m.inline.showBaseline = false
-	m.turnDone = true
-	m.items = []logItem{{kind: "assistant", text: "same answer"}}
-	if cmd := m.flushInline(); cmd == nil {
-		t.Fatal("legacy answer should be emitted")
-	}
-	m.items = []logItem{{kind: "assistant", messageID: "stable-1", text: "same answer"}}
-	if cmd := m.flushInline(); cmd != nil {
-		t.Fatal("authoritative ID should bridge the one legacy emission")
-	}
-	m.items = append(m.items, logItem{kind: "assistant", messageID: "stable-2", text: "same answer"})
-	if cmd := m.flushInline(); cmd == nil {
-		t.Fatal("second stable equal-text answer was swallowed by bridge")
-	}
-}
-
-func TestInlineLegacyEqualTextSiblingsRemainDistinct(t *testing.T) {
-	m := inlineTestModel()
-	m.inline.forgetAll()
-	m.inline.prime(nil)
-	m.inline.showBaseline = false
-	m.turnDone = true
-	m.items = []logItem{
-		{kind: "assistant", text: "same answer"},
-		{kind: "assistant", text: "same answer"},
-	}
-	if cmd := m.flushInline(); cmd == nil {
-		t.Fatal("id-less equal-text siblings should both be emitted")
-	}
-	if len(m.inline.printed) != 2 {
-		t.Fatalf("printed identities = %d, want 2", len(m.inline.printed))
 	}
 }
 
@@ -191,19 +152,20 @@ func TestInlineLongStreamPrintsPrefixThenOnlyFinalDelta(t *testing.T) {
 	m.inline.showBaseline = false
 	m.streaming = true
 	m.turnDone = false
-	m.items = []logItem{{kind: "assistant", text: strings.Repeat("x", inlinePrefixBytes)}}
-	if cmd := m.flushInline(); cmd == nil {
+	m.items = []historyCell{{kind: "assistant", messageID: "stream-1", status: "streaming", text: strings.Repeat("x", inlinePrefixBytes)}}
+	if cmd := planTestHistory(m); cmd == nil {
 		t.Fatal("long active stream prefix was not emitted")
 	}
-	if got := m.inline.offsets["assistant:active"]; got <= 0 || got >= len(m.items[0].text) {
+	if got := m.inline.offsets["message:stream-1"]; got <= 0 || got >= len(m.items[0].text) {
 		t.Fatalf("stream offset=%d, want a committed prefix with a live tail", got)
 	}
 	m.items[0].text += "tail"
 	m.turnDone = true
-	if cmd := m.flushInline(); cmd == nil {
+	m.items[0].status = "completed"
+	if cmd := planTestHistory(m); cmd == nil {
 		t.Fatal("final stream delta was not emitted")
 	}
-	if _, ok := m.inline.offsets["assistant:active"]; ok {
+	if _, ok := m.inline.offsets["message:stream-1"]; ok {
 		t.Fatal("finalized stream retained an active offset")
 	}
 }
@@ -216,36 +178,34 @@ func TestInlineLongStreamKeepsSentenceTailAcrossChunks(t *testing.T) {
 	m.inline.showBaseline = false
 	m.streaming = true
 	m.turnDone = false
-	m.items = []logItem{{kind: "assistant", text: "hello " + strings.Repeat("longrun", 400) + "world"}}
-	if cmd := m.flushInline(); cmd == nil {
+	m.items = []historyCell{{kind: "assistant", messageID: "stream-1", status: "streaming", text: "hello " + strings.Repeat("longrun", 400) + "world"}}
+	if cmd := planTestHistory(m); cmd == nil {
 		t.Fatal("long stream prefix was not emitted")
 	}
-	offset := m.inline.offsets["assistant:active"]
+	offset := m.inline.offsets["message:stream-1"]
 	if offset <= 0 || offset >= len(m.items[0].text) {
 		t.Fatalf("stream prefix offset=%d, text bytes=%d; want a committed prefix and live tail", offset, len(m.items[0].text))
 	}
-	if !strings.Contains(m.inlineBody(), "world") {
-		t.Fatalf("live frame lost the sentence tail: %q", m.inlineBody())
+	m.layout()
+	if !strings.Contains(m.View(), "world") {
+		t.Fatalf("live frame lost the sentence tail: %q", m.View())
 	}
 	m.turnDone = true
-	if cmd := m.flushInline(); cmd == nil {
+	m.items[0].status = "completed"
+	if cmd := planTestHistory(m); cmd == nil {
 		t.Fatal("final sentence suffix was not emitted")
 	}
 }
 
-func TestInlineFailedPreviewGetsMarkerWithoutConfirmedID(t *testing.T) {
+func TestInlineInterruptedStreamRemainsIdentified(t *testing.T) {
 	m := inlineTestModel()
-	m.inline.forgetAll()
 	m.inline.prime(nil)
-	m.inline.showBaseline = false
-	m.turnDone = true
-	m.turnFailed = true
-	m.items = []logItem{{kind: "assistant", text: "partial"}}
-	if cmd := m.flushInline(); cmd == nil {
-		t.Fatal("failed partial should still be rendered")
+	m.items = []historyCell{{kind: "assistant", messageID: "stream-interrupted", status: "interrupted", text: "partial"}}
+	if planTestHistory(m) == nil {
+		t.Fatal("interrupted output lost")
 	}
-	if len(m.inline.failedMarks) != 1 || len(m.inline.printed) != 1 {
-		t.Fatalf("failed preview bookkeeping = marks %d printed %d", len(m.inline.failedMarks), len(m.inline.printed))
+	if planTestHistory(m) != nil {
+		t.Fatal("interrupted output duplicated")
 	}
 }
 
@@ -254,7 +214,7 @@ func TestCopyUsesRawHostClipboardText(t *testing.T) {
 	copy := &captureClipboard{}
 	m.clipboard = copy
 	raw := "  answer\n\x1b[31mnot rendered\x1b[0m\n你好🙂"
-	m.confirmedItems = []logItem{{kind: "assistant", text: raw, messageID: "answer-1"}}
+	m.confirmedItems = []historyCell{{kind: "assistant", text: raw, messageID: "answer-1"}}
 	cmd := m.copyLatestResponse()
 	if cmd == nil {
 		t.Fatal("copy command was nil")
@@ -265,15 +225,15 @@ func TestCopyUsesRawHostClipboardText(t *testing.T) {
 	if copy.text != raw {
 		t.Fatalf("clipboard text=%q, want raw %q", copy.text, raw)
 	}
-	if m.status != "copied latest response" {
-		t.Fatalf("copy status=%q", m.status)
+	if noticeText(m) != "copied latest response" {
+		t.Fatalf("copy status=%q", noticeText(m))
 	}
 }
 
 func TestCopyReportsAdapterError(t *testing.T) {
 	m := inlineTestModel()
 	m.clipboard = &captureClipboard{err: errors.New("no pasteboard")}
-	m.confirmedItems = []logItem{{kind: "assistant", text: "answer", messageID: "answer-1"}}
+	m.confirmedItems = []historyCell{{kind: "assistant", text: "answer", messageID: "answer-1"}}
 	cmd := m.copyLatestResponse()
 	if cmd == nil {
 		t.Fatal("copy command was nil")
@@ -281,8 +241,8 @@ func TestCopyReportsAdapterError(t *testing.T) {
 	model, _ := m.Update(cmd())
 	updated := modelValue(t, model)
 	m = &updated
-	if !strings.Contains(m.status, "copy failed") {
-		t.Fatalf("copy error status=%q", m.status)
+	if !strings.Contains(noticeText(m), "copy failed") {
+		t.Fatalf("copy error status=%q", noticeText(m))
 	}
 }
 
@@ -295,7 +255,7 @@ func TestCopyTimesOutAndDoesNotCrossSessionToast(t *testing.T) {
 	m.sessionID = "session-a"
 	m.reportGeneration = 4
 	m.clipboard = contextBlockingClipboard{}
-	m.confirmedItems = []logItem{{kind: "assistant", text: "answer", messageID: "answer-1"}}
+	m.confirmedItems = []historyCell{{kind: "assistant", text: "answer", messageID: "answer-1"}}
 	cmd := m.copyLatestResponse()
 	if cmd == nil {
 		t.Fatal("copy command was nil")
@@ -306,14 +266,14 @@ func TestCopyTimesOutAndDoesNotCrossSessionToast(t *testing.T) {
 	model, _ := m.Update(cmd())
 	updated := modelValue(t, model)
 	m = &updated
-	if m.status != "" {
-		t.Fatalf("stale clipboard result crossed session boundary: %q", m.status)
+	if noticeText(m) != "" {
+		t.Fatalf("stale clipboard result crossed session boundary: %q", noticeText(m))
 	}
 }
 
 func TestCopyCommandIsTransient(t *testing.T) {
 	m := inlineTestModel()
-	m.confirmedItems = []logItem{{kind: "assistant", text: "answer", messageID: "answer-1"}}
+	m.confirmedItems = []historyCell{{kind: "assistant", text: "answer", messageID: "answer-1"}}
 	m.clipboard = &captureClipboard{}
 	if slashCommandHasTranscriptOutput("/copy") {
 		t.Fatal("/copy should not add a duplicate command line to the transcript")
@@ -325,8 +285,8 @@ func TestCopyCommandIsTransient(t *testing.T) {
 	model, _ := m.Update(cmd())
 	updated := modelValue(t, model)
 	m = &updated
-	if m.status != "copied latest response" {
-		t.Fatalf("copy status=%q", m.status)
+	if noticeText(m) != "copied latest response" {
+		t.Fatalf("copy status=%q", noticeText(m))
 	}
 }
 
@@ -338,8 +298,8 @@ func TestBusyMutationUsesCatalogAdmission(t *testing.T) {
 	if cmd != nil || m.client.(*recordingClient).submitCount() != before {
 		t.Fatal("busy /clear bypassed catalog admission")
 	}
-	if !strings.Contains(m.status, "busy") {
-		t.Fatalf("busy rejection status=%q", m.status)
+	if !strings.Contains(noticeText(m), "busy") {
+		t.Fatalf("busy rejection status=%q", noticeText(m))
 	}
 }
 
@@ -365,16 +325,16 @@ func TestProtocolSnapshotKeepsRawMessageForCopy(t *testing.T) {
 func TestStableMessageIDsSurviveResyncWithoutReprint(t *testing.T) {
 	client := &recordingClient{snapshot: protocolSnapshot("s", protocol.MessageView{ID: "a", Role: "assistant", Content: "done"})}
 	m := NewWithClient(client, t.TempDir(), false)
-	if cmd := m.flushInline(); cmd == nil {
+	if cmd := planTestHistory(&m); cmd == nil {
 		t.Fatal("initial stable history should be emitted to native scrollback")
 	}
-	if cmd := m.flushInline(); cmd != nil {
+	if cmd := planTestHistory(&m); cmd != nil {
 		t.Fatal("replaying initial baseline emitted history twice")
 	}
 	s := client.snapshot
 	s.Revision.LogSeq++
 	m.applySnapshot(s)
-	if cmd := m.flushInline(); cmd != nil {
+	if cmd := planTestHistory(&m); cmd != nil {
 		t.Fatal("identical resync reprinted stable history")
 	}
 	if len(m.items) != 1 || m.items[0].messageID != "a" {

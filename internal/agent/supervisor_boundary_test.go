@@ -364,3 +364,43 @@ func TestTranscriptRestoredToolResultSettlesQueuedCall(t *testing.T) {
 		t.Fatalf("restored tool left queued: %+v", items)
 	}
 }
+
+// The child event stream is now the source of approval/capability enrichment
+// (the periodic catalog poll was removed), so the row published to root watchers
+// while a child is blocked on approval must carry the approval, the
+// waiting_approval status and the enriched capabilities.
+func TestChildRowLockedEnrichesApprovalForEventStream(t *testing.T) {
+	ag := newRuntimeAgent(t)
+	ag.mu.Lock()
+	ag.pendingApproval = &ApprovalRequest{ID: "ap-1", Tool: "Bash", Reason: "needs review"}
+	ag.mu.Unlock()
+
+	s := &SessionSupervisor{}
+	r := &managedRun{agent: ag, fact: session.ChildRunRecorded{Child: protocol.ChildSession{
+		SessionID: "child-1", Purpose: childPurposeTask,
+		Run: protocol.RunView{ID: "run-1", Status: "running", WaitPolicy: "join"},
+	}}}
+	r.mu.Lock()
+	row := s.childRowLocked(r)
+	r.mu.Unlock()
+
+	if row.Approval == nil || row.Approval.ID != "ap-1" {
+		t.Fatalf("event-stream row lost the pending approval: %+v", row.Approval)
+	}
+	if row.Run.Status != "waiting_approval" {
+		t.Fatalf("status = %q, want waiting_approval", row.Run.Status)
+	}
+	if !row.Capabilities.Approve || !row.Capabilities.Interrupt {
+		t.Fatalf("capabilities not enriched: %+v", row.Capabilities)
+	}
+
+	// A settled child must not advertise interrupt/approve and clears approval.
+	r.agent = nil
+	r.fact.Child.Run.Status = "succeeded"
+	r.mu.Lock()
+	settled := s.childRowLocked(r)
+	r.mu.Unlock()
+	if settled.Approval != nil || settled.Capabilities.Interrupt || settled.Capabilities.Approve {
+		t.Fatalf("settled row kept live-only enrichment: %+v", settled)
+	}
+}

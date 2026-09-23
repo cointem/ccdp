@@ -70,7 +70,7 @@ var configFieldNames = []string{
 	"permission_mode", "always_allow", "always_deny", "system_prompt",
 	"context_window", "compact_threshold", "max_result_size_chars",
 	"keep_after_compact", "bash_timeout_seconds", "max_turns",
-	"max_budget_usd", "max_reply_tokens", "fallback_model",
+	"max_budget_usd", "fallback_model",
 	"max_tool_output_chars_per_turn", "enable_guardian", "enable_memory",
 	"sandbox_mode", "max_parallel_tools", "sandbox_limits",
 	"sandbox_allow_network", "additional_directories", "disallowed_directories",
@@ -271,8 +271,6 @@ func (c *Config) ApplyCLIOverride(field string, value any) error {
 		err = setBool(&c.Verbose)
 	case "debug":
 		err = setBool(&c.Debug)
-	case "max_reply_tokens":
-		err = setInt(&c.MaxReplyTokens)
 	case "fallback_model":
 		err = setString(&c.FallbackModel)
 	case "max_tool_output_chars_per_turn":
@@ -381,8 +379,6 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			dst.Verbose = src.Verbose
 		case "debug":
 			dst.Debug = src.Debug
-		case "max_reply_tokens":
-			dst.MaxReplyTokens = src.MaxReplyTokens
 		case "fallback_model":
 			dst.FallbackModel = src.FallbackModel
 		case "max_tool_output_chars_per_turn":
@@ -524,6 +520,24 @@ func cloneProviders(src map[string]ProviderConfig) map[string]ProviderConfig {
 	dst := make(map[string]ProviderConfig, len(src))
 	for k, v := range src {
 		v.Models = append([]string(nil), v.Models...)
+		if v.ModelConfigs != nil {
+			models := make(map[string]ModelConfig, len(v.ModelConfigs))
+			for name, model := range v.ModelConfigs {
+				if model.Pricing != nil {
+					price := *model.Pricing
+					model.Pricing = &price
+				}
+				models[name] = model
+			}
+			v.ModelConfigs = models
+		}
+		if v.ContextWindows != nil {
+			windows := make(map[string]int, len(v.ContextWindows))
+			for model, window := range v.ContextWindows {
+				windows[model] = window
+			}
+			v.ContextWindows = windows
+		}
 		dst[k] = v
 	}
 	return dst

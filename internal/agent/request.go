@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -346,42 +347,94 @@ func (a *Agent) buildRequestSnapshotWithPrompt(cfg config.Config, model string, 
 	if sessionStartAt.IsZero() {
 		sessionStartAt = time.Now()
 	}
-	sys := cfg.SystemPrompt
-	sys += fmt.Sprintf("\n\n# Environment\n- Date: %s\n- Timezone: %s\n- OS: %s\n- Shell: %s",
-		sessionStartAt.Format("2006-01-02 15:04:05"), time.Local.String(), runtime.GOOS, shellName())
-	sys += fmt.Sprintf("\n- Workspace: %s\n- Permission mode: %s\n- Session: %s",
-		cfg.Workspace, cfg.PermissionMode, sessionID)
-	if modelSwitch != "" {
-		sys += "\n\n" + modelSwitch
-	}
-	if interrupted {
-		sys += "\n\n# Interrupted turn\nYour previous turn was interrupted by the user. Tools that were\nrunning may have partially executed and their effects may be incomplete.\nBefore continuing, verify the relevant state (re-read files, re-run git\nstatus or tests) rather than assuming the last known state."
-	}
-	if plan {
-		sys += "\n\n" + PlanModeInstructions
-	}
-	if instructions != "" {
-		sys += "\n\n# Project instructions\n\n" + instructions
-	}
-	if cfg.MemoryEnabled() {
-		if sec := a.MemorySection(); sec != "" {
-			sys += sec
+	blocks := a.buildSystemBlocks(cfg, sessionStartAt, sessionID, plan, modelSwitch, interrupted, instructions, skillsSection, frozenTools)
+	sys := joinSystemBlocks(blocks)
+	req := a.buildRequestFromConfig(cfg, model, sys, history, plan, frozenTools)
+	req.SystemBlocks = blocks
+	a.mu.Lock()
+	a.toolsTokensEstimate = estimateToolsTokens(frozenTools)
+	a.mu.Unlock()
+	return req
+}
+
+// estimateToolsTokens estimates the wire cost of the tool schemas so the
+// context-usage breakdown can split total tokens into messages / tools / system.
+func estimateToolsTokens(tools []llm.ToolDef) int {
+	total := 0
+	for _, t := range tools {
+		total += llm.EstimateTokens(t.Function.Name + "\n" + t.Function.Description)
+		if p, err := json.Marshal(t.Function.Parameters); err == nil {
+			total += llm.EstimateTokens(string(p))
 		}
+		total += 12 // per-tool schema overhead
 	}
+	return total
+}
+
+// buildSystemBlocks composes the system prompt as an ordered list of sections.
+// Cacheable sections are stable across a session (core instructions, repository
+// layout, skills index, project instructions) and lead the list; a wire that
+// supports prompt caching (Anthropic cache_control) can hold them across
+// requests. Dynamic sections (environment, memory, plan, todo) follow the
+// cache boundary and are never cached.
+func (a *Agent) buildSystemBlocks(cfg config.Config, sessionStartAt time.Time, sessionID string, plan bool, modelSwitch string, interrupted bool, instructions, skillsSection string, frozenTools []llm.ToolDef) []llm.SystemBlock {
+	blocks := make([]llm.SystemBlock, 0, 11)
+	add := func(cacheable bool, text string) {
+		if text == "" {
+			return
+		}
+		blocks = append(blocks, llm.SystemBlock{Text: text, Cacheable: cacheable})
+	}
+
+	// Stable, cacheable prefix.
+	add(true, cfg.SystemPrompt)
+	add(true, availableToolsFromDefs(frozenTools))
 	if info, err := workspace.CachedScan(cfg.Workspace, false); err == nil && info != nil {
 		a.mu.Lock()
 		a.wsInfo = info
 		a.mu.Unlock()
-		sys += "\n\n# Repository layout\n\n" + info.RepoMap(120)
+		add(true, "\n\n# Repository layout\n\n"+info.RepoMap(120))
 	}
-	if skillsSection != "" {
-		sys += skillsSection
+	add(true, skillsSection)
+	if instructions != "" {
+		add(true, "\n\n# Project instructions\n\n"+instructions)
+	}
+
+	// Dynamic tail past the cache boundary.
+	add(false, fmt.Sprintf("\n\n# Environment\n- Date: %s\n- Timezone: %s\n- OS: %s\n- Shell: %s\n- Workspace: %s\n- Permission mode: %s\n- Session: %s",
+		sessionStartAt.Format("2006-01-02 15:04:05"), time.Local.String(), runtime.GOOS, shellName(),
+		cfg.Workspace, cfg.PermissionMode, sessionID))
+	if modelSwitch != "" {
+		add(false, "\n\n"+modelSwitch)
+	}
+	if interrupted {
+		add(false, "\n\n# Interrupted turn\nYour previous turn was interrupted by the user. Tools that were\nrunning may have partially executed and their effects may be incomplete.\nBefore continuing, verify the relevant state (re-read files, re-run git\nstatus or tests) rather than assuming the last known state.")
+	}
+	if plan {
+		add(false, "\n\n"+PlanModeInstructions)
+	}
+	if cfg.MemoryEnabled() {
+		if sec := a.MemorySection(); sec != "" {
+			add(false, sec)
+		}
 	}
 	if sec := a.todoSection(); sec != "" {
-		sys += "\n\n" + sec
+		add(false, "\n\n"+sec)
 	}
-	sys += "\n\n" + availableToolsFromDefs(frozenTools)
-	return a.buildRequestFromConfig(cfg, model, sys, history, plan, frozenTools)
+	return blocks
+}
+
+// joinSystemBlocks concatenates the ordered system sections into the single
+// system string used by the chat/responses wires.
+func joinSystemBlocks(blocks []llm.SystemBlock) string {
+	var sb strings.Builder
+	for i, b := range blocks {
+		if i > 0 && !strings.HasPrefix(b.Text, "\n") {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(b.Text)
+	}
+	return sb.String()
 }
 
 func availableToolsFromDefs(defs []llm.ToolDef) string {
@@ -492,8 +545,8 @@ func (a *Agent) buildRequestFromConfig(cfg config.Config, model, sys string, his
 		Stream:          true,
 	}
 	applyGenerationRequest(cfg, &req)
-	if cfg.MaxReplyTokens > 0 {
-		req.MaxTokens = intPtr(cfg.MaxReplyTokens)
+	if limit := cfg.MaxOutputTokensFor(model); limit > 0 {
+		req.MaxTokens = intPtr(limit)
 	}
 	if plan {
 		req.Tools = filterReadOnlyTools(req.Tools)

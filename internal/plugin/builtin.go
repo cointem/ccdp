@@ -62,11 +62,11 @@ func NewProviderPlugin(p llm.Provider) Plugin {
 }
 
 // NewHTTPProviderPlugin registers the built-in compatible HTTP adapter while
-// retaining the model's endpoint/key fingerprint as a generated route. This
-// keeps a reload from reusing a stale adapter, while generic plugin providers
-// continue to use explicit routes through NewProviderPlugin.
-func NewHTTPProviderPlugin(p llm.Provider, model, endpoint, apiKey string) Plugin {
-	return &providerPlugin{provider: p, defaultRoute: true, model: model, endpoint: endpoint, apiKey: apiKey}
+// retaining the model's endpoint/key/wire fingerprint as a generated route.
+// This keeps a reload from reusing a stale adapter, while generic plugin
+// providers continue to use explicit routes through NewProviderPlugin.
+func NewHTTPProviderPlugin(p llm.Provider, model string, binding HTTPBinding) Plugin {
+	return &providerPlugin{provider: p, defaultRoute: true, model: model, binding: binding}
 }
 
 type providerPlugin struct {
@@ -74,8 +74,7 @@ type providerPlugin struct {
 	dispose      func()
 	defaultRoute bool
 	model        string
-	endpoint     string
-	apiKey       string
+	binding      HTTPBinding
 }
 
 func (p *providerPlugin) Name() string       { return "default-provider" }
@@ -90,7 +89,7 @@ func (p *providerPlugin) Init(ctx *Context) error {
 		if model == "" {
 			model = p.provider.Name()
 		}
-		ctx.Models.RouteDefault(model, p.provider.Name(), p.endpoint, p.apiKey)
+		ctx.Models.RouteDefault(model, p.provider.Name(), p.binding)
 	} else {
 		ctx.Models.Route(p.provider.Name(), p.provider.Name())
 	}

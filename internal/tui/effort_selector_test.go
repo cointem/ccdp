@@ -23,16 +23,16 @@ func effortTestModel(t *testing.T) *Model {
 func TestEffortHorizontalPreviewAnimationAndCommit(t *testing.T) {
 	m := effortTestModel(t)
 	client := m.client.(*recordingClient)
-	if m.picker == nil || m.picker.action.Kind != selectorEffort || m.picker.options[m.picker.index].ID != "medium" {
+	if m.picker == nil || m.picker.action.Kind != selectorEffort || m.picker.Options[m.picker.Index].ID != "medium" {
 		t.Fatal("did not open at confirmed effort")
 	}
-	initial := m.picker.index
+	initial := m.picker.Index
 	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
-	if m.picker.index != initial {
+	if m.picker.Index != initial {
 		t.Fatal("effort incorrectly uses vertical navigation")
 	}
 	_, cmd := m.handlePickerKey(tea.KeyMsg{Type: tea.KeyRight})
-	if cmd == nil || m.picker.options[m.picker.index].ID != "high" {
+	if cmd == nil || m.picker.Options[m.picker.Index].ID != "high" {
 		t.Fatal("right did not preview high")
 	}
 	if m.snapshot.Settings.ReasoningEffort != "medium" || client.submitCount() != 0 {
@@ -94,25 +94,25 @@ func TestEffortFramesFitAndOtherSelectorsStayVertical(t *testing.T) {
 		m.width, m.height = size[0], size[1]
 		m.layout()
 		for i := range effortOptions {
-			m.picker.index = i
+			m.picker.Index = i
 			frame := sanitizeANSI(m.View())
 			if lipgloss.Width(frame) > size[0] || lipgloss.Height(frame) > size[1] {
 				t.Fatalf("overflow at %v option %d", size, i)
 			}
-			if !strings.Contains(frame, "["+effortOptions[i].ID+"]") || !strings.Contains(frame, "Esc") {
+			if !strings.Contains(frame, effortOptions[i].ID) || !strings.Contains(frame, "Esc") {
 				t.Fatalf("selection/exit hidden at %v: %s", size, frame)
 			}
 		}
 	}
 	m := effortTestModel(t)
 	m.runCommand("/verbosity")
-	old := m.picker.index
+	old := m.picker.Index
 	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyRight})
-	if m.picker.index != old {
+	if m.picker.Index != old {
 		t.Fatal("verbosity became horizontal")
 	}
 	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
-	if m.picker.index != old+1 {
+	if m.picker.Index != old+1 {
 		t.Fatal("verbosity lost vertical navigation")
 	}
 }

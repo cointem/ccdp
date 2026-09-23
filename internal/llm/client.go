@@ -17,9 +17,10 @@ import (
 
 // Config holds the connection settings for the LLM provider.
 type Config struct {
-	BaseURL string // e.g. https://api.openai.com/v1 or a compatible gateway
-	APIKey  string
-	Model   string
+	APIModel string // concrete wire ID; Model remains the qualified registry identity
+	BaseURL  string // e.g. https://api.openai.com/v1 or a compatible gateway
+	APIKey   string
+	Model    string
 	// ContextWindow and MaxOutputTokens are operator/provider limits used by
 	// request admission. Zero means the adapter does not publish that limit.
 	ContextWindow   int
@@ -35,6 +36,9 @@ type Config struct {
 	// MaxRetries default when OneAttempt is false.
 	OneAttempt bool
 	Debug      bool // print request summaries to stderr
+	// Wire selects the provider wire format: "chat" (default; Chat Completions
+	// /chat/completions) or "responses" (OpenAI Responses /responses).
+	Wire string
 }
 
 // RetryableError marks a provider failure that may be retried by the owning
@@ -97,12 +101,7 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.BaseURL == "" {
 		return nil, errors.New("llm: base_url is required")
 	}
-	baseURL := strings.TrimRight(cfg.BaseURL, "/")
-	if !strings.HasSuffix(baseURL, "/v1") && !strings.HasSuffix(baseURL, "/api") {
-		// Most compatible gateways expose the chat endpoint at /chat/completions
-		// directly under their base URL; we accept both styles and normalize
-		// below at request time. No rewrite here to avoid breaking Ollama etc.
-	}
+	baseURL := normalizeBaseURL(cfg.BaseURL)
 	httpc := cfg.HTTPClient
 	if httpc == nil {
 		httpc = &http.Client{Timeout: cfg.Timeout}
@@ -152,6 +151,7 @@ func (c *Client) Capabilities() Capabilities {
 
 // StreamResult is the final outcome of a streaming call.
 type StreamResult struct {
+	CacheReported bool
 	Text          string
 	Reasoning     string // chain-of-thought deltas, when the provider sends them
 	ToolCalls     []ToolCall
@@ -176,7 +176,7 @@ func (c *Client) StreamWithReasoning(ctx context.Context, req CompletionRequest,
 
 func (c *Client) stream(ctx context.Context, req CompletionRequest, onDelta func(string), onReasoning func(string)) (StreamResult, error) {
 	req.Stream = true
-	body, err := json.Marshal(req)
+	body, err := c.marshalRequestBody(req)
 	if err != nil {
 		return StreamResult{}, fmt.Errorf("llm: marshal request: %w", err)
 	}
@@ -211,35 +211,94 @@ func (c *Client) stream(ctx context.Context, req CompletionRequest, onDelta func
 	}
 }
 
-// streamOnce performs a single request attempt. The second return reports
-// whether the failure is transient and worth retrying; the third reports
-// whether any delta was already delivered to the caller (which rules out a
-// retry, since a fresh attempt would replay the text from the beginning); the
-// fourth returns a provider-advertised Retry-After delay when present.
-func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(string), onReasoning func(string)) (result StreamResult, retryable bool, emitted bool, retryAfter time.Duration, err error) {
-	url := c.baseURL + "/chat/completions"
+// isResponses reports whether this client uses the OpenAI Responses wire
+// (POST /responses + response.xxx SSE events) instead of Chat Completions.
+func (c *Client) isResponses() bool {
+	return strings.EqualFold(strings.TrimSpace(c.cfg.Wire), "responses")
+}
+
+// isAnthropic reports whether this client uses the Anthropic Messages wire
+// (POST /v1/messages + anthropic-framed SSE events + x-api-key auth).
+func (c *Client) isAnthropic() bool {
+	return strings.EqualFold(strings.TrimSpace(c.cfg.Wire), "anthropic")
+}
+
+// normalizeBaseURL appends /v1 to a bare external host (no path) so a user
+// writing "https://gateway.example" hits the OpenAI-compatible /v1 prefix for
+// both the chat (/v1/chat/completions) and responses (/v1/responses) wires. It
+// is idempotent and conservative: an explicit trailing /v1, /api, or any
+// concrete path is honored unchanged, and loopback hosts (Ollama etc. that
+// serve at the root) are left alone. Callers serving at a root path can always
+// pin the exact endpoint by writing it out.
+func normalizeBaseURL(raw string) string {
+	b := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if i := strings.Index(b, "://"); i >= 0 {
+		rest := b[i+3:]
+		if strings.Contains(rest, "/") {
+			return b // concrete path already present
+		}
+		host := rest
+		if colon := strings.IndexByte(host, ':'); colon >= 0 {
+			host = host[:colon]
+		}
+		if isLoopbackHost(host) {
+			return b
+		}
+	}
+	return b + "/v1"
+}
+
+func isLoopbackHost(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "localhost", "127.0.0.1", "::1", "0.0.0.0":
+		return true
+	}
+	return false
+}
+
+// marshalRequestBody builds the wire-specific request payload.
+func (c *Client) marshalRequestBody(req CompletionRequest) ([]byte, error) {
+	if c.cfg.APIModel != "" {
+		req.Model = c.cfg.APIModel
+	}
+	if c.isResponses() {
+		return c.responsesBody(req)
+	}
+	if c.isAnthropic() {
+		return c.anthropicBody(req)
+	}
+	return json.Marshal(req)
+}
+
+// postStream sends one streaming POST attempt and surfaces transient failures.
+// On success it returns the open 200+SSE response (caller owns resp.Body); on
+// any non-stream outcome it returns the classified error without a body handle.
+func (c *Client) postStream(ctx context.Context, url string, body []byte) (resp *http.Response, retryable bool, retryAfter time.Duration, err error) {
 	c.DebugLog("POST %s (payload %d bytes)", url, len(body))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return StreamResult{}, false, false, 0, fmt.Errorf("llm: build request: %w", err)
+		return nil, false, 0, fmt.Errorf("llm: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 	if c.cfg.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+		if c.isAnthropic() {
+			httpReq.Header.Set("x-api-key", c.cfg.APIKey)
+			httpReq.Header.Set("anthropic-version", "2023-06-01")
+		} else {
+			httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+		}
 	}
 	httpReq.Header.Set("User-Agent", "ccdp/0.1")
-
-	resp, err := c.httpc.Do(httpReq)
+	resp, err = c.httpc.Do(httpReq)
 	if err != nil {
 		if ctx.Err() != nil {
-			return StreamResult{}, false, false, 0, ctx.Err()
+			return nil, false, 0, ctx.Err()
 		}
-		return StreamResult{}, true, false, 0, &RetryableError{Err: fmt.Errorf("llm: request failed: %w", err)}
+		return nil, true, 0, &RetryableError{Err: fmt.Errorf("llm: request failed: %w", err)}
 	}
-	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		msg := providerHTTPError(resp.Status, raw)
 		// 429 / 5xx are transient; other 4xx are not.
@@ -259,20 +318,75 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		if retryable {
 			statusErr = &RetryableError{Err: statusErr, RetryAfter: after}
 		}
-		return StreamResult{}, retryable, false, after, statusErr
+		return nil, retryable, after, statusErr
 	}
-
 	// A 200 without an SSE content-type is not a stream: gateways return
 	// 200+JSON error bodies, and providers that ignore the stream parameter
 	// reply with a regular completion. Surfacing it beats silently returning
 	// an empty result.
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
-		return StreamResult{}, false, false, 0, nonStreamError(resp, ct)
+		defer resp.Body.Close()
+		return nil, false, 0, nonStreamError(resp, ct)
 	}
+	return resp, false, 0, nil
+}
+
+// reasoningPhase tracks whether the model is currently in its reasoning phase,
+// so every wire closes it at the same boundaries: the first answer text, the
+// first tool/function call fragment, the terminal finish event, and the end of
+// the stream. end() reports the close to the caller as an empty text delta: the
+// runtime finalizes the open thinking cell on it without starting an answer
+// cell. Without the signal the thinking cell only settles when an unrelated
+// event arrives, which leaves the UI showing "Thinking…" while the model streams
+// tool arguments or the tail of the reply.
+type reasoningPhase struct {
+	onDelta func(string)
+	open    bool
+}
+
+// start marks a reasoning phase as open; it is idempotent.
+func (p *reasoningPhase) start() { p.open = true }
+
+// end closes an open reasoning phase and tells the caller. Repeated calls
+// without a new start are no-ops, so every boundary can call it unconditionally.
+func (p *reasoningPhase) end() {
+	if !p.open {
+		return
+	}
+	p.open = false
+	if p.onDelta != nil {
+		p.onDelta("")
+	}
+}
+
+// markClosed closes the phase without a signal of its own: the caller is about
+// to deliver a non-empty answer delta, which already finalizes the thinking cell
+// downstream.
+func (p *reasoningPhase) markClosed() { p.open = false }
+
+// streamOnce performs a single request attempt. The second return reports
+// whether the failure is transient and worth retrying; the third reports
+// whether any delta was already delivered to the caller (which rules out a
+// retry, since a fresh attempt would replay the text from the beginning); the
+// fourth returns a provider-advertised Retry-After delay when present.
+func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(string), onReasoning func(string)) (result StreamResult, retryable bool, emitted bool, retryAfter time.Duration, err error) {
+	if c.isResponses() {
+		return c.responsesStreamOnce(ctx, body, onDelta, onReasoning)
+	}
+	if c.isAnthropic() {
+		return c.anthropicStreamOnce(ctx, body, onDelta, onReasoning)
+	}
+	var resp *http.Response
+	resp, retryable, retryAfter, err = c.postStream(ctx, c.baseURL+"/chat/completions", body)
+	if err != nil {
+		return StreamResult{}, retryable, false, retryAfter, err
+	}
+	defer resp.Body.Close()
 
 	var (
 		toolCalls = map[int]*ToolCall{} // index → call being assembled
 		callOrder []int                 // preserve first-seen order of indexes
+		thinking  = &reasoningPhase{onDelta: onDelta}
 	)
 	emitDelta := func(s string) {
 		if s == "" {
@@ -280,6 +394,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		}
 		result.Text += s
 		emitted = true
+		thinking.markClosed()
 		if onDelta != nil {
 			onDelta(s)
 		}
@@ -290,6 +405,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		}
 		result.Reasoning += s
 		emitted = true
+		thinking.start()
 		if onReasoning != nil {
 			onReasoning(s)
 		}
@@ -298,6 +414,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
+	completed := false
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -313,6 +430,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			completed = true
 			break
 		}
 		var chunk StreamChunk
@@ -326,8 +444,10 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		if chunk.Usage != nil {
 			result.PromptTokens = chunk.Usage.PromptTokens
 			result.CompletionTok = chunk.Usage.CompletionTokens
-			if chunk.Usage.PromptDetails != nil {
-				result.CachedTokens = chunk.Usage.PromptDetails.CachedTokens
+			result.CacheReported = chunk.Usage.PromptDetails != nil && chunk.Usage.PromptDetails.CachedTokens != nil
+			result.CachedTokens = 0
+			if result.CacheReported {
+				result.CachedTokens = *chunk.Usage.PromptDetails.CachedTokens
 			}
 		}
 		if len(chunk.Choices) == 0 {
@@ -336,6 +456,8 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		choice := chunk.Choices[0]
 		if choice.FinishReason != "" {
 			result.FinishReason = choice.FinishReason
+			completed = true
+			thinking.end()
 		}
 		delta := choice.Delta
 		if delta.Content != nil && *delta.Content != "" {
@@ -343,6 +465,11 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		}
 		if delta.ReasoningContent != nil && *delta.ReasoningContent != "" {
 			emitReasoning(*delta.ReasoningContent)
+		}
+		if len(delta.ToolCalls) > 0 {
+			// The model has moved on to the call itself: its arguments can
+			// stream for a long time, so thinking must not stay open.
+			thinking.end()
 		}
 		for _, tc := range delta.ToolCalls {
 			idx := tc.Index
@@ -365,6 +492,11 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		}
 	}
 
+	// The stream can end while reasoning is still open (broken connection, or a
+	// provider that sent no further boundary event): the caller must not be left
+	// holding an unfinished thinking cell.
+	thinking.end()
+
 	// Materialize tool calls in first-seen order, skipping incomplete ones.
 	for _, idx := range callOrder {
 		call := toolCalls[idx]
@@ -376,6 +508,9 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 
 	if err := scanner.Err(); err != nil {
 		return result, true, emitted, 0, &RetryableError{Err: fmt.Errorf("llm: read stream: %w", err)}
+	}
+	if !completed {
+		return result, true, emitted, 0, &RetryableError{Err: fmt.Errorf("llm: stream ended before completion marker")}
 	}
 	return result, false, emitted, 0, nil
 }

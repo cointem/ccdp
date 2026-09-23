@@ -178,6 +178,10 @@ type Config struct {
 	BaseURL         string `json:"base_url"`
 	Model           string `json:"model"`
 	Workspace       string `json:"workspace"` // working directory for the agent
+	// WireAPI selects the provider wire format for the top-level base_url:
+	// "chat" (Chat Completions /chat/completions, default) or "responses"
+	// (OpenAI Responses /responses). Provider-scoped wire_api overrides this.
+	WireAPI string `json:"wire_api"`
 
 	// Providers is a table of named model providers (Codex's
 	// [model_providers]). A model is served by the provider that lists it; the
@@ -217,10 +221,6 @@ type Config struct {
 
 	// NoSessionPersistence disables writing session files (--no-session-persistence).
 	NoSessionPersistence bool `json:"-"`
-
-	// MaxReplyTokens caps a single model reply (0 = provider default). When a
-	// reply is cut off by the length limit, the agent continues automatically.
-	MaxReplyTokens int `json:"max_reply_tokens"`
 
 	// FallbackModel is tried when the primary model fails (Claude's
 	// --fallback-model).
@@ -298,10 +298,150 @@ type Pricing struct {
 // ProviderConfig describes one named model provider. An empty APIKey means the
 // top-level api_key is used.
 type ProviderConfig struct {
-	Name    string   `json:"name"` // optional display name
-	BaseURL string   `json:"base_url"`
-	APIKey  string   `json:"api_key"`
-	Models  []string `json:"models"` // model names this provider can serve
+	APIKeyEnv    string                 `json:"api_key_env,omitempty"`
+	ModelConfigs map[string]ModelConfig `json:"models"`
+	Name         string                 `json:"name"` // optional display name
+	BaseURL      string                 `json:"base_url"`
+	APIKey       string                 `json:"api_key"`
+	Models       []string               `json:"-"` // model names this provider can serve
+	// WireAPI selects the wire format for this provider ("chat" | "responses").
+	// Empty means inherit the top-level wire_api (default "chat").
+	WireAPI string `json:"wire_api"`
+	// ContextWindow overrides the top-level window for this provider; zero inherits.
+	ContextWindow int `json:"-"`
+	// ContextWindows overrides the provider default for individual listed models.
+	ContextWindows map[string]int `json:"-"`
+}
+
+// ResolvedProvider is the single atomic answer to "which provider serves this
+// model, and with what base URL, key and wire format". Every field is derived
+// from the SAME ProviderConfig record so the endpoint/credential can never be
+// paired with a different provider's wire format — the divergence the historic
+// independent EndpointFor (sorted ids) and WireFor (map order) lookups allowed.
+type ResolvedProvider struct {
+	ID      string // configured provider id, empty when no provider serves the model
+	BaseURL string
+	APIKey  string
+	Wire    string // normalized "chat" | "responses"
+	Served  bool   // a configured provider claims this model
+}
+
+// servingProviderForModel deterministically finds the provider that lists model
+// (sorted provider ids, first match wins) so every resolution agrees on one
+// record. found is false when no configured provider serves the model.
+func (c *Config) servingProviderForModel(model string) (string, ProviderConfig, bool) {
+	if c == nil {
+		return "", ProviderConfig{}, false
+	}
+	if id, name, qualified := strings.Cut(model, "/"); qualified {
+		if p, ok := c.Providers[id]; ok {
+			if _, exists := p.ModelConfigs[name]; exists {
+				return id, p, true
+			}
+			for _, m := range p.Models {
+				if m == name {
+					return id, p, true
+				}
+			}
+			return "", ProviderConfig{}, false
+		}
+	}
+	ids := make([]string, 0, len(c.Providers))
+	for id := range c.Providers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		p := c.Providers[id]
+		for _, m := range p.Models {
+			if m == model {
+				return id, p, true
+			}
+		}
+	}
+	return "", ProviderConfig{}, false
+}
+
+// ResolveProvider returns the atomic (endpoint, key, wire) tuple for model.
+// Empty per-provider fields inherit the top-level values, matching the historic
+// fallback semantics, but the choice of provider record is made once.
+func (c *Config) ResolveProvider(model string) ResolvedProvider {
+	resolved := ResolvedProvider{Wire: "chat"}
+	baseURL, apiKey, wire := "", "", ""
+	if c != nil {
+		baseURL, apiKey, wire = c.BaseURL, c.APIKey, c.WireAPI
+	}
+	if id, p, ok := c.servingProviderForModel(model); ok {
+		resolved.ID = id
+		resolved.Served = true
+		if p.BaseURL != "" {
+			baseURL = p.BaseURL
+		}
+		if p.ModelConfigs != nil || p.APIKey != "" || p.APIKeyEnv != "" {
+			apiKey = providerEnvKey(p)
+		}
+		if p.WireAPI != "" {
+			wire = p.WireAPI
+		}
+	}
+	resolved.BaseURL = baseURL
+	resolved.APIKey = apiKey
+	resolved.Wire = WireAPINormalized(wire)
+	return resolved
+}
+
+// ContextWindowFor resolves a model's configured context budget without changing
+// the top-level fallback, so switching providers cannot leak an override.
+func (c *Config) ContextWindowFor(model string) int {
+	if c == nil {
+		return 0
+	}
+	if _, p, ok := c.servingProviderForModel(model); ok {
+		if n := p.ModelConfigs[c.APIModelFor(model)].ContextWindow; n > 0 {
+			return n
+		}
+		if window := p.ContextWindows[model]; window > 0 {
+			return window
+		}
+		if p.ContextWindow > 0 {
+			return p.ContextWindow
+		}
+	}
+	return c.ContextWindow
+}
+
+// WireFor returns the normalized wire format for a model. It is defined in
+// terms of ResolveProvider so it can never disagree with EndpointFor about which
+// provider serves the model.
+func (c *Config) WireFor(model string) string {
+	return c.ResolveProvider(model).Wire
+}
+
+// WireAPINormalized returns a normalized wire format: "anthropic", "responses"
+// or "chat". Provider/chat aliases not recognized fall back to chat.
+func WireAPINormalized(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "anthropic", "anthropic-messages", "anthropic_messages":
+		return "anthropic"
+	case "responses", "openai-responses", "openai_responses":
+		return "responses"
+	default:
+		return "chat"
+	}
+}
+
+// validWireAPI reports whether a provider wire_api value is a known, explicit
+// wire name. Unknown/typo values (e.g. "respinses") are rejected at config
+// load instead of silently falling back to chat, so a misconfiguration fails
+// loudly rather than hitting an unintended endpoint.
+func validWireAPI(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "chat", "responses", "openai-responses", "openai_responses",
+		"anthropic", "anthropic-messages", "anthropic_messages":
+		return true
+	default:
+		return false
+	}
 }
 
 // ToolSpec describes a user-defined external tool. When the model calls it,
@@ -333,7 +473,7 @@ func defaultConfig() Config {
 		BaseURL:            "https://api.openai.com/v1",
 		Model:              "gpt-5.4-mini",
 		Workspace:          ".",
-		PermissionMode:     string(permissions.ModeDefault),
+		PermissionMode:     string(permissions.ModeAcceptEdits),
 		SystemPrompt:       DefaultSystemPrompt,
 		ContextWindow:      200000,
 		CompactThreshold:   0.85,
@@ -401,11 +541,7 @@ func applyEnvChecked(cfg *Config) error {
 		return err
 	})
 	apply("CCDP_MAX_REPLY_TOKENS", func(v string) error {
-		n, err := parseEnvInt("CCDP_MAX_REPLY_TOKENS", v)
-		if err == nil {
-			cfg.MaxReplyTokens = n
-		}
-		return err
+		return fmt.Errorf("CCDP_MAX_REPLY_TOKENS is obsolete; set providers.<id>.models.<model>.max_output_tokens")
 	})
 	apply("CCDP_ENABLE_WEB_TOOLS", func(v string) error {
 		b, err := parseEnvBool("CCDP_ENABLE_WEB_TOOLS", v)
@@ -494,6 +630,9 @@ func LoadFrom(path string) (Config, error) {
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return cfg, fmt.Errorf("config: parse %s: %w", path, err)
 		}
+		if err := rejectLegacyModelFields(raw); err != nil {
+			return cfg, err
+		}
 		applyConfigFields(&cfg, &fileCfg, raw, SourceUserFile, path, true)
 	} else if !os.IsNotExist(err) {
 		return cfg, fmt.Errorf("config: read %s: %w", path, err)
@@ -510,17 +649,42 @@ func LoadFrom(path string) (Config, error) {
 
 // Validate checks the config for usable values.
 func (c *Config) Validate() error {
+	if err := c.validateModelConfigs(); err != nil {
+		return err
+	}
 	if err := protocol.ValidateGeneration(c.ReasoningEffort, c.Verbosity); err != nil {
 		return err
 	}
 	if c.BaseURL == "" {
 		return fmt.Errorf("config: base_url is required (set CCDP_BASE_URL or ~/.ccdp/config.json)")
 	}
-	if _, err := permissions.ParseMode(c.PermissionMode); err != nil {
+	if mode, err := permissions.ParseMode(c.PermissionMode); err != nil {
 		return err
+	} else {
+		c.PermissionMode = string(mode)
 	}
 	if _, err := sandbox.ParseMode(c.SandboxMode); err != nil {
 		return err
+	}
+	for id, p := range c.Providers {
+		for model, window := range p.ContextWindows {
+			if window < 4000 {
+				return fmt.Errorf("config: providers.%s.context_windows.%s must be at least 4000", id, model)
+			}
+			found := false
+			for _, listed := range p.Models {
+				if listed == model {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("config: providers.%s.context_windows model %q is not in models", id, model)
+			}
+		}
+		if p.ContextWindow != 0 && p.ContextWindow < 4000 {
+			return fmt.Errorf("config: providers.%s.context_window must be zero (inherit) or at least 4000, got %d", id, p.ContextWindow)
+		}
 	}
 	if c.ContextWindow < 4000 {
 		return fmt.Errorf("config: context_window must be at least 4000, got %d", c.ContextWindow)
@@ -549,32 +713,13 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// EndpointFor resolves the base_url and api_key serving a model. It searches
-// the configured providers for one that lists the model (deterministic: sorted
-// provider ids) and falls back to the top-level base_url/api_key.
+// EndpointFor resolves the base_url and api_key serving a model. It is defined
+// in terms of ResolveProvider so it agrees with WireFor about which provider
+// record produced the values, and falls back to the top-level base_url/api_key
+// when no configured provider lists the model.
 func (c *Config) EndpointFor(model string) (baseURL, apiKey string) {
-	baseURL, apiKey = c.BaseURL, c.APIKey
-	ids := make([]string, 0, len(c.Providers))
-	for id := range c.Providers {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		p := c.Providers[id]
-		for _, m := range p.Models {
-			if m != model {
-				continue
-			}
-			if p.BaseURL != "" {
-				baseURL = p.BaseURL
-			}
-			if p.APIKey != "" {
-				apiKey = p.APIKey
-			}
-			return baseURL, apiKey
-		}
-	}
-	return baseURL, apiKey
+	resolved := c.ResolveProvider(model)
+	return resolved.BaseURL, resolved.APIKey
 }
 
 // ProviderNames returns the configured provider ids (used by /plugins).
@@ -648,10 +793,7 @@ func (c *Config) SavePermissionRules() error {
 // CostFor computes the USD cost of a token usage for the given model,
 // falling back to the configured model's pricing when unknown.
 func (c *Config) CostFor(model string, inputTokens, outputTokens int) float64 {
-	p, ok := c.Pricing[model]
-	if !ok {
-		p = c.Pricing[c.Model]
-	}
+	p := c.PricingFor(model)
 	if p.Input == 0 && p.Output == 0 {
 		return 0
 	}
@@ -750,6 +892,9 @@ func loadProjectSettings(ws string, store *TrustStore) (Config, error) {
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal(data, &raw); err != nil {
 			return proj, fmt.Errorf("config: parse %s: %w", p, err)
+		}
+		if err := rejectLegacyModelFields(raw); err != nil {
+			return proj, err
 		}
 		source := SourceProject
 		if name == "settings.local.json" {

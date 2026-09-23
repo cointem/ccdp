@@ -263,3 +263,130 @@ func TestStreamSurfacesNonStreaming200(t *testing.T) {
 		})
 	}
 }
+
+func TestReasoningStreamRequiresCompletionMarker(t *testing.T) {
+	for _, ending := range []string{"", "data: [DONE]\n\n", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"} {
+		t.Run(ending, func(t *testing.T) {
+			var attempts atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				streamSSE(w, `{"choices":[{"delta":{"reasoning_content":"partial thought"}}]}`, true)
+				fmt.Fprint(w, ending)
+			}))
+			defer srv.Close()
+			c, err := NewClient(Config{BaseURL: srv.URL, APIKey: "k", Model: "m", RetryDelay: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := c.Stream(context.Background(), CompletionRequest{Model: "m"}, nil)
+			if (err != nil) != (ending == "") {
+				t.Fatalf("ending=%q error=%v", ending, err)
+			}
+			if res.Reasoning != "partial thought" || attempts.Load() != 1 {
+				t.Fatalf("lost or replayed reasoning: %+v attempts=%d", res, attempts.Load())
+			}
+		})
+	}
+}
+
+// sinkRecorder labels what the caller's sinks received, in order, so reasoning
+// boundary tests can assert timing (not just that a signal eventually arrived).
+type sinkRecorder struct {
+	events []string
+}
+
+func (s *sinkRecorder) delta(text string) {
+	if text == "" {
+		s.events = append(s.events, "close")
+		return
+	}
+	s.events = append(s.events, "answer:"+text)
+}
+
+func (s *sinkRecorder) reasoning(text string) {
+	s.events = append(s.events, "thinking:"+text)
+}
+
+// TestChatThinkingClosesAtToolCallBoundary verifies the Chat Completions wire
+// finalizes the thinking cell when the model starts emitting a tool call. The
+// arguments can stream for a long time, and "Thinking…" must not stay open
+// through them.
+func TestChatThinkingClosesAtToolCallBoundary(t *testing.T) {
+	var rec sinkRecorder
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		streamSSE(w, `{"choices":[{"delta":{"reasoning_content":"planning"}}]}`, true)
+		streamSSE(w, `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"write_file","arguments":"{\"a"}}]}}]}`, true)
+		streamSSE(w, `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]}}]}`, true)
+		streamSSE(w, `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`, true)
+		streamSSE(w, `[DONE]`, true)
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(Config{BaseURL: srv.URL, APIKey: "k", Model: "m", Timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.StreamWithReasoning(context.Background(), CompletionRequest{Model: "m"}, rec.delta, rec.reasoning); err != nil {
+		t.Fatalf("stream error: %v", err)
+	}
+	want := []string{"thinking:planning", "close"}
+	if strings.Join(rec.events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", rec.events, want)
+	}
+}
+
+// TestChatThinkingClosesOnAnswerDelta covers the reply that continues into
+// answer text: the non-empty delta already finalizes the thinking cell, so the
+// wire must not add a stray empty delta in front of it.
+func TestChatThinkingClosesOnAnswerDelta(t *testing.T) {
+	var rec sinkRecorder
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		streamSSE(w, `{"choices":[{"delta":{"reasoning_content":"thinking hard"}}]}`, true)
+		streamSSE(w, `{"choices":[{"delta":{"content":"the answer"}}]}`, true)
+		streamSSE(w, `[DONE]`, true)
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(Config{BaseURL: srv.URL, APIKey: "k", Model: "m", Timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.StreamWithReasoning(context.Background(), CompletionRequest{Model: "m"}, rec.delta, rec.reasoning); err != nil {
+		t.Fatalf("stream error: %v", err)
+	}
+	// The answer delta is itself the close signal, so no empty delta may precede
+	// it: a stray one would flicker the turn out of the streaming state.
+	want := []string{"thinking:thinking hard", "answer:the answer"}
+	if strings.Join(rec.events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", rec.events, want)
+	}
+}
+
+// TestChatThinkingClosesOnceForReasoningOnlyReply covers the reply that never
+// leaves the thinking phase: finish_reason and the end-of-stream safety net must
+// finalize the cell exactly once, not twice.
+func TestChatThinkingClosesOnceForReasoningOnlyReply(t *testing.T) {
+	var rec sinkRecorder
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		streamSSE(w, `{"choices":[{"delta":{"reasoning_content":"plan"}}]}`, true)
+		streamSSE(w, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`, true)
+		streamSSE(w, `[DONE]`, true)
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(Config{BaseURL: srv.URL, APIKey: "k", Model: "m", Timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.StreamWithReasoning(context.Background(), CompletionRequest{Model: "m"}, rec.delta, rec.reasoning); err != nil {
+		t.Fatalf("stream error: %v", err)
+	}
+	want := []string{"thinking:plan", "close"}
+	if strings.Join(rec.events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", rec.events, want)
+	}
+}

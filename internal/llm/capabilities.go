@@ -121,7 +121,7 @@ func ProviderCapabilitiesOf(provider Provider) (Capabilities, bool) {
 // to call more than once; it performs no provider or network operation.
 func AdmitRequest(provider Provider, req CompletionRequest) (RequestBudget, error) {
 	caps, described := ProviderCapabilitiesOf(provider)
-	req = requestWithProviderDefaults(req, caps, described)
+	req = requestForBudgetEstimate(req, caps, described)
 	budget := estimateRequestBudget(req, caps.ContextWindow, caps.ImageTokenReserve)
 	providerName := ""
 	if provider != nil {
@@ -181,13 +181,10 @@ const (
 	defaultOutputTokenReserve = 4096
 )
 
-// requestWithProviderDefaults materializes the output budget that a provider
-// will receive when the caller leaves MaxTokens unset.  Keeping this on the
-// request (rather than only in the estimate) makes the selected reservation
-// visible in the frozen wire manifest and gives the provider an actual
-// max_tokens ceiling.  A provider without a finite context window remains
-// compatible with the legacy provider-default behavior.
-func requestWithProviderDefaults(req CompletionRequest, caps Capabilities, described bool) CompletionRequest {
+// requestForBudgetEstimate reserves headroom for admission accounting only.
+// This copy must never be sent to the provider: an estimated reservation is
+// not a requested output cap, and reasoning consumes the output budget too.
+func requestForBudgetEstimate(req CompletionRequest, caps Capabilities, described bool) CompletionRequest {
 	if !described || req.MaxTokens != nil || caps.ContextWindow <= 0 {
 		return req
 	}
@@ -253,10 +250,6 @@ func estimateRequestBudget(req CompletionRequest, contextWindow, imageTokenReser
 	}
 	b.TotalTokens = b.InputTokens + b.ReservedOutputTokens
 	return b
-}
-
-func estimateContent(content any) (textTokens, imageTokens int) {
-	return estimateContentWithReserve(content, defaultImageTokenReserve)
 }
 
 func estimateContentWithReserve(content any, imageTokenReserve int) (textTokens, imageTokens int) {

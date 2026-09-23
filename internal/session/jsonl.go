@@ -308,6 +308,18 @@ func (s *JSONLStore) RecoveryReport() RecoveryReport {
 	return s.recovery
 }
 
+// SkippedRecords returns the durable events replay could not decode because
+// this build has no type for them. The log remains readable and appendable; the
+// list exists so callers can tell the user that some history was not shown.
+func (s *JSONLStore) SkippedRecords() []SkippedRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.state.Skipped) == 0 {
+		return nil
+	}
+	return append([]SkippedRecord(nil), s.state.Skipped...)
+}
+
 func (s *JSONLStore) SessionID() string  { return s.sessionID }
 func (s *JSONLStore) Dir() string        { return s.dir }
 func (s *JSONLStore) EventsPath() string { return s.eventsPath }
@@ -462,13 +474,14 @@ func readLog(path string, maxBytes int64) (logState, bool, *logTail, error) {
 				data = data[:len(data)-1]
 			}
 		}
-		envelope, events, wires, parseErr := parseTransaction(data)
+		parsed, parseErr := parseTransaction(data)
 		if parseErr != nil {
 			if !terminated && errors.Is(parseErr, ErrTorn) {
 				return state, false, &logTail{offset: lineOffset, bytes: int64(len(line))}, fmt.Errorf("%w", parseErr)
 			}
 			return state, false, nil, fmt.Errorf("%s line at byte %d: %w", path, lineOffset, parseErr)
 		}
+		envelope, events, wires := parsed.envelope, parsed.events, parsed.wires
 		if envelope.FirstSeq != state.Cursor+1 {
 			return state, false, nil, fmt.Errorf("%w: sequence starts at %d, expected %d", ErrCorrupt, envelope.FirstSeq, state.Cursor+1)
 		}
@@ -486,7 +499,7 @@ func readLog(path string, maxBytes int64) (logState, bool, *logTail, error) {
 			}
 		}
 		result := CommitResult{TransactionID: envelope.TransactionID, FirstSeq: envelope.FirstSeq, LastSeq: envelope.LastSeq, Cursor: envelope.LastSeq, Applied: true}
-		applyPrepared(&state, preparedCommit{TransactionID: envelope.TransactionID, InputFingerprint: envelope.InputFingerprint, Events: events, Wires: wires, Envelope: envelope, Result: result})
+		applyPrepared(&state, preparedCommit{TransactionID: envelope.TransactionID, InputFingerprint: envelope.InputFingerprint, Events: events, Wires: wires, Seqs: parsed.seqs, Skipped: parsed.skipped, Envelope: envelope, Result: result})
 		if !terminated {
 			noNewline = true
 		}

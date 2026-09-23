@@ -20,7 +20,7 @@ func TestQuestionUIAnswersDoNotUseApproval(t *testing.T) {
 	m.setQuestion(uiQuestionRequest())
 	m.textarea.SetValue("preserved draft")
 	key := func(msg tea.KeyMsg) tea.Cmd { _, cmd := m.handleQuestionKey(msg); return cmd }
-	if (FocusRouter{}).Target(m) != FocusQuestion {
+	if (PanelManager{}).Target(m) != FocusQuestion {
 		t.Fatal("question did not own input")
 	}
 	key(tea.KeyMsg{Type: tea.KeyDown})
@@ -60,7 +60,7 @@ func TestQuestionUIAnswersDoNotUseApproval(t *testing.T) {
 	}
 }
 
-func TestQuestionSnapshotPreservesDraftAndCancellation(t *testing.T) {
+func TestQuestionSnapshotPreservesDraftAndDeferral(t *testing.T) {
 	m := sugModel()
 	m.setQuestion(uiQuestionRequest())
 	m.question.input.SetValue("draft")
@@ -69,13 +69,16 @@ func TestQuestionSnapshotPreservesDraftAndCancellation(t *testing.T) {
 		t.Fatal("snapshot reset draft")
 	}
 	_, cmd := m.handleQuestionKey(tea.KeyMsg{Type: tea.KeyEsc})
-	if cmd == nil {
-		t.Fatal("no cancellation command")
+	if cmd != nil || m.questionActive() {
+		t.Fatal("escape should defer locally without sending cancellation")
 	}
-	cmd()
-	answer := m.client.(*recordingClient).submits[0].Answer
-	if !answer.Cancelled || len(answer.Answers) != 0 {
-		t.Fatal("cancelled question fabricated answers")
+	m.setQuestion(uiQuestionRequest())
+	if m.questionActive() {
+		t.Fatal("same snapshot reopened deferred question")
+	}
+	m.openPendingDecision()
+	if !m.questionActive() || m.question.input.Value() != "draft" {
+		t.Fatal("reopening lost the answer draft")
 	}
 	m.setQuestion(nil)
 	if m.question != nil {
@@ -90,7 +93,7 @@ func TestQuestionModalFitsTerminal(t *testing.T) {
 		request := uiQuestionRequest()
 		request.Questions[0].Question = strings.Repeat("较长的问题文字 ", 20)
 		m.setQuestion(request)
-		rendered := m.renderQuestion()
+		rendered := m.renderQuestionInline()
 		if lipgloss.Width(rendered) > width || lipgloss.Height(rendered) > m.height {
 			t.Fatalf("modal %dx%d exceeds %dx%d", lipgloss.Width(rendered), lipgloss.Height(rendered), width, m.height)
 		}

@@ -299,12 +299,15 @@ func TestModelRegistryDefaultRouteMatchesConnection(t *testing.T) {
 	r := NewModelRegistry()
 	p := &fakeProvider{name: "model"}
 	r.Register(p)
-	r.RouteDefault("model", "model", "https://a.example/v1", "key-a")
-	if got, ok := r.ResolveDefault("model", "https://a.example/v1", "key-a"); !ok || got != p {
+	r.RouteDefault("model", "model", HTTPBinding{Endpoint: "https://a.example/v1", APIKey: "key-a", Wire: "chat"})
+	if got, ok := r.ResolveDefault("model", HTTPBinding{Endpoint: "https://a.example/v1", APIKey: "key-a", Wire: "chat"}); !ok || got != p {
 		t.Fatalf("expected matching default route: provider=%v ok=%v", got, ok)
 	}
-	if got, ok := r.ResolveDefault("model", "https://b.example/v1", "key-b"); ok || got != nil {
+	if got, ok := r.ResolveDefault("model", HTTPBinding{Endpoint: "https://b.example/v1", APIKey: "key-b", Wire: "chat"}); ok || got != nil {
 		t.Fatalf("stale default route reused: provider=%v ok=%v", got, ok)
+	}
+	if got, ok := r.ResolveDefault("model", HTTPBinding{Endpoint: "https://a.example/v1", APIKey: "key-a", Wire: "responses"}); ok || got != nil {
+		t.Fatalf("adapter speaking the previous wire format was reused: provider=%v ok=%v", got, ok)
 	}
 }
 

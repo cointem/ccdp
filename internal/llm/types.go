@@ -116,7 +116,7 @@ type Usage struct {
 // PromptTokensDetail carries cache-hit accounting (OpenAI-style
 // prompt_tokens_details.cached_tokens).
 type PromptTokensDetail struct {
-	CachedTokens int `json:"cached_tokens"`
+	CachedTokens *int `json:"cached_tokens"`
 }
 
 // APIError is a structured provider error.
@@ -124,6 +124,15 @@ type APIError struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    string `json:"code"`
+}
+
+// SystemBlock is one ordered, independently-addressable section of the system
+// prompt. Cacheable marks stable, session-constant sections that a caching
+// wire (Anthropic cache_control) may hold across requests; dynamic sections
+// (environment, memory, plan) are never cached.
+type SystemBlock struct {
+	Text      string
+	Cacheable bool
 }
 
 // CompletionRequest is the full request body for Chat Completions.
@@ -137,11 +146,16 @@ type CompletionRequest struct {
 	Verbosity       string          `json:"verbosity,omitempty"`
 	Model           string          `json:"model"`
 	Messages        []ChatMessage   `json:"messages"`
-	Tools           []ToolDef       `json:"tools,omitempty"`
-	Temperature     *float64        `json:"temperature,omitempty"`
-	TopP            *float64        `json:"top_p,omitempty"`
-	MaxTokens       *int            `json:"max_tokens,omitempty"`
-	Stream          bool            `json:"stream"`
+	// SystemBlocks is the structured system prompt. chat/responses render it as
+	// a single system message (joined); anthropic renders it as a system array
+	// with cache_control on cacheable sections. Empty means the system message
+	// in Messages is authoritative.
+	SystemBlocks []SystemBlock `json:"system_blocks,omitempty"`
+	Tools        []ToolDef     `json:"tools,omitempty"`
+	Temperature  *float64      `json:"temperature,omitempty"`
+	TopP         *float64      `json:"top_p,omitempty"`
+	MaxTokens    *int          `json:"max_tokens,omitempty"`
+	Stream       bool          `json:"stream"`
 }
 
 // UnmarshalArgs parses raw JSON arguments from a tool call delta.

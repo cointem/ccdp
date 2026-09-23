@@ -52,7 +52,7 @@ func TestConsumedInputStaysClearedAfterTurnFailure(t *testing.T) {
 				if len(m.inputImages) != wantImages {
 					t.Fatalf("composer attachments changed: %d", len(m.inputImages))
 				}
-				if len(m.pendingSubmissions) != 0 || len(m.pendingImages) != 0 || m.retryCommandID != "" {
+				if m.pendingSubmissionCount() != 0 || m.pendingSubmissionCount() != 0 || m.retryCommandID != "" {
 					t.Fatal("consumed input retained as pending/retry")
 				}
 				if op := m.operations[sent.ID]; op.Active() {

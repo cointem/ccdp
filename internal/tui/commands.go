@@ -9,7 +9,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"ccdp/internal/agent"
 	"ccdp/internal/commands"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
@@ -47,7 +46,7 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	}
 	if m.routing != nil && m.sessionID != m.routing.rootID {
 		switch cmd {
-		case "agents", "agent", "agent-history", "agent-output", "transcript", "parent", "root", "help", "cost", "copy", "stop-tree", "quit":
+		case "pending", "tasks", "next", "reconnect", "agents", "agent", "agent-history", "agent-output", "transcript", "parent", "root", "help", "cost", "context", "copy", "stop-tree", "quit":
 		default:
 			m.pushStatus("this command belongs to the main session; use /root first")
 			return m, nil
@@ -59,6 +58,20 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	}
 
 	switch cmd {
+	case "reconnect":
+		return m, m.reconnect()
+	case "next":
+		if len(args) == 0 {
+			m.pushStatus("usage: /next <message> — send in the next turn")
+			return m, nil
+		}
+		m.textarea.SetValue(strings.Join(args, " "))
+		return m.submitInput(protocol.InputFollowup)
+	case "pending":
+		return m, m.openPendingDecision()
+	case "tasks":
+		m.tasksVisible = !m.tasksVisible
+		return m, nil
 	case "agents":
 		return m, m.loadAgentCatalog(true)
 	case "agent":
@@ -122,6 +135,15 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	case "cost":
 		m.pushLog("system", renderUsage(m.usage, m.modelName))
 
+	case "context":
+		if len(args) != 0 {
+			m.pushLog("error", "usage: /context")
+			return m, nil
+		}
+		m.pushLog("system", m.renderContext())
+		m.showContextDetail = true
+		return m, nil
+
 	case "copy":
 		if len(args) > 1 {
 			m.pushLog("error", "usage: /copy [message-id] (copies the latest response by default)")
@@ -157,19 +179,15 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			lines := make([]string, len(modes))
 			selected := 0
 			for i, mode := range modes {
-				lines[i] = fmt.Sprintf("%s — %s", mode, descriptions[mode])
+				lines[i] = fmt.Sprintf("%s — %s", mode.Label(), descriptions[mode])
 				if mode == m.mode {
 					selected = i
 				}
 			}
-			options := make([]selectorOption, len(modes))
-			pendingMode := ""
-			if m.hasSnapshot && m.snapshot.Pending != nil && m.snapshot.Pending.Permission != nil {
-				pendingMode = m.snapshot.Pending.Permission.Mode
-			}
+			options := make([]SelectorOption, len(modes))
 			for i, mode := range modes {
-				options[i] = selectorOption{ID: string(mode), Label: string(mode), Description: descriptions[mode],
-					Current: mode == m.mode, Pending: pendingMode != "" && pendingMode == string(mode)}
+				options[i] = SelectorOption{ID: string(mode), Label: mode.Label(), Description: descriptions[mode],
+					Current: mode == m.mode}
 			}
 			return m, m.startSelectorAt("Select permission mode", options, selected, true, selectorAction{Kind: selectorMode})
 		}
@@ -181,7 +199,7 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		policy := m.permissionPolicy()
 		policy.Mode = string(mode)
 		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
-			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+string(mode))
+			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+mode.Label())
 
 	case "effort", "verbosity":
 		if len(args) == 0 {
@@ -207,23 +225,8 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			models := m.availableModels()
 			selected := 0
 			currentModel := m.modelName
-			pendingModel := ""
-			if m.hasSnapshot {
-				if m.snapshot.Settings.Model.Model != "" {
-					currentModel = m.snapshot.Settings.Model.Model
-				}
-				if m.snapshot.Pending != nil && m.snapshot.Pending.Model != nil {
-					pendingModel = m.snapshot.Pending.Model.Model
-				}
-			}
-			// A pending binding may be ahead of the provider catalog while a
-			// provider is being opened. Keep it selectable and visibly marked so
-			// the picker reflects the complete confirmed/pending state.
-			for _, model := range []string{currentModel, pendingModel} {
-				if model == "" || containsString(models, model) {
-					continue
-				}
-				models = append(models, model)
+			if m.hasSnapshot && m.snapshot.Settings.Model.Model != "" {
+				currentModel = m.snapshot.Settings.Model.Model
 			}
 			for i, model := range models {
 				if model == currentModel {
@@ -231,10 +234,9 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 					break
 				}
 			}
-			options := make([]selectorOption, len(models))
+			options := make([]SelectorOption, len(models))
 			for i, model := range models {
-				options[i] = selectorOption{ID: model, Label: model, Current: model == currentModel,
-					Pending: pendingModel != "" && model == pendingModel}
+				options[i] = SelectorOption{ID: model, Label: model, Current: model == currentModel}
 			}
 			return m, m.startSelectorAt("Select model", options, selected, true, selectorAction{Kind: selectorModel})
 		}
@@ -276,19 +278,15 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			lines := make([]string, len(modes))
 			selected := 0
 			for i, mode := range modes {
-				lines[i] = fmt.Sprintf("%s — %s", mode, descriptions[mode])
+				lines[i] = fmt.Sprintf("%s — %s", string(mode), descriptions[mode])
 				if mode == current {
 					selected = i
 				}
 			}
-			options := make([]selectorOption, len(modes))
-			pendingMode := ""
-			if m.hasSnapshot && m.snapshot.Pending != nil && m.snapshot.Pending.Sandbox != nil {
-				pendingMode = m.snapshot.Pending.Sandbox.Mode
-			}
+			options := make([]SelectorOption, len(modes))
 			for i, mode := range modes {
-				options[i] = selectorOption{ID: string(mode), Label: string(mode), Description: descriptions[mode],
-					Current: mode == current, Pending: pendingMode != "" && pendingMode == string(mode)}
+				options[i] = SelectorOption{ID: string(mode), Label: string(mode), Description: descriptions[mode],
+					Current: mode == current}
 			}
 			return m, m.startSelectorAt("Select sandbox mode", options, selected, true, selectorAction{Kind: selectorSandbox})
 		}
@@ -327,13 +325,13 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			for i, p := range previews {
 				lines[i] = p
 			}
-			options := make([]selectorOption, len(lines))
+			options := make([]SelectorOption, len(lines))
 			for i, line := range lines {
 				keep := total - len(lines) + i + 1
 				if keep < 0 {
 					keep = 0
 				}
-				options[i] = selectorOption{ID: "keep:" + strconv.Itoa(keep), Label: line}
+				options[i] = SelectorOption{ID: "keep:" + strconv.Itoa(keep), Label: line}
 			}
 			return m, m.startSelectorAt("Rewind to message", options, len(options)-1, true, selectorAction{Kind: selectorRewind})
 		}
@@ -495,13 +493,17 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			m.pushLog("error", "/sessions is unavailable through this session protocol")
 			return m, nil
 		}
-		sessions, err := agent.ListSessions(m.ag.SessionDir())
+		sessions, issues, err := m.savedSessions()
 		if err != nil {
 			m.pushLog("error", err.Error())
 			return m, nil
 		}
 		if len(sessions) == 0 {
-			m.pushLog("system", "no saved sessions")
+			if note := sessionListIssuesNote(issues); note != "" {
+				m.pushLog("system", "no saved sessions could be read\n"+note)
+			} else {
+				m.pushLog("system", "no saved sessions")
+			}
 			return m, nil
 		}
 		var sb strings.Builder
@@ -521,6 +523,9 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			}
 			fmt.Fprintf(&sb, "  %s  %s  %s\n    %s  (%d messages)%s\n",
 				s.ID, s.UpdatedAt.Format("2006-01-02 15:04"), s.Model, title, len(s.History), forkNote)
+		}
+		if note := sessionListIssuesNote(issues); note != "" {
+			sb.WriteString("\n" + note + "\n")
 		}
 		m.pushLog("system", sb.String())
 
@@ -587,6 +592,10 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			rule := strings.Join(args[1:], " ")
+			if err := permissions.ValidatePermissionRule(args[0], rule); err != nil {
+				m.pushLog("error", err.Error())
+				return m, nil
+			}
 			if m.client == nil {
 				m.pushLog("error", "/permissions requires a session protocol")
 				return m, nil
@@ -695,7 +704,7 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		m.pushLog("system", "custom commands: "+strings.Join(names, ", "))
 
 	case "quit", "exit":
-		return m, tea.Quit
+		return m, m.requestQuit()
 
 	default:
 		// User-defined slash commands (markdown templates).
@@ -733,9 +742,17 @@ func (m *Model) startResumePicker() tea.Cmd {
 		m.pushLog("error", "resume requires an agent session opener")
 		return nil
 	}
-	sessions, err := agent.ListSessions(m.ag.SessionDir())
-	if err != nil || len(sessions) == 0 {
-		m.pushLog("system", "no saved sessions to resume")
+	sessions, issues, err := m.savedSessions()
+	if err != nil {
+		m.pushLog("error", err.Error())
+		return nil
+	}
+	if len(sessions) == 0 {
+		if note := sessionListIssuesNote(issues); note != "" {
+			m.pushLog("system", "no saved sessions could be resumed\n"+note)
+		} else {
+			m.pushLog("system", "no saved sessions to resume")
+		}
 		return nil
 	}
 	lines := make([]string, 0, len(sessions))
@@ -747,9 +764,9 @@ func (m *Model) startResumePicker() tea.Cmd {
 		lines = append(lines, fmt.Sprintf("%s  %s\n    %s  (%d messages)",
 			s.ID, s.UpdatedAt.Format("2006-01-02 15:04"), title, len(s.History)))
 	}
-	options := make([]selectorOption, len(sessions))
+	options := make([]SelectorOption, len(sessions))
 	for i, s := range sessions {
-		options[i] = selectorOption{ID: s.ID, Label: lines[i]}
+		options[i] = SelectorOption{ID: s.ID, Label: lines[i]}
 	}
 	return m.startSelectorAt("Resume a session", options, 0, true, selectorAction{Kind: selectorResume})
 }
@@ -782,7 +799,7 @@ func looksLikePatch(text string) bool {
 }
 
 // renderUsage formats the session usage accounting for /cost.
-func renderUsage(u agent.Usage, model string) string {
+func renderUsage(u protocol.UsageSnapshot, model string) string {
 	var sb strings.Builder
 	sb.WriteString("Usage (model " + model + "):\n")
 	sb.WriteString(fmt.Sprintf("  input tokens:   %d\n", u.InputTokens))
@@ -796,13 +813,59 @@ func renderUsage(u agent.Usage, model string) string {
 	return sb.String()
 }
 
-func (m Model) renderConfig() string {
-	if !m.hasSnapshot {
-		return fmt.Sprintf("model: %s\nmode: %s\nworkspace: %s\nsession: %s\n(no runtime snapshot)", m.modelName, m.mode, m.workspace, m.sessionID)
+// renderContext visualizes how much of the model's context window the session
+// currently occupies. It uses only authoritative numbers: the runtime's live
+// context estimate and window, plus cumulative request accounting. It never
+// invents a per-section (system/tools/messages) split, which the runtime does
+// not track, and it shows proportion as a bar rather than a printed percentage.
+func (m *Model) renderContext() string {
+	model, usage := m.modelName, m.usage
+	window, used := 0, usage.InputTokens+usage.OutputTokens
+	if m.hasSnapshot {
+		model = m.snapshot.Settings.Model.Model
+		usage = m.snapshot.Usage
+		window = m.snapshot.Settings.ContextWindow
+		used = m.snapshot.ContextUsedTokens
 	}
-	s := m.snapshot.Settings
-	return fmt.Sprintf("model: %s\nmode: %s\nexecution: %s\nsandbox: %s\nworkspace: %s\nsession: %s\nrevision: %d",
-		s.Model.Model, s.Permission.Mode, s.ExecutionMode, s.Sandbox.Mode, m.workspace, m.sessionID, m.snapshot.Revision.LogSeq)
+	if used < 0 {
+		used = 0
+	}
+	var b strings.Builder
+	b.WriteString("Context (model " + model + "):\n")
+	if window > 0 {
+		free := max(0, window-used)
+		b.WriteString(fmt.Sprintf("  window:  %s tokens\n", formatContextTokens(window)))
+		b.WriteString(fmt.Sprintf("  in use:  %s tokens  %s\n", formatContextTokens(used), contextBar(used, window)))
+		b.WriteString(fmt.Sprintf("  free:    %s tokens\n", formatContextTokens(free)))
+	} else {
+		b.WriteString("  window:  unknown (model reported no limit)\n")
+		b.WriteString(fmt.Sprintf("  in use:  %s tokens\n", formatContextTokens(used)))
+	}
+	b.WriteString("\n  Cumulative this session:\n")
+	b.WriteString(fmt.Sprintf("    input:   %d\n", usage.InputTokens))
+	b.WriteString(fmt.Sprintf("    output:  %d\n", usage.OutputTokens))
+	if usage.CachedTokens > 0 {
+		b.WriteString(fmt.Sprintf("    cached:  %d\n", usage.CachedTokens))
+	}
+	b.WriteString(fmt.Sprintf("    turns:   %d\n", usage.TurnCount))
+	b.WriteString(fmt.Sprintf("    cost:    $%.4f\n", usage.Cost))
+	return b.String()
+}
+
+// contextBar draws a fixed-width proportion bar. Any non-zero use fills at
+// least one cell so a nearly empty window is still visibly non-empty, and the
+// bar saturates at the window rather than overflowing past it.
+func contextBar(used, window int) string {
+	if window <= 0 {
+		return ""
+	}
+	const cells = 20
+	filled := 0
+	if used > 0 {
+		filled = (used*cells + window - 1) / window
+	}
+	filled = min(cells, filled)
+	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", cells-filled) + "]"
 }
 
 // exportMarkdown serializes the retained protocol snapshot without reaching
@@ -835,42 +898,6 @@ func exportMarkdown(snapshot protocol.SessionView, workspace string) string {
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
-func (m Model) renderPermissions() string {
-	policy := m.permissionPolicy()
-	var b strings.Builder
-	fmt.Fprintf(&b, "permission mode: %s\n", policy.Mode)
-	b.WriteString("always allow:\n")
-	if len(policy.AlwaysAllow) == 0 {
-		b.WriteString("  (none)\n")
-	} else {
-		for _, rule := range policy.AlwaysAllow {
-			b.WriteString("  - " + rule + "\n")
-		}
-	}
-	b.WriteString("always deny:\n")
-	if len(policy.AlwaysDeny) == 0 {
-		b.WriteString("  (none)\n")
-	} else {
-		for _, rule := range policy.AlwaysDeny {
-			b.WriteString("  - " + rule + "\n")
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-func (m Model) renderStatusReport() string {
-	plan := m.planMode
-	model := m.modelName
-	mode := string(m.mode)
-	if m.hasSnapshot {
-		model = m.snapshot.Settings.Model.Model
-		mode = m.snapshot.Settings.Permission.Mode
-		plan = m.snapshot.Settings.ExecutionMode == protocol.ExecutionModePlan
-	}
-	return fmt.Sprintf("model: %s\nmode: %s\nplan: %v\nsession: %s\nworkspace: %s\nrevision: %d",
-		model, mode, plan, m.sessionID, m.workspace, m.snapshot.Revision.LogSeq)
-}
-
 // renderPlugins formats the loaded plugins and providers for /plugins.
 func renderPlugins(plugins, providers []string) string {
 	var sb strings.Builder
@@ -890,7 +917,7 @@ func renderPlugins(plugins, providers []string) string {
 
 // pushLog appends a message from the local UI (not the agent).
 func (m *Model) pushLog(kind, text string) {
-	m.addReport(logItem{kind: kind, text: text})
+	m.addReport(historyCell{kind: kind, text: text})
 	m.render()
 	m.followOutput = true
 	m.viewport.GotoBottom()

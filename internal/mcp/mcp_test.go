@@ -265,12 +265,12 @@ func TestManagerRegisterTools(t *testing.T) {
 	reg := tools.NewRegistry()
 	m.RegisterTools(reg)
 
-	tool, ok := reg.Get("echo")
+	tool, ok := reg.Get("mcp__fake__echo")
 	if !ok {
 		t.Fatal("echo tool not registered")
 	}
-	if tool.Name() != "echo" {
-		t.Fatalf("tool name = %q", tool.Name())
+	if tool.Name() != "mcp__fake__echo" {
+		t.Fatalf("tool name = %q, want qualified MCP name", tool.Name())
 	}
 	out, err := tool.Run(&tools.Context{
 		Context: context.Background(),
@@ -313,14 +313,14 @@ func TestManagerRefreshKeepsOldStepBindingAlive(t *testing.T) {
 	reg := tools.NewRegistry()
 	m.RegisterTools(reg)
 	step := m.AcquireStep(reg)
-	old, ok := step.Tools.Get("echo")
+	old, ok := step.Tools.Get("mcp__fake__echo")
 	if !ok {
 		t.Fatal("old step lost echo binding")
 	}
 	if err := m.Refresh(context.Background(), map[string]ServerConfig{"fake": server}); err != nil {
 		t.Fatal(err)
 	}
-	current, ok := reg.Get("echo")
+	current, ok := reg.Get("mcp__fake__echo")
 	if !ok || current == old {
 		t.Fatal("refresh did not publish a new binding")
 	}
@@ -346,7 +346,7 @@ func TestManagerPrepareAbortDoesNotPublishCandidate(t *testing.T) {
 	defer m.Close()
 	reg := tools.NewRegistry()
 	m.RegisterTools(reg)
-	old, ok := reg.Get("echo")
+	old, ok := reg.Get("mcp__fake__echo")
 	if !ok {
 		t.Fatal("initial echo binding missing")
 	}
@@ -354,13 +354,13 @@ func TestManagerPrepareAbortDoesNotPublishCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current, ok := reg.Get("echo"); !ok || current != old {
+	if current, ok := reg.Get("mcp__fake__echo"); !ok || current != old {
 		t.Fatalf("prepare published candidate: current=%T old=%T", current, old)
 	}
 	if err := candidate.Abort(); err != nil {
 		t.Fatalf("abort candidate: %v", err)
 	}
-	if current, ok := reg.Get("echo"); !ok || current != old {
+	if current, ok := reg.Get("mcp__fake__echo"); !ok || current != old {
 		t.Fatalf("abort changed active binding: current=%T old=%T", current, old)
 	}
 }

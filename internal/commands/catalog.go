@@ -217,7 +217,7 @@ func (c Catalog) Help() string {
 		b.WriteByte('\n')
 	}
 	b.WriteString("\nCustom commands: markdown files in ~/.ccdp/commands/<name>.md or .ccdp/commands/<name>.md become /name; $ARGUMENTS is replaced by the args.\n")
-	b.WriteString("Keys\n  Enter        send message      ⌥Enter       newline (⌃J also works)\n  ↑/↓          edit multiline input or browse input history\n  Home/End     move within input\n  ⌃C           interrupt agent; press twice when idle to quit\n  ⌘C           native terminal copy (or /copy for the latest response)\n  trackpad     native history; PgUp/PgDn or ⌃U/⌃D scroll the view\n  ⌃O           browse agents\n  y/n          approve/deny      a/x  always allow/deny for session\n  esc          dismiss or return; preserve input\n  /transcript  read full messages and tool output\n  Reader       / search · n next · o raw · c copy · esc return\n")
+	b.WriteString("Keys\n  Enter        send/steer; /next queues      ⌥Enter       newline (⌃J also works)\n  ↑/↓          edit multiline input or browse input history\n  Home/End     move within input\n  ⌃C           interrupt agent; press twice when idle to quit\n  ⌘C           native terminal copy (or /copy for the latest response)\n  trackpad     native history; PgUp/PgDn or ⌃U/⌃D scroll the view\n  ⌃O           read transcript (review details in approval)\n  ⌃A           browse agents\n  Approval     ↑/↓ choose · Enter confirm · Esc later · /pending reopen\n  esc          dismiss or return; interrupt when running\n  /transcript  read full messages and tool output\n  Reader       / search · n next · o raw · c copy · esc return\n")
 	return b.String()
 }
 
@@ -234,6 +234,10 @@ func prefixed(names []string) []string {
 // from the old help parser, and ? as the documented help alias.
 func Default() Catalog {
 	return New([]Entry{
+		{Name: "next", Help: "<message> queue input for the next turn", Feedback: FeedbackOperation, Busy: BusyAllow, Mutation: true},
+		{Name: "reconnect", Help: "reattach to session updates without resending commands", Feedback: FeedbackNotice, Busy: BusyAllow},
+		{Name: "pending", Help: "reopen a deferred question or approval", Feedback: FeedbackSelector, Busy: BusyAllow},
+		{Name: "tasks", Help: "toggle the current task checklist", Feedback: FeedbackSelector, Busy: BusyAllow},
 		{Name: "agents", Help: "browse child agents, progress and pending approvals", Feedback: FeedbackSelector, Busy: BusyAllow},
 		{Name: "agent", Help: "<id> [send|followup|interrupt|cancel|continue <text>]", Busy: BusyAllow},
 		{Name: "parent", Help: "view the parent agent without stopping execution", Busy: BusyAllow},
@@ -246,10 +250,11 @@ func Default() Catalog {
 		{Name: "clear", Help: "clear conversation history", Feedback: FeedbackOperation, Busy: BusyReject, Mutation: true},
 		{Name: "compact", Help: "compact context now", Feedback: FeedbackOperation, Busy: BusyReject, Mutation: true},
 		{Name: "cost", Help: "show token usage and estimated cost", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
+		{Name: "context", Help: "visualize context window use and cumulative tokens", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "copy", Help: "copy the latest response (or /copy <message-id>) to the host clipboard", Feedback: FeedbackNotice, Busy: BusyAllow},
 		{Name: "config", Help: "show runtime configuration or set a session setting", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, TransientSubcommands: []string{"set"}},
 		{Name: "doctor", Help: "run environment diagnostics", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
-		{Name: "permissions", Help: "show or manage permission rules", Feedback: FeedbackReport, Busy: BusyReject, Transcript: true, TransientSubcommands: []string{"allow", "deny", "remove"}, Mutation: true},
+		{Name: "permissions", Help: "show or manage permission rules", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, TransientSubcommands: []string{"allow", "deny", "remove"}, Mutation: true},
 		{Name: "memory", Help: "show or clear session memory", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, TransientSubcommands: []string{"clear"}, Mutation: true},
 		{Name: "github", Help: "show GitHub integration status", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "pr-comments", Help: "fetch review comments on the current PR", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
@@ -258,12 +263,12 @@ func Default() Catalog {
 		{Name: "plugins", Help: "show loaded plugins and LLM providers", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "mcp", Help: "show connected MCP servers, tools, resources, prompts", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "skills", Help: "list available skills", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
-		{Name: "mode", Help: "choose or switch permission mode", Feedback: FeedbackSelector, Busy: BusyReject, Mutation: true},
+		{Name: "mode", Help: "choose or switch permission mode", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "model", Help: "choose or switch the active model", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
-		{Name: "effort", Help: "choose reasoning effort with left/right; default clears override", Feedback: FeedbackSelector, Busy: BusyReject, Mutation: true},
-		{Name: "verbosity", Help: "choose response verbosity: low|medium|high|default", Feedback: FeedbackSelector, Busy: BusyReject, Mutation: true},
-		{Name: "plan", Help: "toggle plan mode (propose-then-approve)", Feedback: FeedbackSelector, Busy: BusyReject, Mutation: true},
-		{Name: "sandbox", Help: "choose or switch sandbox mode", Feedback: FeedbackSelector, Busy: BusyReject, Mutation: true},
+		{Name: "effort", Help: "choose reasoning effort with left/right; default clears override", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
+		{Name: "verbosity", Help: "choose response verbosity: low|medium|high|default", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
+		{Name: "plan", Help: "toggle plan mode (propose-then-approve)", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
+		{Name: "sandbox", Help: "choose or switch sandbox mode", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "remove", Help: "remove the last n messages", Feedback: FeedbackOperation, Busy: BusyReject, Mutation: true},
 		{Name: "rewind", Help: "keep the first n messages or pick interactively", Feedback: FeedbackSelector, Busy: BusyReject, Mutation: true},
 		{Name: "fork", Help: "branch a new session from message n", Feedback: FeedbackOperation, Busy: BusyReject, Mutation: true},

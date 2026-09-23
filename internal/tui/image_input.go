@@ -39,7 +39,7 @@ func (p *pasteFoldState) summary() string {
 	return fmt.Sprintf("pasted %d lines · ctrl+e to expand/edit", p.Lines)
 }
 
-func (m *Model) recordPastedText(text string) {
+func (m *composerState) recordPastedText(text string) {
 	// Count the complete editable source. A short paste appended to an
 	// existing long paste must not leave a stale fold, and a paste after a
 	// short draft may be what pushes the composer over the folding threshold.
@@ -75,14 +75,14 @@ func (m *Model) togglePasteFold() bool {
 	return true
 }
 
-func (m *Model) expandPasteFoldForEdit() {
+func (m *composerState) expandPasteFoldForEdit() {
 	if m == nil || m.pasteFold == nil || m.pasteFold.Expanded {
 		return
 	}
 	m.pasteFold.Expanded = true
 }
 
-func (m *Model) refreshPasteFold() {
+func (m *composerState) refreshPasteFold() {
 	if m == nil || m.pasteFold == nil {
 		return
 	}
@@ -177,14 +177,7 @@ func (m *Model) removeInputImage() {
 	m.layout()
 }
 
-func (m *Model) imageInputHeight() int {
-	if len(m.inputImages) > 0 {
-		return 1
-	}
-	return 0
-}
-
-func (m *Model) imageInputSummary() string {
+func (m *composerState) imageInputSummary(width int) string {
 	if len(m.inputImages) == 0 {
 		return ""
 	}
@@ -196,7 +189,7 @@ func (m *Model) imageInputSummary() string {
 		hint = "⌥←/→ select · ⌥⌫ remove"
 	}
 	label := fmt.Sprintf("[Image %d/%d · %s · %d×%d · %d KB]  %s", idx+1, len(m.inputImages), strings.TrimPrefix(img.MediaType, "image/"), cfg.Width, cfg.Height, (len(img.Data)+1023)/1024, hint)
-	return styleStatus.Render(truncateDisplay(label, max(1, m.width-2))) + "\n"
+	return styleStatus.Render(truncateDisplay(label, max(1, width-2))) + "\n"
 }
 
 func sameInputImages(a, b []protocol.InputImage) bool {
@@ -213,7 +206,7 @@ func sameInputImages(a, b []protocol.InputImage) bool {
 
 // History keeps immutable attachments within a byte budget, not unbounded
 // copies of every screenshot ever pasted. Ordinary text history is unchanged.
-func (m *Model) rememberImageHistory(index int, images []protocol.InputImage) {
+func (m *composerState) rememberImageHistory(index int, images []protocol.InputImage) {
 	if len(images) == 0 {
 		return
 	}

@@ -4,8 +4,8 @@
 //
 // The Manager owns the servers; on startup it runs the initialize handshake and
 // tools/list discovery, then registers every advertised tool into the agent's
-// tool registry under the "mcp" scope so the model can call them like any
-// built-in tool.
+// tool registry under the "mcp" scope, qualified as `mcp__<server>__<tool>` so
+// a server can never collide with or shadow a built-in tool.
 package mcp
 
 import (

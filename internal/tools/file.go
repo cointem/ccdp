@@ -129,10 +129,6 @@ func (t *ReadTool) Run(ctx *Context) (string, error) {
 	return sb.String(), nil
 }
 
-func readRange(path string, offset, limit int) ([]byte, error) {
-	return readRangeChecked(path, offset, limit, false)
-}
-
 func readRangeChecked(path string, offset, limit int, noFollow bool) ([]byte, error) {
 	data, _, err := readRangeSnapshot(path, offset, limit, noFollow)
 	return data, err

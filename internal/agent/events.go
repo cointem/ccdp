@@ -40,11 +40,12 @@ const (
 
 // Usage is the accumulated token and cost accounting for the session.
 type Usage struct {
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	CachedTokens int     `json:"cached_tokens"` // prompt tokens served from provider cache
-	Cost         float64 `json:"cost"`
-	TurnCount    int     `json:"turn_count"`
+	Cache        protocol.CacheStats `json:"cache,omitempty"`
+	InputTokens  int                 `json:"input_tokens"`
+	OutputTokens int                 `json:"output_tokens"`
+	CachedTokens int                 `json:"cached_tokens"` // prompt tokens served from provider cache
+	Cost         float64             `json:"cost"`
+	TurnCount    int                 `json:"turn_count"`
 }
 
 // ToolEvent describes one tool invocation for the UI.

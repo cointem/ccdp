@@ -45,7 +45,6 @@ type Options struct {
 const (
 	childPurposeTask     = "task"
 	childPurposeGuardian = "guardian"
-	maxChildTurns        = 50
 	defaultChildWorkers  = 4
 )
 
@@ -202,8 +201,8 @@ func pinChildProvider(source *plugin.ModelRegistry, cfg config.Config, binding m
 	if binding.client != nil && binding.provider != "" && binding.model != "" {
 		pinned.Register(binding.client)
 		if binding.routeKind == "http" {
-			_, apiKey := cfg.EndpointFor(binding.model)
-			pinned.RouteDefault(binding.model, binding.provider, binding.endpoint, apiKey)
+			pinned.RouteDefault(binding.model, binding.provider,
+				binding.httpBinding(cfg.ResolveProvider(binding.model).APIKey))
 		} else {
 			pinned.Route(binding.model, binding.provider)
 		}
@@ -362,12 +361,59 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 	if purpose != childPurposeTask && purpose != childPurposeGuardian {
 		return config.Config{}, Options{}, fmt.Errorf("agent: unknown child purpose %q", purpose)
 	}
+	cfg, binding, sourceModels, parentID, registryNames, perms, parentCtx := a.childSourceSnapshot()
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	// Freeze the catalog after pinning the provider that was bound at the step
+	// boundary. A registry route can be replaced while a request is streaming;
+	// resolving the same model name from that newer route would silently send a
+	// child through a different provider. Clone keeps the parent's immutable
+	// snapshot intact, while Register/Route(Default) creates a child-owned
+	// exact binding before the final Freeze.
+	providers := pinChildProvider(sourceModels, cfg, binding)
+	if perms == nil {
+		perms = cfg.PermManager()
+	} else {
+		perms = perms.Clone()
+	}
+	if cfg.PermissionMode != string(permissions.ModePlan) {
+		cfg.PermissionMode = string(perms.CurrentMode())
+	}
+	allowed := childAllowedTools(purpose, registryNames)
+	if binding.model != "" {
+		cfg.Model = binding.model
+	}
+	cfg.SessionID = ""
+	cfg.EnableGuardian = config.BoolPtr(false)
+	// The constructor filters cfg.Hooks to decision hooks. It must not replay
+	// project lifecycle commands, start MCP servers, or write AutoMem state as
+	// a startup side effect. Parent SubagentStart/Stop callbacks remain around
+	// Task itself; they are not duplicated inside the child.
+	cfg.MCPServers = nil
+	cfg.EnableMemory = config.BoolPtr(false)
+	return cfg, Options{
+		RootContext:           parentCtx,
+		EffectiveConfigFrozen: true,
+		ProviderRegistry:      providers,
+		Permissions:           perms,
+		NonInteractive:        true,
+		AllowedTools:          allowed,
+		Purpose:               purpose,
+		ParentSessionID:       parentID,
+	}, nil
+}
+
+// childSourceSnapshot captures the immutable parent state a child inherits at a
+// step boundary (or, for direct constructor callers, at the call boundary):
+// config, active binding, frozen catalog, tool-name set, permissions, and the
+// context the child runs under.
+func (a *Agent) childSourceSnapshot() (cfg config.Config, binding modelBinding, sourceModels *plugin.ModelRegistry, parentID string, registryNames []string, perms *permissions.Manager, parentCtx context.Context) {
 	a.mu.Lock()
-	cfg := cloneConfig(a.cfg)
-	binding := a.activeBinding
-	var sourceModels *plugin.ModelRegistry
-	parentID := a.sessionID
-	var registryNames []string
+	defer a.mu.Unlock()
+	cfg = cloneConfig(a.cfg)
+	binding = a.activeBinding
+	parentID = a.sessionID
 	// A child launched by a tool inherits the exact step admission boundary,
 	// not whichever model/config/catalog happens to be live after a reload.
 	// The parent captures this snapshot in beginStep and clears it when the turn
@@ -391,27 +437,18 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 			registryNames = a.registry.Names()
 		}
 	}
-	parentCtx := a.turnCtx
+	parentCtx = a.turnCtx
 	if parentCtx == nil {
 		parentCtx = a.rootCtx
 	}
-	perms := a.perms
-	a.mu.Unlock()
-	if parentCtx == nil {
-		parentCtx = context.Background()
-	}
-	// Freeze the catalog after pinning the provider that was bound at the step
-	// boundary. A registry route can be replaced while a request is streaming;
-	// resolving the same model name from that newer route would silently send a
-	// child through a different provider. Clone keeps the parent's immutable
-	// snapshot intact, while Register/Route(Default) creates a child-owned
-	// exact binding before the final Freeze.
-	providers := pinChildProvider(sourceModels, cfg, binding)
-	if perms == nil {
-		perms = cfg.PermManager()
-	} else {
-		perms = perms.Clone()
-	}
+	perms = a.perms
+	return cfg, binding, sourceModels, parentID, registryNames, perms, parentCtx
+}
+
+// childAllowedTools computes the tool-name set a child may call for its
+// purpose: task children drop the Task/Agent tools, guardians are restricted to
+// the built-in read-only set.
+func childAllowedTools(purpose string, registryNames []string) map[string]bool {
 	allowed := make(map[string]bool, len(registryNames))
 	for _, name := range registryNames {
 		allowed[name] = true
@@ -426,28 +463,5 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 			allowed[name] = true
 		}
 	}
-	if binding.model != "" {
-		cfg.Model = binding.model
-	}
-	if cfg.MaxTurns <= 0 || cfg.MaxTurns > maxChildTurns {
-		cfg.MaxTurns = maxChildTurns
-	}
-	cfg.SessionID = ""
-	cfg.EnableGuardian = config.BoolPtr(false)
-	// The constructor filters cfg.Hooks to decision hooks. It must not replay
-	// project lifecycle commands, start MCP servers, or write AutoMem state as
-	// a startup side effect. Parent SubagentStart/Stop callbacks remain around
-	// Task itself; they are not duplicated inside the child.
-	cfg.MCPServers = nil
-	cfg.EnableMemory = config.BoolPtr(false)
-	return cfg, Options{
-		RootContext:           parentCtx,
-		EffectiveConfigFrozen: true,
-		ProviderRegistry:      providers,
-		Permissions:           perms,
-		NonInteractive:        true,
-		AllowedTools:          allowed,
-		Purpose:               purpose,
-		ParentSessionID:       parentID,
-	}, nil
+	return allowed
 }

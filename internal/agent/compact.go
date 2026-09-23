@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"ccdp/internal/events"
 	"ccdp/internal/hooks"
@@ -23,7 +24,7 @@ type compactFailureState struct {
 // needsCompact reports whether the conversation has grown past the configured
 // fraction of the model's context window.
 func (a *Agent) needsCompact() bool {
-	return a.estimateTokens() > int(float64(a.cfg.ContextWindow)*a.cfg.CompactThreshold)
+	return a.estimateTokens() > int(float64(a.cfg.ContextWindowFor(a.cfg.Model))*a.cfg.CompactThreshold)
 }
 
 // estimateTokens approximates the prompt size of the current history. When the
@@ -103,7 +104,7 @@ func (a *Agent) compactFailureKeyLocked() string {
 	var compactThreshold float64
 	var keepAfterCompact int
 	if a.cfg != nil {
-		contextWindow = a.cfg.ContextWindow
+		contextWindow = a.cfg.ContextWindowFor(a.cfg.Model)
 		compactThreshold = a.cfg.CompactThreshold
 		keepAfterCompact = a.cfg.KeepAfterCompact
 	}
@@ -167,48 +168,10 @@ func (a *Agent) compactContextMode(hctx context.Context, manual bool) {
 		return
 	}
 
-	keep := a.cfg.KeepAfterCompact
-	if keep < 4 {
-		keep = 4
-	}
-
-	// Snapshot the spans we need before doing any model work.
-	a.mu.Lock()
-	if len(a.history) <= 1+keep {
-		a.mu.Unlock()
+	head, toSummarize, keptTail, lastTs, keep, ok := a.compactSpans()
+	if !ok {
 		return
 	}
-	cut := len(a.history) - keep // messages[cut:] stays intact
-	// Never split a tool_call↔result pair at the boundary: walk cut back past
-	// any tool results whose caller would land in the summarized head.
-	for cut > 1 && a.history[cut].Role == messages.RoleTool {
-		cut--
-	}
-	// A model step is part of the user turn that produced it. Move the
-	// boundary to the beginning of that turn so compaction never leaves a
-	// user message or an assistant/tool round on the opposite side of its
-	// own context. The newest complete turn remains in the tail even when it
-	// is larger than the nominal keep count; the budget/admission layer can
-	// then decide whether another compaction or an explicit user action is
-	// required.
-	for cut > 1 && a.history[cut].Role != messages.RoleUser {
-		cut--
-	}
-	// History does not contain the wire system prompt. Preserve only any
-	// explicit leading system facts; pinning history[0] would permanently keep
-	// the first user message and make compaction ineffective for short sessions.
-	headLen := 0
-	for headLen < cut && a.history[headLen].Role == messages.RoleSystem {
-		headLen++
-	}
-	head := make([]messages.Message, headLen)
-	copy(head, a.history[:headLen])
-	toSummarize := make([]messages.Message, cut-headLen)
-	copy(toSummarize, a.history[headLen:cut])
-	keptTail := make([]messages.Message, len(a.history)-cut)
-	copy(keptTail, a.history[cut:])
-	lastTs := a.history[cut-1].CreatedAt
-	a.mu.Unlock()
 
 	summary, err := a.summarize(hctx, toSummarize)
 	if err != nil {
@@ -239,6 +202,61 @@ func (a *Agent) compactContextMode(hctx context.Context, manual bool) {
 		return
 	}
 
+	a.commitCompaction(hctx, head, summary, keptTail, lastTs, keep)
+}
+
+// compactSpans snapshots the history spans needed by a compaction under one
+// lock: the leading system facts (head), the region to summarize
+// (toSummarize), and the newest complete turn kept verbatim (keptTail). ok is
+// false when the history is already small enough that no compaction is needed.
+func (a *Agent) compactSpans() (head, toSummarize, keptTail []messages.Message, lastTs time.Time, keep int, ok bool) {
+	keep = a.cfg.KeepAfterCompact
+	if keep < 4 {
+		keep = 4
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.history) <= 1+keep {
+		return nil, nil, nil, time.Time{}, keep, false
+	}
+	cut := len(a.history) - keep // messages[cut:] stays intact
+	// Never split a tool_call↔result pair at the boundary: walk cut back past
+	// any tool results whose caller would land in the summarized head.
+	for cut > 1 && a.history[cut].Role == messages.RoleTool {
+		cut--
+	}
+	// A model step is part of the user turn that produced it. Move the
+	// boundary to the beginning of that turn so compaction never leaves a
+	// user message or an assistant/tool round on the opposite side of its
+	// own context. The newest complete turn remains in the tail even when it
+	// is larger than the nominal keep count; the budget/admission layer can
+	// then decide whether another compaction or an explicit user action is
+	// required.
+	for cut > 1 && a.history[cut].Role != messages.RoleUser {
+		cut--
+	}
+	// History does not contain the wire system prompt. Preserve only any
+	// explicit leading system facts; pinning history[0] would permanently keep
+	// the first user message and make compaction ineffective for short sessions.
+	headLen := 0
+	for headLen < cut && a.history[headLen].Role == messages.RoleSystem {
+		headLen++
+	}
+	head = make([]messages.Message, headLen)
+	copy(head, a.history[:headLen])
+	toSummarize = make([]messages.Message, cut-headLen)
+	copy(toSummarize, a.history[headLen:cut])
+	keptTail = make([]messages.Message, len(a.history)-cut)
+	copy(keptTail, a.history[cut:])
+	lastTs = a.history[cut-1].CreatedAt
+	return head, toSummarize, keptTail, lastTs, keep, true
+}
+
+// commitCompaction rebuilds history as the leading facts plus a summary user
+// message plus the kept tail, persists it (so an older full projection cannot
+// overwrite it), resets the token baseline, and publishes the compacted events
+// and post-compact hook.
+func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, summary string, keptTail []messages.Message, lastTs time.Time, keep int) {
 	// Restore context that the model may otherwise lose (Claude Code's compact
 	// restore: discovered tools, active todos, recently touched files).
 	if restore := a.restoreContextSnippet(keptTail); restore != "" {

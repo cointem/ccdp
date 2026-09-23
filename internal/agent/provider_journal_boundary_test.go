@@ -53,7 +53,7 @@ func TestForkJournalAdmissionFailureDoesNotCreateChild(t *testing.T) {
 	if err := a.Save(); err != nil {
 		t.Fatal(err)
 	}
-	before, err := ListSessions(a.cfg.SessionDir)
+	before, _, err := ListSessions(a.cfg.SessionDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestForkJournalAdmissionFailureDoesNotCreateChild(t *testing.T) {
 	if err == nil || !errors.As(err, &journalErr) {
 		t.Fatalf("fork error = %v, want request journal failure", err)
 	}
-	after, err := ListSessions(a.cfg.SessionDir)
+	after, _, err := ListSessions(a.cfg.SessionDir)
 	if err != nil {
 		t.Fatal(err)
 	}

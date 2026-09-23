@@ -21,6 +21,7 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/events"
 	"ccdp/internal/llm"
+	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 )
 
@@ -231,15 +232,7 @@ func capturedRequestPricing(cfg *config.Config, model string) config.Pricing {
 	if cfg == nil {
 		return config.Pricing{}
 	}
-	if price, ok := cfg.Pricing[model]; ok {
-		return price
-	}
-	// Keep the existing CostFor fallback semantics, but choose the card now
-	// rather than looking at a potentially changed config during finish.
-	if price, ok := cfg.Pricing[cfg.Model]; ok {
-		return price
-	}
-	return config.Pricing{}
+	return cfg.PricingFor(model)
 }
 
 // recordPreparedRequest durably records the exact request body before the
@@ -452,29 +445,26 @@ func (a *Agent) finishRequestAttempt(attempt requestAttempt, result llm.StreamRe
 			outcome = "error"
 		}
 	}
-	a.mu.Lock()
-	current := a.usage
-	cost := requestAttemptCost(attempt, inputTokens, outputTokens)
-	if math.IsNaN(cost) || math.IsInf(cost, 0) {
-		a.mu.Unlock()
-		err := a.poisonRequestJournal(errors.New("agent: provider usage cost is not finite"))
+	candidate, cost, usageErr := a.accumulateAttemptUsage(inputTokens, outputTokens, cachedTokens, attempt)
+	if usageErr != nil {
+		err := a.poisonRequestJournal(usageErr)
 		a.persistMu.Unlock()
 		return err
 	}
-	candidate := current
-	candidate.InputTokens += inputTokens
-	candidate.OutputTokens += outputTokens
-	candidate.CachedTokens += cachedTokens
-	candidate.TurnCount++
-	candidate.Cost += cost
-	if math.IsNaN(candidate.Cost) || math.IsInf(candidate.Cost, 0) {
-		a.mu.Unlock()
-		err := a.poisonRequestJournal(errors.New("agent: accumulated usage cost is not finite"))
-		a.persistMu.Unlock()
-		return err
+	cache := protocol.CacheStats{Tracking: true, InputTokens: inputTokens}
+	if result.CacheReported && cachedTokens >= 0 && cachedTokens <= inputTokens {
+		cache.CachedTokens = cachedTokens
+		cache.ReportedInputTokens = inputTokens
 	}
-	a.mu.Unlock()
+	if !candidate.Cache.Tracking && candidate.TurnCount > 1 {
+		candidate.Cache.UnknownHistory = true
+	}
+	candidate.Cache.Tracking = true
+	candidate.Cache.InputTokens += cache.InputTokens
+	candidate.Cache.CachedTokens += cache.CachedTokens
+	candidate.Cache.ReportedInputTokens += cache.ReportedInputTokens
 	usage := session.Usage{
+		Cache:       cache,
 		InputTokens: int64(inputTokens), OutputTokens: int64(outputTokens),
 		CachedTokens: int64(cachedTokens), TotalTokens: int64(inputTokens + outputTokens),
 		Cost: cost, TurnCount: 1,
@@ -491,7 +481,7 @@ func (a *Agent) finishRequestAttempt(attempt requestAttempt, result llm.StreamRe
 	}}
 	absolute := session.Usage{
 		InputTokens: int64(candidate.InputTokens), OutputTokens: int64(candidate.OutputTokens),
-		CachedTokens: int64(candidate.CachedTokens), TotalTokens: int64(candidate.InputTokens + candidate.OutputTokens),
+		CachedTokens: int64(candidate.CachedTokens), Cache: candidate.Cache, TotalTokens: int64(candidate.InputTokens + candidate.OutputTokens),
 		Cost: candidate.Cost, TurnCount: int64(candidate.TurnCount),
 	}
 	revision := uint64(p.CurrentCursor() + 1)
@@ -527,6 +517,29 @@ func (a *Agent) finishRequestAttempt(attempt requestAttempt, result llm.StreamRe
 		})
 	}
 	return nil
+}
+
+// accumulateAttemptUsage folds a finished attempt's tokens into the session
+// usage counter, rejecting non-finite costs. The caller holds persistMu so the
+// counter update is serialized with the durable journal section.
+func (a *Agent) accumulateAttemptUsage(inputTokens, outputTokens, cachedTokens int, attempt requestAttempt) (candidate Usage, cost float64, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	current := a.usage
+	cost = requestAttemptCost(attempt, inputTokens, outputTokens)
+	if math.IsNaN(cost) || math.IsInf(cost, 0) {
+		return current, cost, errors.New("agent: provider usage cost is not finite")
+	}
+	candidate = current
+	candidate.InputTokens += inputTokens
+	candidate.OutputTokens += outputTokens
+	candidate.CachedTokens += cachedTokens
+	candidate.TurnCount++
+	candidate.Cost += cost
+	if math.IsNaN(candidate.Cost) || math.IsInf(candidate.Cost, 0) {
+		return current, cost, errors.New("agent: accumulated usage cost is not finite")
+	}
+	return candidate, cost, nil
 }
 
 func (p *sessionPersistence) loadPreparedRequest(requestID string) (preparedRequest, error) {

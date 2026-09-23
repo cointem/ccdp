@@ -20,37 +20,35 @@ const sha256HexLength = 64
 type EventType string
 
 const (
-	EventTypeSessionCreated            EventType = "SessionCreated"
-	EventTypeSessionImported           EventType = "SessionImported"
-	EventTypeSessionClosed             EventType = "SessionClosed"
-	EventTypeInputQueued               EventType = "InputQueued"
-	EventTypeInputDelivered            EventType = "InputDelivered"
-	EventTypeInputCancelled            EventType = "InputCancelled"
-	EventTypeCommandScheduled          EventType = "CommandScheduled"
-	EventTypeCommandCompleted          EventType = "CommandCompleted"
-	EventTypeSettingsScheduled         EventType = "SettingsScheduled"
-	EventTypeSettingsChanged           EventType = "SettingsChanged"
-	EventTypeSettingsScheduleCancelled EventType = "SettingsScheduleCancelled"
-	EventTypeWorkflowChanged           EventType = "WorkflowChanged"
-	EventTypeTurnStarted               EventType = "TurnStarted"
-	EventTypeTurnFinished              EventType = "TurnFinished"
-	EventTypeRequestPrepared           EventType = "RequestPrepared"
-	EventTypeAttemptFinished           EventType = "AttemptFinished"
-	EventTypeAssistantCommitted        EventType = "AssistantCommitted"
-	EventTypeToolStarted               EventType = "ToolStarted"
-	EventTypeToolFinished              EventType = "ToolFinished"
-	EventTypeToolResultsProjected      EventType = "ToolResultsProjected"
-	EventTypeApprovalRequested         EventType = "ApprovalRequested"
-	EventTypeApprovalResolved          EventType = "ApprovalResolved"
-	EventTypeHookStarted               EventType = "HookStarted"
-	EventTypeHookFinished              EventType = "HookFinished"
-	EventTypeContextCompacted          EventType = "ContextCompacted"
-	EventTypeConversationReset         EventType = "ConversationReset"
-	EventTypeConversationRewound       EventType = "ConversationRewound"
-	EventTypeTasksChanged              EventType = "TasksChanged"
-	EventTypeMemoryChanged             EventType = "MemoryChanged"
-	EventTypeToolsDiscovered           EventType = "ToolsDiscovered"
-	EventTypeUsageChanged              EventType = "UsageChanged"
+	EventTypeSessionCreated       EventType = "SessionCreated"
+	EventTypeSessionImported      EventType = "SessionImported"
+	EventTypeSessionClosed        EventType = "SessionClosed"
+	EventTypeInputQueued          EventType = "InputQueued"
+	EventTypeInputDelivered       EventType = "InputDelivered"
+	EventTypeInputCancelled       EventType = "InputCancelled"
+	EventTypeCommandScheduled     EventType = "CommandScheduled"
+	EventTypeCommandCompleted     EventType = "CommandCompleted"
+	EventTypeSettingsChanged      EventType = "SettingsChanged"
+	EventTypeWorkflowChanged      EventType = "WorkflowChanged"
+	EventTypeTurnStarted          EventType = "TurnStarted"
+	EventTypeTurnFinished         EventType = "TurnFinished"
+	EventTypeRequestPrepared      EventType = "RequestPrepared"
+	EventTypeAttemptFinished      EventType = "AttemptFinished"
+	EventTypeAssistantCommitted   EventType = "AssistantCommitted"
+	EventTypeToolStarted          EventType = "ToolStarted"
+	EventTypeToolFinished         EventType = "ToolFinished"
+	EventTypeToolResultsProjected EventType = "ToolResultsProjected"
+	EventTypeApprovalRequested    EventType = "ApprovalRequested"
+	EventTypeApprovalResolved     EventType = "ApprovalResolved"
+	EventTypeHookStarted          EventType = "HookStarted"
+	EventTypeHookFinished         EventType = "HookFinished"
+	EventTypeContextCompacted     EventType = "ContextCompacted"
+	EventTypeConversationReset    EventType = "ConversationReset"
+	EventTypeConversationRewound  EventType = "ConversationRewound"
+	EventTypeTasksChanged         EventType = "TasksChanged"
+	EventTypeMemoryChanged        EventType = "MemoryChanged"
+	EventTypeToolsDiscovered      EventType = "ToolsDiscovered"
+	EventTypeUsageChanged         EventType = "UsageChanged"
 )
 
 // Event is the sealed, typed fact interface used by Store.  External packages
@@ -244,11 +242,11 @@ type Settings struct {
 	AdditionalDirectories     []string `json:"additional_directories,omitempty"`
 	DisallowedDirectories     []string `json:"disallowed_directories,omitempty"`
 	ContextWindow             int      `json:"context_window,omitempty"`
+	EffectiveContextWindow    int      `json:"effective_context_window,omitempty"`
 	CompactThreshold          float64  `json:"compact_threshold,omitempty"`
 	MaxResultSizeChars        int      `json:"max_result_size_chars,omitempty"`
 	MaxTurns                  int      `json:"max_turns,omitempty"`
 	MaxBudgetUSD              float64  `json:"max_budget_usd,omitempty"`
-	MaxReplyTokens            int      `json:"max_reply_tokens,omitempty"`
 	MaxToolOutputCharsPerTurn int      `json:"max_tool_output_chars_per_turn,omitempty"`
 	Workspace                 string   `json:"workspace,omitempty"`
 }
@@ -263,7 +261,7 @@ func (s Settings) validate() error {
 	if s.MaxOutputTokens != nil && *s.MaxOutputTokens < 0 {
 		return errors.New("max_output_tokens must not be negative")
 	}
-	if s.ContextWindow < 0 || s.MaxResultSizeChars < 0 || s.MaxTurns < 0 || s.MaxReplyTokens < 0 || s.MaxToolOutputCharsPerTurn < 0 {
+	if s.EffectiveContextWindow < 0 || s.ContextWindow < 0 || s.MaxResultSizeChars < 0 || s.MaxTurns < 0 || s.MaxToolOutputCharsPerTurn < 0 {
 		return errors.New("settings limits must not be negative")
 	}
 	if s.MaxBudgetUSD < 0 {
@@ -395,16 +393,20 @@ func (m RequestManifest) validate() error {
 }
 
 type Usage struct {
-	InputTokens  int64   `json:"input_tokens"`
-	OutputTokens int64   `json:"output_tokens"`
-	CachedTokens int64   `json:"cached_tokens,omitempty"`
-	TotalTokens  int64   `json:"total_tokens"`
-	Cost         float64 `json:"cost"`
-	TurnCount    int64   `json:"turn_count,omitempty"`
-	PriceVersion string  `json:"price_version,omitempty"`
+	Cache        protocol.CacheStats `json:"cache,omitempty"`
+	InputTokens  int64               `json:"input_tokens"`
+	OutputTokens int64               `json:"output_tokens"`
+	CachedTokens int64               `json:"cached_tokens,omitempty"`
+	TotalTokens  int64               `json:"total_tokens"`
+	Cost         float64             `json:"cost"`
+	TurnCount    int64               `json:"turn_count,omitempty"`
+	PriceVersion string              `json:"price_version,omitempty"`
 }
 
 func (u Usage) validate() error {
+	if u.Cache.InputTokens < 0 || u.Cache.CachedTokens < 0 || u.Cache.ReportedInputTokens < 0 || u.Cache.CachedTokens > u.Cache.ReportedInputTokens || u.Cache.ReportedInputTokens > u.Cache.InputTokens {
+		return errors.New("invalid cache usage values")
+	}
 	if u.InputTokens < 0 || u.OutputTokens < 0 || u.CachedTokens < 0 || u.TotalTokens < 0 || u.Cost < 0 || u.TurnCount < 0 {
 		return errors.New("usage values must not be negative")
 	}
@@ -604,20 +606,9 @@ type CommandCompleted struct {
 	Output    *BlobRef `json:"output,omitempty"`
 }
 
-type SettingsScheduled struct {
-	ChangeID       string   `json:"change_id"`
-	Settings       Settings `json:"settings"`
-	SourceRevision uint64   `json:"source_revision"`
-}
-
 type SettingsChanged struct {
 	Revision uint64   `json:"revision"`
 	Settings Settings `json:"settings"`
-}
-
-type SettingsScheduleCancelled struct {
-	ChangeID string `json:"change_id"`
-	Reason   string `json:"reason,omitempty"`
 }
 
 type WorkflowChanged struct {
@@ -788,68 +779,64 @@ func validateOutcome(value string) error {
 	}
 }
 
-func (e SessionCreated) Type() EventType            { return EventTypeSessionCreated }
-func (e SessionCreated) seal()                      {}
-func (e SessionImported) Type() EventType           { return EventTypeSessionImported }
-func (e SessionImported) seal()                     {}
-func (e SessionClosed) Type() EventType             { return EventTypeSessionClosed }
-func (e SessionClosed) seal()                       {}
-func (e InputQueued) Type() EventType               { return EventTypeInputQueued }
-func (e InputQueued) seal()                         {}
-func (e InputDelivered) Type() EventType            { return EventTypeInputDelivered }
-func (e InputDelivered) seal()                      {}
-func (e InputCancelled) Type() EventType            { return EventTypeInputCancelled }
-func (e InputCancelled) seal()                      {}
-func (e CommandScheduled) Type() EventType          { return EventTypeCommandScheduled }
-func (e CommandScheduled) seal()                    {}
-func (e CommandCompleted) Type() EventType          { return EventTypeCommandCompleted }
-func (e CommandCompleted) seal()                    {}
-func (e SettingsScheduled) Type() EventType         { return EventTypeSettingsScheduled }
-func (e SettingsScheduled) seal()                   {}
-func (e SettingsChanged) Type() EventType           { return EventTypeSettingsChanged }
-func (e SettingsChanged) seal()                     {}
-func (e SettingsScheduleCancelled) Type() EventType { return EventTypeSettingsScheduleCancelled }
-func (e SettingsScheduleCancelled) seal()           {}
-func (e WorkflowChanged) Type() EventType           { return EventTypeWorkflowChanged }
-func (e WorkflowChanged) seal()                     {}
-func (e TurnStarted) Type() EventType               { return EventTypeTurnStarted }
-func (e TurnStarted) seal()                         {}
-func (e TurnFinished) Type() EventType              { return EventTypeTurnFinished }
-func (e TurnFinished) seal()                        {}
-func (e RequestPrepared) Type() EventType           { return EventTypeRequestPrepared }
-func (e RequestPrepared) seal()                     {}
-func (e AttemptFinished) Type() EventType           { return EventTypeAttemptFinished }
-func (e AttemptFinished) seal()                     {}
-func (e AssistantCommitted) Type() EventType        { return EventTypeAssistantCommitted }
-func (e AssistantCommitted) seal()                  {}
-func (e ToolStarted) Type() EventType               { return EventTypeToolStarted }
-func (e ToolStarted) seal()                         {}
-func (e ToolFinished) Type() EventType              { return EventTypeToolFinished }
-func (e ToolFinished) seal()                        {}
-func (e ToolResultsProjected) Type() EventType      { return EventTypeToolResultsProjected }
-func (e ToolResultsProjected) seal()                {}
-func (e ApprovalRequested) Type() EventType         { return EventTypeApprovalRequested }
-func (e ApprovalRequested) seal()                   {}
-func (e ApprovalResolved) Type() EventType          { return EventTypeApprovalResolved }
-func (e ApprovalResolved) seal()                    {}
-func (e HookStarted) Type() EventType               { return EventTypeHookStarted }
-func (e HookStarted) seal()                         {}
-func (e HookFinished) Type() EventType              { return EventTypeHookFinished }
-func (e HookFinished) seal()                        {}
-func (e ContextCompacted) Type() EventType          { return EventTypeContextCompacted }
-func (e ContextCompacted) seal()                    {}
-func (e ConversationReset) Type() EventType         { return EventTypeConversationReset }
-func (e ConversationReset) seal()                   {}
-func (e ConversationRewound) Type() EventType       { return EventTypeConversationRewound }
-func (e ConversationRewound) seal()                 {}
-func (e TasksChanged) Type() EventType              { return EventTypeTasksChanged }
-func (e TasksChanged) seal()                        {}
-func (e MemoryChanged) Type() EventType             { return EventTypeMemoryChanged }
-func (e MemoryChanged) seal()                       {}
-func (e ToolsDiscovered) Type() EventType           { return EventTypeToolsDiscovered }
-func (e ToolsDiscovered) seal()                     {}
-func (e UsageChanged) Type() EventType              { return EventTypeUsageChanged }
-func (e UsageChanged) seal()                        {}
+func (e SessionCreated) Type() EventType       { return EventTypeSessionCreated }
+func (e SessionCreated) seal()                 {}
+func (e SessionImported) Type() EventType      { return EventTypeSessionImported }
+func (e SessionImported) seal()                {}
+func (e SessionClosed) Type() EventType        { return EventTypeSessionClosed }
+func (e SessionClosed) seal()                  {}
+func (e InputQueued) Type() EventType          { return EventTypeInputQueued }
+func (e InputQueued) seal()                    {}
+func (e InputDelivered) Type() EventType       { return EventTypeInputDelivered }
+func (e InputDelivered) seal()                 {}
+func (e InputCancelled) Type() EventType       { return EventTypeInputCancelled }
+func (e InputCancelled) seal()                 {}
+func (e CommandScheduled) Type() EventType     { return EventTypeCommandScheduled }
+func (e CommandScheduled) seal()               {}
+func (e CommandCompleted) Type() EventType     { return EventTypeCommandCompleted }
+func (e CommandCompleted) seal()               {}
+func (e SettingsChanged) Type() EventType      { return EventTypeSettingsChanged }
+func (e SettingsChanged) seal()                {}
+func (e WorkflowChanged) Type() EventType      { return EventTypeWorkflowChanged }
+func (e WorkflowChanged) seal()                {}
+func (e TurnStarted) Type() EventType          { return EventTypeTurnStarted }
+func (e TurnStarted) seal()                    {}
+func (e TurnFinished) Type() EventType         { return EventTypeTurnFinished }
+func (e TurnFinished) seal()                   {}
+func (e RequestPrepared) Type() EventType      { return EventTypeRequestPrepared }
+func (e RequestPrepared) seal()                {}
+func (e AttemptFinished) Type() EventType      { return EventTypeAttemptFinished }
+func (e AttemptFinished) seal()                {}
+func (e AssistantCommitted) Type() EventType   { return EventTypeAssistantCommitted }
+func (e AssistantCommitted) seal()             {}
+func (e ToolStarted) Type() EventType          { return EventTypeToolStarted }
+func (e ToolStarted) seal()                    {}
+func (e ToolFinished) Type() EventType         { return EventTypeToolFinished }
+func (e ToolFinished) seal()                   {}
+func (e ToolResultsProjected) Type() EventType { return EventTypeToolResultsProjected }
+func (e ToolResultsProjected) seal()           {}
+func (e ApprovalRequested) Type() EventType    { return EventTypeApprovalRequested }
+func (e ApprovalRequested) seal()              {}
+func (e ApprovalResolved) Type() EventType     { return EventTypeApprovalResolved }
+func (e ApprovalResolved) seal()               {}
+func (e HookStarted) Type() EventType          { return EventTypeHookStarted }
+func (e HookStarted) seal()                    {}
+func (e HookFinished) Type() EventType         { return EventTypeHookFinished }
+func (e HookFinished) seal()                   {}
+func (e ContextCompacted) Type() EventType     { return EventTypeContextCompacted }
+func (e ContextCompacted) seal()               {}
+func (e ConversationReset) Type() EventType    { return EventTypeConversationReset }
+func (e ConversationReset) seal()              {}
+func (e ConversationRewound) Type() EventType  { return EventTypeConversationRewound }
+func (e ConversationRewound) seal()            {}
+func (e TasksChanged) Type() EventType         { return EventTypeTasksChanged }
+func (e TasksChanged) seal()                   {}
+func (e MemoryChanged) Type() EventType        { return EventTypeMemoryChanged }
+func (e MemoryChanged) seal()                  {}
+func (e ToolsDiscovered) Type() EventType      { return EventTypeToolsDiscovered }
+func (e ToolsDiscovered) seal()                {}
+func (e UsageChanged) Type() EventType         { return EventTypeUsageChanged }
+func (e UsageChanged) seal()                   {}
 
 func (e SessionCreated) validate() error {
 	if err := requireID("session_id", e.SessionID); err != nil {
@@ -944,15 +931,8 @@ func (e CommandCompleted) validate() error {
 	}
 	return nil
 }
-func (e SettingsScheduled) validate() error {
-	if err := requireID("change_id", e.ChangeID); err != nil {
-		return err
-	}
-	return e.Settings.validate()
-}
-func (e SettingsChanged) validate() error           { return e.Settings.validate() }
-func (e SettingsScheduleCancelled) validate() error { return requireID("change_id", e.ChangeID) }
-func (e WorkflowChanged) validate() error           { return e.Workflow.validate() }
+func (e SettingsChanged) validate() error { return e.Settings.validate() }
+func (e WorkflowChanged) validate() error { return e.Workflow.validate() }
 func (e TurnStarted) validate() error {
 	if err := requireID("turn_id", e.TurnID); err != nil {
 		return err
@@ -1151,12 +1131,8 @@ func decodeEvent(w wireEvent) (Event, error) {
 		event = &CommandScheduled{}
 	case EventTypeCommandCompleted:
 		event = &CommandCompleted{}
-	case EventTypeSettingsScheduled:
-		event = &SettingsScheduled{}
 	case EventTypeSettingsChanged:
 		event = &SettingsChanged{}
-	case EventTypeSettingsScheduleCancelled:
-		event = &SettingsScheduleCancelled{}
 	case EventTypeWorkflowChanged:
 		event = &WorkflowChanged{}
 	case EventTypeTurnStarted:
@@ -1198,7 +1174,7 @@ func decodeEvent(w wireEvent) (Event, error) {
 	case EventTypeUsageChanged:
 		event = &UsageChanged{}
 	default:
-		return nil, fmt.Errorf("unknown event type %q", w.Type)
+		return nil, fmt.Errorf("%w: %q", ErrUnknownEventType, w.Type)
 	}
 	if err := decodeStrict(w.Payload, event); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", w.Type, err)

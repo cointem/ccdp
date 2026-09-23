@@ -691,7 +691,7 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	if len(ag.HooksList()[hooks.EventPreToolUse]) != 1 {
 		t.Fatal("project hook was not loaded")
 	}
-	if ag.PermissionMode() != permissions.ModeDefault || ag.SandboxMode() != sandbox.ModeConfine {
+	if ag.PermissionMode() != permissions.ModeAcceptEdits || ag.SandboxMode() != sandbox.ModeConfine {
 		t.Fatalf("project attempted to loosen modes: permission=%s sandbox=%s", ag.PermissionMode(), ag.SandboxMode())
 	}
 	if _, ok := ag.registry.Get("WebFetch"); ok {
@@ -709,7 +709,7 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	if len(ag.HooksList()[hooks.EventPreToolUse]) != 0 {
 		t.Fatal("removed project hook remained active")
 	}
-	if ag.PermissionMode() != permissions.ModeDefault || ag.SandboxMode() != sandbox.ModeConfine {
+	if ag.PermissionMode() != permissions.ModeAcceptEdits || ag.SandboxMode() != sandbox.ModeConfine {
 		t.Fatalf("removed project modes remained active: permission=%s sandbox=%s", ag.PermissionMode(), ag.SandboxMode())
 	}
 	if _, ok := ag.registry.Get("WebFetch"); !ok {
@@ -736,6 +736,7 @@ func TestProjectSettingsLoadedAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
+	cfg.PermissionMode = string(permissions.ModeDefault)
 	cfg.Workspace = dir
 	cfg.SessionDir = filepath.Join(dir, "sessions")
 	cfg.TrustStore = trust

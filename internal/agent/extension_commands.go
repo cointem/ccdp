@@ -448,64 +448,69 @@ func (a *Agent) scheduleCommandOperationWithBusy(cmd protocol.Command, name stri
 		a.publishState()
 	}
 	receipt := a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
-	go func() {
-		defer a.operationWG.Done()
-		output, err := operation(ctx)
-		status := "success"
-		if err != nil {
-			status = "error"
-		}
-		boundedOutput := boundedCommandOutput(output)
-		if requireIdle {
-			a.mu.Lock()
-			// context.CancelFunc is deliberately not comparable. The context
-			// returned by WithCancel is the operation's identity, so clear the
-			// cancellation handles only if this worker still owns that context.
-			if a.turnCtx == ctx {
-				a.turnCancel = nil
-				a.turnCtx = nil
-			}
-			if !a.closing && !a.closed {
-				a.busy = false
-				a.phase = protocol.PhaseIdle
-			}
-			a.mu.Unlock()
-		}
-		cancel()
-		// receipt persists CommandCompleted before publishing the final receipt.
-		// Keep that durable boundary ahead of all transient operation output so a
-		// restart cannot observe a successful report without its completion fact.
-		completion := &session.CommandCompleted{CommandID: string(cmd.ID), Outcome: status}
-		if err != nil {
-			completion.Code = string(protocol.ErrorInternal)
-			completion.Report = err.Error()
-		}
-		finalReceipt := a.receiptWithFactAndOutput(cmd, func() protocol.ReceiptStatus {
-			if err != nil {
-				return protocol.ReceiptRejected
-			}
-			return protocol.ReceiptApplied
-		}(), protocol.OperationID(cmd.ID), func() *protocol.CommandError {
-			if err == nil {
-				return nil
-			}
-			return &protocol.CommandError{Code: protocol.ErrorInternal, Message: err.Error()}
-		}(), completion, boundedOutput)
-		if finalReceipt.Rejected() {
-			reason := "command completion was not persisted"
-			if finalReceipt.Error != nil {
-				reason = finalReceipt.Error.Error()
-			}
-			a.emit(Event{Type: EventError, Text: name + ": " + reason})
-		} else {
-			a.emit(Event{Type: EventToolResult, Tool: &ToolEvent{ID: string(cmd.ID), Name: name, Status: status, Output: boundedOutput}})
-			if err != nil {
-				a.emit(Event{Type: EventError, Text: name + ": " + err.Error()})
-			}
-		}
-		a.publishState()
-	}()
+	go a.completeScheduledOperation(ctx, cancel, cmd, name, operation, requireIdle)
 	return receipt
+}
+
+// completeScheduledOperation runs a long-lived command operation, releases its
+// busy reservation, and persists the terminal CommandCompleted admission ahead
+// of the final receipt so a restart cannot observe a success without it.
+func (a *Agent) completeScheduledOperation(ctx context.Context, cancel context.CancelFunc, cmd protocol.Command, name string, operation func(context.Context) (string, error), requireIdle bool) {
+	defer a.operationWG.Done()
+	output, err := operation(ctx)
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	boundedOutput := boundedCommandOutput(output)
+	if requireIdle {
+		a.mu.Lock()
+		// context.CancelFunc is deliberately not comparable. The context returned
+		// by WithCancel is the operation's identity, so clear the cancellation
+		// handles only if this worker still owns that context.
+		if a.turnCtx == ctx {
+			a.turnCancel = nil
+			a.turnCtx = nil
+		}
+		if !a.closing && !a.closed {
+			a.busy = false
+			a.phase = protocol.PhaseIdle
+		}
+		a.mu.Unlock()
+	}
+	cancel()
+	// receipt persists CommandCompleted before publishing the final receipt.
+	// Keep that durable boundary ahead of all transient operation output so a
+	// restart cannot observe a successful report without its completion fact.
+	completion := &session.CommandCompleted{CommandID: string(cmd.ID), Outcome: status}
+	if err != nil {
+		completion.Code = string(protocol.ErrorInternal)
+		completion.Report = err.Error()
+	}
+	finalReceipt := a.receiptWithFactAndOutput(cmd, func() protocol.ReceiptStatus {
+		if err != nil {
+			return protocol.ReceiptRejected
+		}
+		return protocol.ReceiptApplied
+	}(), protocol.OperationID(cmd.ID), func() *protocol.CommandError {
+		if err == nil {
+			return nil
+		}
+		return &protocol.CommandError{Code: protocol.ErrorInternal, Message: err.Error()}
+	}(), completion, boundedOutput)
+	if finalReceipt.Rejected() {
+		reason := "command completion was not persisted"
+		if finalReceipt.Error != nil {
+			reason = finalReceipt.Error.Error()
+		}
+		a.emit(Event{Type: EventError, Text: name + ": " + reason})
+	} else {
+		a.emit(Event{Type: EventToolResult, Tool: &ToolEvent{ID: string(cmd.ID), Name: name, Status: status, Output: boundedOutput}})
+		if err != nil {
+			a.emit(Event{Type: EventError, Text: name + ": " + err.Error()})
+		}
+	}
+	a.publishState()
 }
 
 func boundedCommandOutput(value string) string {

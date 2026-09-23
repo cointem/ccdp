@@ -11,6 +11,7 @@
 package permissions
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -32,11 +33,32 @@ var ValidModes = []Mode{ModeDefault, ModeAcceptEdits, ModePlan, ModeBypass}
 
 // ParseMode converts a string to a Mode.
 func ParseMode(s string) (Mode, error) {
+	switch s {
+	case "manual":
+		return ModeDefault, nil
+	case "edits":
+		return ModeAcceptEdits, nil
+	case "bypass":
+		return ModeBypass, nil
+	}
 	switch Mode(s) {
 	case ModeDefault, ModeAcceptEdits, ModePlan, ModeBypass:
 		return Mode(s), nil
 	}
-	return "", fmt.Errorf("unknown permission mode %q (want default|acceptEdits|plan|bypassPermissions)", s)
+	return "", fmt.Errorf("unknown permission mode %q (want manual|edits|bypass|plan)", s)
+}
+
+// Label returns the public name while persisted legacy values remain compatible.
+func (m Mode) Label() string {
+	switch m {
+	case ModeDefault:
+		return "manual"
+	case ModeAcceptEdits:
+		return "edits"
+	case ModeBypass:
+		return "bypass"
+	}
+	return string(m)
 }
 
 // Decision is the outcome of a permission check.
@@ -246,6 +268,23 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 			return DecisionAsk, reason
 		}
 	}
+	// Bash needs a command-aware gate: a whole-string glob rule can otherwise
+	// approve a chained command (`git status && <anything>`) whose tail the user
+	// never sanctioned. Handle Bash with the segment-aware path and return here;
+	// every non-Bash tool falls through to the generic rule/session/bypass chain.
+	if toolName == "Bash" {
+		command := StringArg(args, "command", "")
+		if commandAllowedByRules(command, policy.AlwaysAllow) {
+			return DecisionAllow, "allowed by always_allow rule"
+		}
+		if allowedSession {
+			return DecisionAllow, "allowed by session rule"
+		}
+		if allowAll || mode == ModeBypass {
+			return DecisionAllow, "bypass mode"
+		}
+		return m.checkBash(mode, command)
+	}
 	for _, allow := range policy.AlwaysAllow {
 		if ruleMatches(allow, toolName, invocation) {
 			return DecisionAllow, fmt.Sprintf("allowed by always_allow rule %q", allow)
@@ -258,13 +297,20 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 		return DecisionAllow, "bypass mode"
 	}
 
-	// Tool-specific classification.
+	// A namespaced MCP tool (`mcp__<server>__<tool>`) is remote-provided: its
+	// name is attacker-controlled text from a server, so it must never be
+	// auto-approved by the built-in name classification below. It can still be
+	// allowed via an explicit always_allow rule (checked above) or bypass mode,
+	// but its default is an ask — mirroring Claude Code (MCP tools are always
+	// passthrough) and Codex (never self-allowed). This gate is defense in
+	// depth: namespacing already keeps remote names out of the switch cases.
+	if isNamespacedMCPToolName(toolName) {
+		return DecisionAsk, fmt.Sprintf("MCP tool %q requires approval", toolName)
+	}
+
+	// Tool-specific classification. Bash is handled earlier via the
+	// segment-aware gate, so it is intentionally absent from this switch.
 	switch toolName {
-	case "Bash":
-		if mode == ModePlan {
-			return DecisionAsk, "Bash is not available in plan mode"
-		}
-		return m.checkBash(mode, StringArg(args, "command", ""))
 	case "Write", "Edit":
 		if mode == ModePlan {
 			return DecisionAsk, fmt.Sprintf("%s is not available in plan mode", toolName)
@@ -417,6 +463,28 @@ func (m *Manager) CheckExecution(mode ExecutionMode, toolName string, args map[s
 	return m.Check(toolName, args)
 }
 
+// ValidatePermissionRule reports whether a rule is worth storing. It refuses
+// the over-broad "allow every Bash command" forms, which silently disable the
+// command gate. kind is "allow" or "deny".
+func ValidatePermissionRule(kind, rule string) error {
+	rule = strings.TrimSpace(rule)
+	if rule == "" {
+		return errors.New("permission rule must not be empty")
+	}
+	if strings.ContainsRune(rule, '\n') {
+		return errors.New("permission rule must be a single line")
+	}
+	if kind == "allow" {
+		bare := strings.TrimSuffix(rule, ":*")
+		bare = strings.TrimSuffix(bare, "*")
+		bare = strings.TrimSuffix(bare, ":")
+		if bare == "Bash" {
+			return errors.New(`refusing to allow all of "Bash": that disables the command gate; allow a specific command such as Bash:git status* instead`)
+		}
+	}
+	return nil
+}
+
 func (m *Manager) checkBash(mode Mode, command string) (Decision, string) {
 	command = strings.TrimSpace(command)
 	if command == "" {
@@ -429,21 +497,87 @@ func (m *Manager) checkBash(mode Mode, command string) (Decision, string) {
 			return DecisionDeny, fmt.Sprintf("dangerous command pattern: %s", pat.desc)
 		}
 	}
-
-	// Safe read-only prefixes are always allowed.
-	first := firstToken(command)
-	if safeTokens[first] && !hasDangerousOperator(command) {
-		return DecisionAllow, "read-only command"
-	}
-	if !hasDangerousOperator(command) && gitSafe(command) {
-		return DecisionAllow, "safe git command"
-	}
-
-	// Everything else asks, even in acceptEdits (which only auto-accepts file edits).
 	if mode == ModeBypass {
 		return DecisionAllow, "bypass mode"
 	}
-	return DecisionAsk, "command is not in the safe allowlist"
+
+	// Split into sequential command segments and require *every* one to be
+	// individually read-only. A chain like `git status && rm -rf x` no longer
+	// inherits the leading command's safety, and constructs we cannot tokenize
+	// (command substitution, subshells, unbalanced quotes) fail closed to ask.
+	segments, ok := splitCommandSegments(command)
+	if !ok || len(segments) == 0 {
+		return DecisionAsk, "command uses shell constructs that cannot be auto-approved"
+	}
+	for _, segment := range segments {
+		if !segmentReadOnly(segment) {
+			return DecisionAsk, "command is not in the safe allowlist"
+		}
+	}
+	return DecisionAllow, "read-only command"
+}
+
+// segmentReadOnly reports whether a single command segment (no control
+// operators) is safe to auto-allow: a read-only binary or a conservative git
+// subcommand, with no redirections or mutation primaries.
+func segmentReadOnly(segment string) bool {
+	segment = strings.TrimSpace(segment)
+	if segment == "" {
+		return true
+	}
+	if hasDangerousOperator(segment) {
+		return false
+	}
+	if safeTokens[firstToken(segment)] {
+		return true
+	}
+	return gitSafe(segment)
+}
+
+// commandAllowedByRules reports whether an always_allow rule set covers a Bash
+// command. Unlike the historic whole-string glob, it splits the command into
+// segments and requires every segment to be matched by some rule, so an allow
+// rule for the head of a chain cannot authorize its tail. A bare `Bash` rule is
+// an explicit whole-tool opt-in by the user and permits any command.
+func commandAllowedByRules(command string, rules []string) bool {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return false
+	}
+	for _, rule := range rules {
+		if rule == "Bash" {
+			return true
+		}
+	}
+	segments, ok := splitCommandSegments(command)
+	if !ok || len(segments) == 0 {
+		return false
+	}
+	for _, segment := range segments {
+		covered := false
+		for _, rule := range rules {
+			if bashRuleCoversSegment(rule, segment) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return false
+		}
+	}
+	return true
+}
+
+// bashRuleCoversSegment matches one command segment against one allow rule.
+// Rules may be written with or without the `Bash:` prefix; both forms glob the
+// bare command text, anchored and case-insensitive.
+func bashRuleCoversSegment(rule, segment string) bool {
+	pattern := strings.TrimPrefix(rule, "Bash:")
+	if pattern == "" {
+		return false
+	}
+	ok, _ := globMatch(pattern, segment)
+	return ok
 }
 
 // describeInvocation produces a stable key for rule matching and rememberance.
@@ -463,6 +597,18 @@ func SessionKey(toolName string, args map[string]any) string {
 		return CommandKey(StringArg(args, "command", ""))
 	}
 	return describeInvocation(toolName, args)
+}
+
+// mcpToolNamePrefix is kept in lockstep with protocol.MCPToolNamePrefix. The
+// permissions package deliberately carries no internal dependencies, so the
+// prefix is restated here rather than imported; protocol.MCPToolName is the
+// single producer of qualified MCP names.
+const mcpToolNamePrefix = "mcp__"
+
+// isNamespacedMCPToolName reports whether a tool name was published by an MCP
+// server (it carries the `mcp__` qualification).
+func isNamespacedMCPToolName(name string) bool {
+	return strings.HasPrefix(name, mcpToolNamePrefix)
 }
 
 // ruleMatches supports rules like "Bash" (whole tool) or "Bash:git status*"
@@ -585,16 +731,141 @@ func hasDangerousOperator(s string) bool {
 	return false
 }
 
-// gitSafe allows a conservative subset of git commands.
-func gitSafe(command string) bool {
-	for _, p := range []string{
-		"git status", "git diff", "git log", "git branch", "git remote",
-		"git config --list", "git stash list", "git show", "git blame",
-		"git rev-parse", "git shortlog", "git tag", "git describe",
-	} {
-		if strings.HasPrefix(command, p) {
-			return true
+// splitCommandSegments divides a shell command line into its sequential
+// command segments on the control operators `;`, `&&`, `||`, `|`, `&` and new
+// lines. It reports ok=false for anything it cannot tokenize conservatively —
+// command substitution `$(`/backticks, subshell parentheses, or an unbalanced
+// quote — so callers fail closed to an approval prompt rather than guessing.
+// Redirections (`<`, `>`) are kept inside a segment; hasDangerousOperator flags
+// them there.
+func splitCommandSegments(s string) ([]string, bool) {
+	var (
+		segments     []string
+		current      strings.Builder
+		inSingle     bool
+		inDouble     bool
+		runes        = []rune(s)
+		flushSegment = func() {
+			if t := strings.TrimSpace(current.String()); t != "" {
+				segments = append(segments, t)
+			}
+			current.Reset()
 		}
+	)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+			current.WriteRune(r)
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+			current.WriteRune(r)
+		case r == '\\' && !inSingle:
+			current.WriteRune(r)
+			if i+1 < len(runes) {
+				i++
+				current.WriteRune(runes[i])
+			}
+		case inSingle || inDouble:
+			current.WriteRune(r)
+		case r == '$' && i+1 < len(runes) && runes[i+1] == '(':
+			return nil, false // command substitution
+		case r == '`':
+			return nil, false // command substitution
+		case r == '(' || r == ')':
+			return nil, false // subshell / process substitution
+		case r == ';' || r == '\n':
+			flushSegment()
+		case r == '&':
+			if i+1 < len(runes) && runes[i+1] == '&' {
+				i++ // consume the second '&' of &&
+			}
+			flushSegment()
+		case r == '|':
+			if i+1 < len(runes) && runes[i+1] == '|' {
+				i++ // consume the second '|' of ||
+			}
+			flushSegment()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if inSingle || inDouble {
+		return nil, false // unbalanced quote
+	}
+	flushSegment()
+	return segments, true
+}
+
+// gitSafe allows a conservative, argv-aware subset of read-only git commands.
+// Matching is per-token so a mutating subcommand can never piggy-back on a safe
+// prefix (`git remote set-url`, `git branch -D`, `git tag v1` all fall through
+// to the ask gate) — the historic strings.HasPrefix check let them slip by.
+func gitSafe(command string) bool {
+	tokens := strings.Fields(command)
+	if len(tokens) < 2 || tokens[0] != "git" {
+		return false
+	}
+	sub := tokens[1]
+	args := tokens[2:]
+	switch sub {
+	case "status", "diff", "log", "show", "blame", "rev-parse", "describe", "shortlog", "ls-files", "grep":
+		return true
+	case "branch":
+		return gitListOnlySubcommand(args, map[string]bool{
+			"-d": true, "-D": true, "--delete": true,
+			"-m": true, "-M": true, "--move": true,
+			"-c": true, "-C": true, "--copy": true,
+		})
+	case "tag":
+		return gitListOnlySubcommand(args, map[string]bool{"-d": true, "--delete": true, "-v": true})
+	case "remote":
+		return gitRemoteSafe(args)
+	case "config":
+		return len(args) > 0 && (args[0] == "--list" || args[0] == "-l")
+	case "stash":
+		return len(args) > 0 && args[0] == "list"
+	}
+	return false
+}
+
+// gitListOnlySubcommand permits only flag-form, non-mutating arguments (a bare
+// listing such as `git branch -a`); a positional argument or a delete/move flag
+// means the subcommand mutates, so it is rejected.
+func gitListOnlySubcommand(args []string, mutating map[string]bool) bool {
+	for _, arg := range args {
+		if mutating[arg] {
+			return false
+		}
+		if !strings.HasPrefix(arg, "-") {
+			return false // positional arg creates/deletes rather than lists
+		}
+	}
+	return true
+}
+
+// gitRemoteSafe allows only the read-only forms of `git remote`: the bare list,
+// its verbose variant, `show`, and `get-url`. Anything that mutates remotes
+// (add/remove/set-url/rename/prune/update/fetch) is rejected.
+func gitRemoteSafe(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	switch args[0] {
+	case "show", "get-url":
+		return true
+	}
+	if strings.HasPrefix(args[0], "-") {
+		for _, arg := range args {
+			switch arg {
+			case "-v", "--verbose", "--no-color", "-n":
+				continue
+			default:
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }
@@ -628,7 +899,9 @@ var denyPatterns = []denyPattern{
 	{regexp.MustCompile(`wget\s+.*\|.*sh\s*$`), "wget|sh remote execution"},
 	{regexp.MustCompile(`chmod\s+-R\s*7\s*/\s*$`), "chmod -R 777 /"},
 	{regexp.MustCompile(`:\(\)`), "fork bomb"},
-	{regexp.MustCompile(`git\s+push\s+--force`), "force push"},
+	{regexp.MustCompile(`git\s+push\b[^\n]*(\s--force(-with-lease)?\b|\s-f\b)`), "force push"},
 	{regexp.MustCompile(`git\s+reset\s+--hard`), "destructive git reset"},
+	{regexp.MustCompile(`git\s+clean\s+-[a-zA-Z]*f`), "git clean with force"},
+	{regexp.MustCompile(`git\s+(checkout|restore)\b[^\n]*\s(\.|\-\s|\-\-)\s*$`), "discard working tree changes"},
 	{regexp.MustCompile(`git\s+checkout\s+--\s`), "discard working tree changes"},
 }

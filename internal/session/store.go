@@ -275,48 +275,81 @@ func encodeTransaction(txID string, first Cursor, events []wireEvent, inputFinge
 	return line, envelope, nil
 }
 
-func parseTransaction(data []byte) (transactionEnvelope, []Event, []wireEvent, error) {
+func parseTransaction(data []byte) (parsedTransaction, error) {
 	var envelope transactionEnvelope
 	if err := decodeStrict(data, &envelope); err != nil {
 		if isUnexpectedEOF(err) {
-			return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: transaction JSON: %v", ErrTorn, err)
+			return parsedTransaction{}, fmt.Errorf("%w: transaction JSON: %v", ErrTorn, err)
 		}
-		return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: transaction JSON: %v", ErrCorrupt, err)
+		return parsedTransaction{}, fmt.Errorf("%w: transaction JSON: %v", ErrCorrupt, err)
 	}
 	if envelope.SchemaVersion > SchemaVersion {
-		return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: transaction schema_version %d", ErrFutureVersion, envelope.SchemaVersion)
+		return parsedTransaction{}, fmt.Errorf("%w: transaction schema_version %d", ErrFutureVersion, envelope.SchemaVersion)
 	}
 	if envelope.SchemaVersion != SchemaVersion {
-		return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: unsupported transaction schema_version %d", ErrCorrupt, envelope.SchemaVersion)
+		return parsedTransaction{}, fmt.Errorf("%w: unsupported transaction schema_version %d", ErrCorrupt, envelope.SchemaVersion)
 	}
 	if envelope.TransactionID == "" || envelope.FirstSeq == 0 || envelope.LastSeq < envelope.FirstSeq || len(envelope.Events) == 0 || envelope.InputFingerprint == "" {
-		return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: invalid transaction bounds or ID", ErrCorrupt)
+		return parsedTransaction{}, fmt.Errorf("%w: invalid transaction bounds or ID", ErrCorrupt)
 	}
 	if envelope.LastSeq-envelope.FirstSeq+1 != Cursor(len(envelope.Events)) {
-		return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: transaction sequence count mismatch", ErrCorrupt)
+		return parsedTransaction{}, fmt.Errorf("%w: transaction sequence count mismatch", ErrCorrupt)
 	}
 	checksum, err := checksumBody(envelope.body())
 	if err != nil || !strings.EqualFold(checksum, envelope.Checksum) {
 		if err != nil {
-			return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: checksum: %v", ErrCorrupt, err)
+			return parsedTransaction{}, fmt.Errorf("%w: checksum: %v", ErrCorrupt, err)
 		}
-		return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: transaction checksum mismatch", ErrCorrupt)
+		return parsedTransaction{}, fmt.Errorf("%w: transaction checksum mismatch", ErrCorrupt)
 	}
-	events := make([]Event, 0, len(envelope.Events))
+	parsed := parsedTransaction{
+		envelope: envelope,
+		events:   make([]Event, 0, len(envelope.Events)),
+		wires:    make([]wireEvent, 0, len(envelope.Events)),
+		seqs:     make([]Cursor, 0, len(envelope.Events)),
+	}
 	for i, wire := range envelope.Events {
+		seq := envelope.FirstSeq + Cursor(i)
 		event, err := decodeEvent(wire)
 		if err != nil {
+			if errors.Is(err, ErrUnknownEventType) {
+				// Version skew, not damage: the record is intact and checksummed,
+				// this build simply has no type for it. Count and skip it so a log
+				// written by another build still resumes; everything else in the
+				// transaction keeps its own sequence position.
+				parsed.skipped = append(parsed.skipped, SkippedRecord{Seq: seq, Kind: wire.Type, Reason: err.Error()})
+				continue
+			}
 			if isUnexpectedEOF(err) {
-				return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: event %d: %v", ErrTorn, i, err)
+				return parsedTransaction{}, fmt.Errorf("%w: event %d: %v", ErrTorn, i, err)
 			}
-			if strings.Contains(err.Error(), "unknown event type") {
-				return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: %v", ErrUnknownEventType, err)
-			}
-			return transactionEnvelope{}, nil, nil, fmt.Errorf("%w: event %d: %v", ErrCorrupt, i, err)
+			return parsedTransaction{}, fmt.Errorf("%w: event %d: %v", ErrCorrupt, i, err)
 		}
-		events = append(events, event)
+		parsed.events = append(parsed.events, event)
+		parsed.wires = append(parsed.wires, wire)
+		parsed.seqs = append(parsed.seqs, seq)
 	}
-	return envelope, events, envelope.Events, nil
+	return parsed, nil
+}
+
+// parsedTransaction is one verified transaction line as replay sees it: the
+// events this build can decode, each with the sequence number it occupies in
+// the log, plus the records it had to skip.
+type parsedTransaction struct {
+	envelope transactionEnvelope
+	events   []Event
+	wires    []wireEvent
+	seqs     []Cursor
+	skipped  []SkippedRecord
+}
+
+// SkippedRecord names one durable event that replay could not decode because
+// this build has no type for it. Skipping is confined to version skew; corrupt
+// or torn records still fail the open.
+type SkippedRecord struct {
+	Seq    Cursor
+	Kind   EventType
+	Reason string
 }
 
 type storedTransaction struct {
@@ -335,6 +368,9 @@ type logState struct {
 	Records      []Record
 	Transactions map[string]storedTransaction
 	Dedupe       map[string]dedupeEntry
+	// Skipped lists records replay could not decode because this build has no
+	// event type for them. It is only ever filled while reading a log.
+	Skipped []SkippedRecord
 }
 
 func newLogState() logState {
@@ -355,9 +391,16 @@ type preparedCommit struct {
 	InputFingerprint string
 	Events           []Event
 	Wires            []wireEvent
-	Line             []byte
-	Envelope         transactionEnvelope
-	Result           CommitResult
+	// Seqs gives each event its sequence number in the log. The live write path
+	// leaves it nil, because there the events are contiguous from FirstSeq;
+	// replay fills it in, because skipped records leave holes behind.
+	Seqs []Cursor
+	// Skipped carries the records replay dropped for version skew, so applying
+	// the transaction also accounts for them.
+	Skipped  []SkippedRecord
+	Line     []byte
+	Envelope transactionEnvelope
+	Result   CommitResult
 }
 
 func prepareCommit(state *logState, expected Cursor, batch Batch, options JSONLOptions) (preparedCommit, error) {
@@ -463,18 +506,22 @@ func prepareCommit(state *logState, expected Cursor, batch Batch, options JSONLO
 }
 
 func applyPrepared(state *logState, prepared preparedCommit) {
-	if len(prepared.Events) == 0 || !prepared.Result.Applied {
+	if !prepared.Result.Applied {
 		return
 	}
 	fingerprint := transactionFingerprint(prepared.Wires)
 	state.Transactions[prepared.TransactionID] = storedTransaction{Result: prepared.Result, Fingerprint: fingerprint, InputFingerprint: prepared.InputFingerprint}
 	for i, event := range prepared.Events {
 		seq := prepared.Envelope.FirstSeq + Cursor(i)
+		if prepared.Seqs != nil {
+			seq = prepared.Seqs[i]
+		}
 		state.Records = append(state.Records, Record{Seq: seq, TransactionID: prepared.TransactionID, Event: event})
 		if key := eventDedupeKey(event); key != "" {
 			state.Dedupe[key] = dedupeEntry{Fingerprint: eventFingerprint(prepared.Wires[i]), Result: prepared.Result}
 		}
 	}
+	state.Skipped = append(state.Skipped, prepared.Skipped...)
 	state.Cursor = prepared.Result.Cursor
 }
 

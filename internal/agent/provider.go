@@ -50,47 +50,67 @@ func requestJournalMetadataFrom(ctx context.Context) (requestJournalMetadata, bo
 }
 
 // httpProviderFor creates the built-in OpenAI-compatible adapter for exactly
-// one model. EndpointFor is evaluated with the frozen config supplied by the
-// caller; no registry fallback is consulted here.
-func httpProviderFor(cfg config.Config, model string) (llm.Provider, string, error) {
-	baseURL, apiKey := cfg.EndpointFor(model)
+// one model from the caller's already-resolved binding. The endpoint, key and
+// wire format arrive as one value so a model's credential can never be paired
+// with a different provider's wire format.
+func httpProviderFor(cfg config.Config, model string, binding plugin.HTTPBinding) (llm.Provider, error) {
 	client, err := llm.NewClient(llm.Config{
-		BaseURL:         baseURL,
-		APIKey:          apiKey,
+		BaseURL:         binding.Endpoint,
+		APIKey:          binding.APIKey,
 		Model:           model,
+		APIModel:        cfg.APIModelFor(model),
 		ContextWindow:   cfg.ContextWindow,
-		MaxOutputTokens: cfg.MaxReplyTokens,
+		MaxOutputTokens: cfg.MaxOutputTokensFor(model),
 		Timeout:         10 * time.Minute,
 		// The runtime journals one RequestPrepared/AttemptFinished pair around
 		// each provider call. Keep HTTP retry decisions at that boundary so a
 		// transient failure cannot disappear inside one opaque Stream call.
 		OneAttempt: true,
+		Wire:       binding.Wire,
 		Debug:      cfg.Debug,
 	})
 	if err != nil {
-		return nil, baseURL, err
+		return nil, err
 	}
-	return client, baseURL, nil
+	return client, nil
 }
 
-// resolveProviderForModel resolves a provider and its public endpoint as one
-// binding. Explicit plugin routes always win. If no route exists, an HTTP
-// adapter is created for this model's own config endpoint and registered under
-// that model. In particular, a sole unrelated registry provider is never used
-// for a model with a different configured endpoint.
-func resolveProviderForModel(cfg config.Config, models *plugin.ModelRegistry, model string) (llm.Provider, string, string, error) {
+// resolvedRoute is the atomic provider identity for one model: the adapter, its
+// public endpoint, where the route came from, and — for a generated HTTP
+// adapter — the wire format and the config provider record that produced the
+// whole tuple. A plugin route carries neither wire nor providerID because
+// neither is derived from the HTTP config.
+type resolvedRoute struct {
+	client     llm.Provider
+	endpoint   string
+	routeKind  string
+	wire       string
+	providerID string
+}
+
+// resolveProviderForModel resolves a provider and its complete endpoint/key/wire
+// binding as one unit. Explicit plugin routes always win. If no route exists, an
+// HTTP adapter is created for this model's own config binding and registered
+// under that model. In particular, a sole unrelated registry provider is never
+// used for a model with a different configured endpoint.
+func resolveProviderForModel(cfg config.Config, models *plugin.ModelRegistry, model string) (resolvedRoute, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return nil, "", "", errors.New("agent: model is required")
+		return resolvedRoute{}, errors.New("agent: model is required")
 	}
-	endpoint, apiKey := cfg.EndpointFor(model)
+	if err := cfg.ValidateModelSelection(model); err != nil {
+		return resolvedRoute{}, err
+	}
+	cfg.ContextWindow = cfg.ContextWindowFor(model)
+	resolved := cfg.ResolveProvider(model)
+	binding := plugin.HTTPBinding{Endpoint: resolved.BaseURL, APIKey: resolved.APIKey, Wire: resolved.Wire}
 	if models != nil {
-		if p, ok := models.ResolveDefault(model, endpoint, apiKey); ok && p != nil {
-			return providerWithOperatorCaps(cfg, p), endpoint, "http", nil
+		if p, ok := models.ResolveDefault(model, binding); ok && p != nil && httpCapsMatch(cfg, model, p) {
+			return resolvedRoute{client: providerWithOperatorCaps(cfg, model, p), endpoint: binding.Endpoint, routeKind: "http", wire: binding.Wire, providerID: resolved.ID}, nil
 		}
 		if p, routeKind, routeEndpoint, ok := models.ResolveRouteInfo(model); ok && p != nil {
 			// A generated HTTP route is reusable only when ResolveDefault above
-			// matched the complete endpoint/key binding. If config was reloaded,
+			// matched the complete endpoint/key/wire binding. If config was reloaded,
 			// let the branch below create a fresh adapter for this model instead
 			// of inheriting the stale route. Explicit plugin routes are always
 			// authoritative and never borrow cfg's HTTP endpoint.
@@ -109,21 +129,27 @@ func resolveProviderForModel(cfg config.Config, models *plugin.ModelRegistry, mo
 				// description; an undescribed provider keeps the historical
 				// permissive tool/image/system behaviour but is still bounded by
 				// the operator window and reply cap.
-				return providerWithOperatorCaps(cfg, p), pluginEndpoint, "plugin", nil
+				return resolvedRoute{client: providerWithOperatorCaps(cfg, model, p), endpoint: pluginEndpoint, routeKind: "plugin"}, nil
 			}
 		}
 	}
-	p, endpoint, err := httpProviderFor(cfg, model)
+	p, err := httpProviderFor(cfg, model, binding)
 	if err != nil {
-		return nil, endpoint, "", err
+		return resolvedRoute{}, err
 	}
 	if models != nil {
 		// Registering a per-model adapter is what makes later preparations use
-		// the same endpoint without invoking Resolve's sole-provider fallback.
+		// the same binding without invoking Resolve's sole-provider fallback.
 		models.Register(p)
-		models.RouteDefault(model, p.Name(), endpoint, apiKey)
+		models.RouteDefault(model, p.Name(), binding)
 	}
-	return p, endpoint, "http", nil
+	return resolvedRoute{client: p, endpoint: binding.Endpoint, routeKind: "http", wire: binding.Wire, providerID: resolved.ID}, nil
+}
+
+// Recreate generated adapters when configured budgets change, including increases.
+func httpCapsMatch(cfg config.Config, model string, p llm.Provider) bool {
+	caps, ok := llm.ProviderCapabilitiesOf(p)
+	return ok && caps.ContextWindow == cfg.ContextWindow && caps.MaxOutputTokens == cfg.MaxOutputTokensFor(model)
 }
 
 // operatorCapsProvider is the small adapter used for explicit plugin routes.
@@ -152,8 +178,8 @@ func (p *operatorCapsProvider) StreamWithReasoning(ctx context.Context, req llm.
 	return p.provider.Stream(ctx, req, onDelta)
 }
 
-func providerWithOperatorCaps(cfg config.Config, provider llm.Provider) llm.Provider {
-	if provider == nil || (cfg.ContextWindow <= 0 && cfg.MaxReplyTokens <= 0) {
+func providerWithOperatorCaps(cfg config.Config, model string, provider llm.Provider) llm.Provider {
+	if provider == nil || (cfg.ContextWindow <= 0 && cfg.MaxOutputTokensFor(model) <= 0) {
 		return provider
 	}
 	caps, described := llm.ProviderCapabilitiesOf(provider)
@@ -165,8 +191,8 @@ func providerWithOperatorCaps(cfg config.Config, provider llm.Provider) llm.Prov
 	if cfg.ContextWindow > 0 && (caps.ContextWindow <= 0 || cfg.ContextWindow < caps.ContextWindow) {
 		caps.ContextWindow = cfg.ContextWindow
 	}
-	if cfg.MaxReplyTokens > 0 && (caps.MaxOutputTokens <= 0 || cfg.MaxReplyTokens < caps.MaxOutputTokens) {
-		caps.MaxOutputTokens = cfg.MaxReplyTokens
+	if cfg.MaxOutputTokensFor(model) > 0 && (caps.MaxOutputTokens <= 0 || cfg.MaxOutputTokensFor(model) < caps.MaxOutputTokens) {
+		caps.MaxOutputTokens = cfg.MaxOutputTokensFor(model)
 	}
 	// Avoid wrapping an HTTP client (or another provider already carrying the
 	// same ceilings) so registry identity and its optional methods remain
@@ -183,11 +209,20 @@ func providerWithOperatorCaps(cfg config.Config, provider llm.Provider) llm.Prov
 // providerBinding builds an immutable binding without consulting mutable Agent
 // state after the config/registry snapshots have been captured.
 func providerBinding(cfg config.Config, models *plugin.ModelRegistry, model string, version uint64) (modelBinding, error) {
-	p, endpoint, routeKind, err := resolveProviderForModel(cfg, models, model)
+	route, err := resolveProviderForModel(cfg, models, model)
 	if err != nil {
 		return modelBinding{}, fmt.Errorf("resolve provider for %s: %w", model, err)
 	}
-	return modelBinding{model: model, provider: p.Name(), endpoint: endpoint, routeKind: routeKind, client: p, version: version}, nil
+	return modelBinding{
+		model:      model,
+		provider:   route.client.Name(),
+		endpoint:   route.endpoint,
+		routeKind:  route.routeKind,
+		wire:       route.wire,
+		providerID: route.providerID,
+		client:     route.client,
+		version:    version,
+	}, nil
 }
 
 // prepareProviderCall is the only request-to-provider boundary. The request

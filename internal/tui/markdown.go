@@ -1,7 +1,7 @@
 package tui
 
 // This file contains the deliberately small Markdown projection used by the
-// transcript.  It is a display parser: logItem.text remains the source of
+// transcript.  It is a display parser: historyCell.text remains the source of
 // truth, and callers that copy or export a message continue to use that raw
 // text.  Keeping the parser here also makes it possible to render streamed
 // assistant text conservatively without teaching tool output about Markdown.
@@ -52,7 +52,7 @@ const maxMarkdownLines = 8192
 
 // A source block can be much larger than the managed frame. Keep parsing
 // bounded while retaining the opening fence and the newest tail so an active
-// stream shows its latest output; the complete source remains on logItem and
+// stream shows its latest output; the complete source remains on historyCell and
 // is available to the reader.
 const maxMarkdownPreviewLines = 256
 
@@ -218,7 +218,7 @@ func markdownTableCells(line string) []string {
 
 // renderMarkdown is the assistant-only rich text projection.  width is a
 // terminal cell width; source is never changed by this function.
-func renderMarkdown(source string, width int) string {
+func renderMarkdown(source string, width int, workspace ...string) string {
 	width = max(1, width)
 	blocks, truncated := parseMarkdownBlocksBounded(source)
 	if len(blocks) == 0 {
@@ -229,7 +229,7 @@ func renderMarkdown(source string, width int) string {
 		if bi > 0 {
 			rows = append(rows, "")
 		}
-		rows = append(rows, renderMarkdownBlock(block, width)...)
+		rows = append(rows, renderMarkdownBlock(block, width, workspace...)...)
 	}
 	if truncated {
 		rows = append(rows, "", styleStatus.Render("… content continues in the reader"))
@@ -237,7 +237,7 @@ func renderMarkdown(source string, width int) string {
 	return strings.TrimRight(strings.Join(rows, "\n"), "\n")
 }
 
-func renderMarkdownBlock(block markdownBlock, width int) []string {
+func renderMarkdownBlock(block markdownBlock, width int, workspace ...string) []string {
 	switch block.kind {
 	case markdownHeading:
 		if len(block.lines) == 0 {
@@ -245,7 +245,7 @@ func renderMarkdownBlock(block markdownBlock, width int) []string {
 		}
 		prefix := strings.Repeat("#", max(1, min(6, block.level)))
 		_ = prefix // The source marker is intentionally omitted from display.
-		return []string{styleAssistant.Bold(true).Render(renderMarkdownInline(block.lines[0]))}
+		return []string{styleAssistant.Bold(true).Render(renderMarkdownInline(block.lines[0], workspace...))}
 	case markdownCode:
 		if (strings.EqualFold(block.language, "diff") || strings.EqualFold(block.language, "patch")) && isUnifiedDiff(strings.Join(block.lines, "\n")) {
 			return strings.Split(renderDiff(strings.Join(block.lines, "\n"), width), "\n")
@@ -262,21 +262,21 @@ func renderMarkdownBlock(block markdownBlock, width int) []string {
 			indent := match[1]
 			marker := match[2]
 			body := match[3]
-			out = append(out, styleBrand.Render(indent+marker)+" "+renderMarkdownInline(body))
+			out = append(out, styleBrand.Render(indent+marker)+" "+renderMarkdownInline(body, workspace...))
 		}
 		return out
 	case markdownQuote:
 		out := make([]string, 0, len(block.lines))
 		for _, line := range block.lines {
-			out = append(out, styleDivider.Render("│ ")+styleStatus.Render(renderMarkdownInline(line)))
+			out = append(out, styleDivider.Render("│ ")+styleStatus.Render(renderMarkdownInline(line, workspace...)))
 		}
 		return out
 	case markdownTable:
-		return renderMarkdownTable(block.lines, width)
+		return renderMarkdownTable(block.lines, width, workspace...)
 	default:
 		out := make([]string, 0, len(block.lines))
 		for _, line := range block.lines {
-			out = append(out, renderMarkdownInline(line))
+			out = append(out, renderMarkdownInline(line, workspace...))
 		}
 		return out
 	}
@@ -284,15 +284,23 @@ func renderMarkdownBlock(block markdownBlock, width int) []string {
 
 func renderMarkdownCode(block markdownBlock, width int) []string {
 	out := make([]string, 0, len(block.lines)+1)
-	if block.language != "" {
+	lang := strings.ToLower(strings.TrimSpace(block.language))
+	if lang != "" && lang != "text" && lang != "txt" && lang != "plain" && lang != "plaintext" && lang != "output" && lang != "none" {
 		out = append(out, styleStatus.Render("  "+block.language))
 	}
 	codeWidth := max(4, width-2)
-	for _, line := range block.lines {
-		// Keep source indentation visible.  lipgloss wraps the final display
+	highlighted := highlightCode(block.lines, block.language, isDarkTheme())
+	for i, line := range block.lines {
+		styled := ""
+		if i < len(highlighted) && highlighted[i] != "" {
+			styled = highlighted[i]
+		} else {
+			styled = styleAssistant.Render(line)
+		}
+		// Keep source indentation visible. lipgloss wraps the final display
 		// line at the component boundary if a code line is very long.
 		if lipgloss.Width(line) <= codeWidth {
-			out = append(out, styleDivider.Render("│ ")+styleAssistant.Render(line))
+			out = append(out, styleDivider.Render("│ ")+styled)
 			continue
 		}
 		parts := wrapMarkdownCodeLine(line, codeWidth)
@@ -332,7 +340,7 @@ func wrapMarkdownCodeLine(line string, width int) []string {
 	return parts
 }
 
-func renderMarkdownTable(raw []string, width int) []string {
+func renderMarkdownTable(raw []string, width int, workspace ...string) []string {
 	if len(raw) < 2 {
 		return nil
 	}
@@ -351,7 +359,7 @@ func renderMarkdownTable(raw []string, width int) []string {
 	// A table should not make a narrow terminal unreadable. Key/value rows
 	// retain every cell and are easier to scan than a clipped grid.
 	if width < 48 || columns > 4 {
-		return renderMarkdownTableKeyValue(headers, rows, width)
+		return renderMarkdownTableKeyValue(headers, rows, width, workspace...)
 	}
 	widths := make([]int, columns)
 	all := append([][]string{headers}, rows...)
@@ -366,7 +374,7 @@ func renderMarkdownTable(raw []string, width int) []string {
 			// Keep every table value available in the display projection. A
 			// key/value fallback can wrap long cells without silently replacing
 			// their tail with an ellipsis.
-			return renderMarkdownTableKeyValue(headers, rows, width)
+			return renderMarkdownTableKeyValue(headers, rows, width, workspace...)
 		}
 		widths[ci] = min(widths[ci], cellLimit)
 	}
@@ -400,7 +408,7 @@ func renderMarkdownTable(raw []string, width int) []string {
 	return out
 }
 
-func renderMarkdownTableKeyValue(headers []string, rows [][]string, width int) []string {
+func renderMarkdownTableKeyValue(headers []string, rows [][]string, width int, workspace ...string) []string {
 	out := make([]string, 0, len(rows)*2+1)
 	for ri, row := range rows {
 		for ci, value := range row {
@@ -412,7 +420,7 @@ func renderMarkdownTableKeyValue(headers []string, rows [][]string, width int) [
 			if ri == 0 {
 				prefix = styleAssistant.Bold(true).Render(key + ": ")
 			}
-			out = append(out, presentationRows(prefix+renderMarkdownInline(value), width)...)
+			out = append(out, presentationRows(prefix+renderMarkdownInline(value, workspace...), width)...)
 		}
 	}
 	if len(out) == 0 {
@@ -426,7 +434,7 @@ func renderMarkdownTableKeyValue(headers []string, rows [][]string, width int) [
 // renderMarkdownInline handles only inline constructs with unambiguous
 // delimiters.  A malformed marker is emitted as ordinary text, avoiding the
 // common failure mode where shell output gets swallowed by a greedy parser.
-func renderMarkdownInline(source string) string {
+func renderMarkdownInline(source string, workspace ...string) string {
 	if source == "" {
 		return ""
 	}
@@ -459,8 +467,7 @@ func renderMarkdownInline(source string) string {
 				plain.Reset()
 				label := source[i+match[2] : i+match[3]]
 				url := source[i+match[4] : i+match[5]]
-				out.WriteString(styleMarkdownLink.Render(renderMarkdownInlinePlain(label)))
-				out.WriteString(styleStatus.Render(" (" + url + ")"))
+				out.WriteString(renderTerminalLink(renderMarkdownInlinePlain(label), url, workspace...))
 				i += match[1]
 				continue
 			}
@@ -540,111 +547,6 @@ func renderMarkdownInlinePlain(source string) string {
 	source = strings.ReplaceAll(source, "~~", "")
 	source = strings.ReplaceAll(source, "`", "")
 	return source
-}
-
-// markdownStream tracks source bytes separately from the display projection.
-// StablePrefix ends only at a safe newline or visual line boundary; an
-// unfinished fenced block/paragraph therefore remains in the managed tail.
-type markdownStream struct {
-	source    strings.Builder
-	committed int
-}
-
-func (s *markdownStream) Append(delta string) {
-	if s == nil || delta == "" {
-		return
-	}
-	s.source.WriteString(delta)
-}
-
-func (s *markdownStream) Source() string {
-	if s == nil {
-		return ""
-	}
-	return s.source.String()
-}
-
-func (s *markdownStream) StablePrefix(width int) string {
-	if s == nil {
-		return ""
-	}
-	source := s.Source()
-	end := markdownStablePrefixEnd(source, s.committed, width)
-	if end <= s.committed {
-		return ""
-	}
-	prefix := source[s.committed:end]
-	s.committed = end
-	return prefix
-}
-
-func (s *markdownStream) Tail() string {
-	if s == nil {
-		return ""
-	}
-	source := s.Source()
-	if s.committed >= len(source) {
-		return ""
-	}
-	return source[s.committed:]
-}
-
-func markdownStablePrefixEnd(source string, offset, width int) int {
-	if offset < 0 || offset > len(source) {
-		offset = 0
-	}
-	if offset >= len(source) {
-		return offset
-	}
-	// Keep an unclosed fence in the managed frame. Once the fence closes, the
-	// complete code block is safe to freeze as one display unit.
-	lastSafe := -1
-	inFence := false
-	lineStart := offset
-	for lineStart < len(source) {
-		lineEnd := strings.IndexByte(source[lineStart:], '\n')
-		if lineEnd < 0 {
-			break
-		}
-		lineEnd += lineStart + 1
-		line := strings.TrimSpace(source[lineStart : lineEnd-1])
-		if markdownFenceRE.MatchString(source[lineStart : lineEnd-1]) {
-			inFence = !inFence
-			if !inFence {
-				lastSafe = lineEnd
-			}
-		} else if !inFence && line == "" {
-			lastSafe = lineEnd
-		}
-		lineStart = lineEnd
-	}
-	if lastSafe > offset {
-		return lastSafe
-	}
-	// Long plain output still needs bounded streaming. Visual boundaries are a
-	// conservative fallback only when the current suffix has no Markdown
-	// markers. A pending list/table/emphasis block must stay in the managed tail
-	// until its source proves that the block is complete.
-	if !inFence && !markdownHasPendingSyntax(source[offset:]) {
-		return offset + streamCommitEnd(source[offset:], width)
-	}
-	return offset
-}
-
-func markdownHasPendingSyntax(source string) bool {
-	if strings.Count(source, "```")%2 == 1 ||
-		strings.Count(source, "**")%2 == 1 ||
-		strings.Count(source, "__")%2 == 1 ||
-		strings.Count(source, "~~")%2 == 1 {
-		return true
-	}
-	for _, line := range strings.Split(source, "\n") {
-		trimmed := strings.TrimLeft(line, " \t")
-		if strings.HasPrefix(trimmed, "|") || markdownListRE.MatchString(line) || markdownHeadingRE.MatchString(line) || strings.HasPrefix(trimmed, ">") {
-			return true
-		}
-	}
-	return false
 }
 
 func markdownTokenIsWord(r rune) bool {

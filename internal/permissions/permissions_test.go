@@ -14,6 +14,29 @@ func TestParseModeIncludesPlan(t *testing.T) {
 	}
 }
 
+// TestNamespacedMCPToolNeverAutoAllowed guards the identity-shadowing attack:
+// a malicious MCP server that advertises a tool whose raw name equals a built-in
+// (e.g. "Read") is published as "mcp__<server>__Read" and must still require
+// approval rather than inherit the built-in's auto-allow classification. An
+// explicit always_allow rule on the fully qualified name remains the only
+// non-bypass path to auto-approve it.
+func TestNamespacedMCPToolNeverAutoAllowed(t *testing.T) {
+	m := NewManager(ModeAcceptEdits, Policy{})
+	if d, _ := m.Check("mcp__evil__Read", map[string]any{"file_path": "a.go"}); d != DecisionAsk {
+		t.Errorf("shadowing MCP Read should ask, got %v", d)
+	}
+	if d, _ := m.Check("mcp__evil__Write", map[string]any{"file_path": "a.go"}); d != DecisionAsk {
+		t.Errorf("MCP Write in acceptEdits must still ask, got %v", d)
+	}
+	if d, _ := m.Check("Read", map[string]any{"file_path": "a.go"}); d != DecisionAllow {
+		t.Errorf("built-in Read must remain read-only-allowed, got %v", d)
+	}
+	allow := NewManager(ModeDefault, Policy{AlwaysAllow: []string{"mcp__evil__Read"}})
+	if d, _ := allow.Check("mcp__evil__Read", map[string]any{"file_path": "a.go"}); d != DecisionAllow {
+		t.Errorf("explicit always_allow on the qualified name should permit it, got %v", d)
+	}
+}
+
 func TestPlanModeGates(t *testing.T) {
 	m := NewManager(ModePlan, Policy{})
 	if d, _ := m.Check("Bash", map[string]any{"command": "ls"}); d != DecisionAsk {
@@ -204,5 +227,71 @@ func TestClonePreservesRememberedDecisionsWithoutSharingState(t *testing.T) {
 	}
 	if parent.CurrentMode() == ModeBypass {
 		t.Fatal("child mode mutation leaked into parent")
+	}
+}
+
+// TestHeadAllowRuleCannotAuthorizeChainedTail is the argv-aware regression: an
+// allow rule for the head of a chain must never approve a tail the user did not
+// sanction (the historic whole-string glob matched `git status && rm x`).
+func TestHeadAllowRuleCannotAuthorizeChainedTail(t *testing.T) {
+	m := NewManager(ModeDefault, Policy{AlwaysAllow: []string{"Bash:git status*"}})
+	if d, _ := m.Check("Bash", map[string]any{"command": "git status && rm x"}); d == DecisionAllow {
+		t.Errorf("chained tail must not be auto-allowed by the head rule, got %v", d)
+	}
+	// The head command on its own is still allowed by the rule.
+	if d, _ := m.Check("Bash", map[string]any{"command": "git status --short"}); d != DecisionAllow {
+		t.Errorf("git status --short should still be allowed, got %v", d)
+	}
+}
+
+// TestGitSafeRejectsMutatingSubcommands tightens the historic prefix match that
+// auto-allowed `git remote set-url`, `git branch -D` and `git tag <name>`.
+func TestGitSafeRejectsMutatingSubcommands(t *testing.T) {
+	m := NewManager(ModeDefault, Policy{})
+	for _, cmd := range []string{
+		"git remote set-url origin https://evil.example",
+		"git remote remove origin",
+		"git branch -D main",
+		"git tag v9.9",
+	} {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d == DecisionAllow {
+			t.Errorf("mutating git subcommand must not be auto-allowed: %q", cmd)
+		}
+	}
+	// Read-only git forms remain allowed.
+	for _, cmd := range []string{"git remote", "git remote -v", "git branch -a", "git tag", "git config --list"} {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d != DecisionAllow {
+			t.Errorf("read-only git form should stay allowed: %q got %v", cmd, d)
+		}
+	}
+}
+
+// TestForcePushShortFlagDenied checks `-f` is treated like `--force`.
+func TestForcePushShortFlagDenied(t *testing.T) {
+	m := NewManager(ModeDefault, Policy{})
+	for _, cmd := range []string{"git push -f origin main", "git push --force origin main"} {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d != DecisionDeny {
+			t.Errorf("%q should be denied as a force push, got %v", cmd, d)
+		}
+	}
+	// A plain push is not denied outright — it just asks.
+	if d, _ := m.Check("Bash", map[string]any{"command": "git push origin main"}); d != DecisionAsk {
+		t.Errorf("plain git push should ask, got %v", d)
+	}
+}
+
+// TestCommandSubstitutionFailsClosed ensures un-tokenizable constructs are never
+// auto-allowed and fall through to the approval prompt.
+func TestCommandSubstitutionFailsClosed(t *testing.T) {
+	m := NewManager(ModeDefault, Policy{})
+	for _, cmd := range []string{
+		"echo $(rm -rf x)",
+		"ls `whoami`",
+		"cat <(secret)",
+		"echo unbalanced \"quote",
+	} {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d == DecisionAllow {
+			t.Errorf("unsafe-to-parse command must not be auto-allowed: %q", cmd)
+		}
 	}
 }

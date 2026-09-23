@@ -39,183 +39,257 @@ import (
 //   - Each turn runs in its own goroutine; at most one turn is active.
 //   - Approval answers travel on approvalResp; interrupts are delivered via
 //     turnCancel + an interrupt flag.
-type Agent struct {
+//
+// Struct fields are grouped into a few embedded sub-structs purely for
+// declaration readability (Go field promotion keeps call sites unchanged).
+// All mutexes and the concurrency invariants stay on the Agent itself; the
+// sub-structs hold no locks of their own.
+//
+// planState groups plan-mode bookkeeping (Claude Code's /plan). Guarded by mu.
+type planState struct {
+	planMode     bool
+	pendingPlan  *PlanRequest
+	planResp     chan bool
+	planBaseMode permissions.Mode
+}
+
+// approvalState groups per-turn approval bookkeeping. Guarded by mu.
+type approvalState struct {
+	approvalCache map[string]bool
+	// Pending approval (guarded by mu).
+	pendingQuestion   *protocol.QuestionRequest
+	questionResp      chan protocol.AnswerQuestion
+	pendingApproval   *ApprovalRequest
+	approvalResp      chan approvalAnswer
+	approvalResolving bool
+}
+
+// modelState groups the primary + fallback model binding bookkeeping. Guarded
+// by mu (see currentProvider / activeModelSnapshot).
+type modelState struct {
+	// primaryBinding and fallbackBinding each hold a complete provider identity
+	// — client, endpoint, wire format and the config provider record that
+	// produced them. Keeping them as whole bindings, rather than parallel
+	// endpoint/kind fields, is what stops a model switch or fallback promotion
+	// from pairing one provider's endpoint with another's wire format.
+	primaryBinding  modelBinding
+	fallbackBinding modelBinding
+	usedFallback    bool
+	activeModel     string
+	// The active binding keeps model, endpoint/provider identity, and client as
+	// one immutable unit, swapped atomically when a model change applies.
+	activeBinding modelBinding
+}
+
+// budgetState groups per-turn tool-output accounting (guarded by mu).
+type budgetState struct {
+	outputBudget       int
+	deferToolEvents    bool
+	deferredToolEvents []Event
+}
+
+// turnMemoryState groups AutoMem / guardian / interrupt bookkeeping (guarded
+// by mu).
+type turnMemoryState struct {
+	tokenBaseline struct {
+		promptTokens int
+		historyLen   int
+	}
+	guardianUses  int
+	turnUserMsg   string
+	turnTouched   []string
+	turnSummary   string
+	interruptNote bool
+}
+
+// seqState groups the monotonic revision/sequence counters (guarded by mu).
+type seqState struct {
+	settingsRev    uint64
+	contextRev     uint64
+	catalogVersion uint64
+	turnSeq        uint64
+	stepSeq        uint64
+	viewGeneration uint64
+	logSeq         uint64
+}
+
+// dedupState groups the protocol command/input dedup indexes (guarded by mu).
+type dedupState struct {
+	seenReceipts     map[protocol.CommandID]protocol.Receipt
+	seenCommands     map[protocol.CommandID]string
+	seenInputs       map[protocol.InputID]protocol.Receipt
+	seenInputBody    map[protocol.InputID]string
+	pendingInputs    []protocol.InputView
+	inputAttachments map[protocol.InputID]frozenInputAttachments
+}
+
+// watchState groups the Watch subscription registry. Guarded by watchMu.
+type watchState struct {
+	watchers  map[uint64]*runtimeWatcher
+	nextWatch uint64
+}
+
+// deps groups the injected service dependencies, mirroring codex's separate
+// SessionServices struct. These are the long-lived references the agent owns.
+type deps struct {
 	supervisor      *SessionSupervisor
 	supervisorOwner bool
-	transcript      *transcriptState
-	finalizeRun     func(error) error // called after workers/hooks finish, before closing the writer
-	streamEpoch     string
-	eventSeq        uint64 // guarded by watchMu
 	cfg             *config.Config
 	baseCfg         config.Config // user/CLI config before workspace overrides
-	// trustStore is an application-owned service, never project data. Tests
-	// and embedders may inject a temporary store through Config.TrustStore;
-	// ordinary sessions fall back to the user-level default store.
-	trustStore *config.TrustStore
-	client     llm.Provider
-	registry   *tools.Registry
-	perms      *permissions.Manager
-	hooks      *hooks.Manager
-	sandbox    *sandbox.Sandbox
-	wsInfo     *workspace.Info // cached workspace model
-
-	// Plugin host and domain registries.
-	host        *plugin.Host
-	evbus       *events.Bus
-	models      *plugin.ModelRegistry
-	gohooks     *plugin.GoHooks
-	sessionReg  *plugin.SessionRegistry
-	mcp         *mcp.Manager
-	skills      *skills.Store
-	checkpoints *checkpoint.Store
-	resources   *tools.Resources
-	// Child runtimes keep their immutable permission/tool boundary directly on
-	// the Agent. This avoids a process-global map keyed by *Agent and makes the
-	// lifetime of child slots follow the parent/child object graph.
-	childState *childRuntimeState
-	childSlots *childSlots
-	// childStep is replaced at each parent step boundary with the frozen
-	// effective config/provider catalog/tool-name view used for that request.
-	// Child construction consumes it only while the matching turn is busy.
-	childStep *childStepSnapshot
-
-	// persistence is the sole business-fact writer for this session.  The
-	// legacy JSON snapshot remains a read-only import source; persistence owns
-	// the JSONL store and optional blob scope.
+	trustStore      *config.TrustStore
+	client          llm.Provider
+	registry        *tools.Registry
+	perms           *permissions.Manager
+	hooks           *hooks.Manager
+	sandbox         *sandbox.Sandbox
+	wsInfo          *workspace.Info // cached workspace model
+	host            *plugin.Host
+	evbus           *events.Bus
+	models          *plugin.ModelRegistry
+	gohooks         *plugin.GoHooks
+	sessionReg      *plugin.SessionRegistry
+	mcp             *mcp.Manager
+	skills          *skills.Store
+	checkpoints     *checkpoint.Store
+	resources       *tools.Resources
+	// persistence is the sole business-fact writer for this session.
 	persistence    *sessionPersistence
 	persistenceErr error
-	// persistMu serializes the Agent projection with durable commits. A full
-	// Save must not read an older history while an append/queue-delivery commit
-	// is in flight, otherwise its cache could overwrite the confirmed log view.
-	persistMu sync.Mutex
-	// settingsCommitMu is the publication boundary for a resolved config and
-	// its executable extension catalog. Typed queries take a read lock so they
-	// cannot observe cfg from one generation with tools/MCP/policy from another.
-	settingsCommitMu sync.RWMutex
+}
 
+// childStateGroups holds the child-runtime hard-policy boundary.
+type childStateGroups struct {
+	childState *childRuntimeState
+	childSlots *childSlots
+	childStep  *childStepSnapshot
+}
+
+// sessionData groups identity and history (guarded by mu where documented).
+type sessionData struct {
 	sessionID string
 	createdAt time.Time
 	history   []messages.Message
+	// Session lineage is set by Fork and persisted by Save.
+	parentID      string
+	branchPoint   int
+	branchSummary string
+	events        chan Event // agent → UI
+	// sessionStartAt fixes the environment "Date" once per session so the
+	// system prompt prefix stays byte-identical across turns (prompt cache).
+	sessionStartAt time.Time
+	// modelSwitchMsg is injected into the next request's system prompt after a
+	// model switch (Codex's ModelSwitchInstructions), then cleared.
+	modelSwitchMsg string
+}
 
-	events chan Event // agent → UI
+// toolDiscoveryData groups per-custom-tool and deferred-tool admission state.
+type toolDiscoveryData struct {
+	// customPerms holds per-custom-tool permission overrides from config
+	// ("allow" / "deny" / "ask").
+	customPerms map[string]string
+	// deferTools are tools not injected inline (MCP + config custom tools);
+	// the model discovers them via ToolSearch. discovered tracks which of
+	// them have been surfaced this session.
+	deferTools map[string]bool
+	discovered map[string]bool
+}
 
-	// Turn lifecycle (guarded by mu where cross-goroutine). pendingMsgs is the
-	// persistent inbox: user messages submitted while a turn is busy. They are
-	// steered into the running turn at tool-result boundaries (pi's steering),
-	// drained as follow-up turns when the turn ends, and persisted in the
-	// session snapshot so a crash never loses a queued message.
-	mu            sync.Mutex
+// turnLifecycleData groups the per-turn inbox/interrupt state. Guarded by mu.
+type turnLifecycleData struct {
 	busy          bool
 	interruptFlag bool
 	stop          bool
 	turnCancel    context.CancelFunc
 	turnCtx       context.Context
 	pendingMsgs   []string
+}
 
-	// approvalCache memoizes approval decisions within one turn, keyed by the
-	// permission SessionKey (Codex's approval cache). Parallel workers
-	// submitting the same call — or the Go-hook / shell-hook / permission
-	// gates all asking about one call — get the first decision replayed
-	// instead of a second modal. Reset at the start of every turn so the
-	// security posture never outlives the turn; "always allow" decisions that
-	// should persist go through perms.RememberAllow as before.
-	approvalCache map[string]bool
+// runtimeData groups the process/lifecycle machinery for a session.
+type runtimeData struct {
+	rootCtx        context.Context
+	rootCancel     context.CancelFunc
+	runStarted     chan struct{}
+	runStartedFlag bool
+	runDone        chan struct{}
+	runOnce        sync.Once
+	turnWG         sync.WaitGroup
+	operationWG    sync.WaitGroup
+	compactCancel  context.CancelFunc
+	compactFailure *compactFailureState
+	closeOnce      sync.Once
+	closeDone      chan struct{}
+	closeErr       error
+	commands       chan runtimeCommand
+	eventQueue     chan Event
+	eventDone      chan struct{}
+	eventWG        sync.WaitGroup
+	closing        bool
+	closed         bool
+	settling       bool // terminal event published before a queued turn starts
+	phase          protocol.RuntimePhase
+	workflow       protocol.WorkflowState
+	lastTurn       *protocol.TurnOutcome
+}
 
-	// Pending approval (guarded by mu).
-	pendingQuestion *protocol.QuestionRequest
-	questionResp    chan protocol.AnswerQuestion
-	pendingApproval *ApprovalRequest
-	approvalResp    chan approvalAnswer
-	// approvalResolving is guarded by mu. Exactly one of the command path or
-	// the turn-context cancellation path may claim the ApprovalResolved fact;
-	// this prevents an allow/cancel race from writing two payloads under one
-	// durable ApprovalID.
-	approvalResolving bool
+type Agent struct {
+	configuredModel string // launch configuration model; independent of the active selection
+	transcript      *transcriptState
+	finalizeRun     func(error) error // called after workers/hooks finish, before closing the writer
+	streamEpoch     string
+	deps
+	eventSeq uint64 // guarded by watchMu
+
+	// settingsCommitMu is the publication boundary for a resolved config and
+	// its executable extension catalog. Typed queries take a read lock so they
+	// cannot observe cfg from one generation with tools/MCP/policy from another.
+	settingsCommitMu sync.RWMutex
+
+	persistMu sync.Mutex
+
+	childStateGroups
+
+	sessionData
+
+	mu sync.Mutex
+	turnLifecycleData
+
+	// approvalState groups per-turn approval bookkeeping. Guarded by mu.
+	approvalState
 
 	// Plan mode (Claude Code's /plan): while on, the model only proposes a plan;
 	// mutating tools are blocked until the user approves it.
-	planMode     bool
-	pendingPlan  *PlanRequest
-	planResp     chan bool
-	planBaseMode permissions.Mode
+	planState
 
-	// customPerms holds per-custom-tool permission overrides from config
-	// ("allow" / "deny" / "ask").
-	customPerms map[string]string
+	// customPerms / deferTools / discovered
+	toolDiscoveryData
 
-	// deferTools are tools not injected inline (MCP + config custom tools);
-	// the model discovers them via ToolSearch. discovered tracks which of
-	// them have been surfaced this session.
-	deferTools map[string]bool
-	discovered map[string]bool
-
-	// sessionStartAt fixes the environment "Date" once per session so the
-	// system prompt prefix stays byte-identical across turns (prompt cache).
-	sessionStartAt time.Time
-
-	// modelSwitchMsg is injected into the next request's system prompt after a
-	// model switch (Codex's ModelSwitchInstructions), then cleared.
-	modelSwitchMsg string
-
-	// fallbackClient is used when the primary model fails (Claude's
+	// fallbackBinding is used when the primary model fails (Claude's
 	// --fallback-model). usedFallback latches per turn so each turn gets one
 	// fallback attempt. activeModel tracks the model actually in use so usage
-	// is priced with the right rate card after a fallback switch. primaryClient
-	// remembers the session's original client so every turn can restore it: a
-	// transient primary failure must not disable the primary for the rest of
-	// the session.
+	// is priced with the right rate card after a fallback switch. primaryBinding
+	// remembers the session's original provider binding so every turn can
+	// restore it: a transient primary failure must not disable the primary for
+	// the rest of the session.
 	//
-	// client, primaryClient and cfg.Model are written by the canonical model
+	// client, primaryBinding and cfg.Model are written by the canonical model
 	// command and the fallback switch (turn goroutine), so every access goes
 	// through a.mu (see currentProvider / activeModelSnapshot).
-	fallbackClient    llm.Provider
-	fallbackEndpoint  string
-	fallbackRouteKind string
-	primaryClient     llm.Provider
-	primaryEndpoint   string
-	primaryRouteKind  string
-	usedFallback      bool
-	activeModel       string
+	modelState
 
 	// outputBudget is the running count of tool-result characters delivered to
 	// the model this turn (per-turn aggregate limit).
-	outputBudget int
-	// Tool result notifications are held until the corresponding history
-	// messages have committed. This preserves the durable-before-publish
-	// invariant for clients that inspect history immediately after an event.
-	deferToolEvents    bool
-	deferredToolEvents []Event
+	budgetState
 
 	// tokenBaseline anchors compaction estimates on the provider's real prompt
 	// token count (Codex's BodyAfterPrefix idea): lastPromptTokens was reported
 	// for a request built from baselineLen history messages; tokens for history
 	// grown since then are estimated locally. Reset when history is rewritten.
-	tokenBaseline struct {
-		promptTokens int
-		historyLen   int
-	}
+	turnMemoryState
 
-	// guardianUses counts guardian reviews this turn (circuit breaker ≤ 3).
-	guardianUses int
-
-	// AutoMem per-turn tracking (guarded by mu): the current user request, the
-	// files touched, and the assistant's final summary. recordMemory (in
-	// turnFinished) folds these into the session memory log.
-	turnUserMsg string
-	turnTouched []string
-	turnSummary string
-
-	// interruptNote is injected into the next request's system prompt once
-	// (Codex's INTERRUPTED_GUIDANCE): after a user interrupt the model must
-	// know that tools may have partially executed and verify state.
-	interruptNote bool
-
-	// Session lineage (pi's session tree), set by Fork and persisted by Save:
-	// the session this one branched from, the history index the branch starts
-	// at, and the LLM summary of the abandoned direction.
-	parentID      string
-	branchPoint   int
-	branchSummary string
+	// toolsTokensEstimate caches the tool-schema token footprint from the last
+	// request prep, so the context-usage breakdown can split used tokens into
+	// messages / tools / system without re-deriving tool schemas at snapshot.
+	toolsTokensEstimate int
 
 	// trace is the JSONL session trace file (nil when tracing is off).
 	trace   *os.File
@@ -228,89 +302,44 @@ type Agent struct {
 	// usage accumulates token/cost accounting (guarded by mu).
 	usage Usage
 
+	// toolUses counts tool calls that reached execution (guarded by mu), so a
+	// parent can show a child's tool activity without replaying its transcript.
+	toolUses int
+
 	// Runtime lifecycle and command admission. Submit is the sole application
 	// entry and commands are normalized before application. The root context
 	// owns every turn and event worker so Close can cancel and join all work
 	// before releasing providers, hooks, traces, and tools.
-	rootCtx        context.Context
-	rootCancel     context.CancelFunc
-	runStarted     chan struct{}
-	runStartedFlag bool
-	runDone        chan struct{}
-	runOnce        sync.Once
-	turnWG         sync.WaitGroup
-	operationWG    sync.WaitGroup
-	compactCancel  context.CancelFunc
-	// compactFailure suppresses an automatic retry for the exact same
-	// history/model/budget state after a provider failure. It is deliberately
-	// live-only: a resumed session may try again, while an explicit /compact
-	// always bypasses the suppression and never drops history.
-	compactFailure *compactFailureState
-	closeOnce      sync.Once
-	closeDone      chan struct{}
-	closeErr       error
-	commands       chan runtimeCommand
+	runtimeData
 
-	eventQueue chan Event
-	eventDone  chan struct{}
-	eventWG    sync.WaitGroup
-
-	closing  bool
-	closed   bool
-	settling bool // terminal event is being published before a queued turn starts
-	phase    protocol.RuntimePhase
-	workflow protocol.WorkflowState
-	// lastTurn is the latest turn's recoverable outcome. It is updated by the
-	// runtime event bridge so Watch overflow cannot hide a provider failure.
-	// Access is guarded by mu.
-	lastTurn *protocol.TurnOutcome
-
-	// The active binding keeps model, endpoint/provider identity, and client as
-	// one immutable unit. A pending binding is applied only at a step boundary;
-	// no request can observe a model from one unit and a client from another.
-	activeBinding  modelBinding
-	pendingBinding *modelBinding
-	// pendingSettingsRevision/changeID identify a durable SettingsScheduled
-	// candidate. They are separate from settingsRev, which remains the active
-	// revision until the candidate is committed at the next step boundary.
-	pendingSettingsRevision uint64
-	pendingSettingsChangeID string
-	settingsRev             uint64
-	contextRev              uint64
-	catalogVersion          uint64
-	turnSeq                 uint64
-	stepSeq                 uint64
-	viewGeneration          uint64
-	logSeq                  uint64
-	seenReceipts            map[protocol.CommandID]protocol.Receipt
-	// seenCommands retains only the canonical body digest.  Keeping a full
+	// seqState groups the monotonic revision/sequence counters (guarded by mu).
+	seqState
+	// seenCommands retains only the canonical body digest. Keeping a full
 	// command here made every accepted SubmitInput (including its potentially
 	// large text payload) live for the lifetime of the session; durable command
 	// facts remain the source of truth across resume.
-	seenCommands map[protocol.CommandID]string
-	seenInputs   map[protocol.InputID]protocol.Receipt
-	// seenInputBody is a digest index, not a copy of the user text. Durable
-	// InputQueued facts remain the source of truth for replay and conflict
-	// checks, while the live index avoids retaining every historical payload.
-	seenInputBody map[protocol.InputID]string
-	pendingInputs []protocol.InputView
-	// inputAttachments is keyed by durable input identity. The bytes are
-	// captured at admission so a queued/repeated request never re-reads a
-	// mutable workspace path.
-	inputAttachments map[protocol.InputID]frozenInputAttachments
+	dedupState
 
-	watchMu   sync.Mutex
-	watchers  map[uint64]*runtimeWatcher
-	nextWatch uint64
+	watchMu sync.Mutex
+	watchState
 }
 
 type modelBinding struct {
-	model     string
-	provider  string
-	endpoint  string
-	routeKind string
-	client    llm.Provider
-	version   uint64
+	model      string
+	provider   string // resolved provider/adapter name
+	routeKind  string // "http" | "plugin" | "explicit"
+	endpoint   string // base URL for this binding
+	wire       string // normalized wire format ("chat" | "responses"), bound once with the endpoint
+	providerID string // config provider id that served this model ("" for plugin routes)
+	client     llm.Provider
+	version    uint64
+}
+
+// httpBinding is the generated-route fingerprint for this binding. The
+// credential is deliberately not a binding field — callers read it from the
+// same config record that produced the endpoint and wire format.
+func (b modelBinding) httpBinding(apiKey string) plugin.HTTPBinding {
+	return plugin.HTTPBinding{Endpoint: b.endpoint, APIKey: apiKey, Wire: b.wire}
 }
 
 type runtimeCommand struct {
@@ -395,7 +424,8 @@ func agentOptionsRequireIsolation(opts Options) bool {
 // before providers, permissions, and the sandbox are constructed.  The
 // session log is authoritative for mutable session policy; credentials and
 // opaque provider configuration deliberately remain sourced from the current
-// process configuration.
+// process configuration. A provider record owns its endpoint and credential
+// together, so neither is ever restored or re-paired from the log here.
 func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings) {
 	if cfg == nil {
 		return
@@ -406,11 +436,11 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 	if settings.Model != "" {
 		cfg.Model = settings.Model
 	}
-	if settings.Endpoint != "" {
-		if endpoint, err := sanitizeRequestEndpoint(settings.Endpoint); err == nil {
-			cfg.BaseURL = endpoint
-		}
-	}
+	// settings.Endpoint is a record of which endpoint served the previous
+	// request — possibly a provider-scoped or plugin endpoint — not a runtime
+	// setting. Applying it to cfg.BaseURL would authenticate the top-level
+	// credential against another provider's server, so the resumed binding is
+	// always re-derived from the model plus the current config.
 	if settings.PermissionPolicy != "" {
 		cfg.PermissionMode = settings.PermissionPolicy
 	}
@@ -454,9 +484,6 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 		cfg.ReasoningEffort = settings.ReasoningEffort
 		cfg.Verbosity = settings.Verbosity
 	}
-	if settings.MaxReplyTokens > 0 {
-		cfg.MaxReplyTokens = settings.MaxReplyTokens
-	}
 	if settings.MaxToolOutputCharsPerTurn > 0 {
 		cfg.MaxToolOutputCharsPerTurn = settings.MaxToolOutputCharsPerTurn
 	}
@@ -474,79 +501,16 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 		return nil, err
 	}
 	baseCfg := cloneConfig(cfg)
-	effectiveCfg := baseCfg
-	trustStore := baseCfg.TrustStore
-	if trustStore == nil {
-		trustStore = config.DefaultTrustStore()
-	}
-	if !opts.EffectiveConfigFrozen {
-		projectCfg, err := config.LoadProjectSettingsTrusted(baseCfg.Workspace, trustStore)
-		if err != nil {
-			return nil, err
-		}
-		config.ApplyProjectSettings(&effectiveCfg, &projectCfg)
-	}
-	effectiveCfg.TrustStore = trustStore
-	if initial != nil && initial.Settings != nil {
-		applySessionSettingsToConfig(&effectiveCfg, *initial.Settings)
-	}
 	isolated := agentOptionsRequireIsolation(opts)
-	if isolated {
-		// Child and guardian sessions never inherit lifecycle side effects from
-		// the parent. Their tool admission is enforced separately by
-		// ChildToolGate, but startup hooks/MCP/memory must also be disabled so a
-		// child cannot run arbitrary commands merely by being constructed.
-		if opts.Purpose == childPurposeTask {
-			// Preserve only the parent's prompt/tool decision hooks. The child
-			// never receives SessionStart/End or SubagentStart/Stop hooks; those
-			// lifecycle events belong to the owning runtime and are not replayed.
-			effectiveCfg.Hooks = childDecisionHooks(effectiveCfg.Hooks)
-		} else {
-			effectiveCfg.Hooks = hooks.Config{}
-		}
-		effectiveCfg.MCPServers = map[string]mcp.ServerConfig{}
-		effectiveCfg.EnableGuardian = config.BoolPtr(false)
-		effectiveCfg.EnableMemory = config.BoolPtr(false)
-		if opts.Purpose == childPurposeGuardian {
-			// Guardian's read-only gate is name based. Do not let a configured
-			// custom command replace a built-in name such as Read and turn that
-			// allowlisted name into arbitrary shell execution.
-			effectiveCfg.Tools = nil
-		}
-	}
-	err := error(nil)
-	if err := effectiveCfg.Validate(); err != nil {
+	effectiveCfg, err := buildEffectiveConfig(baseCfg, initial, isolated, opts)
+	if err != nil {
 		return nil, err
 	}
 	cfg = &effectiveCfg
+	if err := validateResumeSession(cfg, initial); err != nil {
+		return nil, err
+	}
 
-	if cfg.SessionID != "" {
-		if err := validateSessionID(cfg.SessionID); err != nil {
-			return nil, err
-		}
-	}
-	if initial != nil {
-		if err := validateSessionID(initial.ID); err != nil {
-			return nil, err
-		}
-		if cfg.SessionID != initial.ID {
-			return nil, fmt.Errorf("agent: resume config session id %q does not match snapshot %q", cfg.SessionID, initial.ID)
-		}
-	}
-	if initial == nil && !cfg.NoSessionPersistence && cfg.SessionID != "" {
-		existingEvents := filepath.Join(cfg.SessionDir, cfg.SessionID, "events.v1.jsonl")
-		if _, err := os.Stat(existingEvents); err == nil {
-			return nil, fmt.Errorf("agent: session %q already exists; use Resume", cfg.SessionID)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("agent: inspect session %q: %w", cfg.SessionID, err)
-		}
-		legacyPath := filepath.Join(cfg.SessionDir, cfg.SessionID+".json")
-		if _, err := os.Stat(legacyPath); err == nil {
-			return nil, fmt.Errorf("agent: legacy session %q exists; use Resume", cfg.SessionID)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("agent: inspect legacy session %q: %w", cfg.SessionID, err)
-		}
-	}
 	rootParent := opts.RootContext
 	if rootParent == nil {
 		rootParent = context.Background()
@@ -556,21 +520,217 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 	}
 	rootCtx, rootCancel := context.WithCancel(rootParent)
 
-	// Extension host: domain registries + plugins.
+	// Extension host: domain registries, plugins, and provider bindings.
+	host, err := buildExtensionHost(cfg, opts, rootCancel)
+	if err != nil {
+		return nil, err
+	}
+
+	// Custom external tools (config "tools"): register under a "custom" scope
+	// and remember their permission overrides.
+	customPerms := map[string]string{}
+	for _, spec := range cfg.Tools {
+		name := strings.TrimSpace(spec.Name)
+		if name == "" || strings.TrimSpace(spec.Command) == "" {
+			continue
+		}
+		host.registry.RegisterIn("custom", tools.NewCommandTool(name, spec.Description, spec.Command, spec.InputSchema))
+		customPerms[name] = strings.ToLower(spec.Permission)
+	}
+
+	sid := newSessionID()
+	if cfg.SessionID != "" {
+		sid = cfg.SessionID
+	}
+	createdAt := time.Now().UTC()
+	if initial != nil && !initial.CreatedAt.IsZero() {
+		createdAt = initial.CreatedAt
+	}
+
+	a := &Agent{
+		configuredModel: baseCfg.Model,
+		deps: deps{
+			baseCfg:    baseCfg,
+			trustStore: cfg.TrustStore,
+			client:     host.primaryBinding.client,
+			registry:   host.registry,
+			gohooks:    host.ectx.Hooks,
+			sessionReg: host.ectx.Session,
+			mcp:        mcp.NewManager(),
+			perms:      cfg.PermManager(),
+			host:       host.host,
+			evbus:      host.bus,
+			models:     host.models,
+			cfg:        cfg,
+		},
+		sessionData: sessionData{
+			sessionID:      sid,
+			createdAt:      createdAt,
+			events:         evCh,
+			branchPoint:    0,
+			sessionStartAt: createdAt,
+		},
+		toolDiscoveryData: toolDiscoveryData{
+			customPerms: customPerms,
+			deferTools:  map[string]bool{},
+			discovered:  map[string]bool{},
+		},
+		approvalState: approvalState{approvalCache: map[string]bool{}},
+		modelState: modelState{
+			primaryBinding:  host.primaryBinding,
+			fallbackBinding: host.fallbackBinding,
+		},
+		dedupState: dedupState{
+			seenReceipts:     make(map[protocol.CommandID]protocol.Receipt),
+			seenCommands:     make(map[protocol.CommandID]string),
+			seenInputs:       make(map[protocol.InputID]protocol.Receipt),
+			seenInputBody:    make(map[protocol.InputID]string),
+			inputAttachments: make(map[protocol.InputID]frozenInputAttachments),
+		},
+		watchState: watchState{watchers: make(map[uint64]*runtimeWatcher)},
+		seqState: seqState{
+			settingsRev:    1,
+			contextRev:     1,
+			catalogVersion: 1,
+			viewGeneration: 1,
+		},
+		runtimeData: runtimeData{
+			rootCtx:    rootCtx,
+			rootCancel: rootCancel,
+			runStarted: make(chan struct{}),
+			runDone:    make(chan struct{}),
+			closeDone:  make(chan struct{}),
+			commands:   make(chan runtimeCommand, 64),
+			eventQueue: make(chan Event, 512),
+			eventDone:  make(chan struct{}),
+			phase:      protocol.PhaseIdle,
+			workflow:   protocol.WorkflowOff,
+		},
+	}
+	if err := a.finalizeConstruction(initial, opts, isolated, rootCancel); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// buildEffectiveConfig merges the base config with project settings and, for a
+// resume, the durable session settings snapshot, then applies the isolation
+// overrides for child/guardian sessions. It returns the validated config the
+// runtime is built from.
+func buildEffectiveConfig(base config.Config, initial *SessionSnapshot, isolated bool, opts Options) (config.Config, error) {
+	trustStore := base.TrustStore
+	if trustStore == nil {
+		trustStore = config.DefaultTrustStore()
+	}
+	if !opts.EffectiveConfigFrozen {
+		projectCfg, err := config.LoadProjectSettingsTrusted(base.Workspace, trustStore)
+		if err != nil {
+			return config.Config{}, err
+		}
+		config.ApplyProjectSettings(&base, &projectCfg)
+	}
+	base.TrustStore = trustStore
+	if initial != nil && initial.Settings != nil {
+		applySessionSettingsToConfig(&base, *initial.Settings)
+	}
+	if !isolated && !opts.EffectiveConfigFrozen {
+		if err := base.ApplyProjectPermission(); err != nil {
+			return config.Config{}, err
+		}
+	}
+	if isolated {
+		// Child and guardian sessions never inherit lifecycle side effects from
+		// the parent. Their tool admission is enforced separately by
+		// ChildToolGate, but startup hooks/MCP/memory must also be disabled so a
+		// child cannot run arbitrary commands merely by being constructed.
+		if opts.Purpose == childPurposeTask {
+			// Preserve only the parent's prompt/tool decision hooks. The child
+			// never receives SessionStart/End or SubagentStart/Stop hooks; those
+			// lifecycle events belong to the owning runtime and are not replayed.
+			base.Hooks = childDecisionHooks(base.Hooks)
+		} else {
+			base.Hooks = hooks.Config{}
+		}
+		base.MCPServers = map[string]mcp.ServerConfig{}
+		base.EnableGuardian = config.BoolPtr(false)
+		base.EnableMemory = config.BoolPtr(false)
+		if opts.Purpose == childPurposeGuardian {
+			// Guardian's read-only gate is name based. Do not let a configured
+			// custom command replace a built-in name such as Read and turn that
+			// allowlisted name into arbitrary shell execution.
+			base.Tools = nil
+		}
+	}
+	if err := base.Validate(); err != nil {
+		return config.Config{}, err
+	}
+	return base, nil
+}
+
+// validateResumeSession checks the restored session identity and, for a fresh
+// session, guards against clobbering an existing durable log.
+func validateResumeSession(cfg *config.Config, initial *SessionSnapshot) error {
+	if cfg.SessionID != "" {
+		if err := validateSessionID(cfg.SessionID); err != nil {
+			return err
+		}
+	}
+	if initial != nil {
+		if err := validateSessionID(initial.ID); err != nil {
+			return err
+		}
+		if cfg.SessionID != initial.ID {
+			return fmt.Errorf("agent: resume config session id %q does not match snapshot %q", cfg.SessionID, initial.ID)
+		}
+	}
+	if initial == nil && !cfg.NoSessionPersistence && cfg.SessionID != "" {
+		existingEvents := filepath.Join(cfg.SessionDir, cfg.SessionID, "events.v1.jsonl")
+		if _, err := os.Stat(existingEvents); err == nil {
+			return fmt.Errorf("agent: session %q already exists; use Resume", cfg.SessionID)
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("agent: inspect session %q: %w", cfg.SessionID, err)
+		}
+		legacyPath := filepath.Join(cfg.SessionDir, cfg.SessionID+".json")
+		if _, err := os.Stat(legacyPath); err == nil {
+			return fmt.Errorf("agent: legacy session %q exists; use Resume", cfg.SessionID)
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("agent: inspect legacy session %q: %w", cfg.SessionID, err)
+		}
+	}
+	return nil
+}
+
+// extensionHost aggregates the domain registries, plugin host, and the
+// primary/fallback provider bindings produced before the Agent literal exists.
+type extensionHost struct {
+	bus      *events.Bus
+	registry *tools.Registry
+	models   *plugin.ModelRegistry
+	ectx     *plugin.Context
+	host     *plugin.Host
+	// primaryBinding is always resolved; fallbackBinding is the zero binding when
+	// no fallback model is configured or when it could not be resolved.
+	primaryBinding  modelBinding
+	fallbackBinding modelBinding
+}
+
+// buildExtensionHost wires the domain bus, tool registry, model registry and
+// plugin host, and resolves the primary and fallback provider bindings. It
+// takes the cancellation func of the yet-to-exist root context so a rejected
+// construction can roll back without leaving a live root or plugin.
+func buildExtensionHost(cfg *config.Config, opts Options, rootCancel context.CancelFunc) (*extensionHost, error) {
 	bus := events.NewBus()
 	registry := tools.NewRegistry()
 	models := plugin.NewModelRegistry()
 	if opts.ProviderRegistry != nil {
 		models = opts.ProviderRegistry.Clone()
 	}
-	var client llm.Provider
-	var baseURL, primaryRouteKind string
-	if p, endpoint, routeKind, resolveErr := resolveProviderForModel(effectiveCfg, models, cfg.Model); resolveErr != nil {
+	primaryBinding, resolveErr := providerBinding(*cfg, models, cfg.Model, 1)
+	if resolveErr != nil {
 		rootCancel()
 		return nil, resolveErr
-	} else {
-		client, baseURL, primaryRouteKind = p, endpoint, routeKind
 	}
+	client := primaryBinding.client
 	ectx := &plugin.Context{
 		Events:  bus,
 		Tools:   registry,
@@ -598,7 +758,8 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 	// the same model, so only install the built-in plugin when this model was
 	// resolved by the HTTP adapter.
 	if _, suppliedRoute := opts.ProviderRegistry.ResolveRoute(cfg.Model); opts.ProviderRegistry == nil || !suppliedRoute {
-		if err := host.Load(plugin.NewHTTPProviderPlugin(client, cfg.Model, baseURL, func() string { _, key := cfg.EndpointFor(cfg.Model); return key }())); err != nil {
+		httpFingerprint := primaryBinding.httpBinding(cfg.ResolveProvider(cfg.Model).APIKey)
+		if err := host.Load(plugin.NewHTTPProviderPlugin(client, cfg.Model, httpFingerprint)); err != nil {
 			rollback()
 			return nil, err
 		}
@@ -606,89 +767,66 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 
 	// Fallback model (Claude's --fallback-model): built lazily, used only if
 	// the primary model's stream fails.
-	var fallback llm.Provider
-	var fallbackEndpoint, fallbackRouteKind string
+	var fallbackBinding modelBinding
 	if cfg.FallbackModel != "" {
-		fallback, fallbackEndpoint, fallbackRouteKind, err = resolveProviderForModel(effectiveCfg, models, cfg.FallbackModel)
-		if err != nil {
-			// Keep construction compatible with the old lazy fallback behavior:
-			// an invalid fallback is unavailable until it is selected, while the
-			// primary provider remains usable.
-			fallback = nil
-			fallbackEndpoint = ""
-			fallbackRouteKind = ""
-		}
+		// An unresolvable fallback stays unavailable rather than failing
+		// construction, matching the primary provider remaining usable.
+		fallbackBinding, _ = providerBinding(*cfg, models, cfg.FallbackModel, 1)
 	}
+	return &extensionHost{
+		bus:             bus,
+		registry:        registry,
+		models:          models,
+		ectx:            ectx,
+		host:            host,
+		primaryBinding:  primaryBinding,
+		fallbackBinding: fallbackBinding,
+	}, nil
+}
 
-	// Custom external tools (config "tools"): register under a "custom" scope
-	// and remember their permission overrides.
-	customPerms := map[string]string{}
-	for _, spec := range cfg.Tools {
-		name := strings.TrimSpace(spec.Name)
-		if name == "" || strings.TrimSpace(spec.Command) == "" {
-			continue
-		}
-		registry.RegisterIn("custom", tools.NewCommandTool(name, spec.Description, spec.Command, spec.InputSchema))
-		customPerms[name] = strings.ToLower(spec.Permission)
+// abortConstruction is the single teardown path for a construction that must
+// return an error. It unwinds resources in acquisition order; closeWriter is
+// false only when the session writer never opened, so it must not be closed.
+func (a *Agent) abortConstruction(rootCancel context.CancelFunc, closeWriter bool) {
+	if closeWriter {
+		_ = a.closePersistence()
 	}
+	rootCancel()
+	if a.resources != nil {
+		_ = a.resources.Close()
+	}
+	if a.mcp != nil {
+		a.mcp.Close()
+	}
+	if a.host != nil {
+		_ = a.host.Close()
+	}
+}
 
-	sid := newSessionID()
-	if cfg.SessionID != "" {
-		sid = cfg.SessionID
+// finalizeConstruction turns the freshly-built Agent literal into a fully
+// initialized runtime: session lineage, durable snapshot replay, persistence,
+// execution mode, session services, tool discovery, and the supervisor.
+func (a *Agent) finalizeConstruction(initial *SessionSnapshot, opts Options, isolated bool, rootCancel context.CancelFunc) error {
+	a.applySessionLineage(opts, isolated)
+	a.applyInitialSnapshot(initial)
+	if err := a.acquirePersistence(initial, rootCancel); err != nil {
+		return err
 	}
-	createdAt := time.Now().UTC()
-	if initial != nil && !initial.CreatedAt.IsZero() {
-		createdAt = initial.CreatedAt
+	if err := a.replayOwnedStore(initial, opts, rootCancel); err != nil {
+		return err
 	}
+	a.initExecutionMode(initial)
+	if err := a.startSessionServices(rootCancel, isolated); err != nil {
+		return err
+	}
+	a.finalizeToolsAndSkills(isolated)
+	a.openTraceAndSupervisor(opts)
+	return nil
+}
 
-	a := &Agent{
-		cfg:               cfg,
-		baseCfg:           baseCfg,
-		trustStore:        trustStore,
-		client:            client,
-		primaryClient:     client,
-		registry:          registry,
-		host:              host,
-		evbus:             bus,
-		models:            ectx.Models,
-		gohooks:           ectx.Hooks,
-		sessionReg:        ectx.Session,
-		mcp:               mcp.NewManager(),
-		perms:             cfg.PermManager(),
-		sessionID:         sid,
-		createdAt:         createdAt,
-		events:            evCh,
-		customPerms:       customPerms,
-		approvalCache:     map[string]bool{},
-		deferTools:        map[string]bool{},
-		discovered:        map[string]bool{},
-		sessionStartAt:    createdAt,
-		fallbackClient:    fallback,
-		fallbackEndpoint:  fallbackEndpoint,
-		fallbackRouteKind: fallbackRouteKind,
-		primaryEndpoint:   baseURL,
-		primaryRouteKind:  primaryRouteKind,
-		rootCtx:           rootCtx,
-		rootCancel:        rootCancel,
-		runStarted:        make(chan struct{}),
-		runDone:           make(chan struct{}),
-		closeDone:         make(chan struct{}),
-		commands:          make(chan runtimeCommand, 64),
-		eventQueue:        make(chan Event, 512),
-		eventDone:         make(chan struct{}),
-		seenReceipts:      make(map[protocol.CommandID]protocol.Receipt),
-		seenCommands:      make(map[protocol.CommandID]string),
-		seenInputs:        make(map[protocol.InputID]protocol.Receipt),
-		seenInputBody:     make(map[protocol.InputID]string),
-		inputAttachments:  make(map[protocol.InputID]frozenInputAttachments),
-		watchers:          make(map[uint64]*runtimeWatcher),
-		settingsRev:       1,
-		contextRev:        1,
-		catalogVersion:    1,
-		viewGeneration:    1,
-		phase:             protocol.PhaseIdle,
-		workflow:          protocol.WorkflowOff,
-	}
+// applySessionLineage records child/parent identity and the child hard-policy
+// state derived from options.
+func (a *Agent) applySessionLineage(opts Options, isolated bool) {
 	if opts.ParentSessionID != "" {
 		// Child lineage is part of the new session's identity, not a live
 		// pointer back into the parent. The option is copied at construction
@@ -698,7 +836,7 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 	if opts.Permissions != nil {
 		a.perms = opts.Permissions.Clone()
 	}
-	a.childSlots = newChildSlots(cfg.MaxParallelTools)
+	a.childSlots = newChildSlots(a.cfg.MaxParallelTools)
 	if isolated {
 		a.childState = &childRuntimeState{
 			purpose:        opts.Purpose,
@@ -708,112 +846,112 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 			perms:          a.perms,
 		}
 	}
-	if initial != nil {
-		a.history = cloneMessages(initial.History)
-		a.pendingInputs = pendingInputSnapshot(initial.ID, initial.Pending, initial.PendingInputs)
-		a.pendingMsgs = pendingTexts(a.pendingInputs)
-		for id, attachments := range initial.PendingAttachments {
-			a.inputAttachments[protocol.InputID(id)] = frozenInputAttachments{Attachments: cloneImageAttachments(attachments), Frozen: true}
-		}
-		a.usage = initial.Usage
-		a.parentID, a.branchPoint, a.branchSummary = initial.ParentID, initial.BranchPoint, initial.BranchSummary
-		a.turnSeq, a.stepSeq = initial.turnSeq, initial.stepSeq
+}
+
+// applyInitialSnapshot restores history, pending inbox and usage from a resume
+// snapshot so the runner can continue where the prior session left off.
+func (a *Agent) applyInitialSnapshot(initial *SessionSnapshot) {
+	if initial == nil {
+		return
 	}
-	resourceDir := filepath.Join(cfg.SessionDir, sid)
-	if cfg.NoSessionPersistence {
+	a.history = cloneMessages(initial.History)
+	a.pendingInputs = pendingInputSnapshot(initial.ID, initial.Pending, initial.PendingInputs)
+	a.pendingMsgs = pendingTexts(a.pendingInputs)
+	for id, attachments := range initial.PendingAttachments {
+		a.inputAttachments[protocol.InputID(id)] = frozenInputAttachments{Attachments: cloneImageAttachments(attachments), Frozen: true}
+	}
+	a.usage = initial.Usage
+	a.parentID, a.branchPoint, a.branchSummary = initial.ParentID, initial.BranchPoint, initial.BranchSummary
+	a.turnSeq, a.stepSeq = initial.turnSeq, initial.stepSeq
+}
+
+// acquirePersistence sets up the resources container, the active model
+// binding, and the checkpoint/persistence stores, then opens the session
+// writer for the fresh or resume path.
+func (a *Agent) acquirePersistence(initial *SessionSnapshot, rootCancel context.CancelFunc) error {
+	resourceDir := filepath.Join(a.cfg.SessionDir, a.sessionID)
+	if a.cfg.NoSessionPersistence {
 		resourceDir = ""
 	}
-	a.resources = tools.NewResourcesWithContext(sid, resourceDir, rootCtx)
-	a.activeBinding = modelBinding{model: cfg.Model, provider: client.Name(), endpoint: baseURL, routeKind: primaryRouteKind, client: client, version: 1}
-	// Acquire and initialize the session writer before starting hooks, MCP
-	// servers, or any other externally visible session work. A lock or sync
-	// failure must leave construction side-effect free from the caller's view.
-	if cfg.NoSessionPersistence {
+	a.resources = tools.NewResourcesWithContext(a.sessionID, resourceDir, a.rootCtx)
+	a.activeBinding = a.primaryBinding
+	if a.cfg.NoSessionPersistence {
 		a.checkpoints = checkpoint.NewMemoryStore(a.sessionID)
 	} else {
-		a.checkpoints = checkpoint.NewStore(cfg.SessionDir, a.sessionID)
+		a.checkpoints = checkpoint.NewStore(a.cfg.SessionDir, a.sessionID)
 	}
 	openErr := error(nil)
-	if initial == nil && cfg.SessionID != "" {
+	if initial == nil && a.cfg.SessionID != "" {
 		openErr = a.openPersistenceFresh()
 	} else {
 		openErr = a.openPersistence()
 	}
 	if openErr != nil {
-		rootCancel()
-		_ = a.resources.Close()
-		a.mcp.Close()
-		_ = a.host.Close()
-		return nil, openErr
+		a.abortConstruction(rootCancel, false)
+		return openErr
 	}
-	if initial != nil {
-		// The caller's snapshot was read before this Agent acquired the target
-		// writer. Replay the now-owned store once more so a concurrent writer
-		// cannot be overwritten by a stale history/pending projection during the
-		// first Save. The durable log is authoritative at this boundary.
-		if p := a.persistenceHandle(); p != nil {
-			replayErr := error(nil)
-			if len(opts.memoryResume) > 0 {
-				replayErr = p.restoreMemoryRun(opts.memoryResume, opts.memoryBlobs)
-				a.transcript = p.transcript
-			} else {
-				replayErr = p.populateMemoryResume(initial)
-			}
-			if replayErr != nil {
-				_ = a.closePersistence()
-				rootCancel()
-				_ = a.resources.Close()
-				a.mcp.Close()
-				_ = a.host.Close()
-				return nil, replayErr
-			}
-			owned, replayErr := p.snapshotFromOwnedStore(sid)
-			if replayErr != nil {
-				_ = a.closePersistence()
-				rootCancel()
-				_ = a.resources.Close()
-				a.mcp.Close()
-				_ = a.host.Close()
-				return nil, replayErr
-			}
-			if owned != nil {
-				if (owned.Model != "" && owned.Model != cfg.Model) || (owned.Workspace != "" && owned.Workspace != cfg.Workspace) {
-					_ = a.closePersistence()
-					rootCancel()
-					_ = a.resources.Close()
-					a.mcp.Close()
-					_ = a.host.Close()
-					return nil, fmt.Errorf("agent: session settings changed while opening %q; retry resume", sid)
-				}
-				a.mu.Lock()
-				a.createdAt = owned.CreatedAt
-				a.history = cloneMessages(owned.History)
-				a.pendingInputs = pendingInputSnapshot(sid, owned.Pending, owned.PendingInputs)
-				a.pendingMsgs = pendingTexts(a.pendingInputs)
-				a.inputAttachments = make(map[protocol.InputID]frozenInputAttachments)
-				for id, attachments := range owned.PendingAttachments {
-					a.inputAttachments[protocol.InputID(id)] = frozenInputAttachments{Attachments: cloneImageAttachments(attachments), Frozen: true}
-				}
-				a.usage = owned.Usage
-				a.parentID, a.branchPoint, a.branchSummary = owned.ParentID, owned.BranchPoint, owned.BranchSummary
-				if owned.turnSeq > a.turnSeq {
-					a.turnSeq = owned.turnSeq
-				}
-				if owned.stepSeq > a.stepSeq {
-					a.stepSeq = owned.stepSeq
-				}
-				a.mu.Unlock()
-			}
+	return nil
+}
+
+// replayOwnedStore replays the now-owned durable log once more so a concurrent
+// writer cannot be overwritten by a stale history/pending projection during the
+// first Save. Restores input dedup so a resumed command is not re-executed.
+func (a *Agent) replayOwnedStore(initial *SessionSnapshot, opts Options, rootCancel context.CancelFunc) error {
+	if initial == nil {
+		return nil
+	}
+	if p := a.persistenceHandle(); p != nil {
+		replayErr := error(nil)
+		if len(opts.memoryResume) > 0 {
+			replayErr = p.restoreMemoryRun(opts.memoryResume, opts.memoryBlobs)
+			a.transcript = p.transcript
+		} else {
+			replayErr = p.populateMemoryResume(initial)
 		}
-		if err := a.restoreInputDedup(); err != nil {
-			_ = a.closePersistence()
-			rootCancel()
-			_ = a.resources.Close()
-			a.mcp.Close()
-			_ = a.host.Close()
-			return nil, err
+		if replayErr != nil {
+			a.abortConstruction(rootCancel, true)
+			return replayErr
+		}
+		owned, replayErr := p.snapshotFromOwnedStore(a.sessionID)
+		if replayErr != nil {
+			a.abortConstruction(rootCancel, true)
+			return replayErr
+		}
+		if owned != nil {
+			if (owned.Model != "" && owned.Model != a.cfg.Model) || (owned.Workspace != "" && owned.Workspace != a.cfg.Workspace) {
+				a.abortConstruction(rootCancel, true)
+				return fmt.Errorf("agent: session settings changed while opening %q; retry resume", a.sessionID)
+			}
+			a.mu.Lock()
+			a.createdAt = owned.CreatedAt
+			a.history = cloneMessages(owned.History)
+			a.pendingInputs = pendingInputSnapshot(a.sessionID, owned.Pending, owned.PendingInputs)
+			a.pendingMsgs = pendingTexts(a.pendingInputs)
+			a.inputAttachments = make(map[protocol.InputID]frozenInputAttachments)
+			for id, attachments := range owned.PendingAttachments {
+				a.inputAttachments[protocol.InputID(id)] = frozenInputAttachments{Attachments: cloneImageAttachments(attachments), Frozen: true}
+			}
+			a.usage = owned.Usage
+			a.parentID, a.branchPoint, a.branchSummary = owned.ParentID, owned.BranchPoint, owned.BranchSummary
+			if owned.turnSeq > a.turnSeq {
+				a.turnSeq = owned.turnSeq
+			}
+			if owned.stepSeq > a.stepSeq {
+				a.stepSeq = owned.stepSeq
+			}
+			a.mu.Unlock()
 		}
 	}
+	if err := a.restoreInputDedup(); err != nil {
+		a.abortConstruction(rootCancel, true)
+		return err
+	}
+	return nil
+}
+
+// initExecutionMode seeds plan mode and the workflow phase for the restored or
+// fresh session.
+func (a *Agent) initExecutionMode(initial *SessionSnapshot) {
 	initialMode := a.perms.CurrentMode()
 	a.planBaseMode = initialMode
 	if initialMode == permissions.ModePlan {
@@ -829,56 +967,49 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 			a.workflow = protocol.WorkflowState(initial.Workflow.Phase)
 		}
 	}
-	// A nil legacy channel is the normal protocol/Watch-only configuration.
-	// Do not start a worker or accumulate a second, unobservable event queue in
-	// that mode; typed Watch publication remains owned by publishEvent.
-	if evCh != nil {
+}
+
+// startSessionServices launches the event worker and the sandbox/hooks/MCP
+// stack. MCP startup and SessionStart run only after every configured server
+// has completed its handshake, so a failed candidate never produces a visible
+// hook side effect.
+func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated bool) error {
+	if a.events != nil {
 		a.eventWG.Add(1)
 		go a.eventLoop()
 	}
-	a.sandbox = cfg.Sandbox()
-	a.checkpoints.SetExecutionBoundary(rootCtx, a.sandbox)
-	a.hooks = hooks.NewManager(cfg.Hooks, hooks.Options{SessionID: a.sessionID, Workspace: cfg.Workspace, Mode: cfg.PermissionMode, Sandbox: a.sandbox, FailClosed: true})
+	a.sandbox = a.cfg.Sandbox()
+	a.checkpoints.SetExecutionBoundary(a.rootCtx, a.sandbox)
+	a.hooks = hooks.NewManager(a.cfg.Hooks, hooks.Options{SessionID: a.sessionID, Workspace: a.cfg.Workspace, Mode: a.cfg.PermissionMode, Sandbox: a.sandbox, FailClosed: true})
 	a.mcp.SetSandbox(a.sandbox)
-	a.hooks.SetTranscript(cfg.SessionDir)
-	// MCP startup is a candidate preparation step. Do not run lifecycle hooks
-	// or publish a partially initialized session until every configured server
-	// has completed its handshake.
+	a.hooks.SetTranscript(a.cfg.SessionDir)
 	if !isolated {
-		if err := a.mcp.StartChecked(rootCtx, cfg.MCPServers); err != nil {
-			_ = a.closePersistence()
-			rootCancel()
-			_ = a.resources.Close()
-			a.mcp.Close()
-			_ = a.host.Close()
-			return nil, err
+		if err := a.mcp.StartChecked(a.rootCtx, a.cfg.MCPServers); err != nil {
+			a.abortConstruction(rootCancel, true)
+			return err
 		}
-		a.mcp.RegisterTools(registry)
-		// SessionStart is bounded and owned by this constructor. Running it only
-		// after MCP preparation prevents a failed candidate from producing a
-		// visible hook side effect.
-		if hookOut := a.runHookWithJournal(rootCtx, hooks.EventSessionStart, func(hctx context.Context) hooks.Output {
+		a.mcp.RegisterTools(a.registry)
+		if hookOut := a.runHookWithJournal(a.rootCtx, hooks.EventSessionStart, func(hctx context.Context) hooks.Output {
 			return a.hooks.SessionStart(hctx)
 		}); hookOut.Decision == hooks.DecisionDeny || hookOut.Decision == hooks.DecisionBlock {
 			if err := a.persistenceFailure(); err != nil {
-				_ = a.closePersistence()
-				rootCancel()
-				_ = a.resources.Close()
-				a.mcp.Close()
-				_ = a.host.Close()
-				return nil, err
+				a.abortConstruction(rootCancel, true)
+				return err
 			}
 		}
 	}
+	return nil
+}
 
-	// ToolSearch lets the model discover deferred tools on demand (Codex /
-	// Claude Code's tool search). Config custom tools and MCP tools are
-	// deferred: their schemas are not injected inline.
-	registry.RegisterIn("builtin", &toolSearchTool{ag: a})
-	registry.RegisterIn("builtin", &askUserQuestionTool{ag: a})
-	registry.RegisterIn("builtin", &enterPlanModeTool{ag: a})
-	registry.RegisterIn("builtin", &exitPlanModeTool{ag: a})
-	for _, spec := range cfg.Tools {
+// finalizeToolsAndSkills registers the built-in control tools, records the
+// deferred (MCP + config custom) tools for on-demand discovery, and loads user
+// and project skills.
+func (a *Agent) finalizeToolsAndSkills(isolated bool) {
+	a.registry.RegisterIn("builtin", &toolSearchTool{ag: a})
+	a.registry.RegisterIn("builtin", &askUserQuestionTool{ag: a})
+	a.registry.RegisterIn("builtin", &enterPlanModeTool{ag: a})
+	a.registry.RegisterIn("builtin", &exitPlanModeTool{ag: a})
+	for _, spec := range a.cfg.Tools {
 		if name := strings.TrimSpace(spec.Name); name != "" {
 			a.deferTools[name] = true
 		}
@@ -888,18 +1019,19 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 			a.deferTools[n] = true
 		}
 	}
-
-	// Skills: user skills (~/.ccdp/skills) plus project skills (.ccdp/skills).
 	a.skills = skills.NewStore()
 	if !isolated {
 		home, _ := os.UserHomeDir()
 		a.skills.Load(filepath.Join(home, ".ccdp", "skills"),
-			filepath.Join(cfg.Workspace, ".ccdp", "skills"))
+			filepath.Join(a.cfg.Workspace, ".ccdp", "skills"))
 	}
+}
 
+// openTraceAndSupervisor opens the JSONL trace and attaches the session
+// supervisor, then publishes the session-created lifecycle event.
+func (a *Agent) openTraceAndSupervisor(opts Options) {
 	a.openTrace()
 	a.hooks.SetTranscript(a.TracePath())
-
 	a.streamEpoch = nextRuntimeID("stream")
 	if opts.Supervisor != nil {
 		a.supervisor = opts.Supervisor
@@ -908,7 +1040,6 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 		a.supervisorOwner = true
 	}
 	a.emitSessionLifecycle(false)
-	return a, nil
 }
 
 // CreateCheckpoint snapshots the workspace under a git-based checkpoint and
@@ -1030,18 +1161,15 @@ func Resume(cfg *config.Config, snap *SessionSnapshot, evCh chan Event) (*Agent,
 	if err != nil {
 		return nil, err
 	}
-	if snap.PendingSettings != nil {
-		if err := a.restorePendingSettings(*snap.PendingSettings); err != nil {
-			a.Close()
-			return nil, fmt.Errorf("agent: restore pending settings: %w", err)
-		}
-	}
 	if len(snap.PendingInputs) > 0 || len(snap.Pending) > 0 {
 		pendingCount := len(snap.PendingInputs)
 		if pendingCount == 0 {
 			pendingCount = len(snap.Pending)
 		}
 		a.emitStatus("%d queued message(s) restored — they will run after the next turn", pendingCount)
+	}
+	if skipped := a.skippedRecords(); len(skipped) > 0 {
+		a.emitStatus("%d session record(s) use event kinds this version cannot read and were skipped", len(skipped))
 	}
 	// Refresh mutable hook state, then re-discover deferred tools recorded in
 	// the restored trace.
@@ -1067,9 +1195,6 @@ func (a *Agent) PluginNames() []string { return a.host.Names() }
 
 // HostPending returns registered plugin names waiting for their dependencies.
 func (a *Agent) HostPending() []string { return a.host.Pending() }
-
-// ProviderNames returns the registered LLM provider names.
-func (a *Agent) ProviderNames() []string { return a.models.Names() }
 
 // MCPServers returns the connected MCP server names.
 func (a *Agent) MCPServers() []string { return a.mcp.Names() }
@@ -1144,6 +1269,13 @@ func (a *Agent) Usage() Usage {
 	return a.usage
 }
 
+// ToolUses returns how many tool calls reached execution this session.
+func (a *Agent) ToolUses() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.toolUses
+}
+
 // HooksList returns the configured hooks grouped by event.
 func (a *Agent) HooksList() map[string][]string { return a.hooks.List() }
 
@@ -1156,14 +1288,6 @@ func (a *Agent) PlanMode() bool {
 
 // SessionID returns the session identifier.
 func (a *Agent) SessionID() string { return a.sessionID }
-
-func modelFamily(model string) string {
-	model = strings.ToLower(strings.TrimSpace(model))
-	if i := strings.IndexByte(model, '-'); i > 0 {
-		return model[:i]
-	}
-	return model
-}
 
 // WorkspaceLabel returns the absolute workspace path.
 func (a *Agent) WorkspaceLabel() string { return a.cfg.Workspace }
@@ -1372,48 +1496,7 @@ func (a *Agent) runTurn(input turnInput) {
 		}
 	}()
 
-	a.mu.Lock()
-	// The approval cache is per-turn: decisions made for one user request
-	// never leak into the next one.
-	a.approvalCache = map[string]bool{}
-	a.mu.Unlock()
-	a.resetOutputBudget()
-	a.resetGuardianBudget()
-	// Fallback budget resets per turn: one fallback attempt per turn, not per
-	// session (a transient primary failure should not disable the primary for
-	// the rest of the session). The primary client is restored too, so the
-	// reset is real and not just cosmetic.
-	a.mu.Lock()
-	a.usedFallback = false
-	primary := a.primaryClient
-	if primary != nil {
-		a.client = primary
-		// Fallback changes activeBinding for only the current turn; cfg.Model
-		// and primaryClient remain the authoritative primary binding for the
-		// next turn.
-		model := a.cfg.Model
-		a.activeModel = model
-		endpoint := a.primaryEndpoint
-		if endpoint == "" && a.primaryRouteKind == "http" {
-			endpoint = a.bindingEndpointLocked(model)
-		}
-		a.activeBinding = modelBinding{
-			model:     model,
-			provider:  primary.Name(),
-			endpoint:  endpoint,
-			routeKind: a.primaryRouteKind,
-			client:    primary,
-			version:   a.activeBinding.version + 1,
-		}
-	}
-	a.mu.Unlock()
-
-	// AutoMem: reset the per-turn tracking for this turn.
-	a.mu.Lock()
-	a.turnUserMsg = text
-	a.turnTouched = nil
-	a.turnSummary = ""
-	a.mu.Unlock()
+	a.beginTurnState(text)
 
 	// UserPromptSubmit hook can veto the message before any work happens. Tie
 	// it to the runtime root so Close can stop a hanging external hook; there
@@ -1586,44 +1669,9 @@ func (a *Agent) runTurn(input turnInput) {
 		<-streamDone
 
 		if streamErr != nil {
-			if isRequestJournalFailure(streamErr) {
-				releaseStep()
-				a.emit(Event{Type: EventError, Text: "request journal error: " + streamErr.Error()})
-				return
+			if a.handleStreamError(streamErr, releaseStep) {
+				continue // switched to the fallback model; retry this step
 			}
-			if a.interrupted() {
-				releaseStep()
-				a.mu.Lock()
-				a.interruptNote = true
-				a.mu.Unlock()
-				a.emitStatus("stream interrupted")
-				return
-			}
-			// Fallback model (Claude's --fallback-model): one retry on the
-			// backup client, then give up. activeModel follows so usage is
-			// priced with the fallback rate card, and the request builder
-			// sends the fallback MODEL NAME to the fallback endpoint
-			// (req.Model comes from activeModelSnapshot).
-			a.mu.Lock()
-			fallback := a.fallbackClient
-			if !a.usedFallback && fallback != nil {
-				a.usedFallback = true
-				fallbackModel := a.cfg.FallbackModel
-				a.client = fallback
-				a.activeModel = fallbackModel
-				endpoint := a.fallbackEndpoint
-				if endpoint == "" && a.fallbackRouteKind == "http" {
-					endpoint = a.bindingEndpointLocked(fallbackModel)
-				}
-				a.activeBinding = modelBinding{model: fallbackModel, provider: fallback.Name(), endpoint: endpoint, routeKind: a.fallbackRouteKind, client: fallback, version: a.activeBinding.version + 1}
-				a.mu.Unlock()
-				releaseStep()
-				a.emitStatus("primary model failed (%v) — falling back to %s", streamErr, fallbackModel)
-				continue
-			}
-			a.mu.Unlock()
-			releaseStep()
-			a.emit(Event{Type: EventError, Text: "LLM error: " + streamErr.Error()})
 			return
 		}
 
@@ -1662,6 +1710,7 @@ func (a *Agent) runTurn(input turnInput) {
 		// mode is on (then the text is a plan awaiting approval), or the reply
 		// was cut off by the token limit (then we continue automatically).
 		if len(calls) == 0 {
+
 			if a.inPlanMode() {
 				if !a.requestPlanApproval(callText) {
 					releaseStep()
@@ -1685,9 +1734,9 @@ func (a *Agent) runTurn(input turnInput) {
 				releaseStep()
 				continue
 			}
-			// Claude-style continuation: the reply hit MaxReplyTokens; ask the
+			// The reply hit a provider or configured output limit; ask the
 			// model to keep going (bounded, so it cannot loop forever).
-			if res.FinishReason == "length" && step.cfg.MaxReplyTokens > 0 && continueCount < 3 {
+			if res.FinishReason == "length" && continueCount < 3 {
 				continueCount++
 				a.emitStatus("reply hit the token limit — continuing…")
 				if err := a.appendHistory(messages.Message{
@@ -1719,36 +1768,7 @@ func (a *Agent) runTurn(input turnInput) {
 		// into plausible-looking but incomplete JSON. Never execute those —
 		// hand back an error result so the model re-issues the call with the
 		// complete arguments.
-		var results []toolRunResult
-		a.mu.Lock()
-		a.deferToolEvents = true
-		a.deferredToolEvents = nil
-		a.mu.Unlock()
-		if res.FinishReason == "length" && len(calls) > 0 {
-			a.emitStatus("reply truncated by the token limit — voiding %d incomplete tool call(s)", len(calls))
-			results = make([]toolRunResult, len(calls))
-			journal := toolJournalContextForStep(step)
-			for i, tc := range calls {
-				out := "not executed: the assistant message hit the token limit before this tool call finished streaming, " +
-					"so its arguments may be incomplete. Re-issue the tool call with the full arguments."
-				results[i] = toolRunResult{output: out, isErr: true}
-				if err := a.finishUnexecutedToolWithStatus(withToolCallIndex(journal, i), tc, out, true, "denied"); err != nil {
-					results[i].output = "session persistence failed: " + err.Error()
-				}
-				results[i].status = "denied"
-				a.emit(toolEvent(tc, "denied", "voided (message truncated)"))
-			}
-			if journal.enabled {
-				_, _ = a.projectToolResults(journal, calls, results)
-			}
-		} else {
-			results = a.dispatchToolsForContext(calls, toolJournalContextForStep(step))
-		}
-		a.mu.Lock()
-		a.deferToolEvents = false
-		deferredToolEvents := append([]Event(nil), a.deferredToolEvents...)
-		a.deferredToolEvents = nil
-		a.mu.Unlock()
+		results, deferredToolEvents := a.executeToolCallsForStep(calls, step, res)
 		// Every tool_call id MUST get a result message or the next request
 		// violates the protocol (providers answer 400). dispatchTools fills
 		// synthetic results for calls skipped by an interrupt, so we append
@@ -1810,6 +1830,123 @@ func (a *Agent) settleTurnLocked(turnID protocol.TurnID, saveErr error) {
 	}
 }
 
+// beginTurnState resets all per-turn bookkeeping before a new user message is
+// processed: the approval cache, the tool-output/guardian budgets, the fallback
+// budget (restoring the primary client), and the AutoMem turn tracking.
+func (a *Agent) beginTurnState(text string) {
+	a.mu.Lock()
+	// The approval cache is per-turn: decisions made for one user request
+	// never leak into the next one.
+	a.approvalCache = map[string]bool{}
+	a.mu.Unlock()
+	a.resetOutputBudget()
+	a.resetGuardianBudget()
+	// Fallback budget resets per turn: one fallback attempt per turn, not per
+	// session (a transient primary failure should not disable the primary for
+	// the rest of the session). The primary client is restored too, so the
+	// reset is real and not just cosmetic.
+	a.mu.Lock()
+	a.usedFallback = false
+	primary := a.primaryBinding
+	if primary.client != nil {
+		a.client = primary.client
+		// Fallback changes activeBinding for only the current turn; cfg.Model
+		// and primaryBinding remain the authoritative primary binding for the
+		// next turn.
+		a.activeModel = primary.model
+		primary.version = a.activeBinding.version + 1
+		a.activeBinding = primary
+	}
+	a.mu.Unlock()
+
+	// AutoMem: reset the per-turn tracking for this turn.
+	a.mu.Lock()
+	a.turnUserMsg = text
+	a.turnTouched = nil
+	a.turnSummary = ""
+	a.mu.Unlock()
+}
+
+// executeToolCallsForStep runs the batch of tool calls admitted this step and
+// returns them in call order with any events deferred while they were in
+// flight. A reply cut off by the token limit never executes its "salvaged" but
+// incomplete calls; those are returned as errors so the model re-issues them.
+func (a *Agent) executeToolCallsForStep(calls []messages.ToolCall, step stepRuntime, res llm.StreamResult) ([]toolRunResult, []Event) {
+	a.mu.Lock()
+	a.deferToolEvents = true
+	a.deferredToolEvents = nil
+	a.mu.Unlock()
+	journal := toolJournalContextForStep(step)
+	var results []toolRunResult
+	if res.FinishReason == "length" && len(calls) > 0 {
+		a.emitStatus("reply truncated by the token limit — voiding %d incomplete tool call(s)", len(calls))
+		results = make([]toolRunResult, len(calls))
+		for i, tc := range calls {
+			out := "not executed: the assistant message hit the token limit before this tool call finished streaming, " +
+				"so its arguments may be incomplete. Re-issue the tool call with the full arguments."
+			results[i] = toolRunResult{output: out, isErr: true}
+			if err := a.finishUnexecutedToolWithStatus(withToolCallIndex(journal, i), tc, out, true, "denied"); err != nil {
+				results[i].output = "session persistence failed: " + err.Error()
+			}
+			results[i].status = "denied"
+			a.emit(toolEvent(tc, "denied", "voided (message truncated)"))
+		}
+		if journal.enabled {
+			_, _ = a.projectToolResults(journal, calls, results)
+		}
+	} else {
+		results = a.dispatchToolsForContext(calls, journal)
+	}
+	a.mu.Lock()
+	a.deferToolEvents = false
+	deferredToolEvents := append([]Event(nil), a.deferredToolEvents...)
+	a.deferredToolEvents = nil
+	a.mu.Unlock()
+	return results, deferredToolEvents
+}
+
+// handleStreamError classifies a provider-stream failure and resolves it. It
+// returns true when the caller should retry the step against the fallback model
+// (the primary client failed once and the fallback budget for this turn is
+// unused); false ends the turn, having released the step lease and emitted the
+// appropriate error/interruption signal.
+func (a *Agent) handleStreamError(streamErr error, releaseStep func()) bool {
+	if isRequestJournalFailure(streamErr) {
+		releaseStep()
+		a.emit(Event{Type: EventError, Text: "request journal error: " + streamErr.Error()})
+		return false
+	}
+	if a.interrupted() {
+		releaseStep()
+		a.mu.Lock()
+		a.interruptNote = true
+		a.mu.Unlock()
+		a.emitStatus("stream interrupted")
+		return false
+	}
+	// Fallback model (Claude's --fallback-model): one retry on the backup client,
+	// then give up. activeModel follows so usage is priced with the fallback rate
+	// card, and the request builder sends the fallback MODEL NAME to the fallback
+	// endpoint (req.Model comes from activeModelSnapshot).
+	a.mu.Lock()
+	fallback := a.fallbackBinding
+	if !a.usedFallback && fallback.client != nil {
+		a.usedFallback = true
+		a.client = fallback.client
+		a.activeModel = fallback.model
+		fallback.version = a.activeBinding.version + 1
+		a.activeBinding = fallback
+		a.mu.Unlock()
+		releaseStep()
+		a.emitStatus("primary model failed (%v) — falling back to %s", streamErr, fallback.model)
+		return true
+	}
+	a.mu.Unlock()
+	releaseStep()
+	a.emit(Event{Type: EventError, Text: "LLM error: " + streamErr.Error()})
+	return false
+}
+
 // turnFinished runs when a turn completes: it persists the session, publishes
 // one explicitly-bound terminal event, and then drains any queued user
 // messages. The settling phase covers even the no-queue path so a Submit that
@@ -1862,36 +1999,41 @@ func (a *Agent) turnFinished() {
 	}
 	a.emitTerminalEvent(Event{Type: EventTurnDone, TurnID: string(turnID)})
 
-	// The terminal helper reserved the next turn by keeping busy=true. Inputs
-	// arriving after the Done event therefore remain queued until this owner
-	// durably delivers the first one. Safe commands may still stage state, but
-	// no command can start a competing turn while the reservation is held.
-	nextTurnID := fmt.Sprintf("turn-%d", completedTurnSeq+1)
+	a.launchQueuedTurn(completedTurnSeq)
+}
 
+// idleAfterTurn resets the owner to a non-busy terminal phase under the lock.
+func (a *Agent) idleAfterTurn() {
+	a.mu.Lock()
+	a.busy = false
+	a.settling = false
+	if a.closing || a.closed {
+		a.phase = protocol.PhaseStopping
+	} else {
+		a.phase = protocol.PhaseIdle
+	}
+	a.mu.Unlock()
+}
+
+// launchQueuedTurn claims the oldest queued input and starts it as the next
+// turn under the owner lock. The caller must already hold the busy reservation
+// (from publishTerminal or a compaction reservation) so a competing turn cannot
+// start. When no input is available, or cancellation/persistence stalls it, the
+// session is left idle and false is returned.
+func (a *Agent) launchQueuedTurn(completedTurnSeq uint64) bool {
+	nextTurnID := fmt.Sprintf("turn-%d", completedTurnSeq+1)
 	next, ok, err := a.claimPendingInputAndAppend(nextTurnID, "")
 	if err != nil {
 		a.markPersistenceFailure(err)
-		a.mu.Lock()
-		a.busy = false
-		a.settling = false
-		if !a.closing && !a.closed {
-			a.phase = protocol.PhaseIdle
-		}
-		a.mu.Unlock()
+		a.idleAfterTurn()
 		a.emit(Event{Type: EventError, Text: "queued input delivery failed: " + err.Error()})
 		a.publishState()
-		return
+		return false
 	}
 	if !ok {
-		a.mu.Lock()
-		a.busy = false
-		a.settling = false
-		if !a.closing && !a.closed {
-			a.phase = protocol.PhaseIdle
-		}
-		a.mu.Unlock()
+		a.idleAfterTurn()
 		a.publishState()
-		return
+		return false
 	}
 	a.mu.Lock()
 	if a.closing || a.closed || a.stop || a.interruptFlag || a.persistenceErr != nil {
@@ -1904,14 +2046,14 @@ func (a *Agent) turnFinished() {
 		}
 		a.mu.Unlock()
 		a.publishState()
-		return
+		return false
 	}
 	a.turnSeq++
 	a.turnWG.Add(1)
-	// The queued input becomes the next turn only under this owner lock.
-	// Reset the old terminal flags before publishing the new preparing state;
-	// a later Interrupt/Stop cannot be erased by runTurn because it no longer
-	// clears them asynchronously.
+	// The queued input becomes the next turn only under this owner lock. Reset
+	// the old terminal flags before publishing the new preparing state; a later
+	// interrupt/stop cannot be erased by runTurn because it no longer clears
+	// them asynchronously.
 	a.interruptFlag = false
 	a.stop = false
 	a.settling = false
@@ -1920,6 +2062,7 @@ func (a *Agent) turnFinished() {
 	a.mu.Unlock()
 	a.publishState()
 	go a.runTurn(next)
+	return true
 }
 
 // dispatchTools executes a batch of tool calls. With maxParallelTools > 1 the
@@ -2109,68 +2252,15 @@ func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournal
 			output = a.toolOutputPreview(output, 0)
 		}()
 	}
-	// Resolve the frozen implementation before admission. Looking up an object
-	// is not execution; it lets the hard child/plan gates classify capabilities
-	// by concrete implementation rather than a forgeable tool name.
-	var tool tools.Tool
-	var ok bool
-	if journal.enabled && journal.toolLease != nil {
-		tool, ok = journal.toolLease.Get(tc.Name)
-	} else {
-		tool, ok = a.registry.Get(tc.Name)
+	// Resolve the frozen implementation and apply the non-overridable hard
+	// admission gates (child/guardian policy, plan mode, hard deny, strict
+	// sandbox, config custom-perm). A custom "allow" shortcut runs immediately.
+	tool, out, runNow, denied := a.hardAdmitTool(tc, journal, execution)
+	if denied {
+		return out, true
 	}
-	// Child/guardian policy is a hard admission boundary. It must run before
-	// hooks, permission overrides, and especially Tool.Run; prompt instructions
-	// or a parent bypass mode cannot override it.
-	if denied, reason := ChildToolGate(a, tc); denied {
-		a.emit(toolEvent(tc, "denied", reason))
-		return fmt.Sprintf("permission denied: %s", reason), true
-	}
-	if !ok {
-		a.emit(toolEvent(tc, "error", "unknown tool "+tc.Name))
-		return fmt.Sprintf("Error: unknown tool %q", tc.Name), true
-	}
-	if purpose, _, _, child := ChildRuntime(a); child && purpose == childPurposeGuardian && !readOnlyImplementation(tool) {
-		reason := fmt.Sprintf("guardian hard deny: tool %q is not the built-in read-only implementation", tc.Name)
-		a.emit(toolEvent(tc, "denied", reason))
-		return fmt.Sprintf("permission denied: %s", reason), true
-	}
-	// Plan mode hard-blocks mutating tools even if the model somehow calls one.
-	// Capability is determined from the frozen concrete implementation, never
-	// from a name that a custom/plugin scope can shadow.
-	if a.inPlanMode() && !planAllowedImplementation(tool) {
-		a.emit(toolEvent(tc, "denied", "blocked in plan mode"))
-		return fmt.Sprintf("blocked in plan mode: %s modifies state; only built-in read-only tools are available until the plan is approved", tc.Name), true
-	}
-	// Explicit hard denials are checked before any custom permission, Go-hook,
-	// or shell-hook allow path. Hooks can add an approval requirement, but they
-	// must never turn an always-deny/dangerous invocation into an execution.
-	if denied, reason := a.perms.HardDeny(tc.Name, tc.Arguments); denied {
-		a.emit(toolEvent(tc, "denied", reason))
-		return fmt.Sprintf("permission denied: %s", reason), true
-	}
-
-	// Sandbox × approval linkage: in strict sandbox mode, network tools are
-	// blocked unless network access was explicitly allowed (Codex's
-	// sandbox_mode ↔ approval matrix).
-	if sb := a.currentSandbox(); sb != nil && sb.CurrentMode() == sandbox.ModeStrict && !sb.AllowNetwork {
-		switch tc.Name {
-		case "WebFetch", "WebSearch":
-			a.emit(toolEvent(tc, "denied", "network blocked by strict sandbox"))
-			return fmt.Sprintf("permission denied: %s needs network access, which strict sandbox mode blocks (set sandbox_allow_network: true to permit)", tc.Name), true
-		}
-	}
-
-	// Custom tools may carry a config-level permission override that bypasses
-	// the normal approval gate ("allow" runs it, "deny" refuses it).
-	if perm, isCustom := a.customPerms[tc.Name]; isCustom {
-		switch perm {
-		case "allow":
-			return a.runToolWithJournal(tc, tool, journal, execution)
-		case "deny":
-			a.emit(toolEvent(tc, "denied", "denied by tool config"))
-			return fmt.Sprintf("permission denied: %s is configured with permission \"deny\"", tc.Name), true
-		}
+	if runNow {
+		return a.runToolWithJournal(tc, tool, journal, execution)
 	}
 
 	// In-process Go hooks run first; their verdict can veto the call.
@@ -2251,6 +2341,73 @@ func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournal
 	return a.runToolWithJournal(tc, tool, journal, execution)
 }
 
+// hardAdmitTool resolves the frozen tool implementation and applies the
+// non-overridable admission gates: child/guardian hard policy, plan-mode
+// mutation block, explicit hard denies, strict-sandbox network blocks, and
+// config-level custom-tool permissions. These must run before any hook,
+// permission override, or Tool.Run; a name a custom/plugin scope can shadow is
+// never used to classify capability. runNow is true only for the custom "allow"
+// shortcut, which bypasses the remaining gates.
+func (a *Agent) hardAdmitTool(tc messages.ToolCall, journal toolJournalContext, execution *toolJournalExecution) (tool tools.Tool, output string, runNow, denied bool) {
+	var ok bool
+	if journal.enabled && journal.toolLease != nil {
+		tool, ok = journal.toolLease.Get(tc.Name)
+	} else {
+		tool, ok = a.registry.Get(tc.Name)
+	}
+	if denied, reason := ChildToolGate(a, tc); denied {
+		a.emit(toolEvent(tc, "denied", reason))
+		return nil, fmt.Sprintf("permission denied: %s", reason), false, true
+	}
+	if !ok {
+		a.emit(toolEvent(tc, "error", "unknown tool "+tc.Name))
+		return nil, fmt.Sprintf("Error: unknown tool %q", tc.Name), false, true
+	}
+	if purpose, _, _, child := ChildRuntime(a); child && purpose == childPurposeGuardian && !readOnlyImplementation(tool) {
+		reason := fmt.Sprintf("guardian hard deny: tool %q is not the built-in read-only implementation", tc.Name)
+		a.emit(toolEvent(tc, "denied", reason))
+		return nil, fmt.Sprintf("permission denied: %s", reason), false, true
+	}
+	// Plan mode hard-blocks mutating tools even if the model somehow calls one.
+	// Capability is determined from the frozen concrete implementation, never
+	// from a name that a custom/plugin scope can shadow.
+	if a.inPlanMode() && !planAllowedImplementation(tool) {
+		a.emit(toolEvent(tc, "denied", "blocked in plan mode"))
+		return nil, fmt.Sprintf("blocked in plan mode: %s modifies state; only built-in read-only tools are available until the plan is approved", tc.Name), false, true
+	}
+	// Explicit hard denials are checked before any custom permission, Go-hook,
+	// or shell-hook allow path. Hooks can add an approval requirement, but they
+	// must never turn an always-deny/dangerous invocation into an execution.
+	if denied, reason := a.perms.HardDeny(tc.Name, tc.Arguments); denied {
+		a.emit(toolEvent(tc, "denied", reason))
+		return nil, fmt.Sprintf("permission denied: %s", reason), false, true
+	}
+
+	// Sandbox × approval linkage: in strict sandbox mode, network tools are
+	// blocked unless network access was explicitly allowed (Codex's
+	// sandbox_mode ↔ approval matrix).
+	if sb := a.currentSandbox(); sb != nil && sb.CurrentMode() == sandbox.ModeStrict && !sb.AllowNetwork {
+		switch tc.Name {
+		case "WebFetch", "WebSearch":
+			a.emit(toolEvent(tc, "denied", "network blocked by strict sandbox"))
+			return nil, fmt.Sprintf("permission denied: %s needs network access, which strict sandbox mode blocks (set sandbox_allow_network: true to permit)", tc.Name), false, true
+		}
+	}
+
+	// Custom tools may carry a config-level permission override that bypasses
+	// the normal approval gate ("allow" runs it, "deny" refuses it).
+	if perm, isCustom := a.customPerms[tc.Name]; isCustom {
+		switch perm {
+		case "allow":
+			return tool, "", true, false
+		case "deny":
+			a.emit(toolEvent(tc, "denied", "denied by tool config"))
+			return nil, fmt.Sprintf("permission denied: %s is configured with permission \"deny\"", tc.Name), false, true
+		}
+	}
+	return tool, "", false, false
+}
+
 // runTool executes an approved tool call, publishing the tool pipeline domain
 // events and running PostToolUse + Go post hooks.
 func (a *Agent) runTool(tc messages.ToolCall, tool tools.Tool) (string, bool) {
@@ -2294,11 +2451,86 @@ func (a *Agent) runToolWithJournal(tc messages.ToolCall, tool tools.Tool, journa
 		raw = a.maybePersistResult(tc, raw)
 		return a.clipAggregate(raw), failed
 	}
+	a.mu.Lock()
+	a.toolUses++
+	a.mu.Unlock()
 	a.evbus.Emit(events.TopicToolPreExecute, events.ToolEvent{ToolName: tc.Name, Args: tc.Arguments, Status: "running"})
 	a.emit(Event{Type: EventToolStart, Tool: &ToolEvent{ID: tc.ID, Name: tc.Name, Args: tc.Arguments}})
 	a.emit(toolEvent(tc, "running", ""))
 	a.emitStatus("%s running…", tc.Name)
 	start := time.Now()
+	tctx := a.buildToolContext(tc, turnCtx, cfg, sb, resources, skills)
+	out, err := tool.Run(tctx)
+	if err == nil && tc.Name == "TodoWrite" {
+		// TodoStore is a mutable session resource. The tool's own store write
+		// completes first; only then publish the typed task replacement so a
+		// replay can restore the list without consulting a sidecar file.
+		if taskErr := a.persistTasksSnapshot(); taskErr != nil {
+			err = taskErr
+		}
+	}
+	elapsed := time.Since(start).Round(time.Millisecond)
+	status := errString(err)
+	if status == "" {
+		status = "ok"
+	}
+	a.logv("tool %s %s in %s", tc.Name, status, elapsed)
+
+	// Invalidate the workspace model after anything that may have changed files.
+	switch tc.Name {
+	case "Write", "Edit", "Bash":
+		workspace.Invalidate(cfg.Workspace)
+	}
+
+	// AutoMem: remember files the turn modified so the memory log can say what
+	// changed. Only Write/Edit carry a reliable file_path argument.
+	if cfg.MemoryEnabled() {
+		switch tc.Name {
+		case "Write", "Edit":
+			if p, _ := tc.Arguments["file_path"].(string); p != "" {
+				a.recordTouched(p)
+			}
+		}
+	}
+
+	if err != nil {
+		raw := fmt.Sprintf("%s failed after %s: %v", tc.Name, elapsed, err)
+		if strings.TrimSpace(out) != "" {
+			raw += "\n" + out
+		}
+		out, _ = finishToolOutput(raw, true)
+		a.emit(toolEvent(tc, "error", out))
+		a.evbus.Emit(events.TopicToolPostExecute, events.ToolEvent{ToolName: tc.Name, Args: tc.Arguments, Status: "error", Error: err.Error()})
+		// PostToolUseFailure hooks observe the failure (non-blocking).
+		a.runHookWithJournal(turnCtx, hooks.EventPostToolUseFailure, func(hctx context.Context) hooks.Output {
+			return a.hooks.PostToolUseFailure(hctx, tc.Name, tc.Arguments, err.Error())
+		})
+		return out, true
+	}
+
+	// PostToolUse shell hooks can append context to the result.
+	if ho := a.runHookWithJournal(turnCtx, hooks.EventPostToolUse, func(hctx context.Context) hooks.Output {
+		return a.hooks.PostToolUse(hctx, tc.Name, tc.Arguments, out)
+	}); ho.HookSpecificOutput != "" {
+		out += "\n" + ho.HookSpecificOutput
+	}
+	// In-process Go post hooks run alongside.
+	if extra := a.gohooks.RunPostTool(tc.Name, tc.Arguments, out); extra != "" {
+		out += extra
+	}
+	out, _ = finishToolOutput(out, false)
+
+	a.emit(toolEvent(tc, "success", out))
+	a.evbus.Emit(events.TopicToolPostExecute, events.ToolEvent{ToolName: tc.Name, Args: tc.Arguments, Status: "success", Output: out})
+	a.evbus.Emit(events.TopicToolResult, events.ToolEvent{ToolName: tc.Name, Args: tc.Arguments, Status: "success", Output: out})
+	return out, false
+}
+
+// buildToolContext assembles the *tools.Context handed to an approved tool,
+// wiring Bash timeout, sub-agent/skills callbacks, session identity, and the
+// streaming output sink. The registry/MCP leases are already frozen at the step
+// boundary, so this context cannot observe a mid-stream plugin update.
+func (a *Agent) buildToolContext(tc messages.ToolCall, turnCtx context.Context, cfg config.Config, sb *sandbox.Sandbox, resources *tools.Resources, skills *skills.Store) *tools.Context {
 	var tctx *tools.Context
 	if resources != nil {
 		tctx = resources.Context(turnCtx, cfg.Workspace, sb)
@@ -2335,67 +2567,7 @@ func (a *Agent) runToolWithJournal(tc messages.ToolCall, tool tools.Tool, journa
 			ID: tc.ID, Name: tc.Name, Status: "stream", Output: line,
 		}})
 	}
-	out, err := tool.Run(tctx)
-	if err == nil && tc.Name == "TodoWrite" {
-		// TodoStore is a mutable session resource. The tool's own store write
-		// completes first; only then publish the typed task replacement so a
-		// replay can restore the list without consulting a sidecar file.
-		if taskErr := a.persistTasksSnapshot(); taskErr != nil {
-			err = taskErr
-		}
-	}
-	elapsed := time.Since(start).Round(time.Millisecond)
-	status := errString(err)
-	if status == "" {
-		status = "ok"
-	}
-	a.logv("tool %s %s in %s", tc.Name, status, elapsed)
-
-	// Invalidate the workspace model after anything that may have changed files.
-	switch tc.Name {
-	case "Write", "Edit", "Bash":
-		workspace.Invalidate(cfg.Workspace)
-	}
-
-	// AutoMem: remember files the turn modified so the memory log can say what
-	// changed. Only Write/Edit carry a reliable file_path argument.
-	if cfg.MemoryEnabled() {
-		switch tc.Name {
-		case "Write", "Edit":
-			if p, _ := tc.Arguments["file_path"].(string); p != "" {
-				a.recordTouched(p)
-			}
-		}
-	}
-
-	if err != nil {
-		raw := fmt.Sprintf("%s failed after %s: %v", tc.Name, elapsed, err)
-		out, _ = finishToolOutput(raw, true)
-		a.emit(toolEvent(tc, "error", err.Error()))
-		a.evbus.Emit(events.TopicToolPostExecute, events.ToolEvent{ToolName: tc.Name, Args: tc.Arguments, Status: "error", Error: err.Error()})
-		// PostToolUseFailure hooks observe the failure (non-blocking).
-		a.runHookWithJournal(turnCtx, hooks.EventPostToolUseFailure, func(hctx context.Context) hooks.Output {
-			return a.hooks.PostToolUseFailure(hctx, tc.Name, tc.Arguments, err.Error())
-		})
-		return out, true
-	}
-
-	// PostToolUse shell hooks can append context to the result.
-	if ho := a.runHookWithJournal(turnCtx, hooks.EventPostToolUse, func(hctx context.Context) hooks.Output {
-		return a.hooks.PostToolUse(hctx, tc.Name, tc.Arguments, out)
-	}); ho.HookSpecificOutput != "" {
-		out += "\n" + ho.HookSpecificOutput
-	}
-	// In-process Go post hooks run alongside.
-	if extra := a.gohooks.RunPostTool(tc.Name, tc.Arguments, out); extra != "" {
-		out += extra
-	}
-	out, _ = finishToolOutput(out, false)
-
-	a.emit(toolEvent(tc, "success", out))
-	a.evbus.Emit(events.TopicToolPostExecute, events.ToolEvent{ToolName: tc.Name, Args: tc.Arguments, Status: "success", Output: out})
-	a.evbus.Emit(events.TopicToolResult, events.ToolEvent{ToolName: tc.Name, Args: tc.Arguments, Status: "success", Output: out})
-	return out, false
+	return tctx
 }
 
 // requestApproval blocks until the user answers the approval request. It is

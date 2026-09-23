@@ -273,7 +273,7 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 		// candidate directly. Even on that path, adapt the frozen provider to
 		// the candidate's effective operator limits before the next step.
 		binding = a.activeBinding
-		binding.client = providerWithOperatorCaps(candidate.cfg, binding.client)
+		binding.client = providerWithOperatorCaps(candidate.cfg, candidate.cfg.Model, binding.client)
 	}
 	if binding.model == "" {
 		binding.model = a.activeBinding.model
@@ -341,8 +341,8 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	// plugin and are represented by the binding itself.
 	if binding.client != nil && binding.routeKind == "http" && a.models != nil {
 		a.models.Register(binding.client)
-		endpoint, apiKey := candidate.cfg.EndpointFor(binding.model)
-		a.models.RouteDefault(binding.model, binding.client.Name(), endpoint, apiKey)
+		a.models.RouteDefault(binding.model, binding.client.Name(),
+			binding.httpBinding(candidate.cfg.ResolveProvider(binding.model).APIKey))
 	}
 
 	// Registry registration is infallible after validation. Publish each
@@ -369,9 +369,7 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	if binding.client != nil {
 		a.activeBinding = binding
 		a.client = binding.client
-		a.primaryClient = binding.client
-		a.primaryEndpoint = binding.endpoint
-		a.primaryRouteKind = binding.routeKind
+		a.primaryBinding = binding
 		a.activeModel = binding.model
 	}
 	a.sandbox = candidate.sandbox
@@ -421,11 +419,13 @@ func (a *Agent) settingsForCandidateLocked(candidate *settingsCandidate, permiss
 	settings.AdditionalDirectories = append([]string(nil), candidate.cfg.AdditionalDirectories...)
 	settings.DisallowedDirectories = append([]string(nil), candidate.cfg.DisallowedDirectories...)
 	settings.ContextWindow = candidate.cfg.ContextWindow
+	settings.EffectiveContextWindow = candidate.cfg.ContextWindowFor(candidate.cfg.Model)
 	settings.CompactThreshold = candidate.cfg.CompactThreshold
 	settings.MaxResultSizeChars = candidate.cfg.MaxResultSizeChars
 	settings.MaxTurns = candidate.cfg.MaxTurns
 	settings.MaxBudgetUSD = candidate.cfg.MaxBudgetUSD
-	settings.MaxReplyTokens = candidate.cfg.MaxReplyTokens
+	maxOutputTokens := candidate.cfg.MaxOutputTokensFor(candidate.cfg.Model)
+	settings.MaxOutputTokens = &maxOutputTokens
 	settings.ReasoningEffort = candidate.cfg.ReasoningEffort
 	settings.Verbosity = candidate.cfg.Verbosity
 	settings.GenerationOptionsSet = true
@@ -461,14 +461,6 @@ func cloneMCPConfig(src map[string]mcp.ServerConfig) map[string]mcp.ServerConfig
 		out[name] = cfg
 	}
 	return out
-}
-
-func (a *Agent) setWebTools(enabled bool) {
-	var webTools []tools.Tool
-	if enabled {
-		webTools = []tools.Tool{tools.NewWebFetchTool(), tools.NewWebSearchTool()}
-	}
-	a.registry.ReplaceScope("web", webTools)
 }
 
 func cloneHookConfig(src hooks.Config) hooks.Config {

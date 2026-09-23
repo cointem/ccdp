@@ -81,7 +81,7 @@ func (m *Model) showAgentHistory(msg agentHistoryMsg) tea.Cmd {
 		return nil
 	}
 	previous := m.reader
-	r := &readerState{kind: readerTranscript, title: "Saved history", sessionID: protocol.SessionID(msg.sessionID), entries: entries, index: len(entries) - 1, request: msg.request, returnOffset: m.viewport.YOffset, returnFollow: m.followOutput, historyBefore: msg.page.Before, historyMore: msg.page.More}
+	r := &readerState{workspace: m.workspace, kind: readerTranscript, title: "Saved history", sessionID: protocol.SessionID(msg.sessionID), entries: entries, index: len(entries) - 1, request: msg.request, returnOffset: m.viewport.YOffset, returnFollow: m.followOutput, historyBefore: msg.page.Before, historyMore: msg.page.More}
 	if previous != nil {
 		r.screenEntered = previous.screenEntered
 		r.returnOffset = previous.returnOffset

@@ -17,8 +17,6 @@ func TestLoadFromEnvironmentOverridesFile(t *testing.T) {
 	t.Setenv("CCDP_PERMISSION_MODE", "bypassPermissions")
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{
-  "api_key":"file-key",
-  "base_url":"https://file.example/v1",
   "model":"file-model",
   "permission_mode":"default"
 }`), 0o600); err != nil {
@@ -115,8 +113,8 @@ func TestLoadFromMerge(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	content := `{
-		"base_url": "https://custom.example/v1",
-		"model": "custom-model",
+		"providers": {"custom": {"base_url":"https://custom.example/v1", "wire_api":"chat", "models":{"custom-model":{}}}},
+		"model": "custom/custom-model",
 		"permission_mode": "acceptEdits",
 		"max_budget_usd": 2.5,
 		"tools": [{"name": "fmt", "description": "fmt", "command": "gofmt"}]
@@ -129,7 +127,7 @@ func TestLoadFromMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFrom: %v", err)
 	}
-	if cfg.BaseURL != "https://custom.example/v1" || cfg.Model != "custom-model" {
+	if cfg.ResolveProvider(cfg.Model).BaseURL != "https://custom.example/v1" || cfg.Model != "custom/custom-model" {
 		t.Errorf("custom values not merged: %+v", cfg)
 	}
 	if cfg.PermissionMode != "acceptEdits" {

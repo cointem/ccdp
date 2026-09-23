@@ -1,6 +1,11 @@
 package agent
 
 import (
+	"ccdp/internal/config"
+	"ccdp/internal/llm"
+	"ccdp/internal/messages"
+	"ccdp/internal/protocol"
+	"ccdp/internal/session"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,11 +15,7 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"ccdp/internal/llm"
-	"ccdp/internal/messages"
-	"ccdp/internal/protocol"
-	"ccdp/internal/session"
+	"unicode/utf8"
 )
 
 // SessionSnapshot is the serializable form of a session.
@@ -31,10 +32,6 @@ type SessionSnapshot struct {
 	// session state recoverable without putting credentials or opaque runtime
 	// objects in the legacy snapshot shape.
 	Settings *session.Settings `json:"settings,omitempty"`
-	// PendingSettings is an admitted candidate that was not yet applied at a
-	// step boundary. It is kept separate from Settings so resume cannot mistake
-	// a scheduled model/policy change for the active configuration.
-	PendingSettings *session.SettingsScheduled `json:"pending_settings,omitempty"`
 	// PendingCommands records admitted asynchronous operations with no durable
 	// completion yet. Resume exposes them as unknown; it never re-runs them.
 	PendingCommands []session.CommandScheduled `json:"pending_commands,omitempty"`
@@ -77,17 +74,6 @@ func cloneInputViews(src []protocol.InputView) []protocol.InputView {
 		return nil
 	}
 	return append([]protocol.InputView(nil), src...)
-}
-
-func clonePendingAttachments(src map[string][]messages.ImageAttachment) map[string][]messages.ImageAttachment {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make(map[string][]messages.ImageAttachment, len(src))
-	for id, attachments := range src {
-		dst[id] = cloneImageAttachments(attachments)
-	}
-	return dst
 }
 
 // pendingInputSnapshot aligns the compatibility text queue with its durable
@@ -310,7 +296,7 @@ func loadSessionSnapshot(dir, id string) (*SessionSnapshot, bool, error) {
 			ID: projection.ID, CreatedAt: projection.CreatedAt, UpdatedAt: projection.updatedAt,
 			Workspace: projection.Workspace, Model: projection.Model, Title: sessionTitle(projection.History),
 			History: cloneMessages(projection.History), Usage: projection.Usage, Pending: append([]string(nil), projection.Pending...), PendingInputs: projection.pendingInputViews(), PendingAttachments: projection.pendingAttachments(),
-			Settings: snapshotSettings(projection.Settings), PendingSettings: snapshotPendingSettings(projection.PendingSettings), PendingCommands: projection.pendingCommands(), Workflow: snapshotWorkflow(projection.Workflow),
+			Settings: snapshotSettings(projection.Settings), PendingCommands: projection.pendingCommands(), Workflow: snapshotWorkflow(projection.Workflow),
 			Memory: projection.MemoryText, Tasks: append([]session.Task(nil), projection.Tasks...),
 			ParentID: projection.ParentID, BranchPoint: projection.BranchPoint, BranchSummary: projection.BranchSummary,
 			turnSeq: projection.turnSeq, stepSeq: projection.stepSeq,
@@ -358,19 +344,30 @@ func validateSessionID(id string) error {
 	return nil
 }
 
+// SessionListIssue records one session directory ListSessions had to leave out.
+// A damaged or unreadable log must not hide every other session, but the
+// omission has to be visible: without it an empty list is indistinguishable
+// from "nothing to resume".
+type SessionListIssue struct {
+	ID     string
+	Reason string
+}
+
 // ListSessions returns both authoritative JSONL sessions and legacy flat JSON
-// sessions, newest first.  It is strictly read-only: it never imports,
-// creates a directory, repairs a tail, or writes a snapshot.  If both layouts
-// contain an ID, the JSONL directory wins and the legacy file is omitted.
-func ListSessions(dir string) ([]SessionSnapshot, error) {
+// sessions, newest first, plus an issue for every session it had to skip.  It is
+// strictly read-only: it never imports, creates a directory, repairs a tail, or
+// writes a snapshot.  If both layouts contain an ID, the JSONL directory wins and
+// the legacy file is omitted.
+func ListSessions(dir string) ([]SessionSnapshot, []SessionListIssue, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	var sessions []SessionSnapshot
+	var issues []SessionListIssue
 	newIDs := make(map[string]bool)
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -385,7 +382,8 @@ func ListSessions(dir string) ([]SessionSnapshot, error) {
 		}
 		snap, legacy, err := loadSessionSnapshot(dir, id)
 		if err != nil {
-			return nil, fmt.Errorf("agent: list session %s: %w", id, err)
+			issues = append(issues, SessionListIssue{ID: id, Reason: err.Error()})
+			continue
 		}
 		if legacy {
 			// A non-authoritative/incomplete import is represented by the legacy
@@ -408,6 +406,7 @@ func ListSessions(dir string) ([]SessionSnapshot, error) {
 		}
 		snap, err := LoadSession(dir, id)
 		if err != nil {
+			issues = append(issues, SessionListIssue{ID: id, Reason: err.Error()})
 			continue
 		}
 		sessions = append(sessions, *snap)
@@ -415,7 +414,7 @@ func ListSessions(dir string) ([]SessionSnapshot, error) {
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)
 	})
-	return sessions, nil
+	return sessions, issues, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -501,28 +500,7 @@ func (a *Agent) Fork(keep int) (string, error) {
 		return "", fmt.Errorf("save source session: %w", err)
 	}
 
-	a.mu.Lock()
-	oldID := a.sessionID
-	sourceCfg := cloneConfig(a.cfg)
-	n := len(a.history)
-	if keep < 0 || keep > n {
-		keep = n
-	}
-	prefix := cloneMessages(a.history[:keep])
-	suffix := cloneMessages(a.history[keep:])
-	usage := a.usage
-	sourceBinding := a.activeBinding
-	rootCtx := a.rootCtx
-	metadata := requestJournalMetadata{
-		Config:           sourceCfg,
-		SettingsRevision: a.settingsRev,
-		ContextRevision:  a.contextRev,
-		CatalogVersion:   a.catalogVersion,
-		Turn:             a.turnSeq,
-		Step:             a.stepSeq,
-		HistoryLen:       len(a.history),
-	}
-	a.mu.Unlock()
+	oldID, sourceCfg, prefix, suffix, usage, sourceBinding, rootCtx, metadata, keep := a.snapshotForkSource(keep)
 
 	// Summarization is best effort for provider errors, but cancellation of the
 	// source root context is a hard stop: do not publish a child with a silently
@@ -567,26 +545,7 @@ func (a *Agent) Fork(keep int) (string, error) {
 	// The fork point can split a tool_call↔result pair (keep may land between
 	// an assistant tool_calls message and its results); sanitize the frozen
 	// child history so its first provider request is valid.
-	prefix = sanitizeToolPairs(prefix)
-	branch := make([]messages.Message, 0, len(prefix)+1)
-	insert := 0
-	if len(prefix) > 0 && prefix[0].Role == messages.RoleSystem {
-		insert = 1
-	}
-	branch = append(branch, prefix[:insert]...)
-	if summary != "" {
-		branch = append(branch, messages.Message{
-			Role: messages.RoleSystem,
-			Content: fmt.Sprintf(
-				"This session was branched from session %s before message %d. Work continued from here in a different direction.\n\nSummary of the abandoned direction (already tried — do not repeat unless asked):\n\n%s",
-				oldID, keep, summary),
-			CreatedAt: newCreatedAt,
-		})
-	}
-	branch = append(branch, prefix[insert:]...)
-	for i := range branch {
-		ensureMessageID(&branch[i])
-	}
+	branch := buildForkBranch(prefix, summary, oldID, keep, newCreatedAt)
 
 	if _, err := childPersistence.commitEvents("fork-"+newID, session.SessionImported{
 		SessionID: newID, FormatVersion: session.SchemaVersion, Source: "fork", OriginalPath: oldID,
@@ -615,8 +574,61 @@ func (a *Agent) Fork(keep int) (string, error) {
 	return newID, nil
 }
 
-func (a *Agent) sessionPath() string {
-	return filepath.Join(a.cfg.SessionDir, a.sessionID+".json")
+// snapshotForkSource captures the immutable source-session state a branch needs
+// under one lock: identity, config, split history spans, usage, binding, root
+// context, and the request-journal metadata. keep is clamped to the history
+// bounds.
+func (a *Agent) snapshotForkSource(keep int) (oldID string, sourceCfg config.Config, prefix, suffix []messages.Message, usage Usage, sourceBinding modelBinding, rootCtx context.Context, metadata requestJournalMetadata, clampedKeep int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	oldID = a.sessionID
+	sourceCfg = cloneConfig(a.cfg)
+	n := len(a.history)
+	if keep < 0 || keep > n {
+		keep = n
+	}
+	prefix = cloneMessages(a.history[:keep])
+	suffix = cloneMessages(a.history[keep:])
+	usage = a.usage
+	sourceBinding = a.activeBinding
+	rootCtx = a.rootCtx
+	metadata = requestJournalMetadata{
+		Config:           sourceCfg,
+		SettingsRevision: a.settingsRev,
+		ContextRevision:  a.contextRev,
+		CatalogVersion:   a.catalogVersion,
+		Turn:             a.turnSeq,
+		Step:             a.stepSeq,
+		HistoryLen:       len(a.history),
+	}
+	return oldID, sourceCfg, prefix, suffix, usage, sourceBinding, rootCtx, metadata, keep
+}
+
+// buildForkBranch assembles the child history: the leading system facts, an
+// injected branch-summary system message, and the kept prefix. The tool_call↔
+// result boundary is sanitized so the child's first provider request is valid.
+func buildForkBranch(prefix []messages.Message, summary, oldID string, branchPoint int, newCreatedAt time.Time) []messages.Message {
+	prefix = sanitizeToolPairs(prefix)
+	branch := make([]messages.Message, 0, len(prefix)+1)
+	insert := 0
+	if len(prefix) > 0 && prefix[0].Role == messages.RoleSystem {
+		insert = 1
+	}
+	branch = append(branch, prefix[:insert]...)
+	if summary != "" {
+		branch = append(branch, messages.Message{
+			Role: messages.RoleSystem,
+			Content: fmt.Sprintf(
+				"This session was branched from session %s before message %d. Work continued from here in a different direction.\n\nSummary of the abandoned direction (already tried — do not repeat unless asked):\n\n%s",
+				oldID, branchPoint, summary),
+			CreatedAt: newCreatedAt,
+		})
+	}
+	branch = append(branch, prefix[insert:]...)
+	for i := range branch {
+		ensureMessageID(&branch[i])
+	}
+	return branch
 }
 
 // ExportSessionMarkdown renders a replayed snapshot without constructing an
@@ -651,4 +663,489 @@ func ExportSessionMarkdown(snapshot *SessionSnapshot) string {
 		}
 	}
 	return strings.TrimRight(sb.String(), "\n") + "\n"
+}
+
+type managedClient struct {
+	supervisor *SessionSupervisor
+	run        *managedRun
+	id         protocol.SessionID
+	initialRun protocol.RunID
+}
+
+func (c *managedClient) current() *managedRun {
+	r, err := c.supervisor.lookup(c.id)
+	if err == nil {
+		return r
+	}
+	return c.run
+}
+
+func (c *managedClient) Snapshot(ctx context.Context) (protocol.SessionView, error) {
+	if err := ctx.Err(); err != nil {
+		return protocol.SessionView{}, err
+	}
+	r := c.current()
+	r.mu.Lock()
+	if r.agent != nil {
+		view, err := r.agent.Snapshot(ctx)
+		view.RunID = r.fact.Child.Run.ID
+		r.mu.Unlock()
+		return view, err
+	}
+	view := r.final
+	row := r.fact.Child
+	r.mu.Unlock()
+	if view.SessionID != "" {
+		view.RunID = row.Run.ID
+		// A closed runtime is still a readable session. Preserve its settings,
+		// but expose the settled run as idle and load the bounded transcript.
+		view.Busy, view.Closing, view.Phase = false, false, protocol.PhaseIdle
+		view.Approval, view.Question, view.Plan = nil, nil, nil
+		if view.Transcript == nil {
+			page, err := c.supervisor.ReadTranscript(ctx, row.SessionID, 0, transcriptWindow)
+			if err != nil {
+				return view, err
+			}
+			view.Transcript, view.TranscriptMore = page.Items, page.More
+		}
+		data, _ := json.Marshal(view)
+		var clone protocol.SessionView
+		_ = json.Unmarshal(data, &clone)
+		return clone, nil
+	}
+	view = protocol.SessionView{SessionID: row.SessionID, RunID: row.Run.ID, Busy: row.Run.Active(), Phase: protocol.PhaseIdle, Usage: row.Run.Usage}
+	if row.Run.Active() {
+		view.Phase = protocol.PhasePreparing
+	}
+	page, err := c.supervisor.ReadTranscript(ctx, row.SessionID, 0, transcriptWindow)
+	if err != nil && !errors.Is(err, os.ErrNotExist) && row.Run.Status != "queued" && row.Run.Status != "starting" {
+		return view, err
+	}
+	view.Transcript, view.TranscriptMore = page.Items, page.More
+	// Recover presentation metadata without starting a runtime/provider.
+	records, _, readErr := c.supervisor.readSessionRecords(ctx, row.SessionID)
+	if readErr == nil {
+		for _, record := range records {
+			if usage, ok := record.Event.(*session.UsageChanged); ok {
+				view.Usage.Cache = usage.Usage.Cache
+			}
+			if changed, ok := record.Event.(*session.SettingsChanged); ok {
+				s := changed.Settings
+				window := s.EffectiveContextWindow
+				if window == 0 {
+					window = s.ContextWindow
+				}
+				maxOutputTokens := 0
+				if s.MaxOutputTokens != nil {
+					maxOutputTokens = *s.MaxOutputTokens
+				}
+				view.Settings = protocol.SettingsSnapshot{
+					Revision:        changed.Revision,
+					Model:           protocol.ModelBinding{Model: s.Model, Provider: s.Provider, Endpoint: s.Endpoint},
+					ExecutionMode:   protocol.ExecutionMode(s.ExecutionMode),
+					Permission:      protocol.PermissionPolicy{Mode: s.PermissionPolicy, AlwaysAllow: s.AlwaysAllow, AlwaysDeny: s.AlwaysDeny, Revision: changed.Revision},
+					Sandbox:         protocol.SandboxPolicy{Mode: s.SandboxPolicy, AllowNetwork: s.AllowNetwork, AdditionalDirectories: s.AdditionalDirectories, DisallowedDirectories: s.DisallowedDirectories, Revision: changed.Revision},
+					ReasoningEffort: s.ReasoningEffort, Verbosity: s.Verbosity,
+					ContextWindow: window, CompactThreshold: s.CompactThreshold,
+					MaxOutputTokens: maxOutputTokens, MaxTurns: s.MaxTurns, MaxBudgetUSD: s.MaxBudgetUSD,
+				}
+			}
+			view.Revision.LogSeq = uint64(record.Seq)
+		}
+	}
+	return view, nil
+}
+
+func (c *managedClient) Watch(ctx context.Context, cursor protocol.Cursor) (protocol.Subscription, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	view, err := c.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	life, cancel := context.WithCancel(ctx)
+	sub := &managedSubscription{ch: make(chan protocol.Update, 64), cancel: cancel, done: make(chan struct{})}
+	sub.ch <- protocol.Update{Type: protocol.UpdateSnapshot, Snapshot: &view}
+	go c.observe(life, sub)
+	return sub, nil
+}
+
+// Observation follows the session across queued, running and dormant states.
+// It owns only its subscriptions; stopping it cannot close or cancel an Agent.
+func (c *managedClient) observe(ctx context.Context, out *managedSubscription) {
+	defer close(out.done)
+	defer close(out.ch)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastRun protocol.RunID
+	var lastStatus string
+	var live protocol.Subscription
+	var updates <-chan protocol.Update
+	var attached *Agent
+	var snapshotAgent *Agent
+	defer func() {
+		if live != nil {
+			_ = live.Close()
+		}
+	}()
+	send := func(update protocol.Update) bool {
+		if len(out.ch) >= cap(out.ch)-1 {
+			out.ch <- protocol.Update{Type: protocol.UpdateResyncRequired, Cursor: update.Cursor, Revision: update.Revision}
+			return false
+		}
+		select {
+		case out.ch <- update:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	for {
+		r := c.current()
+		r.mu.Lock()
+		a, row := r.agent, r.fact.Child
+		r.mu.Unlock()
+		if a != attached || row.Run.ID != lastRun {
+			if live != nil {
+				_ = live.Close()
+				live = nil
+				updates = nil
+			}
+			attached = a
+			if a != nil {
+				var err error
+				live, err = a.Watch(ctx, protocol.Cursor{})
+				if err == nil {
+					updates = live.Updates()
+				} else {
+					attached = nil
+				}
+			}
+		}
+		// Detaching a settled runtime changes the session projection to idle,
+		// even when its run status was already terminal before cleanup.
+		if lastRun != row.Run.ID || lastStatus != row.Run.Status || snapshotAgent != a {
+			snapshot, err := c.Snapshot(ctx)
+			if err != nil {
+				return
+			}
+			if !send(protocol.Update{Type: protocol.UpdateSnapshot, Snapshot: &snapshot, Revision: snapshot.Revision}) {
+				return
+			}
+			lastRun, lastStatus = row.Run.ID, row.Run.Status
+			snapshotAgent = a
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.supervisor.root.rootCtx.Done():
+			return
+		case <-ticker.C:
+		case update, ok := <-updates:
+			if !ok {
+				live = nil
+				updates = nil
+				attached = nil
+				continue
+			}
+			if update.Snapshot != nil {
+				copy := *update.Snapshot
+				copy.RunID = lastRun
+				update.Snapshot = &copy
+			}
+			if !send(update) || update.Type == protocol.UpdateResyncRequired {
+				return
+			}
+		}
+	}
+}
+
+func (c *managedClient) Submit(ctx context.Context, cmd protocol.Command) (protocol.Receipt, error) {
+	cmd, err := cmd.Normalize()
+	if err != nil {
+		return protocol.Receipt{}, err
+	}
+	if cmd.SessionID != c.id {
+		return protocol.Receipt{}, errors.New("command target differs from viewed session")
+	}
+	r := c.current()
+	if cmd.Type == protocol.CommandSubmitInput {
+		r.mu.Lock()
+		settled := !r.fact.Child.Run.Active()
+		ownContinuation := r.fact.CommandID == string(cmd.ID)
+		r.mu.Unlock()
+		if settled || ownContinuation {
+			_, err := c.supervisor.Control(ctx, protocol.AgentControl{ID: cmd.ID, SessionID: cmd.SessionID, RunID: cmd.ExpectedRunID, Action: "continue", Text: cmd.Input.Text, Input: cmd.Input})
+			if err != nil {
+				return protocol.Receipt{}, err
+			}
+			return protocol.Receipt{CommandID: cmd.ID, SessionID: cmd.SessionID, Status: protocol.ReceiptScheduled}, nil
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	row := r.fact.Child
+	if cmd.SessionID != row.SessionID {
+		return protocol.Receipt{}, errors.New("command target differs from viewed session")
+	}
+	expected := cmd.ExpectedRunID
+	if expected == "" {
+		expected = c.initialRun
+	}
+	if expected != row.Run.ID {
+		return protocol.Receipt{}, errors.New("stale run id")
+	}
+	if !row.Run.Active() || row.Run.Status == "settling" {
+		return protocol.Receipt{}, errors.New("run settled; use continue")
+	}
+	switch cmd.Type {
+	case protocol.CommandSubmitInput:
+		if row.Purpose != childPurposeTask {
+			return protocol.Receipt{}, errors.New("guardian is read-only")
+		}
+	case protocol.CommandApproveTool:
+		if r.opts.NonInteractive {
+			return protocol.Receipt{}, errors.New("approval channel unavailable")
+		}
+	case protocol.CommandInterrupt, protocol.CommandAnswerQuestion, protocol.CommandApprovePlan:
+	case protocol.CommandStop:
+		r.cancel()
+		return protocol.Receipt{CommandID: cmd.ID, SessionID: row.SessionID, Status: protocol.ReceiptApplied}, nil
+	default:
+		return protocol.Receipt{}, fmt.Errorf("%s is unavailable in a child view; press Esc to return to the main agent", cmd.Type)
+	}
+	if r.agent == nil {
+		return protocol.Receipt{}, errors.New("child has not started")
+	}
+	// Preserve the runtime's input identity, scheduled/applied state, revision
+	// and rejection. Never manufacture a successful receipt for a queued input.
+	return r.agent.Submit(ctx, cmd)
+}
+
+type managedSubscription struct {
+	ch     chan protocol.Update
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (s *managedSubscription) Updates() <-chan protocol.Update { return s.ch }
+func (s *managedSubscription) Close() error                    { s.cancel(); <-s.done; return nil }
+
+func (s *SessionSupervisor) ReadTranscript(ctx context.Context, id protocol.SessionID, before uint64, limit int) (protocol.TranscriptPage, error) {
+	if limit <= 0 || limit > transcriptWindow {
+		limit = transcriptWindow
+	}
+	records, _, err := s.readSessionRecords(ctx, id)
+	if err != nil {
+		return protocol.TranscriptPage{}, err
+	}
+	// Keep only the requested page's text, not an unbounded text projection.
+	// The compact identity index preserves stable pagination when later facts
+	// complete tools that started before this page.
+	t := &transcriptState{index: make(map[string]uint64), before: before, window: limit}
+	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return protocol.TranscriptPage{}, err
+		}
+		t.facts([]session.Event{record.Event})
+	}
+	items, _ := t.snapshot()
+	var cursor uint64
+	if len(items) > 0 {
+		cursor = t.index[items[0].ID]
+	}
+	return protocol.TranscriptPage{Items: items, Before: cursor, More: cursor > 1}, nil
+}
+
+type outputReader interface {
+	Read(session.BlobRef, int64) ([]byte, error)
+}
+
+func (s *SessionSupervisor) readSessionRecords(ctx context.Context, id protocol.SessionID) ([]session.Record, outputReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	var p *sessionPersistence
+	if id == protocol.SessionID(s.root.sessionID) {
+		p = s.root.persistenceHandle()
+	} else {
+		r, err := s.lookup(id)
+		if err != nil {
+			return nil, nil, err
+		}
+		r.mu.Lock()
+		id = r.fact.Child.SessionID
+		if r.agent != nil {
+			p = r.agent.persistenceHandle()
+		}
+		if p == nil && r.memory != nil {
+			records, blobs := append([]session.Record(nil), r.memory...), r.memoryBlobs
+			r.mu.Unlock()
+			return records, blobs, nil
+		}
+		r.mu.Unlock()
+	}
+	if p != nil {
+		// Keep the writer/reader handle alive for this read. Closing the owner
+		// may detach it, but cannot invalidate the copied immutable records.
+		p.mu.Lock()
+		var blobs outputReader = p.artifacts
+		if p.memoryArtifacts != nil {
+			blobs = p.memoryArtifacts
+		}
+		var records []session.Record
+		var err error
+		if p.store != nil {
+			records, err = p.store.Read(session.Beginning)
+		} else {
+			err = session.ErrClosed
+		}
+		p.mu.Unlock()
+		if !errors.Is(err, session.ErrClosed) {
+			return records, blobs, err
+		}
+	}
+	store, err := session.OpenJSONLReadOnly(s.sessionDir, string(id))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer store.Close()
+	records, err := store.Read(session.Beginning)
+	return records, session.OpenArtifactStoreReadOnly(filepath.Join(s.sessionDir, string(id))), err
+}
+
+func (s *SessionSupervisor) ReadOutput(ctx context.Context, id protocol.SessionID, itemID string, offset int64, limit int) (protocol.OutputPage, error) {
+	if itemID == "" {
+		return protocol.OutputPage{}, errors.New("item_id required; read session history first to select an item")
+	}
+	if offset < 0 {
+		return protocol.OutputPage{}, errors.New("negative output offset")
+	}
+	if limit <= 0 || limit > 64<<10 {
+		limit = 64 << 10
+	}
+	records, blobs, err := s.readSessionRecords(ctx, id)
+	if err != nil {
+		return protocol.OutputPage{}, err
+	}
+	var text string
+	var ref *session.BlobRef
+	found := false
+	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return protocol.OutputPage{}, err
+		}
+		switch e := record.Event.(type) {
+		case *session.InputQueued:
+			messageID := e.MessageID
+			if messageID == "" {
+				messageID = inputMessageID(e.InputID)
+			}
+			if messageID == itemID {
+				text = e.Text
+				found = true
+			}
+		case *session.AssistantCommitted:
+			if "reasoning:"+e.Message.MessageID == itemID && e.Message.ReasoningContent != "" {
+				text = e.Message.ReasoningContent
+				found = true
+			}
+			for _, block := range e.Message.Content {
+				if result := block.ToolResult; result != nil && toolTranscriptID(e.TurnID, e.StepID, result.CallID) == itemID && !found {
+					text = result.Text
+					ref = result.Blob
+					found = true
+				}
+			}
+			if e.Message.MessageID == itemID {
+				found = true
+				text = ""
+				for _, block := range e.Message.Content {
+					if block.Kind == session.ContentText {
+						text += block.Text
+					}
+				}
+			}
+		case *session.ToolFinished:
+			if toolTranscriptID(e.TurnID, e.StepID, e.CallID) == itemID {
+				text = e.Result.Text
+				ref = e.RawOutput
+				if ref == nil {
+					ref = e.Result.Blob
+				}
+				found = true
+			}
+		case *session.TurnFinished:
+			if "error:"+e.TurnID == itemID {
+				text = e.Error
+				found = true
+			}
+		}
+	}
+	if !found {
+		return protocol.OutputPage{}, fmt.Errorf("saved transcript item %q not found", itemID)
+	}
+	if ref != nil {
+		if blobs == nil {
+			return protocol.OutputPage{}, errors.New("output artifact unavailable")
+		}
+		data, err := blobs.Read(*ref, 64<<20)
+		if err != nil {
+			return protocol.OutputPage{}, err
+		}
+		text = string(data)
+	}
+	if offset > int64(len(text)) {
+		return protocol.OutputPage{}, errors.New("offset exceeds output length")
+	}
+	start := int(offset)
+	if start < len(text) && !utf8.RuneStart(text[start]) {
+		return protocol.OutputPage{}, errors.New("offset is not a UTF-8 boundary")
+	}
+	end := min(len(text), start+limit)
+	for end > start && end < len(text) && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	if end == start && start < len(text) {
+		_, n := utf8.DecodeRuneInString(text[start:])
+		end = start + n
+	}
+	return protocol.OutputPage{Text: text[start:end], Next: int64(end), Total: int64(len(text)), More: end < len(text)}, nil
+}
+
+// Called after the run has joined its workers but before releasing its writer.
+// Cancellation is durable so a later continuation cannot drain old inputs.
+func (a *Agent) cancelRunInputs(runID string) error {
+	a.persistMu.Lock()
+	defer a.persistMu.Unlock()
+	a.mu.Lock()
+	a.ensureTypedPendingLocked()
+	var facts []session.Event
+	for _, input := range a.pendingInputs {
+		facts = append(facts, session.InputCancelled{InputID: string(input.ID), Reason: "run settled"})
+	}
+	a.mu.Unlock()
+	if len(facts) == 0 {
+		return nil
+	}
+	if _, err := a.persistenceHandle().commitEvents("run-cancel-inputs-"+runID, facts...); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.pendingInputs, a.pendingMsgs = nil, nil
+	a.mu.Unlock()
+	return nil
+}
+
+func childRunOutput(a *Agent, previous map[string]bool) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// A failed continuation must never return a previous run's answer.
+	for i := len(a.history) - 1; i >= 0; i-- {
+		if a.history[i].Role == messages.RoleAssistant && a.history[i].Content != "" && !previous[a.history[i].ID] {
+			return a.history[i].Content
+		}
+	}
+	return ""
 }

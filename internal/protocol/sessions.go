@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"time"
 )
@@ -45,6 +47,7 @@ type RunView struct {
 	Output     string        `json:"output,omitempty"`
 	Error      string        `json:"error,omitempty"`
 	Usage      UsageSnapshot `json:"usage"`
+	ToolUses   int           `json:"tool_uses,omitempty"`
 }
 
 func (r RunView) Active() bool {
@@ -86,6 +89,7 @@ type OutputPage struct {
 }
 
 type AgentControl struct {
+	Input      *SubmitInput  `json:"input,omitempty"`
 	ID         CommandID     `json:"id"`
 	SessionID  SessionID     `json:"session_id"`
 	RunID      RunID         `json:"run_id,omitempty"`
@@ -113,4 +117,11 @@ type SessionDirectory interface {
 	ReadTranscript(context.Context, SessionID, uint64, int) (TranscriptPage, error)
 	ReadOutput(context.Context, SessionID, string, int64, int) (OutputPage, error)
 	Control(context.Context, AgentControl) (RunView, error)
+}
+
+// InputMessageID is the stable transcript identity of an admitted input.
+func InputMessageID(id InputID) string {
+	data, _ := json.Marshal(string(id))
+	sum := sha256.Sum256(data)
+	return "input-message-" + hex.EncodeToString(sum[:12])
 }

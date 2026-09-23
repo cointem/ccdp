@@ -19,12 +19,10 @@ import (
 // routed here: Ctrl-C remains interrupt/quit and Cmd-C remains native terminal
 // selection copy.
 type Clipboard interface {
-	WriteAll(string) error
+	WriteAllContext(context.Context, string) error
 }
 
 type hostClipboard struct{}
-
-func (hostClipboard) WriteAll(text string) error { return clipboard.WriteAll(text) }
 
 var clipboardWriteTimeout = 2 * time.Second
 
@@ -35,13 +33,11 @@ type clipboardResultMsg struct {
 	sessionID  string
 	generation uint64
 	err        error
-}
-
-// contextClipboard is an optional cancellable extension implemented by the
-// macOS adapter. Test and third-party adapters may keep the small legacy
-// Clipboard interface; writeClipboard still bounds their operation.
-type contextClipboard interface {
-	WriteAllContext(context.Context, string) error
+	// selection marks a drag-copy result. Its success is surfaced through the
+	// right-aligned toast above the composer (chars is the copied rune count)
+	// instead of a status-row notice, so the transcript never shifts.
+	selection bool
+	chars     int
 }
 
 // WriteAllContext uses pbcopy directly on macOS so a hung pasteboard process
@@ -63,25 +59,8 @@ func (hostClipboard) WriteAllContext(ctx context.Context, text string) error {
 	return cmd.Run()
 }
 
-func writeClipboard(ctx context.Context, writer Clipboard, text string) error {
-	if cancellable, ok := writer.(contextClipboard); ok {
-		return cancellable.WriteAllContext(ctx, text)
-	}
-	// The historical Clipboard interface cannot accept a context. Keep its
-	// result channel buffered so a legacy adapter that returns after the timeout
-	// does not strand a sender or block shutdown.
-	result := make(chan error, 1)
-	go func() { result <- writer.WriteAll(text) }()
-	select {
-	case err := <-result:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 func (m *Model) responseText(id string) (string, bool) {
-	find := func(items []logItem) (string, bool) {
+	find := func(items []historyCell) (string, bool) {
 		for i := len(items) - 1; i >= 0; i-- {
 			item := items[i]
 			if item.kind != "assistant" || item.text == "" {
@@ -124,7 +103,7 @@ func (m *Model) copyLatestResponse(id ...string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), clipboardWriteTimeout)
 		defer cancel()
-		err := writeClipboard(ctx, writer, text)
+		err := writer.WriteAllContext(ctx, text)
 		if errors.Is(err, context.DeadlineExceeded) {
 			err = fmt.Errorf("clipboard write timed out after %s", clipboardWriteTimeout)
 		}

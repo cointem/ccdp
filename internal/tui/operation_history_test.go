@@ -8,7 +8,7 @@ import (
 )
 
 func TestOperationHistoryIsBoundedWithoutDroppingActiveOwner(t *testing.T) {
-	m := Model{sessionID: "session", operations: make(map[protocol.CommandID]Operation)}
+	m := Model{sessionID: "session", operationStore: operationStore{operations: make(map[protocol.CommandID]Operation)}}
 	for i := 0; i < maxOperationHistory+32; i++ {
 		id := protocol.CommandID(fmt.Sprintf("terminal-%03d", i))
 		m.registerOperation(protocol.Command{ID: id, SessionID: "session", Type: protocol.CommandSetGeneration}, "setting")

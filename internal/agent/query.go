@@ -157,9 +157,9 @@ func formatQueryConfig(s *queryRuntimeSnapshot) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "model:         %s\n", cfg.Model)
-	fmt.Fprintf(&b, "reasoning_effort: %s\nverbosity: %s\n", cfg.ReasoningEffort, cfg.Verbosity)
-	fmt.Fprintf(&b, "base_url:      %s\n", redactURL(cfg.BaseURL))
-	fmt.Fprintf(&b, "api_key:       %s\n", maskKey(cfg.APIKey))
+	fmt.Fprintf(&b, "reasoning_effort: %s\nverbosity: %s\n", cfg.ReasoningEffortFor(cfg.Model), cfg.Verbosity)
+	fmt.Fprintf(&b, "base_url:      %s\n", redactURL(cfg.ResolveProvider(cfg.Model).BaseURL))
+	fmt.Fprintf(&b, "api_key:       %s\n", maskKey(cfg.ResolveProvider(cfg.Model).APIKey))
 	fmt.Fprintf(&b, "permission:    %s\n", mode)
 	fmt.Fprintf(&b, "sandbox:       %s", sandboxMode)
 	if s.sandboxLimits {
@@ -168,7 +168,7 @@ func formatQueryConfig(s *queryRuntimeSnapshot) string {
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "plan mode:     %v\n", s.view.Settings.ExecutionMode == protocol.ExecutionModePlan)
 	fmt.Fprintf(&b, "workspace:     %s\n", cfg.Workspace)
-	fmt.Fprintf(&b, "context_window:%d\n", cfg.ContextWindow)
+	fmt.Fprintf(&b, "context_window:%d\n", cfg.ContextWindowFor(cfg.Model))
 	fmt.Fprintf(&b, "compact_thr:   %.0f%%\n", cfg.CompactThreshold*100)
 	fmt.Fprintf(&b, "max_turns:     %d\n", cfg.MaxTurns)
 	if cfg.MaxBudgetUSD > 0 {
@@ -225,7 +225,7 @@ func formatQueryDoctor(s *queryRuntimeSnapshot) string {
 	sessionWritable, sessionDetail := probeWritableDir(cfg.SessionDir, ".ccdp-doctor-*")
 	ok("session dir writable", sessionWritable, sessionDetail)
 	ok("api key configured", cfg.APIKey != "", "")
-	ok("base_url set", cfg.BaseURL != "", redactURL(cfg.BaseURL))
+	ok("base_url set", cfg.BaseURL != "", redactURL(cfg.ResolveProvider(cfg.Model).BaseURL))
 	path := cfg.SourcePath()
 	if path == "" {
 		path = config.ConfigPath()

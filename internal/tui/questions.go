@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
 
 	"ccdp/internal/protocol"
@@ -17,6 +16,7 @@ type questionState struct {
 	input                 textinput.Model
 	errorText             string
 	pending               protocol.CommandID
+	deferred              bool
 }
 
 func (m *Model) setQuestion(request *protocol.QuestionRequest) {
@@ -41,16 +41,17 @@ func (m *Model) handleQuestionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if state == nil {
 		return m, nil
 	}
-	if state.pending != "" {
+	if state.pending != "" && msg.String() != "esc" && msg.String() != "ctrl+c" {
 		return m, nil
 	}
 	q := state.request.Questions[state.index]
 	state.errorText = ""
 	switch msg.String() {
 	case "esc":
-		return m, m.submitQuestion(true)
+		state.deferred = true
+		return m, nil
 	case "ctrl+c":
-		return m, m.submitCommand(protocol.Command{Type: protocol.CommandInterrupt}, "interrupt requested")
+		return m, m.requestInterrupt()
 	case "tab":
 		state.editing = !state.editing
 		if state.editing {
@@ -141,6 +142,10 @@ func (s *questionState) toggle() {
 
 func (m *Model) submitQuestion(cancelled bool) tea.Cmd {
 	s := m.question
+	if m.watchDisconnected {
+		s.errorText = "Disconnected: answer preserved. Use Esc then /reconnect."
+		return nil
+	}
 	answer := protocol.AnswerQuestion{RequestID: s.request.ID, Cancelled: cancelled}
 	if !cancelled {
 		answer.Answers = s.answers
@@ -152,64 +157,6 @@ func (m *Model) submitQuestion(cancelled bool) tea.Cmd {
 	cmd := protocol.Command{ID: nextUICommandID(), SessionID: protocol.SessionID(m.sessionID), Type: protocol.CommandAnswerQuestion, Answer: &answer}
 	s.pending = cmd.ID
 	return m.submitCommand(cmd, "answer submitted")
-}
-
-func (m *Model) renderQuestion() string {
-	s := m.question
-	if s == nil {
-		return ""
-	}
-	q := s.request.Questions[s.index]
-	width := min(76, max(10, m.width-6))
-	inner := max(6, width-4)
-	lines := wrapDisplay(q.Question, inner)
-	selectedRow := 0
-	for i, option := range q.Options {
-		if !s.editing && s.cursor == i {
-			selectedRow = len(lines)
-		}
-		cursor, mark := " ", "( )"
-		if q.MultiSelect {
-			mark = "[ ]"
-		}
-		if !s.editing && s.cursor == i {
-			cursor = ">"
-		}
-		for _, label := range s.answers[s.index].Selected {
-			if label == option.Label {
-				if q.MultiSelect {
-					mark = "[x]"
-				} else {
-					mark = "(x)"
-				}
-			}
-		}
-		lines = append(lines, wrapDisplay(fmt.Sprintf("%s %s %s — %s", cursor, mark, option.Label, option.Description), inner)...)
-	}
-	hint := "↑↓ choose · Space toggle · Tab text · Enter next/submit · Ctrl+P back · Esc cancel"
-	hint = "PgUp/PgDn scroll · " + hint
-	rows := max(1, m.height-7-len(wrapDisplay(hint, inner)))
-	if s.scroll < 0 {
-		s.scroll = max(0, selectedRow-rows+1)
-	}
-	offset := min(s.scroll, max(0, len(lines)-rows))
-	s.scroll = offset
-	var b strings.Builder
-	b.WriteString(truncateDisplay(fmt.Sprintf("%s · %d/%d", q.Header, s.index+1, len(s.answers)), inner) + "\n")
-	b.WriteString(strings.Join(lines[offset:min(len(lines), offset+rows)], "\n") + "\n")
-	s.input.Width = max(1, inner-16)
-	b.WriteString(truncateDisplay(s.input.View(), inner) + "\n")
-
-	if s.pending != "" {
-		hint = "Submitting answer…"
-	}
-	for _, line := range wrapDisplay(hint, inner) {
-		b.WriteString(line + "\n")
-	}
-	if s.errorText != "" {
-		b.WriteString(truncateDisplay(s.errorText, inner))
-	}
-	return styleModal.Width(width).Render(strings.TrimSpace(b.String()))
 }
 
 func (s *questionState) restoreCursor() {

@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -33,7 +33,6 @@ type sessionRouting struct {
 	catalogLoading bool
 }
 
-type agentCatalogTick struct{ directory protocol.SessionDirectory }
 type agentCatalogMsg struct {
 	directory protocol.SessionDirectory
 	rows      []protocol.ChildSession
@@ -57,10 +56,15 @@ type agentControlMsg struct {
 	err error
 }
 type inlinePrintMsg struct {
+	batch      uint64
 	generation uint64
 	text       string
 }
-type inlinePrintedMsg struct{ generation uint64 }
+type inlinePrintedMsg struct {
+	generation uint64
+	batch      uint64
+	err        error
+}
 
 var renderGeneration atomic.Uint64
 
@@ -78,11 +82,8 @@ func (m *Model) installSessionRouting(directory protocol.SessionDirectory) {
 	if directory == nil {
 		return
 	}
+	m.delivery.pending = nil
 	m.routing = &sessionRouting{directory: directory, rootID: m.sessionID, rootClient: m.client, views: make(map[string]Model), drafts: make(map[string]sessionDraft), generation: renderGeneration.Add(1)}
-}
-
-func agentCatalogTickCmd(directory protocol.SessionDirectory) tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return agentCatalogTick{directory: directory} })
 }
 
 func (m *Model) loadAgentCatalog(show bool) tea.Cmd {
@@ -101,18 +102,28 @@ func (m *Model) loadAgentCatalog(show bool) tea.Cmd {
 	}
 }
 
+func (m *Model) openAgentPicker() tea.Cmd {
+	if m.routing == nil {
+		return nil
+	}
+	if m.sessionID == m.routing.rootID && len(m.routing.rows) == 1 {
+		return m.openAgentView(string(m.routing.rows[0].SessionID))
+	}
+	return m.agentPicker()
+}
+
 func (m *Model) agentPicker() tea.Cmd {
-	options := []selectorOption{{ID: m.routing.rootID, Label: "main · " + m.routing.rootID}}
+	options := []SelectorOption{{ID: m.routing.rootID, Label: "main · " + m.routing.rootID}}
 	selected := 0
 	for _, row := range m.routing.rows {
 		mark := ""
-		if row.Approval != nil {
+		if childAwaitingApproval(row) {
 			mark = " · approval required"
 		}
 		if string(row.SessionID) == m.sessionID {
 			selected = len(options)
 		}
-		options = append(options, selectorOption{ID: string(row.SessionID), Label: fmt.Sprintf("%s · %s · %s%s\n    %s", row.Title, row.Purpose, row.Run.Status, mark, row.SessionID)})
+		options = append(options, SelectorOption{ID: string(row.SessionID), Label: fmt.Sprintf("%s · %s · %s%s\n    %s", row.Title, row.Purpose, row.Run.Status, mark, row.SessionID)})
 	}
 	return m.startSelectorAt("Agents · select to view, Esc returns", options, selected, true, selectorAction{Kind: selectorAgent})
 }
@@ -153,6 +164,161 @@ func (m *Model) parentAgentID() string {
 	return m.routing.rootID
 }
 
+// agentSpawnOrder returns every child session in the tree ordered by spawn
+// (CreatedAt, then BatchIndex, then SessionID for stability). The active view's
+// position in this list drives both sibling cycling and the header ordinal.
+func (m *Model) agentSpawnOrder() []protocol.ChildSession {
+	if m.routing == nil || len(m.routing.rows) == 0 {
+		return nil
+	}
+	rows := make([]protocol.ChildSession, len(m.routing.rows))
+	copy(rows, m.routing.rows)
+	sort.SliceStable(rows, func(i, j int) bool {
+		if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
+			return rows[i].CreatedAt.Before(rows[j].CreatedAt)
+		}
+		if rows[i].BatchIndex != rows[j].BatchIndex {
+			return rows[i].BatchIndex < rows[j].BatchIndex
+		}
+		return rows[i].SessionID < rows[j].SessionID
+	})
+	return rows
+}
+
+// agentOrdinal reports the active view's 1-based spawn position and the total
+// number of sibling agents, for the "2/3" header label. It returns (0, total)
+// when the root session is active.
+func (m *Model) agentOrdinal() (int, int) {
+	order := m.agentSpawnOrder()
+	if len(order) == 0 {
+		return 0, 0
+	}
+	for i, row := range order {
+		if string(row.SessionID) == m.sessionID {
+			return i + 1, len(order)
+		}
+	}
+	return 0, len(order)
+}
+
+// cycleAgent moves the active view to the next (delta>0) or previous (delta<0)
+// sibling agent in spawn order, wrapping at both ends. From the root it enters
+// the first (or last) child. It is a no-op when there are no children.
+func (m *Model) cycleAgent(delta int) tea.Cmd {
+	order := m.agentSpawnOrder()
+	if len(order) == 0 || delta == 0 {
+		return nil
+	}
+	idx := -1
+	for i, row := range order {
+		if string(row.SessionID) == m.sessionID {
+			idx = i
+			break
+		}
+	}
+	var target protocol.ChildSession
+	switch {
+	case idx < 0 && delta > 0:
+		target = order[0]
+	case idx < 0:
+		target = order[len(order)-1]
+	default:
+		target = order[(idx+delta+len(order))%len(order)]
+	}
+	if string(target.SessionID) == m.sessionID {
+		return nil
+	}
+	return m.openAgentView(string(target.SessionID))
+}
+
+// childSessionForCallID resolves the child sessions spawned by a Task/Agent
+// tool call. A batch fan-out shares one ParentCallID and is distinguished by
+// BatchIndex, so the result is ordered by BatchIndex then CreatedAt to render in
+// input order. It returns nil when the directory is unavailable or the call has
+// not (yet) produced children.
+func (m *Model) childSessionForCallID(callID string) []protocol.ChildSession {
+	if m.routing == nil || callID == "" {
+		return nil
+	}
+	var matches []protocol.ChildSession
+	for _, row := range m.routing.rows {
+		if string(row.ParentCallID) == callID {
+			matches = append(matches, row)
+		}
+	}
+	if len(matches) < 2 {
+		return matches
+	}
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].BatchIndex != matches[j].BatchIndex {
+			return matches[i].BatchIndex < matches[j].BatchIndex
+		}
+		return matches[i].CreatedAt.Before(matches[j].CreatedAt)
+	})
+	return matches
+}
+
+// isAgentTool reports whether a tool name delegates to or inspects child
+// sessions. These tools render a compact agent marker in the parent transcript
+// instead of dumping the child's final answer as ordinary tool output.
+func isAgentTool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "task", "agent", "subagent":
+		return true
+	}
+	return false
+}
+
+// attachAgentMarkers resolves the child sessions for every Task/Agent tool row
+// in the composed transcript. It runs on compose and on each directory refresh
+// so the marker's status and usage stay current while a child is running.
+func (m *Model) attachAgentMarkers() {
+	if m.routing == nil {
+		return
+	}
+	for i := range m.items {
+		item := &m.items[i]
+		if item.kind != "tool" || !isAgentTool(item.toolName) {
+			continue
+		}
+		item.agent = m.childSessionForCallID(item.toolID)
+	}
+}
+
+// applyChildUpdate folds one multiplexed child event from the root stream into
+// the directory cache, then refreshes the parent's agent markers. The runtime
+// republishes each child's current session row as it runs, so the parent Task
+// marker tracks live status and usage without waiting for the polling fallback.
+// The child's nested transcript update is deliberately ignored: a child being
+// viewed owns its own subscription, and child text must never enter the parent.
+func (m *Model) applyChildUpdate(child protocol.ChildSession) {
+	if m.routing == nil || child.SessionID == "" {
+		return
+	}
+	// A terminal run cannot still own an actionable decision. Tolerate an
+	// out-of-order/stale directory projection without leaving a phantom pending
+	// badge in the parent after the child has completed.
+	if !child.Run.Active() {
+		child.Approval = nil
+	}
+	replaced := false
+	for i := range m.routing.rows {
+		if m.routing.rows[i].SessionID == child.SessionID {
+			m.routing.rows[i] = child
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		m.routing.rows = append(m.routing.rows, child)
+	}
+	m.attachAgentMarkers()
+}
+
+func childAwaitingApproval(child protocol.ChildSession) bool {
+	return child.Approval != nil && child.Run.Status == "waiting_approval"
+}
+
 func (m *Model) startAgentSwitch() tea.Cmd {
 	r := m.routing
 	if r == nil || r.pending == nil || r.printing || r.switching {
@@ -165,6 +331,7 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	toChild := targetID != "" && targetID != r.rootID
 	// Already-dispatched print messages are joined before clearing the screen.
 	// Not-yet-dispatched old-generation messages are discarded at admission.
+	m.delivery.pending = nil
 	r.generation = renderGeneration.Add(1)
 	r.printScheduled = false
 	r.printQueue = nil
@@ -178,6 +345,7 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	m.subscription = nil
 	m.watchCancel = nil
 	m.watchCtx = nil
+	animation := m.spinner
 	saved := *m
 	saved.picker = nil
 	saved.approval = nil
@@ -193,12 +361,13 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	for len(r.views) > 8 && len(r.order) > 0 {
 		old := r.order[0]
 		r.order = r.order[1:]
-		if old != r.rootID && old != m.sessionID && len(r.views[old].pendingSubmissions) == 0 && r.views[old].pasteRequest == "" {
+		if old != r.rootID && old != m.sessionID && r.views[old].pendingSubmissionCount() == 0 && r.views[old].pasteRequest == "" {
 			view := r.views[old]
 			r.drafts[old] = sessionDraft{text: view.textarea.Value(), retry: view.retryDraft, retryID: view.retryCommandID, images: cloneInputImages(view.inputImages), retryImages: cloneInputImages(view.retryImages), missingImages: view.missingHistoryImages, follow: view.followOutput, offset: view.viewport.YOffset, paste: clonePasteFold(view.pasteFold)}
 			delete(r.views, old)
 		}
 	}
+	host := m.terminal
 	width, height := m.width, m.height
 	ag := m.ag
 	generation := m.watchGeneration + 1
@@ -211,16 +380,19 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 		*m = fresh
 	}
 	m.ag = ag
+	m.terminal = host
+	m.delivery.pending = nil
 	m.routing = r
 	m.width = width
 	m.height = height
 	m.client = opened.client
 	m.watchGeneration = generation
 	m.watchCursor = protocol.Cursor{}
+	m.spinner = animation
 	m.watchCtx, m.watchCancel = context.WithCancel(context.Background())
 	m.subscription = nil
-	m.approvalPending = false
-	m.pendingApprovalCommand = ""
+	m.watchDisconnected = false
+	m.watchRetry = 0
 	m.hasSnapshot = false
 	m.applySnapshot(opened.snapshot)
 	// The root session owns Bubble Tea's ordinary screen and native scrollback.
@@ -300,7 +472,7 @@ func (m *Model) nextInlinePrint() tea.Cmd {
 			continue
 		}
 		r.printing = true
-		return tea.Sequence(tea.Println(item.text), func() tea.Msg { return inlinePrintedMsg{generation: item.generation} })
+		return m.printHistory(item)
 	}
 	if m.reader != nil && m.reader.enterPending {
 		return m.enterReaderScreen()
@@ -345,40 +517,22 @@ func (m *Model) runAgentCommand(args []string) tea.Cmd {
 }
 
 func (m *Model) applyTranscript(items []protocol.TranscriptItem) {
-	converted := make([]logItem, 0, len(items))
+	m.inline.nextIndex, m.inline.boundaryID = 0, ""
+	converted := make([]historyCell, 0, len(items))
 	for _, item := range items {
-		value := transcriptLogItem(item)
+		if item.ID == "" {
+			continue
+		}
+		value := projectTranscriptCell(item)
 		m.reconcileErrorReport(value)
 		if item.PreviousID != "" {
-			// A stream gains its durable message ID at commit. Preserve print
-			// acknowledgements only when the final text is identical; changed
-			// provider output must still be shown in full. A cumulative stream can
-			// grow between the provisional and durable rows, so carry its emitted
-			// prefix offset separately when that prefix is still byte-for-byte
-			// stable.
-			for i, old := range m.confirmedItems {
+			for _, old := range m.confirmedItems {
 				if old.messageID != item.PreviousID {
 					continue
 				}
-				oldID := itemIdentity(old, i)
-				newItem := logItem{messageID: item.ID}
-				newID := itemIdentity(newItem, 0)
-				m.inline.ensure()
-				if old.text == value.text {
-					if _, ok := m.inline.printed[oldID]; ok {
-						m.inline.printed[newID] = struct{}{}
-					}
-				}
-				oldKey := inlineLogicalKey(old, i)
-				newKey := inlineLogicalKey(newItem, 0)
-				if offset, ok := m.inline.offsets[oldKey]; ok {
-					// Offsets are byte indexes into the original source. Never
-					// apply one to a corrected prefix; letting the new durable
-					// row render from zero is safer than dropping changed text.
-					offset = min(max(0, offset), len(old.text))
-					if offset <= len(value.text) && strings.HasPrefix(value.text, old.text[:offset]) {
-						m.inline.offsets[newKey] = offset
-					}
+				m.inline.reconcile(old, value)
+				if pending := m.delivery.pending; pending != nil && pending.next.epoch == m.inline.epoch {
+					pending.next.reconcile(old, value)
 				}
 				break
 			}
@@ -393,11 +547,20 @@ func (m *Model) applyTranscript(items []protocol.TranscriptItem) {
 		}
 	}
 	m.composeItems()
-	m.render()
+	m.renderVisibleTranscript()
 }
 
 func (m *Model) upsertTranscript(item protocol.TranscriptItem) {
-	value := transcriptLogItem(item)
+	if item.ID == "" {
+		return
+	}
+	value := projectTranscriptCell(item)
+	if m.CellStore.replace(value) {
+		if isAgentTool(value.toolName) {
+			m.attachAgentMarkers()
+		}
+		return
+	}
 	for i := range m.confirmedItems {
 		if m.confirmedItems[i].messageID == item.ID {
 			m.confirmedItems[i] = value
@@ -408,20 +571,14 @@ func (m *Model) upsertTranscript(item protocol.TranscriptItem) {
 	m.appendTranscript(value)
 }
 
-// transcriptLogItem is the single projection used by snapshot and live
-// transcript paths. Tool text is formatted through renderToolText, keeping
-// the displayed summary identical for both paths; the original structured
-// fields remain on logItem for the detail reader and presentation layer.
-func transcriptLogItem(item protocol.TranscriptItem) logItem {
-	text, meta := item.Text, false
-	args := map[string]any(nil)
+// projectTranscriptCell preserves protocol source and typed tool metadata.
+// History and readers share this projection; no formatted text is reparsed.
+func projectTranscriptCell(item protocol.TranscriptItem) historyCell {
+	var args map[string]any
 	if item.Kind == "tool" {
 		args = protocolToolArgs(&protocol.ToolView{Name: item.Tool, Args: item.Args})
-		text, meta = renderToolText(item.Tool, args, item.Status, item.Text)
 	}
-	if item.Truncated {
-		text += "\n[preview truncated; /transcript for saved output]"
-	}
-	return logItem{kind: item.Kind, text: text, messageID: item.ID, turnID: item.TurnID, toolID: string(item.CallID), status: item.Status,
-		toolMeta: meta, toolName: item.Tool, toolArgs: args, toolArgsRaw: string(item.Args), toolOutput: item.Text, toolTruncated: item.Truncated}
+	return historyCell{kind: item.Kind, text: item.Text, messageID: item.ID, turnID: item.TurnID,
+		toolID: string(item.CallID), status: item.Status, toolName: item.Tool, toolArgs: args,
+		toolArgsRaw: string(item.Args), toolTruncated: item.Truncated}
 }

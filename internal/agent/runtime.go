@@ -749,11 +749,6 @@ func (a *Agent) setPhase(phase protocol.RuntimePhase) {
 	a.publishState()
 }
 
-func (a *Agent) bindingEndpointLocked(model string) string {
-	baseURL, _ := a.cfg.EndpointFor(model)
-	return baseURL
-}
-
 func (a *Agent) stopTurn() {
 	a.mu.Lock()
 	a.stop = true
@@ -890,10 +885,7 @@ func (a *Agent) applySubmitInput(cmd protocol.Command) protocol.Receipt {
 		a.persistMu.Unlock()
 		a.emitStatus("queued (will be delivered at a safe turn boundary)")
 		r := a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
-		a.mu.Lock()
-		a.seenInputs[inputID] = r
-		a.seenInputBody[inputID] = inputDigest
-		a.mu.Unlock()
+		a.rememberSeenInput(inputID, inputDigest, r)
 		a.publishState()
 		return r
 	}
@@ -917,11 +909,17 @@ func (a *Agent) applySubmitInput(cmd protocol.Command) protocol.Receipt {
 	a.evbus.Emit(events.TopicMessageAdded, events.MessageEvent{Role: string(deliveredMessage.Role), Content: deliveredMessage.Content})
 	a.startTurnInput(turnInput)
 	r := a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
+	a.rememberSeenInput(inputID, inputDigest, r)
+	return r
+}
+
+// rememberSeenInput records the receipt and body digest for a durably admitted
+// input so a resumed retry of the same input id is deduplicated.
+func (a *Agent) rememberSeenInput(inputID protocol.InputID, inputDigest string, r protocol.Receipt) {
 	a.mu.Lock()
 	a.seenInputs[inputID] = r
 	a.seenInputBody[inputID] = inputDigest
 	a.mu.Unlock()
-	return r
 }
 
 func (a *Agent) makeBinding(model string) (modelBinding, error) {
@@ -934,170 +932,33 @@ func (a *Agent) makeBinding(model string) (modelBinding, error) {
 }
 
 func (a *Agent) applySetModel(cmd protocol.Command) protocol.Receipt {
-	// Model candidates and the step-boundary application form one state
-	// machine. Serialize the capture/commit/publish sequence so a step cannot
-	// commit B after an idle SetModel has already superseded it (or vice versa).
-	// This lock is intentionally narrower than a.mu and may cover durable I/O;
-	// ordinary Agent state readers use its read side for a coherent snapshot.
-	a.settingsCommitMu.Lock()
-	defer a.settingsCommitMu.Unlock()
-	binding, err := a.makeBinding(strings.TrimSpace(cmd.Model.Model))
-	if err != nil {
-		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
-	}
-	a.mu.Lock()
-	cfg := cloneConfig(a.cfg)
-	sourceRevision := a.settingsRev
-	supersededChangeID := ""
-	if a.pendingBinding != nil {
-		// A pending binding is a candidate regardless of whether an older
-		// snapshot populated its revision.  Treating only higher revisions as
-		// pending leaves a legacy/stale candidate alive when an idle command
-		// replaces it, which can then be re-applied at the next step boundary.
-		if a.pendingSettingsRevision > sourceRevision {
-			sourceRevision = a.pendingSettingsRevision
-		}
-		supersededChangeID = a.pendingSettingsChangeID
-	}
-	nextRevision := sourceRevision + 1
-	if nextRevision == 0 {
-		nextRevision = 1
-	}
-	settings := a.sessionSettingsLocked()
-	busy := a.busy
-	settings.Model = binding.model
-	settings.Provider = binding.provider
-	settings.Endpoint, _ = sanitizeRequestEndpoint(binding.endpoint)
-	a.mu.Unlock()
-	scheduledAdmission := false
-	if busy {
-		if err := a.persistSettingsScheduledFactWithCancel(string(cmd.ID), settings, nextRevision, supersededChangeID); err != nil {
-			return a.rejectedReceipt(cmd, protocol.ErrorInternal, err.Error())
-		}
-		scheduledAdmission = true
-		if supersededChangeID != "" && supersededChangeID != string(cmd.ID) {
-			a.finishSupersededSettingsReceipt(supersededChangeID)
-		}
-		// The turn may have reached its terminal boundary while the durable
-		// admission was in flight. Only publish a pending binding when the
-		// runtime is still busy; otherwise continue through the idle Applied
-		// path below and commit SettingsChanged before mutating live state.
-		a.mu.Lock()
-		stillBusy := a.busy
-		if stillBusy {
-			a.pendingBinding = &binding
-			a.pendingSettingsRevision = nextRevision
-			a.pendingSettingsChangeID = string(cmd.ID)
-		}
-		a.mu.Unlock()
-		if stillBusy {
-			a.emitStatus("model %s staged for the next step", binding.model)
-			a.publishState()
-			return a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
-		}
-	}
-	// If the turn became idle after we durably admitted the candidate, close
-	// that same admission in the SettingsChanged + CommandCompleted transaction
-	// rather than writing a bare SettingsChanged fact. Otherwise replay would
-	// retain an already-applied model command as an unresolved Scheduled one.
-	var applyErr error
-	if scheduledAdmission {
-		applyErr = a.persistScheduledSettingsAppliedFact(string(cmd.ID), settings, nextRevision)
-	} else if supersededChangeID != "" {
-		// An idle replacement must close the old scheduled candidate and publish
-		// the new active settings atomically.  In particular, do not leave the
-		// old candidate to be reconstructed by a later step or resume.
-		applyErr = a.persistSettingsAppliedFact(string(cmd.ID), settings, nextRevision, supersededChangeID)
-	} else {
-		applyErr = a.persistSettingsFact(settings, nextRevision)
-	}
-	if applyErr != nil {
-		return a.rejectedReceipt(cmd, protocol.ErrorInternal, applyErr.Error())
-	}
-	a.mu.Lock()
-	a.applyBindingLocked(binding)
-	// applyBindingLocked intentionally preserves a different pending binding
-	// for the normal step-boundary path.  This command has just superseded that
-	// binding at an idle boundary, so clear it explicitly after the durable
-	// replacement transaction succeeds.
-	a.pendingBinding = nil
-	a.settingsRev = nextRevision
-	a.pendingSettingsRevision = 0
-	a.pendingSettingsChangeID = ""
-	a.mu.Unlock()
+	requested := strings.TrimSpace(cmd.Model.Model)
+	return a.applySettingsCommand(cmd, func(target *session.Settings) error {
+		target.Model = requested
+		return nil
+	})
+}
+
+// registerBindingRoutes publishes the resolved client and its route on the
+// model registry so the binding stays consistent for later requests.
+func (a *Agent) registerBindingRoutes(binding modelBinding, cfg config.Config) {
 	a.models.Register(binding.client)
 	if binding.routeKind == "http" {
-		_, apiKey := cfg.EndpointFor(binding.model)
-		a.models.RouteDefault(binding.model, binding.provider, binding.endpoint, apiKey)
+		a.models.RouteDefault(binding.model, binding.provider,
+			binding.httpBinding(cfg.ResolveProvider(binding.model).APIKey))
 	} else {
 		a.models.Route(binding.model, binding.provider)
 	}
-	a.emit(Event{Type: EventModeChanged, Text: "model:" + binding.model})
-	a.emitStatus("model switched to %s", binding.model)
-	a.publishState()
-	return a.receipt(cmd, protocol.ReceiptApplied, "", nil)
-}
-
-// finishSupersededSettingsReceipt closes the in-memory admission receipt
-// after the cancellation and replacement facts have committed.  It does not
-// write another CommandCompleted event: the durable transaction in
-// persistSettingsScheduledFactWithCancel is already the single terminal fact
-// for the old command.
-func (a *Agent) finishSupersededSettingsReceipt(commandID string) {
-	if strings.TrimSpace(commandID) == "" {
-		return
-	}
-	a.mu.Lock()
-	r := protocol.Receipt{CommandID: protocol.CommandID(commandID), SessionID: protocol.SessionID(a.sessionID),
-		Status: protocol.ReceiptRejected, Revision: a.revisionLocked(), OperationID: protocol.OperationID(commandID),
-		Error: &protocol.CommandError{Code: protocol.ErrorInvalidState, Message: "settings change was superseded before its step boundary"}}
-	a.seenReceipts[protocol.CommandID(commandID)] = r
-	a.mu.Unlock()
-	a.publishReceipt(r)
 }
 
 func (a *Agent) applyBindingLocked(binding modelBinding) {
 	a.activeBinding = binding
 	a.client = binding.client
-	a.primaryClient = binding.client
-	a.primaryEndpoint = binding.endpoint
-	a.primaryRouteKind = binding.routeKind
+	a.primaryBinding = binding
 	a.activeModel = binding.model
 	a.cfg.Model = binding.model
 	a.baseCfg.Model = binding.model
 	a.modelSwitchMsg = "# Model\nYou have been switched to the model \"" + binding.model + "\". Adjust your responses to its capabilities."
-	if a.pendingBinding != nil && a.pendingBinding.model == binding.model {
-		a.pendingBinding = nil
-	}
-}
-
-// restorePendingSettings rehydrates an admitted-but-not-yet-applied model
-// change from replay. It never changes the active binding; the normal checked
-// step boundary will commit SettingsChanged and apply the candidate before the
-// next provider request.
-func (a *Agent) restorePendingSettings(candidate session.SettingsScheduled) error {
-	model := strings.TrimSpace(candidate.Settings.Model)
-	if model == "" {
-		return nil
-	}
-	binding, err := a.makeBinding(model)
-	if err != nil {
-		return err
-	}
-	revision := candidate.SourceRevision + 1
-	if revision == 0 {
-		revision = 1
-	}
-	a.mu.Lock()
-	if binding.model == a.activeBinding.model && candidate.Settings.Provider == a.activeBinding.provider {
-		a.mu.Unlock()
-		return nil
-	}
-	a.pendingBinding = &binding
-	a.pendingSettingsRevision = revision
-	a.pendingSettingsChangeID = candidate.ChangeID
-	a.mu.Unlock()
-	return nil
 }
 
 func (a *Agent) beginStep() stepRuntime {
@@ -1105,75 +966,30 @@ func (a *Agent) beginStep() stepRuntime {
 	return step
 }
 
-// beginStepChecked applies one durable SettingsScheduled candidate before its
-// binding becomes visible to a request. A failed SettingsChanged commit leaves
-// the active binding untouched and returns the error to runTurn, which then
-// stops before calling the provider.
+// beginStepChecked captures the step runtime that becomes visible to the next
+// provider request. It holds settingsCommitMu so a step boundary never observes a
+// half-applied settings change racing on the command loop.
 func (a *Agent) beginStepChecked() (stepRuntime, error) {
-	// Match applySetModel's transition lock. A pending candidate is validated,
-	// durably applied, and published as one serialized transition; this avoids
-	// writing an obsolete SettingsChanged fact when a replacement races the
-	// boundary.
 	a.settingsCommitMu.Lock()
 	defer a.settingsCommitMu.Unlock()
+	step, lease := a.captureStepRuntime()
+	if err := a.loadStepExternalContext(&step, lease); err != nil {
+		return stepRuntime{}, err
+	}
+	return step, nil
+}
+
+// captureStepRuntime snapshots the step along with every mutable parent input a
+// Task/guardian can inherit, freezing the registry and tool lease at the same
+// lock boundary as cfg/provider/history. Registry reads are taken once here so a
+// plugin/MCP update during streaming cannot mix a new schema with this step's
+// binding.
+func (a *Agent) captureStepRuntime() (stepRuntime, *tools.Lease) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stepSeq++
 	var lease *tools.Lease
 	var mcpLease *mcp.StepLease
-	for {
-		var pending modelBinding
-		var pendingRevision uint64
-		var pendingChangeID string
-		var capturedRevision uint64
-		a.mu.Lock()
-		if a.pendingBinding != nil {
-			pending = *a.pendingBinding
-			capturedRevision = a.pendingSettingsRevision
-			pendingRevision = capturedRevision
-			pendingChangeID = a.pendingSettingsChangeID
-			if pendingRevision == 0 {
-				pendingRevision = a.settingsRev + 1
-				if pendingRevision == 0 {
-					pendingRevision = 1
-				}
-			}
-		}
-		a.mu.Unlock()
-		if pending.client == nil {
-			break
-		}
-		a.mu.Lock()
-		settings := a.sessionSettingsLocked()
-		settings.Model = pending.model
-		settings.Provider = pending.provider
-		settings.Endpoint, _ = sanitizeRequestEndpoint(pending.endpoint)
-		a.mu.Unlock()
-		if err := a.persistScheduledSettingsAppliedFact(pendingChangeID, settings, pendingRevision); err != nil {
-			return stepRuntime{}, err
-		}
-		a.mu.Lock()
-		// A second model command can arrive while the first candidate is being
-		// committed. Do not apply a stale binding; retry from a fresh snapshot
-		// rather than recursing (which previously exhausted the process stack).
-		candidateStillCurrent := a.pendingBinding != nil &&
-			a.pendingBinding.model == pending.model &&
-			a.pendingBinding.provider == pending.provider &&
-			a.pendingBinding.endpoint == pending.endpoint &&
-			a.pendingBinding.routeKind == pending.routeKind &&
-			a.pendingSettingsRevision == capturedRevision &&
-			a.pendingSettingsChangeID == pendingChangeID
-		if !candidateStillCurrent {
-			a.mu.Unlock()
-			continue
-		}
-		a.applyBindingLocked(pending)
-		a.pendingBinding = nil
-		a.pendingSettingsRevision = 0
-		a.pendingSettingsChangeID = ""
-		a.settingsRev = pendingRevision
-		a.mu.Unlock()
-		break
-	}
-	a.mu.Lock()
-	a.stepSeq++
 	if a.mcp != nil {
 		mcpLease = a.mcp.AcquireStep(a.registry)
 		lease = mcpLease.Tools
@@ -1187,10 +1003,6 @@ func (a *Agent) beginStepChecked() (stepRuntime, error) {
 		turn: a.turnSeq, step: a.stepSeq, settingsRev: a.settingsRev, contextRev: a.contextRev,
 		catalogVersion: a.catalogVersion, sessionID: a.sessionID, sessionStartAt: a.sessionStartAt,
 		plan: a.planMode, modelSwitchMsg: a.modelSwitchMsg, interruptNote: a.interruptNote, toolLease: lease, mcpLease: mcpLease}
-	// Capture all mutable parent inputs that a Task/guardian can inherit while
-	// this step is executing. Keep the registry frozen at the same lock
-	// boundary as cfg/binding; childOptionsFromParent verifies the turn before
-	// consuming it, so a completed turn can never leak an old snapshot.
 	var frozenModels *plugin.ModelRegistry
 	if a.models != nil {
 		frozenModels = a.models.Freeze()
@@ -1217,22 +1029,18 @@ func (a *Agent) beginStepChecked() (stepRuntime, error) {
 	}
 	a.modelSwitchMsg = ""
 	a.interruptNote = false
-	a.mu.Unlock()
-	// Registry reads are taken once at the step boundary. A plugin/MCP update
-	// during streaming therefore cannot mix a new schema with this step's
-	// frozen model/config/history binding.
-	// Instructions and the skill index are external mutable inputs too. Capture
-	// their bounded snapshots at the same step boundary so a file edit during
-	// provider preparation cannot change the request after admission.
+	return step, lease
+}
+
+// loadStepExternalContext captures the instructions, skill index, and tool
+// definitions at the step boundary so a file edit during provider preparation
+// cannot change the request after admission. An input-load failure releases the
+// frozen state and is reported as a user-retryable stepInputError.
+func (a *Agent) loadStepExternalContext(step *stepRuntime, lease *tools.Lease) error {
 	instructions, inputErr := workspace.LoadInstructionsChecked(step.cfg.Workspace)
 	if inputErr != nil {
-		releaseStepLease(step)
-		a.mu.Lock()
-		if a.childStep != nil && a.childStep.turn == step.turn && a.childStep.revision == step.settingsRev {
-			a.childStep = nil
-		}
-		a.mu.Unlock()
-		return stepRuntime{}, &stepInputError{err: fmt.Errorf("load project instructions: %w", inputErr)}
+		a.releaseStepContext(*step)
+		return &stepInputError{err: fmt.Errorf("load project instructions: %w", inputErr)}
 	}
 	step.instructions = instructions
 	a.mu.Lock()
@@ -1242,18 +1050,24 @@ func (a *Agent) beginStepChecked() (stepRuntime, error) {
 	if skillStore != nil && !isolated {
 		home, _ := os.UserHomeDir()
 		if inputErr := skillStore.LoadChecked(filepath.Join(home, ".ccdp", "skills"), filepath.Join(step.cfg.Workspace, ".ccdp", "skills")); inputErr != nil {
-			releaseStepLease(step)
-			a.mu.Lock()
-			if a.childStep != nil && a.childStep.turn == step.turn && a.childStep.revision == step.settingsRev {
-				a.childStep = nil
-			}
-			a.mu.Unlock()
-			return stepRuntime{}, &stepInputError{err: fmt.Errorf("load skills: %w", inputErr)}
+			a.releaseStepContext(*step)
+			return &stepInputError{err: fmt.Errorf("load skills: %w", inputErr)}
 		}
 		step.skillsSection = skillStore.SkillsSection()
 	}
 	step.tools = a.toolDefsSnapshotFromLease(lease)
-	return step, nil
+	return nil
+}
+
+// releaseStepContext releases a step's frozen lease and clears its child-session
+// snapshot on a failed step admission.
+func (a *Agent) releaseStepContext(step stepRuntime) {
+	releaseStepLease(step)
+	a.mu.Lock()
+	if a.childStep != nil && a.childStep.turn == step.turn && a.childStep.revision == step.settingsRev {
+		a.childStep = nil
+	}
+	a.mu.Unlock()
 }
 
 type stepRuntime struct {
@@ -1373,14 +1187,17 @@ func (a *Agent) toolDefsSnapshotFromLease(lease *tools.Lease) []llm.ToolDef {
 }
 
 func (a *Agent) applyExecutionMode(cmd protocol.Command) protocol.Receipt {
-	if a.isBusy() {
-		return a.rejectedReceipt(cmd, protocol.ErrorBusy, "execution mode changes apply only between steps")
-	}
 	on := cmd.ExecutionMode.Mode == protocol.ExecutionModePlan
-	if err := a.setExecutionMode(on); err != nil {
-		return a.rejectedReceipt(cmd, protocol.ErrorInternal, err.Error())
-	}
-	return a.receipt(cmd, protocol.ReceiptApplied, "", nil)
+	return a.applySettingsCommand(cmd, func(target *session.Settings) error {
+		// PermissionPolicy already holds the concrete base mode; a plan toggle only
+		// moves the execution-mode dimension and preserves that base.
+		if on {
+			target.ExecutionMode = "plan"
+		} else {
+			target.ExecutionMode = "execute"
+		}
+		return nil
+	})
 }
 
 func (a *Agent) setExecutionMode(on bool) error {
@@ -1444,138 +1261,71 @@ func (a *Agent) setExecutionMode(on bool) error {
 }
 
 func (a *Agent) applyPermissionPolicy(cmd protocol.Command) protocol.Receipt {
-	if a.isBusy() {
-		return a.rejectedReceipt(cmd, protocol.ErrorBusy, "permission changes apply only after the current turn settles")
-	}
 	p := cmd.PermissionPolicy.Policy
-	a.mu.Lock()
-	currentMode := a.perms.CurrentMode()
-	currentAllow := append([]string(nil), a.cfg.AlwaysAllow...)
-	currentDeny := append([]string(nil), a.cfg.AlwaysDeny...)
-	plan := a.planMode
-	a.mu.Unlock()
-	mode := currentMode
-	var err error
-	if p.Mode != "" {
-		mode, err = permissions.ParseMode(p.Mode)
-		if err != nil {
-			return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
+	return a.applySettingsCommand(cmd, func(target *session.Settings) error {
+		currentMode := permissions.Mode(target.PermissionPolicy)
+		plan := target.ExecutionMode == "plan"
+		mode := currentMode
+		if p.Mode != "" {
+			parsed, err := permissions.ParseMode(p.Mode)
+			if err != nil {
+				return err
+			}
+			mode = parsed
 		}
-	}
-	if mode == permissions.ModePlan {
-		// /mode plan is a compatibility entry into the independent plan
-		// workflow. Preserve the current policy, which may have changed since
-		// planBaseMode was captured at startup or on a previous plan entry.
-		mode = currentMode
-		if mode == permissions.ModePlan || mode == "" {
-			mode = permissions.ModeDefault
+		if mode == permissions.ModePlan {
+			// /mode plan is a compatibility entry into the independent plan
+			// workflow. Preserve the current base policy, which may have changed
+			// since planBaseMode was captured at startup or a previous plan entry.
+			mode = currentMode
+			if mode == permissions.ModePlan || mode == "" {
+				mode = permissions.ModeDefault
+			}
+			plan = true
 		}
-		plan = true
-	}
-	if p.AlwaysAllow != nil {
-		currentAllow = append([]string(nil), p.AlwaysAllow...)
-	}
-	if p.AlwaysDeny != nil {
-		currentDeny = append([]string(nil), p.AlwaysDeny...)
-	}
-	a.mu.Lock()
-	nextRevision := a.settingsRev + 1
-	if nextRevision == 0 {
-		nextRevision = 1
-	}
-	settings := a.sessionSettingsLocked()
-	settings.PermissionPolicy = string(mode)
-	settings.AlwaysAllow = append([]string(nil), currentAllow...)
-	settings.AlwaysDeny = append([]string(nil), currentDeny...)
-	settings.ExecutionMode = "execute"
-	workflow := session.WorkflowState{Phase: string(protocol.WorkflowOff)}
-	if plan {
-		settings.ExecutionMode = "plan"
-		workflow.Phase = string(protocol.WorkflowDrafting)
-	}
-	a.mu.Unlock()
-	if err := a.persistSettingsWorkflowFact(settings, nextRevision, &workflow); err != nil {
-		return a.rejectedReceipt(cmd, protocol.ErrorInternal, err.Error())
-	}
-	a.mu.Lock()
-	a.cfg.AlwaysAllow = append([]string(nil), currentAllow...)
-	a.cfg.AlwaysDeny = append([]string(nil), currentDeny...)
-	a.baseCfg.AlwaysAllow = append([]string(nil), currentAllow...)
-	a.baseCfg.AlwaysDeny = append([]string(nil), currentDeny...)
-	if plan {
-		a.planBaseMode = mode
-		a.planMode = true
-		a.workflow = protocol.WorkflowDrafting
-	} else {
-		a.planMode = false
-		a.workflow = protocol.WorkflowOff
-	}
-	a.cfg.PermissionMode = string(mode)
-	a.baseCfg.PermissionMode = string(mode)
-	a.settingsRev = nextRevision
-	a.mu.Unlock()
-	a.perms.SetMode(mode)
-	a.perms.SetPolicy(permissions.Policy{AlwaysAllow: append([]string(nil), currentAllow...), AlwaysDeny: append([]string(nil), currentDeny...)})
-	a.syncHookContext()
-	a.emit(Event{Type: EventModeChanged, Mode: mode})
-	a.emitStatus("permission policy updated")
-	a.publishState()
-	return a.receipt(cmd, protocol.ReceiptApplied, "", nil)
+		allow := target.AlwaysAllow
+		if p.AlwaysAllow != nil {
+			allow = p.AlwaysAllow
+		}
+		deny := target.AlwaysDeny
+		if p.AlwaysDeny != nil {
+			deny = p.AlwaysDeny
+		}
+		target.PermissionPolicy = string(mode)
+		target.AlwaysAllow = cloneStringSlice(allow)
+		target.AlwaysDeny = cloneStringSlice(deny)
+		if plan {
+			target.ExecutionMode = "plan"
+		} else {
+			target.ExecutionMode = "execute"
+		}
+		return nil
+	})
 }
 
 func (a *Agent) applySandboxPolicy(cmd protocol.Command) protocol.Receipt {
-	if a.isBusy() {
-		return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox changes apply only after the current turn settles")
-	}
 	p := cmd.SandboxPolicy.Policy
-	mode, err := sandbox.ParseMode(p.Mode)
-	if err != nil {
-		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
-	}
-	a.mu.Lock()
-	cfg := cloneConfig(a.cfg)
-	cfg.SandboxMode = string(mode)
-	// Nil directory lists denote a mode-only patch. Preserve the existing
-	// network and directory policy for that form; a non-nil list is an explicit
-	// replacement (including an intentionally empty list).
-	if p.AdditionalDirectories != nil || p.DisallowedDirectories != nil {
-		cfg.SandboxAllowNetwork = p.AllowNetwork
-		if p.AdditionalDirectories != nil {
-			cfg.AdditionalDirectories = append([]string(nil), p.AdditionalDirectories...)
+	return a.applySettingsCommand(cmd, func(target *session.Settings) error {
+		mode, err := sandbox.ParseMode(p.Mode)
+		if err != nil {
+			return err
 		}
-		if p.DisallowedDirectories != nil {
-			cfg.DisallowedDirectories = append([]string(nil), p.DisallowedDirectories...)
+		target.SandboxPolicy = string(mode)
+		// Nil directory lists denote a mode-only patch. Preserve the existing
+		// network and directory policy for that form; a non-nil list is an explicit
+		// replacement (including an intentionally empty list).
+		if p.AdditionalDirectories != nil || p.DisallowedDirectories != nil {
+			target.AllowNetwork = p.AllowNetwork
+			target.AllowNetworkSet = true
+			if p.AdditionalDirectories != nil {
+				target.AdditionalDirectories = cloneStringSlice(p.AdditionalDirectories)
+			}
+			if p.DisallowedDirectories != nil {
+				target.DisallowedDirectories = cloneStringSlice(p.DisallowedDirectories)
+			}
 		}
-	}
-	nextRevision := a.settingsRev + 1
-	if nextRevision == 0 {
-		nextRevision = 1
-	}
-	settings := a.sessionSettingsLocked()
-	settings.SandboxPolicy = cfg.SandboxMode
-	settings.AllowNetwork = cfg.SandboxAllowNetwork
-	settings.AdditionalDirectories = append([]string(nil), cfg.AdditionalDirectories...)
-	settings.DisallowedDirectories = append([]string(nil), cfg.DisallowedDirectories...)
-	a.mu.Unlock()
-	if err := a.persistSettingsFact(settings, nextRevision); err != nil {
-		return a.rejectedReceipt(cmd, protocol.ErrorInternal, err.Error())
-	}
-	a.mu.Lock()
-	a.cfg.SandboxMode = cfg.SandboxMode
-	a.cfg.SandboxAllowNetwork = cfg.SandboxAllowNetwork
-	a.cfg.AdditionalDirectories = append([]string(nil), cfg.AdditionalDirectories...)
-	a.cfg.DisallowedDirectories = append([]string(nil), cfg.DisallowedDirectories...)
-	a.baseCfg.SandboxMode = cfg.SandboxMode
-	a.baseCfg.SandboxAllowNetwork = cfg.SandboxAllowNetwork
-	a.baseCfg.AdditionalDirectories = append([]string(nil), cfg.AdditionalDirectories...)
-	a.baseCfg.DisallowedDirectories = append([]string(nil), cfg.DisallowedDirectories...)
-	a.sandbox = buildSandbox(&cfg, cfg.Workspace)
-	a.settingsRev = nextRevision
-	a.mu.Unlock()
-	a.emit(Event{Type: EventSandboxChanged})
-	a.emitStatus("sandbox mode → %s", mode)
-	a.publishState()
-	return a.receipt(cmd, protocol.ReceiptApplied, "", nil)
+		return nil
+	})
 }
 
 func (a *Agent) applyApproveTool(cmd protocol.Command) protocol.Receipt {
@@ -1682,17 +1432,14 @@ func (a *Agent) snapshotLocked() protocol.SessionView {
 		Phase: a.phase, Workflow: a.workflow, Busy: a.busy, Closing: a.closing,
 		Settings: settings, Catalog: a.catalogSnapshotLocked(), Usage: protocol.UsageSnapshot{
 			InputTokens: a.usage.InputTokens, OutputTokens: a.usage.OutputTokens,
-			CachedTokens: a.usage.CachedTokens, Cost: a.usage.Cost, TurnCount: a.usage.TurnCount,
+			CachedTokens: a.usage.CachedTokens, Cache: a.usage.Cache, Cost: a.usage.Cost, TurnCount: a.usage.TurnCount,
 		}}
-	if a.pendingBinding != nil {
-		p := a.pendingSettingsLocked()
-		view.Pending = &p
-	}
 	view.History = make([]protocol.MessageView, 0, len(a.history))
 	for _, m := range a.history {
-		mv := protocol.MessageView{ID: m.ID, Role: string(m.Role), Content: m.Content}
+		mv := protocol.MessageView{ID: m.ID, Role: string(m.Role), Content: m.Content, ReasoningContent: m.ReasoningContent}
 		for _, tc := range m.ToolCalls {
 			mv.ToolCallIDs = append(mv.ToolCallIDs, protocol.CallID(tc.ID))
+			mv.ToolCalls = append(mv.ToolCalls, protocol.MessageViewToolCall{ID: tc.ID, Name: tc.Name})
 		}
 		view.History = append(view.History, mv)
 	}
@@ -1709,9 +1456,33 @@ func (a *Agent) snapshotLocked() protocol.SessionView {
 		outcome := *a.lastTurn
 		view.LastTurn = &outcome
 	}
-	view.ContextUsedTokens = a.contextUsedTokensLocked()
+	view.Tasks = a.tasksViewLocked()
+	used, messages, tools := a.contextTokenBreakdownLocked()
+	view.ContextUsedTokens = used
+	view.MessagesTokens = messages
+	view.ToolsTokens = tools
+	view.SystemTokens = max(0, used-messages-tools)
 	view.Transcript, view.TranscriptMore = a.transcript.snapshot()
 	return view
+}
+
+// tasksViewLocked projects the session's working task list for rendering. The
+// store keeps its own mutex, so Snapshot is safe under a.mu. It returns nil
+// before resources are acquired or once the store is closed, leaving Tasks
+// omitted from the view.
+func (a *Agent) tasksViewLocked() []protocol.TaskView {
+	if a.resources == nil || a.resources.Todos == nil {
+		return nil
+	}
+	states := a.resources.Todos.Snapshot()
+	if len(states) == 0 {
+		return nil
+	}
+	tasks := make([]protocol.TaskView, 0, len(states))
+	for _, st := range states {
+		tasks = append(tasks, protocol.TaskView{ID: st.ID, Title: st.Content, Status: st.Status})
+	}
+	return tasks
 }
 
 // contextUsedTokensLocked mirrors estimateTokens while retaining the snapshot
@@ -1729,6 +1500,26 @@ func (a *Agent) contextUsedTokensLocked() int {
 		base += estimateMessageTokens(m)
 	}
 	return base
+}
+
+// contextTokenBreakdownLocked splits the total used tokens into the three
+// buckets the UI shows. Messages is derived directly from history, tools from
+// the request-prep cached schema estimate, and system as the remainder — so
+// the three always sum exactly to the reported total.
+func (a *Agent) contextTokenBreakdownLocked() (used, messages, tools int) {
+	used = a.contextUsedTokensLocked()
+	messages = 0
+	for _, m := range a.history {
+		messages += estimateMessageTokens(m)
+	}
+	if messages > used {
+		messages = used
+	}
+	tools = a.toolsTokensEstimate
+	if rem := used - messages; tools > rem {
+		tools = max(0, rem)
+	}
+	return used, messages, tools
 }
 
 // approvalArgsView keeps the new Watch/Snapshot DTO credential-free even
@@ -1756,27 +1547,65 @@ func (a *Agent) settingsSnapshotLocked() protocol.SettingsSnapshot {
 		ExecutionMode:   map[bool]protocol.ExecutionMode{true: protocol.ExecutionModePlan, false: protocol.ExecutionModeExecute}[a.planMode],
 		Permission:      protocol.PermissionPolicy{Mode: string(a.perms.CurrentMode()), AlwaysAllow: append([]string(nil), a.cfg.AlwaysAllow...), AlwaysDeny: append([]string(nil), a.cfg.AlwaysDeny...), Revision: a.settingsRev},
 		Sandbox:         protocol.SandboxPolicy{Mode: a.cfg.SandboxMode, AllowNetwork: a.cfg.SandboxAllowNetwork, AdditionalDirectories: append([]string(nil), a.cfg.AdditionalDirectories...), DisallowedDirectories: append([]string(nil), a.cfg.DisallowedDirectories...), Revision: a.settingsRev},
-		ReasoningEffort: a.cfg.ReasoningEffort, Verbosity: a.cfg.Verbosity,
-		ContextWindow: a.cfg.ContextWindow, MaxReplyTokens: a.cfg.MaxReplyTokens, MaxTurns: a.cfg.MaxTurns, MaxBudgetUSD: a.cfg.MaxBudgetUSD}
+		ReasoningEffort: a.cfg.ReasoningEffortFor(a.cfg.Model), Verbosity: a.cfg.Verbosity,
+		ContextWindow: a.cfg.ContextWindowFor(a.cfg.Model), CompactThreshold: a.cfg.CompactThreshold, MaxOutputTokens: a.cfg.MaxOutputTokensFor(a.cfg.Model), MaxTurns: a.cfg.MaxTurns, MaxBudgetUSD: a.cfg.MaxBudgetUSD}
 }
 
-func (a *Agent) pendingSettingsLocked() protocol.PendingSettings {
-	p := protocol.PendingSettings{Revision: a.settingsRev}
-	if a.pendingBinding != nil {
-		if a.pendingSettingsRevision > p.Revision {
-			p.Revision = a.pendingSettingsRevision
-		}
-		m := protocol.ModelBinding{Model: a.pendingBinding.model, Provider: a.pendingBinding.provider, Endpoint: a.pendingBinding.endpoint, BindingVersion: a.pendingBinding.version}
-		p.Model = &m
-	}
-	return p
-}
+// defaultProviderID names the unscoped top-level base_url/api_key pair in the
+// catalog, the fallback for models no configured [providers] record serves.
+const defaultProviderID = "default"
 
 func (a *Agent) catalogSnapshotLocked() protocol.CatalogSnapshot {
-	providers := a.models.Names()
 	out := protocol.CatalogSnapshot{Version: a.catalogVersion}
-	for _, p := range providers {
-		out.Providers = append(out.Providers, protocol.ProviderSnapshot{ID: p, Version: a.catalogVersion})
+	// The catalog is what /model offers. A configured provider record declares
+	// the models it serves and owns their endpoint and credential, so the two
+	// can never disagree in the picker. The unscoped top-level base_url has no
+	// declared list, so the model currently bound to it is published under
+	// defaultProviderID to keep the active selection visible.
+	entries := make(map[string]*protocol.ProviderSnapshot, len(a.cfg.Providers)+1)
+	publish := func(id string, models ...string) {
+		if id == "" {
+			id = defaultProviderID
+		}
+		entry, ok := entries[id]
+		if !ok {
+			entry = &protocol.ProviderSnapshot{ID: id, Version: a.catalogVersion}
+			entries[id] = entry
+		}
+		for _, model := range models {
+			if model != "" && !containsModel(entry.Models, model) {
+				entry.Models = append(entry.Models, model)
+			}
+		}
+	}
+	for id, provider := range a.cfg.Providers {
+		if provider.ModelConfigs != nil {
+			for model := range provider.ModelConfigs {
+				publish(id, id+"/"+model)
+			}
+		} else {
+			publish(id, provider.Models...)
+		}
+	}
+	// Switching the active model must not remove the configured top-level model
+	// from the picker, even when the destination is listed by another provider.
+	if a.configuredModel != "" {
+		resolved := a.cfg.ResolveProvider(a.configuredModel)
+		publish(resolved.ID, a.configuredModel)
+	}
+	if a.activeBinding.model != "" {
+		switch {
+		case a.activeBinding.providerID != "":
+			publish(a.activeBinding.providerID, a.activeBinding.model)
+		case a.activeBinding.routeKind != "" && a.activeBinding.routeKind != "http":
+			publish(a.activeBinding.provider, a.activeBinding.model)
+		default:
+			publish(defaultProviderID, a.activeBinding.model)
+		}
+	}
+	for _, entry := range entries {
+		sort.Strings(entry.Models)
+		out.Providers = append(out.Providers, *entry)
 	}
 	for _, name := range a.registry.Names() {
 		t, ok := a.registry.Get(name)
@@ -1788,6 +1617,15 @@ func (a *Agent) catalogSnapshotLocked() protocol.CatalogSnapshot {
 	sort.Slice(out.Providers, func(i, j int) bool { return out.Providers[i].ID < out.Providers[j].ID })
 	sort.Slice(out.Tools, func(i, j int) bool { return out.Tools[i].ID < out.Tools[j].ID })
 	return out
+}
+
+func containsModel(models []string, want string) bool {
+	for _, model := range models {
+		if model == want {
+			return true
+		}
+	}
+	return false
 }
 
 func marshalSchema(v map[string]any) []byte {
@@ -1975,7 +1813,7 @@ func (a *Agent) eventView(ev Event) protocol.EventView {
 		view.Plan = &protocol.PlanView{ID: ev.Plan.ID, Text: ev.Plan.Plan, Version: planViewVersion}
 	}
 	if ev.Usage != nil {
-		view.Usage = &protocol.UsageSnapshot{InputTokens: ev.Usage.InputTokens, OutputTokens: ev.Usage.OutputTokens, CachedTokens: ev.Usage.CachedTokens, Cost: ev.Usage.Cost, TurnCount: ev.Usage.TurnCount}
+		view.Usage = &protocol.UsageSnapshot{InputTokens: ev.Usage.InputTokens, OutputTokens: ev.Usage.OutputTokens, CachedTokens: ev.Usage.CachedTokens, Cache: ev.Usage.Cache, Cost: ev.Usage.Cost, TurnCount: ev.Usage.TurnCount}
 	}
 	return view
 }

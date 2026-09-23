@@ -373,6 +373,19 @@ type routeEntry struct {
 	kind     string
 	endpoint string
 	keyHash  [32]byte
+	wire     string
+}
+
+// HTTPBinding is the complete identity of a generated HTTP adapter for one
+// model: the endpoint, the credential that authenticates it and the wire
+// format spoken on it all come from the same config provider record. Passing
+// them as one value keeps the cache lookup from treating a subset as an
+// identity — an endpoint/key match with a changed wire_api would otherwise
+// reuse an adapter that speaks the previous provider's protocol.
+type HTTPBinding struct {
+	Endpoint string
+	APIKey   string
+	Wire     string
 }
 
 // NewModelRegistry builds an empty registry.
@@ -463,32 +476,32 @@ func (r *ModelRegistry) Route(model, provider string) {
 }
 
 // RouteDefault maps a model to an adapter created from the model's own
-// endpoint/key configuration. Endpoint and a one-way key fingerprint let a
-// later reload replace a stale adapter without classifying providers by Go
-// concrete type. The credential itself is never retained by the registry.
-func (r *ModelRegistry) RouteDefault(model, provider, endpoint, apiKey string) {
+// endpoint/key/wire configuration. The complete HTTPBinding lets a later reload
+// replace a stale adapter without classifying providers by Go concrete type.
+// The credential itself is never retained by the registry.
+func (r *ModelRegistry) RouteDefault(model, provider string, binding HTTPBinding) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.frozen {
 		return
 	}
 	if entry, ok := r.providers[provider]; ok {
-		r.routes[model] = routeEntry{provider: provider, token: entry.token, kind: "http", endpoint: endpoint, keyHash: sha256.Sum256([]byte(apiKey))}
+		r.routes[model] = routeEntry{provider: provider, token: entry.token, kind: "http", endpoint: binding.Endpoint, keyHash: sha256.Sum256([]byte(binding.APIKey)), wire: binding.Wire}
 	}
 }
 
-// ResolveDefault returns an adapter only when its frozen endpoint and
-// credential fingerprint still match. It is intentionally separate from
+// ResolveDefault returns an adapter only when its frozen endpoint, credential
+// fingerprint and wire format still match. It is intentionally separate from
 // ResolveRoute, which resolves explicit plugin routes regardless of HTTP
 // configuration.
-func (r *ModelRegistry) ResolveDefault(model, endpoint, apiKey string) (llm.Provider, bool) {
+func (r *ModelRegistry) ResolveDefault(model string, binding HTTPBinding) (llm.Provider, bool) {
 	if r == nil {
 		return nil, false
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	route, ok := r.routes[model]
-	if !ok || route.kind != "http" || route.endpoint != endpoint || route.keyHash != sha256.Sum256([]byte(apiKey)) {
+	if !ok || route.kind != "http" || route.endpoint != binding.Endpoint || route.wire != binding.Wire || route.keyHash != sha256.Sum256([]byte(binding.APIKey)) {
 		return nil, false
 	}
 	entry, ok := r.providers[route.provider]

@@ -14,7 +14,7 @@ type AgentTool struct{}
 func NewAgentTool() *AgentTool  { return &AgentTool{} }
 func (*AgentTool) Name() string { return "Agent" }
 func (*AgentTool) Description() string {
-	return "Inspect and control this root's child sessions. Task launches children; Agent lists progress, reads history/full output, waits, sends steer or followup input, interrupts, cancels, or explicitly continues a settled task. Mutations require the exact run_id from list to reject stale commands. No permission approvals or nested delegation are available. Read/wait never launch a model."
+	return "Inspect and control this root's child sessions. Task launches children; Agent lists progress, reads history/full output, waits, sends steer or followup input, interrupts, cancels, or explicitly continues a settled task. read (or output without item_id) returns a page of session history; output with an item_id from that history returns the full text of that item, paged by offset. Mutations require the exact run_id from list to reject stale commands. No permission approvals or nested delegation are available. Read/wait never launch a model."
 }
 func (*AgentTool) Parameters() map[string]any {
 	return map[string]any{
@@ -63,6 +63,12 @@ func (*AgentTool) Run(ctx *Context) (string, error) {
 	case "read":
 		return encode(ctx.Sessions.ReadTranscript(ctx.Context, args.SessionID, args.Before, 64))
 	case "output":
+		if args.ItemID == "" {
+			if args.Offset != 0 {
+				return "", errors.New("offset requires item_id; use before to page session history")
+			}
+			return encode(ctx.Sessions.ReadTranscript(ctx.Context, args.SessionID, args.Before, 64))
+		}
 		return encode(ctx.Sessions.ReadOutput(ctx.Context, args.SessionID, args.ItemID, args.Offset, 32<<10))
 	case "wait":
 		timeout := args.Timeout

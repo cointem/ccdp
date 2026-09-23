@@ -39,18 +39,26 @@ func newJournalAgent(t *testing.T, memory bool) (*Agent, *sessionPersistence, *c
 		t.Fatal(err)
 	}
 	a := &Agent{
-		cfg:         &cfg,
-		persistence: p,
-		sessionID:   "journal-session",
-		settingsRev: 7,
-		contextRev:  9,
-		turnSeq:     2,
-		stepSeq:     4,
-		perms:       permissions.NewManager(permissions.ModeDefault, permissions.Policy{}),
-		evbus:       events.NewBus(),
-		eventQueue:  make(chan Event, 8),
-		eventDone:   make(chan struct{}),
-		watchers:    make(map[uint64]*runtimeWatcher),
+		deps: deps{
+			cfg:         &cfg,
+			persistence: p,
+			perms:       permissions.NewManager(permissions.ModeDefault, permissions.Policy{}),
+			evbus:       events.NewBus(),
+		},
+		sessionData: sessionData{
+			sessionID: "journal-session",
+		},
+		seqState: seqState{
+			settingsRev: 7,
+			contextRev:  9,
+			turnSeq:     2,
+			stepSeq:     4,
+		},
+		runtimeData: runtimeData{
+			eventQueue: make(chan Event, 8),
+			eventDone:  make(chan struct{}),
+		},
+		watchState: watchState{watchers: make(map[uint64]*runtimeWatcher)},
 	}
 	t.Cleanup(func() { _ = p.close() })
 	return a, p, &cfg
@@ -117,10 +125,10 @@ func TestRequestJournalReconstructsExactWireMemoryAndDisk(t *testing.T) {
 			} else if _, err := os.Stat(cfg.SessionDir); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("memory mode touched disk: stat=%v", err)
 			}
-			if err := a.finishRequestAttempt(attempt, llm.StreamResult{PromptTokens: 11, CompletionTok: 5, CachedTokens: 2}, nil); err != nil {
+			if err := a.finishRequestAttempt(attempt, llm.StreamResult{PromptTokens: 11, CompletionTok: 5, CachedTokens: 2, CacheReported: true}, nil); err != nil {
 				t.Fatal(err)
 			}
-			if got := a.Usage(); got.InputTokens != 11 || got.OutputTokens != 5 || got.CachedTokens != 2 || got.TurnCount != 1 || math.Abs(got.Cost-0.000021) > 1e-15 {
+			if got := a.Usage(); got.InputTokens != 11 || got.OutputTokens != 5 || got.CachedTokens != 2 || got.Cache.InputTokens != 11 || got.Cache.ReportedInputTokens != 11 || got.Cache.CachedTokens != 2 || got.TurnCount != 1 || math.Abs(got.Cost-0.000021) > 1e-15 {
 				t.Fatalf("live usage = %+v", got)
 			}
 			records, err := p.Read(session.Beginning)
@@ -414,7 +422,7 @@ func TestRequestJournalFailureStopsRealLoop(t *testing.T) {
 			provider := &requestJournalGateProvider{}
 			a := newJournalRuntimeAgent(t, provider)
 			a.mu.Lock()
-			a.fallbackClient = provider
+			a.fallbackBinding = modelBinding{model: "fallback-model", provider: provider.Name(), client: provider}
 			a.cfg.FallbackModel = "fallback-model"
 			a.mu.Unlock()
 			persistence := a.persistenceHandle()
@@ -440,5 +448,50 @@ func TestRequestJournalFailureStopsRealLoop(t *testing.T) {
 				t.Fatalf("uncommitted usage published: %+v", got)
 			}
 		})
+	}
+}
+
+func TestSessionCacheWeightedPersistedAndExcludesChildUsage(t *testing.T) {
+	a, p, _ := newJournalAgent(t, false)
+	for i, u := range []llm.StreamResult{
+		{PromptTokens: 100, CachedTokens: 0, CacheReported: true},
+		{PromptTokens: 900, CachedTokens: 900, CacheReported: true},
+	} {
+		attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest())
+		if err != nil {
+			t.Fatal(i, err)
+		}
+		if err = a.finishRequestAttempt(attempt, u, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := a.Usage().Cache
+	if want.InputTokens != 1000 || want.CachedTokens != 900 || want.ReportedInputTokens != 1000 || want.UnknownHistory {
+		t.Fatalf("wrong weighted counters: %+v", want)
+	}
+	if err := a.recordChildUsage(Usage{InputTokens: 500, CachedTokens: 50, TurnCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if a.Usage().Cache != want {
+		t.Fatal("child polluted main cache stats")
+	}
+	records, err := p.Read(session.Beginning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := snapshotFromRecords(records, "journal-session")
+	if err != nil || restored.Usage.Cache != want {
+		t.Fatalf("cache lost in replay: %+v %v", restored, err)
+	}
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.finishRequestAttempt(attempt, llm.StreamResult{PromptTokens: 300}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got := a.Usage().Cache
+	if got.InputTokens != 1300 || got.ReportedInputTokens != 1000 {
+		t.Fatalf("missing provider data misclassified: %+v", got)
 	}
 }

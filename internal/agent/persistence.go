@@ -65,6 +65,10 @@ type sessionPersistence struct {
 	// submits byte-identical event data with the same transaction ID.
 	closeTransactionID string
 	closeAt            time.Time
+	// skipped lists the records the event log held for types this build cannot
+	// decode. Replay counts them and continues; the agent reports them so a
+	// resumed session never silently looks shorter than what was written.
+	skipped []session.SkippedRecord
 }
 
 func (a *Agent) openPersistence() error {
@@ -181,6 +185,23 @@ func (a *Agent) persistenceHandle() *sessionPersistence {
 	return a.persistence
 }
 
+// skippedRecords reports the durable records this build counted but could not
+// decode while opening the session log. They are version skew, not damage: the
+// session still resumes, minus the history the writer knew and the reader does
+// not.
+func (a *Agent) skippedRecords() []session.SkippedRecord {
+	p := a.persistenceHandle()
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.skipped) == 0 {
+		return nil
+	}
+	return append([]session.SkippedRecord(nil), p.skipped...)
+}
+
 // persistenceFailure reports a poisoned durable writer. Runtime admission
 // uses this gate to stop accepting work after a synced commit failed; callers
 // must not continue to start a turn against an uncertain log.
@@ -219,7 +240,7 @@ func ensureMessageID(message *messages.Message) {
 }
 
 func inputMessageID(inputID string) string {
-	return stableID("input-message", inputID)
+	return protocol.InputMessageID(protocol.InputID(inputID))
 }
 
 func legacyMessageID(sessionID string, index int) string {
@@ -362,6 +383,7 @@ func openSessionPersistenceModeWithParent(cfg *config.Config, sessionID string, 
 		}
 		p.store = store
 		p.dir = store.Dir()
+		p.skipped = store.SkippedRecords()
 		artifacts, err := session.NewArtifactStore(store.Dir())
 		if err != nil {
 			_ = store.Close()
@@ -522,12 +544,6 @@ func projectionEvent(event session.Event) session.Event {
 		v := e
 		return &v
 	case session.SettingsChanged:
-		v := e
-		return &v
-	case session.SettingsScheduled:
-		v := e
-		return &v
-	case session.SettingsScheduleCancelled:
 		v := e
 		return &v
 	case session.WorkflowChanged:
@@ -1097,106 +1113,6 @@ func (a *Agent) persistSettingsFact(settings session.Settings, revision uint64) 
 	return nil
 }
 
-// persistSettingsScheduledFact records a candidate that was accepted while a
-// turn is still running. The active in-memory binding remains unchanged until
-// the next step boundary; replay can therefore distinguish an admitted
-// pending change from the setting that was actually used by the current step.
-func (a *Agent) persistSettingsScheduledFact(changeID string, settings session.Settings, sourceRevision uint64) error {
-	return a.persistSettingsScheduledFactWithCancel(changeID, settings, sourceRevision, "")
-}
-
-// persistSettingsScheduledFactWithCancel records a replacement and its
-// supersession in one transaction.  A pending model command is an admitted
-// operation, so replacing it must close the old command explicitly instead of
-// leaving a second "unknown" operation in the resume projection.
-func (a *Agent) persistSettingsScheduledFactWithCancel(changeID string, settings session.Settings, sourceRevision uint64, supersededChangeID string) error {
-	if strings.TrimSpace(changeID) == "" {
-		changeID = nextRuntimeID("settings-change")
-	}
-	p := a.persistenceHandle()
-	if p == nil {
-		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
-	}
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
-	if err := a.persistenceFailure(); err != nil {
-		return err
-	}
-	events := make([]session.Event, 0, 3)
-	if supersededChangeID != "" && supersededChangeID != changeID {
-		events = append(events,
-			session.SettingsScheduleCancelled{ChangeID: supersededChangeID, Reason: "superseded by a newer settings change"},
-			session.CommandCompleted{CommandID: supersededChangeID, Outcome: "cancelled", Code: "superseded", Report: "settings change was superseded before its step boundary"},
-		)
-	}
-	events = append(events, session.SettingsScheduled{ChangeID: changeID, Settings: settings, SourceRevision: sourceRevision})
-	if _, err := p.Commit(session.Batch{
-		TransactionID: stableID("settings-scheduled", struct {
-			ChangeID       string
-			Settings       session.Settings
-			SourceRevision uint64
-			Superseded     string
-		}{changeID, settings, sourceRevision, supersededChangeID}),
-		Events: events,
-	}); err != nil {
-		return a.toolJournalFailure(fmt.Errorf("agent: persist scheduled settings: %w", err))
-	}
-	return nil
-}
-
-// persistScheduledSettingsAppliedFact closes one durable settings admission at
-// the step boundary. SettingsChanged and the terminal CommandCompleted for the
-// original scheduled command share a transaction, so replay cannot expose an
-// active binding without its completion (or vice versa).
-func (a *Agent) persistScheduledSettingsAppliedFact(changeID string, settings session.Settings, revision uint64) error {
-	return a.persistSettingsAppliedFact(changeID, settings, revision, "")
-}
-
-// persistSettingsAppliedFact commits the active settings snapshot and the
-// terminal state of the command which caused it in one transaction.  When a
-// stale scheduled candidate is replaced while the session is idle, the
-// cancellation of that candidate belongs to this same publication boundary;
-// otherwise replay can retain an admitted change whose in-memory receipt was
-// already superseded.
-func (a *Agent) persistSettingsAppliedFact(changeID string, settings session.Settings, revision uint64, supersededChangeID string) error {
-	p := a.persistenceHandle()
-	if p == nil {
-		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
-	}
-	a.persistMu.Lock()
-	var err error
-	p.mu.Lock()
-	if p.store == nil {
-		err = session.ErrClosed
-	} else if p.failed != nil {
-		err = fmt.Errorf("%w: %v", session.ErrPersistenceFailed, p.failed)
-	} else {
-		events := make([]session.Event, 0, 4)
-		if strings.TrimSpace(supersededChangeID) != "" && supersededChangeID != changeID {
-			events = append(events,
-				session.SettingsScheduleCancelled{ChangeID: supersededChangeID, Reason: "superseded by a newer settings change"},
-				session.CommandCompleted{CommandID: supersededChangeID, Outcome: "cancelled", Code: "superseded", Report: "settings change was superseded before its step boundary"},
-			)
-		}
-		events = append(events, session.SettingsChanged{Revision: revision, Settings: settings})
-		if strings.TrimSpace(changeID) != "" {
-			events = append(events, session.CommandCompleted{CommandID: changeID, Outcome: "applied"})
-		}
-		_, err = p.commitLocked(session.Batch{TransactionID: stableID("settings-applied", struct {
-			ChangeID   string
-			Revision   uint64
-			Settings   session.Settings
-			Superseded string
-		}{changeID, revision, settings, supersededChangeID}), Events: events})
-	}
-	p.mu.Unlock()
-	a.persistMu.Unlock()
-	if err != nil {
-		return a.toolJournalFailure(fmt.Errorf("agent: persist applied settings: %w", err))
-	}
-	return nil
-}
-
 func (a *Agent) sessionSettingsLocked() session.Settings {
 	settings := session.Settings{}
 	if a == nil {
@@ -1229,11 +1145,13 @@ func (a *Agent) sessionSettingsLocked() session.Settings {
 	settings.AdditionalDirectories = append([]string(nil), a.cfg.AdditionalDirectories...)
 	settings.DisallowedDirectories = append([]string(nil), a.cfg.DisallowedDirectories...)
 	settings.ContextWindow = a.cfg.ContextWindow
+	settings.EffectiveContextWindow = a.cfg.ContextWindowFor(a.cfg.Model)
 	settings.CompactThreshold = a.cfg.CompactThreshold
 	settings.MaxResultSizeChars = a.cfg.MaxResultSizeChars
 	settings.MaxTurns = a.cfg.MaxTurns
 	settings.MaxBudgetUSD = a.cfg.MaxBudgetUSD
-	settings.MaxReplyTokens = a.cfg.MaxReplyTokens
+	maxOutputTokens := a.cfg.MaxOutputTokensFor(a.cfg.Model)
+	settings.MaxOutputTokens = &maxOutputTokens
 	settings.ReasoningEffort = a.cfg.ReasoningEffort
 	settings.Verbosity = a.cfg.Verbosity
 	settings.GenerationOptionsSet = true
@@ -1348,7 +1266,7 @@ func (p *sessionPersistence) persistUsage(usage Usage) error {
 			last = &copy
 		}
 	}
-	converted := session.Usage{InputTokens: int64(usage.InputTokens), OutputTokens: int64(usage.OutputTokens), CachedTokens: int64(usage.CachedTokens), TotalTokens: int64(usage.InputTokens + usage.OutputTokens), Cost: usage.Cost, TurnCount: int64(usage.TurnCount)}
+	converted := session.Usage{InputTokens: int64(usage.InputTokens), OutputTokens: int64(usage.OutputTokens), CachedTokens: int64(usage.CachedTokens), Cache: usage.Cache, TotalTokens: int64(usage.InputTokens + usage.OutputTokens), Cost: usage.Cost, TurnCount: int64(usage.TurnCount)}
 	if last != nil && last.Usage == converted {
 		return nil
 	}
@@ -1692,7 +1610,7 @@ func legacyEvents(snapshot SessionSnapshot, sourcePath string) ([]session.Event,
 	if snapshot.Usage != (Usage{}) {
 		events = append(events, session.UsageChanged{Revision: 1, Usage: session.Usage{
 			InputTokens: int64(snapshot.Usage.InputTokens), OutputTokens: int64(snapshot.Usage.OutputTokens),
-			CachedTokens: int64(snapshot.Usage.CachedTokens), TotalTokens: int64(snapshot.Usage.InputTokens + snapshot.Usage.OutputTokens),
+			CachedTokens: int64(snapshot.Usage.CachedTokens), Cache: snapshot.Usage.Cache, TotalTokens: int64(snapshot.Usage.InputTokens + snapshot.Usage.OutputTokens),
 			Cost: snapshot.Usage.Cost, TurnCount: int64(snapshot.Usage.TurnCount),
 		}})
 	}
@@ -1954,34 +1872,51 @@ func (p *sessionPersistence) populateMemoryResume(snapshot *SessionSnapshot) err
 // path is not an import boundary and therefore uses a distinct SessionImported
 // source without touching a legacy file or requiring an import-complete marker.
 func memoryResumeEvents(snapshot SessionSnapshot) ([]session.Event, error) {
-	createdAt := snapshot.CreatedAt
+	_, importedAt := resumeTimestamps(snapshot)
+	events := make([]session.Event, 0, len(snapshot.History)*2+len(snapshot.Pending)+3)
+	events = appendResumeStateFacts(events, snapshot)
+	if err := appendResumeHistoryEvents(&events, snapshot); err != nil {
+		return nil, err
+	}
+	events = appendResumePendingInputs(events, snapshot, importedAt)
+	events = append(events, session.SessionImported{
+		SessionID: snapshot.ID, FormatVersion: session.SchemaVersion, Source: "memory-resume", ImportedAt: importedAt,
+		ParentID: snapshot.ParentID, BranchPoint: snapshot.BranchPoint, BranchSummary: snapshot.BranchSummary,
+	})
+	return events, nil
+}
+
+// resumeTimestamps reconciles the snapshot's creation and import timestamps.
+func resumeTimestamps(snapshot SessionSnapshot) (createdAt, importedAt time.Time) {
+	createdAt = snapshot.CreatedAt
 	if createdAt.IsZero() {
 		createdAt = snapshot.UpdatedAt
 	}
 	if createdAt.IsZero() {
 		createdAt = time.Unix(0, 0).UTC()
 	}
-	importedAt := snapshot.UpdatedAt
+	importedAt = snapshot.UpdatedAt
 	if importedAt.IsZero() {
 		importedAt = createdAt
 	}
-	events := make([]session.Event, 0, len(snapshot.History)*2+len(snapshot.Pending)+3)
+	return createdAt, importedAt
+}
+
+// appendResumeStateFacts restores workspace/model/usage/memory/tasks/workflow
+// state as durable facts.
+func appendResumeStateFacts(events []session.Event, snapshot SessionSnapshot) []session.Event {
 	if snapshot.Workspace != "" || snapshot.Model != "" {
 		events = append(events, session.SettingsChanged{Revision: 1, Settings: session.Settings{Workspace: snapshot.Workspace, Model: snapshot.Model}})
 	}
 	if snapshot.Usage != (Usage{}) {
 		events = append(events, session.UsageChanged{Revision: 1, Usage: session.Usage{
 			InputTokens: int64(snapshot.Usage.InputTokens), OutputTokens: int64(snapshot.Usage.OutputTokens),
-			CachedTokens: int64(snapshot.Usage.CachedTokens), TotalTokens: int64(snapshot.Usage.InputTokens + snapshot.Usage.OutputTokens),
+			CachedTokens: int64(snapshot.Usage.CachedTokens), Cache: snapshot.Usage.Cache, TotalTokens: int64(snapshot.Usage.InputTokens + snapshot.Usage.OutputTokens),
 			Cost: snapshot.Usage.Cost, TurnCount: int64(snapshot.Usage.TurnCount),
 		}})
 	}
 	if snapshot.Settings != nil {
 		events = append(events, session.SettingsChanged{Revision: 1, Settings: *snapshot.Settings})
-	}
-	if snapshot.PendingSettings != nil {
-		candidate := *snapshot.PendingSettings
-		events = append(events, session.SettingsScheduled{ChangeID: candidate.ChangeID, Settings: candidate.Settings, SourceRevision: candidate.SourceRevision})
 	}
 	for _, command := range snapshot.PendingCommands {
 		// The command payload is intentionally absent from the snapshot.  A
@@ -1998,6 +1933,12 @@ func memoryResumeEvents(snapshot SessionSnapshot) ([]session.Event, error) {
 	if len(snapshot.Tasks) > 0 {
 		events = append(events, session.TasksChanged{Revision: 1, Tasks: append([]session.Task(nil), snapshot.Tasks...)})
 	}
+	return events
+}
+
+// appendResumeHistoryEvents replays each history message into InputQueued +
+// InputDelivered (user) or AssistantCommitted (other) facts.
+func appendResumeHistoryEvents(events *[]session.Event, snapshot SessionSnapshot) error {
 	for i, original := range snapshot.History {
 		message := original
 		if message.ID == "" {
@@ -2008,11 +1949,11 @@ func memoryResumeEvents(snapshot SessionSnapshot) ([]session.Event, error) {
 			inputID := fmt.Sprintf("memory-resume-input-%06d", i)
 			converted, err := messageToSession(message)
 			if err != nil {
-				return nil, fmt.Errorf("memory resume history[%d]: %w", i, err)
+				return fmt.Errorf("memory resume history[%d]: %w", i, err)
 			}
 			// The InputQueued MessageID is the authoritative history identity;
 			// messageToSession also validates the role/content conversion.
-			events = append(events,
+			*events = append(*events,
 				session.InputQueued{InputID: inputID, MessageID: converted.MessageID, Text: message.Content, Strategy: "followup", TurnID: turnID, CreatedAt: message.CreatedAt},
 				session.InputDelivered{InputID: inputID, TurnID: turnID},
 			)
@@ -2020,10 +1961,15 @@ func memoryResumeEvents(snapshot SessionSnapshot) ([]session.Event, error) {
 		}
 		converted, err := messageToSession(message)
 		if err != nil {
-			return nil, fmt.Errorf("memory resume history[%d]: %w", i, err)
+			return fmt.Errorf("memory resume history[%d]: %w", i, err)
 		}
-		events = append(events, session.AssistantCommitted{TurnID: turnID, Message: converted, ToolCalls: sessionMessageToolCalls(converted)})
+		*events = append(*events, session.AssistantCommitted{TurnID: turnID, Message: converted, ToolCalls: sessionMessageToolCalls(converted)})
 	}
+	return nil
+}
+
+// appendResumePendingInputs restores queued inputs as InputQueued facts.
+func appendResumePendingInputs(events []session.Event, snapshot SessionSnapshot, importedAt time.Time) []session.Event {
 	for _, input := range pendingInputSnapshot(snapshot.ID, snapshot.Pending, snapshot.PendingInputs) {
 		if strings.TrimSpace(input.Text) == "" || input.ID == "" {
 			continue
@@ -2041,11 +1987,7 @@ func memoryResumeEvents(snapshot SessionSnapshot) ([]session.Event, error) {
 			Strategy: string(strategy), CreatedAt: created,
 		})
 	}
-	events = append(events, session.SessionImported{
-		SessionID: snapshot.ID, FormatVersion: session.SchemaVersion, Source: "memory-resume", ImportedAt: importedAt,
-		ParentID: snapshot.ParentID, BranchPoint: snapshot.BranchPoint, BranchSummary: snapshot.BranchSummary,
-	})
-	return events, nil
+	return events
 }
 
 func snapshotFromRecords(records []session.Record, id string) (*SessionSnapshot, error) {
@@ -2076,7 +2018,7 @@ func snapshotFromProjection(projection *replayProjection, id string) *SessionSna
 		ID: projection.ID, CreatedAt: projection.CreatedAt, UpdatedAt: projection.updatedAt,
 		Workspace: projection.Workspace, Model: projection.Model, Title: sessionTitle(projection.History),
 		History: cloneMessages(projection.History), Usage: projection.Usage, Pending: append([]string(nil), projection.Pending...), PendingInputs: projection.pendingInputViews(), PendingAttachments: projection.pendingAttachments(),
-		Settings: snapshotSettings(projection.Settings), PendingSettings: snapshotPendingSettings(projection.PendingSettings), Workflow: snapshotWorkflow(projection.Workflow),
+		Settings: snapshotSettings(projection.Settings), Workflow: snapshotWorkflow(projection.Workflow),
 		Memory: projection.MemoryText, Tasks: append([]session.Task(nil), projection.Tasks...),
 		PendingCommands: projection.pendingCommands(),
 		ParentID:        projection.ParentID, BranchPoint: projection.BranchPoint, BranchSummary: projection.BranchSummary,
@@ -2104,17 +2046,6 @@ func snapshotSettings(settings session.Settings) *session.Settings {
 	return &copy
 }
 
-func snapshotPendingSettings(settings *session.SettingsScheduled) *session.SettingsScheduled {
-	if settings == nil {
-		return nil
-	}
-	copy := *settings
-	if snapshot := snapshotSettings(settings.Settings); snapshot != nil {
-		copy.Settings = *snapshot
-	}
-	return &copy
-}
-
 func snapshotWorkflow(workflow session.WorkflowState) *session.WorkflowState {
 	if workflow == (session.WorkflowState{}) {
 		return nil
@@ -2136,7 +2067,6 @@ type replayProjection struct {
 	Model             string
 	Settings          session.Settings
 	SettingsRev       uint64
-	PendingSettings   *session.SettingsScheduled
 	ScheduledCommands map[string]session.CommandScheduled
 	CompletedCommands map[string]session.CommandCompleted
 	Workflow          session.WorkflowState
@@ -2576,17 +2506,6 @@ func (p *replayProjection) apply(event session.Event) error {
 		p.Settings = e.Settings
 		p.SettingsRev = e.Revision
 		p.Model, p.Workspace = e.Settings.Model, e.Settings.Workspace
-		p.PendingSettings = nil
-	case *session.SettingsScheduled:
-		candidate := *e
-		if settings := snapshotSettings(e.Settings); settings != nil {
-			candidate.Settings = *settings
-		}
-		p.PendingSettings = &candidate
-	case *session.SettingsScheduleCancelled:
-		if p.PendingSettings != nil && p.PendingSettings.ChangeID == e.ChangeID {
-			p.PendingSettings = nil
-		}
 	case *session.CommandScheduled:
 		if prior, exists := p.ScheduledCommands[e.CommandID]; exists && prior.InputDigest != e.InputDigest {
 			return fmt.Errorf("command %q was scheduled with different input digest", e.CommandID)
@@ -2684,12 +2603,22 @@ func (p *replayProjection) apply(event session.Event) error {
 		p.History = nil
 		p.historyStep = nil
 	case *session.UsageChanged:
-		p.Usage = Usage{InputTokens: int(e.Usage.InputTokens), OutputTokens: int(e.Usage.OutputTokens), CachedTokens: int(e.Usage.CachedTokens), Cost: e.Usage.Cost, TurnCount: int(e.Usage.TurnCount)}
+		p.Usage = Usage{InputTokens: int(e.Usage.InputTokens), OutputTokens: int(e.Usage.OutputTokens), CachedTokens: int(e.Usage.CachedTokens), Cache: e.Usage.Cache, Cost: e.Usage.Cost, TurnCount: int(e.Usage.TurnCount)}
 	case *session.AttemptFinished:
 		p.observeRuntimeSequence(e.Attempt.TurnID, e.Attempt.StepID)
 		p.Usage.InputTokens += int(e.Attempt.Usage.InputTokens)
 		p.Usage.OutputTokens += int(e.Attempt.Usage.OutputTokens)
 		p.Usage.CachedTokens += int(e.Attempt.Usage.CachedTokens)
+		c := e.Attempt.Usage.Cache
+		if !p.Usage.Cache.Tracking && p.Usage.TurnCount > 0 {
+			p.Usage.Cache.UnknownHistory = true
+		}
+		p.Usage.Cache.Tracking = p.Usage.Cache.Tracking || c.Tracking
+		p.Usage.Cache.InputTokens += c.InputTokens
+		p.Usage.Cache.CachedTokens += c.CachedTokens
+		p.Usage.Cache.ReportedInputTokens += c.ReportedInputTokens
+		p.Usage.Cache.UnknownHistory = p.Usage.Cache.UnknownHistory || c.UnknownHistory
+
 		p.Usage.Cost += e.Attempt.Usage.Cost
 		p.Usage.TurnCount++
 	case *session.TurnStarted:

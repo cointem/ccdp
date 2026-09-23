@@ -1,9 +1,11 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +17,87 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/protocol"
 )
+
+// TestConversationResetErasesNativeHistory pins the /clear contract. The
+// runtime replaces the conversation projection and republishes a same-session
+// snapshot with no transcript; every row of the discarded conversation —
+// including UI-local reports such as /sessions output — must leave the screen,
+// and the native scrollback that holds them must be erased, which no managed
+// frame repaint can reach.
+func TestConversationResetErasesNativeHistory(t *testing.T) {
+	m := NewWithClient(nil, "", false)
+	t.Cleanup(m.watchCancel)
+	view := protocolSnapshot("session", protocol.MessageView{ID: "m1", Role: "assistant", Content: "hello"})
+	m.applySnapshot(view)
+	m.pushLog("system", "/sessions\npubfyu7vgogno2octtqnkes2rr  2026-09-23 22:59")
+	if len(m.confirmedItems) == 0 || len(m.reports) == 0 {
+		t.Fatalf("precondition: transcript=%d reports=%d", len(m.confirmedItems), len(m.reports))
+	}
+	var output bytes.Buffer
+	m.terminal = NewTerminalHost(&output)
+
+	cleared := protocolSnapshot("session")
+	cleared.Revision.LogSeq = view.Revision.LogSeq
+	m.applySnapshot(cleared)
+
+	if !m.nativeHistoryResetPending {
+		t.Fatal("a conversation reset did not arm native-history erasure")
+	}
+	if len(m.reports) != 0 || len(m.items) != 0 || len(m.confirmedItems) != 0 {
+		t.Fatalf("discarded conversation survived the reset: reports=%d items=%d confirmed=%d",
+			len(m.reports), len(m.items), len(m.confirmedItems))
+	}
+	if m.inline.seen(historyCell{messageID: "m1"}, 0) {
+		t.Fatal("reset kept the discarded row's print identity")
+	}
+	if command := m.eraseNativeHistory(); command == nil || !strings.Contains(output.String(), "\x1b[3J") {
+		t.Fatalf("reset did not erase native scrollback: cmd=%v output=%q", command, output.String())
+	}
+	// The re-baselined ledger must not re-print the discarded conversation, and
+	// the conversation that follows must still reach native scrollback.
+	if command := m.planHistory(); command != nil {
+		t.Fatal("reset re-printed the discarded conversation")
+	}
+	m.applyTranscript([]protocol.TranscriptItem{{ID: "m2", Kind: "assistant", Text: "fresh", Status: "completed"}})
+	if command := m.planHistory(); command == nil {
+		t.Fatal("post-reset transcript was not printable")
+	}
+}
+
+// TestWatchConversationResetErasesNativeHistory drives the same reset through
+// the production update path: the runtime's state update is what erases the
+// discarded scrollback, and the pending flag must not survive into later frames.
+func TestWatchConversationResetErasesNativeHistory(t *testing.T) {
+	client := &recordingClient{snapshot: protocolSnapshot("session", protocol.MessageView{ID: "m1", Role: "assistant", Content: "hello"})}
+	m := NewWithClient(client, "", false)
+	t.Cleanup(m.watchCancel)
+	m.applySnapshot(client.snapshot)
+	m.pushLog("system", "/sessions\npubfyu7vgogno2octtqnkes2rr  2026-09-23 22:59")
+	sub, err := client.Watch(context.Background(), protocol.Cursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.subscription = sub
+	var output bytes.Buffer
+	m.terminal = NewTerminalHost(&output)
+
+	cleared := protocolSnapshot("session")
+	cleared.Revision.LogSeq = m.snapshot.Revision.LogSeq
+	next, _ := m.handleWatchUpdate(watchUpdateMsg{sub: sub, update: protocol.Update{
+		Type: protocol.UpdateState, Snapshot: &cleared, Revision: cleared.Revision},
+		sessionID: protocol.SessionID(m.sessionID), generation: m.watchGeneration})
+	m = modelValue(t, next)
+
+	if m.nativeHistoryResetPending {
+		t.Fatal("native-history reset stayed armed after the state update")
+	}
+	if !strings.Contains(output.String(), "\x1b[3J") {
+		t.Fatalf("state update did not erase native scrollback: %q", output.String())
+	}
+	if len(m.reports) != 0 || len(m.confirmedItems) != 0 {
+		t.Fatalf("discarded conversation survived the state update: reports=%d confirmed=%d", len(m.reports), len(m.confirmedItems))
+	}
+}
 
 // recordingClient makes protocol-bound UI tests deterministic without
 // starting an Agent or touching a user's session directory.
@@ -112,8 +195,21 @@ func protocolSnapshot(session string, history ...protocol.MessageView) protocol.
 			Permission: protocol.PermissionPolicy{Mode: "default"},
 			Sandbox:    protocol.SandboxPolicy{Mode: "confine"},
 		},
-		History: history,
+		History:    history,
+		Transcript: testTranscript(history),
 	}
+}
+
+func testTranscript(history []protocol.MessageView) []protocol.TranscriptItem {
+	items := make([]protocol.TranscriptItem, 0, len(history))
+	for i, msg := range history {
+		id := msg.ID
+		if id == "" {
+			id = "fixture-" + strconv.Itoa(i)
+		}
+		items = append(items, protocol.TranscriptItem{ID: id, Kind: msg.Role, Text: msg.Content, Status: "completed"})
+	}
+	return items
 }
 
 func modelValue(t *testing.T, model tea.Model) Model {
@@ -151,7 +247,7 @@ func TestModelUpdateExecutesTypedPickerActionOnReturnedModel(t *testing.T) {
 
 	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyDown})
 	moved := modelValue(t, model)
-	if moved.picker == nil || moved.picker.index != 1 {
+	if moved.picker == nil || moved.picker.Index != 1 {
 		t.Fatalf("Update did not retain picker selection: %#v", moved.picker)
 	}
 	model, cmd = moved.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -168,8 +264,8 @@ func TestModelUpdateExecutesTypedPickerActionOnReturnedModel(t *testing.T) {
 	if len(client.submits) != 1 || client.submits[0].Type != protocol.CommandSetModel || client.submits[0].Model.Model != "beta" {
 		t.Fatalf("picker action did not submit beta: %#v", client.submits)
 	}
-	if selected.status != "model → beta" {
-		t.Fatalf("receipt feedback = %q, want model → beta", selected.status)
+	if noticeText(&selected) != "model → beta" {
+		t.Fatalf("receipt feedback = %q, want model → beta", noticeText(&selected))
 	}
 }
 
@@ -178,27 +274,27 @@ func TestPickerStableIDsScrollAndTinyTerminal(t *testing.T) {
 	m := NewWithClient(client, t.TempDir(), false)
 	m.width, m.height = 24, 8
 	m.baseVpH = 4
-	options := make([]selectorOption, 45)
+	options := make([]SelectorOption, 45)
 	for i := range options {
-		options[i] = selectorOption{ID: "stable-" + strconv.Itoa(i), Label: "item " + strconv.Itoa(i)}
+		options[i] = SelectorOption{ID: "stable-" + strconv.Itoa(i), Label: "item " + strconv.Itoa(i)}
 	}
 	m.startSelectorAt("Many options", options, 0, false, selectorAction{Kind: selectorModel})
-	if m.picker == nil || m.picker.options[0].ID != "stable-0" || m.picker.options[44].ID != "stable-44" {
+	if m.picker == nil || m.picker.Options[0].ID != "stable-0" || m.picker.Options[44].ID != "stable-44" {
 		t.Fatalf("selector did not retain stable option ids: %#v", m.picker)
 	}
 	for range 12 {
 		model, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
 		m = modelValue(t, model)
 	}
-	if m.picker.index != 12 {
-		t.Fatalf("arrow navigation stopped at first page: %d", m.picker.index)
+	if m.picker.Index != 12 {
+		t.Fatalf("arrow navigation stopped at first page: %d", m.picker.Index)
 	}
 	model, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown, Alt: true})
 	m = modelValue(t, model)
-	if m.picker.index <= 12 {
-		t.Fatalf("fn/alt down did not advance the selector: %d", m.picker.index)
+	if m.picker.Index <= 12 {
+		t.Fatalf("fn/alt down did not advance the selector: %d", m.picker.Index)
 	}
-	if got := lipgloss.Height(m.renderPicker()); got > m.height {
+	if got := lipgloss.Height(m.renderInlineSurface()); got > m.height {
 		t.Fatalf("tiny selector height %d exceeds terminal height %d", got, m.height)
 	}
 	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -214,10 +310,10 @@ func TestReportsRemainAnchoredAcrossSnapshotResync(t *testing.T) {
 	m.snapshot = protocol.SessionView{}
 	m.hasSnapshot = false
 	m.applySnapshot(initial)
-	m.addReport(logItem{kind: "system", text: "config report"})
-	m.handleProtocolEvent(protocol.EventView{Kind: protocol.EventUserMessage, SessionID: "test-session", Text: "new prompt"})
-	m.addReport(logItem{kind: "error", text: "turn failed"})
-	m.appendTranscript(logItem{kind: "assistant", text: "partial"})
+	m.addReport(historyCell{kind: "system", text: "config report"})
+	m.handleProtocolEvent(protocol.EventView{Kind: protocol.EventUserMessage, SessionID: "test-session", MessageID: "user-1", Text: "new prompt"})
+	m.addReport(historyCell{kind: "error", text: "turn failed"})
+	m.appendTranscript(historyCell{kind: "assistant", text: "partial"})
 	resynced := initial
 	resynced.Revision.LogSeq = 4
 	resynced.History = []protocol.MessageView{
@@ -225,6 +321,7 @@ func TestReportsRemainAnchoredAcrossSnapshotResync(t *testing.T) {
 		{ID: "user-1", Role: "user", Content: "new prompt"},
 		{ID: "assistant-2", Role: "assistant", Content: "partial"},
 	}
+	resynced.Transcript = testTranscript(resynced.History)
 	m.applySnapshot(resynced)
 	if len(m.items) != 5 {
 		t.Fatalf("merged transcript has %d items: %#v", len(m.items), m.items)
@@ -235,6 +332,7 @@ func TestReportsRemainAnchoredAcrossSnapshotResync(t *testing.T) {
 			t.Fatalf("item %d = %q, want %q; items=%#v", i, m.items[i].text, text, m.items)
 		}
 	}
+	resynced.Transcript = testTranscript(resynced.History)
 	m.applySnapshot(resynced)
 	if len(m.items) != 5 {
 		t.Fatalf("identical resync duplicated or dropped items: %#v", m.items)
@@ -261,7 +359,7 @@ func TestUserEventWithDurableIDDoesNotDuplicateSnapshotMessage(t *testing.T) {
 
 func TestApprovalReceiptOnlyClosesMatchingModal(t *testing.T) {
 	m := sugModel()
-	m.approval = &agent.ApprovalRequest{ID: "danger-1", Tool: "Bash", Command: "rm -i file"}
+	m.approval = &approvalPrompt{ID: "danger-1", Tool: "Bash", Command: "rm -i file"}
 	m.approvalPending = true
 	m.pendingApprovalCommand = "approval-1"
 	m.applyReceipt(protocol.Receipt{CommandID: "other", SessionID: "test-session", Status: protocol.ReceiptApplied}, "other command")
@@ -274,6 +372,7 @@ func TestApprovalReceiptOnlyClosesMatchingModal(t *testing.T) {
 	}
 	m.approvalPending = true
 	m.pendingApprovalCommand = "approval-2"
+	m.pendingApprovalKey = m.approvalKey()
 	m.applyReceipt(protocol.Receipt{CommandID: "approval-2", SessionID: "test-session", Status: protocol.ReceiptApplied}, "")
 	if m.approval != nil || m.approvalPending {
 		t.Fatal("matching success should close the approval modal")
@@ -298,8 +397,8 @@ func TestRejectedInputRestoresDraftAndReusesCommandID(t *testing.T) {
 	if got := m.textarea.Value(); got != "retry this exact draft" {
 		t.Fatalf("rejected input did not restore draft: %q", got)
 	}
-	if len(m.pendingSubmissions) != 0 || m.retryCommandID != firstID {
-		t.Fatalf("retry record missing or still in-flight: pending=%#v retry=%q", m.pendingSubmissions, m.retryCommandID)
+	if m.pendingSubmissionCount() != 0 || m.retryCommandID != firstID {
+		t.Fatalf("retry record missing or still in-flight: pending=%#v retry=%q", m.operations, m.retryCommandID)
 	}
 	_, retryCmd := m.submit()
 	if retryCmd == nil {
@@ -329,8 +428,8 @@ func TestRejectedInputClearsPendingRecordWithNewDraft(t *testing.T) {
 	if got := m.textarea.Value(); got != "new draft" {
 		t.Fatalf("new draft was overwritten: %q", got)
 	}
-	if len(m.pendingSubmissions) != 0 {
-		t.Fatalf("rejected old draft remained in-flight while new draft was active: %#v", m.pendingSubmissions)
+	if m.pendingSubmissionCount() != 0 {
+		t.Fatalf("rejected old draft remained in-flight while new draft was active: %#v", m.operations)
 	}
 	if m.retryCommandID != firstID || m.retryDraft != "old draft" {
 		t.Fatalf("failed old draft lost from retry slot: command=%q draft=%q", m.retryCommandID, m.retryDraft)
@@ -340,7 +439,7 @@ func TestRejectedInputClearsPendingRecordWithNewDraft(t *testing.T) {
 func TestSubmissionTransportFailureClearsPendingAndRestoresRetry(t *testing.T) {
 	m := sugModel()
 	commandID := protocol.CommandID("transport-failure")
-	m.rememberSubmission(commandID, "retry this message")
+	m.registerOperation(protocol.NewSubmitInput(commandID, protocol.SessionID(m.sessionID), protocol.InputID(commandID), "retry this message", protocol.InputSteer), "message submitted")
 	m.textarea.Reset()
 
 	model, _ := m.Update(commandErrorMsg{
@@ -349,8 +448,8 @@ func TestSubmissionTransportFailureClearsPendingAndRestoresRetry(t *testing.T) {
 		err:       context.Canceled,
 	})
 	got := modelValue(t, model)
-	if len(got.pendingSubmissions) != 0 {
-		t.Fatalf("transport failure left in-flight submission: %#v", got.pendingSubmissions)
+	if got.pendingSubmissionCount() != 0 {
+		t.Fatalf("transport failure left in-flight submission: %#v", got.operations)
 	}
 	if got.textarea.Value() != "retry this message" {
 		t.Fatalf("transport failure did not restore draft: %q", got.textarea.Value())
@@ -394,7 +493,8 @@ func TestReceiptDisplayDedupCacheIsBounded(t *testing.T) {
 
 func TestApprovalDecisionCannotBeReenteredWhilePending(t *testing.T) {
 	m := sugModel()
-	m.approval = &agent.ApprovalRequest{ID: "approval-1", Tool: "Bash", Command: "echo ok", Reason: "test"}
+	m.approval = &approvalPrompt{ID: "approval-1", Tool: "Bash", Command: "echo ok", Reason: "test"}
+	m.handleApprovalKey(tea.KeyMsg{Type: tea.KeyDown})
 	model, first := m.handleApprovalKey(tea.KeyMsg{Type: tea.KeyEnter})
 	*m = modelValue(t, model)
 	if first == nil || !m.approvalPending {
@@ -413,14 +513,14 @@ func TestSubmissionShowsPendingStatusUntilReceipt(t *testing.T) {
 	m.textarea.SetValue("hello")
 	model, cmd := m.submit()
 	*m = modelValue(t, model)
-	if cmd == nil || m.status != "submitting…" {
-		t.Fatalf("submission status=%q command=%v, want pending status and command", m.status, cmd != nil)
+	if cmd == nil || noticeText(m) != "submitting…" {
+		t.Fatalf("submission status=%q command=%v, want pending status and command", noticeText(m), cmd != nil)
 	}
 	result := cmd()
 	model, _ = m.Update(result)
 	*m = modelValue(t, model)
-	if m.status != "message submitted" {
-		t.Fatalf("receipt status=%q, want terminal submission status", m.status)
+	if noticeText(m) != "message submitted" {
+		t.Fatalf("receipt status=%q, want terminal submission status", noticeText(m))
 	}
 }
 
@@ -489,13 +589,40 @@ func TestResumeStartedCandidateIsJoinedAndClosedDuringModelClose(t *testing.T) {
 	assertAgentClosed(t, candidate)
 }
 
+func TestResumeOpenedConsumesPendingMouseRelease(t *testing.T) {
+	source := newLifecycleTestAgent(t)
+	defer source.Close()
+
+	m := NewWithResume(source, false)
+	m.sessionID = source.SessionID()
+	m.hasSnapshot = true
+	m.snapshot = protocolSnapshot(source.SessionID())
+
+	// The resume picker arms mouse tracking (so the list can be wheel-scrolled)
+	// and, on Enter, leaves a pending mouse release behind so the later
+	// receipt/error path can disable it. Resume completes via resumeOpenedMsg
+	// instead of a command receipt, so that path must consume the flag itself;
+	// otherwise mouse tracking leaks and the terminal can no longer scroll its
+	// native scrollback with a trackpad/mouse.
+	m.mouseReleasePending = true
+	model, _ := m.update(resumeOpenedMsg{
+		candidate: source,
+		snapshot:  protocolSnapshot(source.SessionID()),
+		source:    source,
+	})
+	got := modelValue(t, model)
+	if got.mouseReleasePending {
+		t.Fatal("resumeOpenedMsg left the selector's pending mouse release armed; mouse tracking leaks after /resume")
+	}
+}
+
 func TestResumeSameSessionReprimesInlineTranscript(t *testing.T) {
 	source := newLifecycleTestAgent(t)
 	defer source.Close()
 
 	m := NewWithResume(source, false)
-	old := logItem{kind: "assistant", messageID: "restored-message", text: "old attachment"}
-	m.items = []logItem{old}
+	old := historyCell{kind: "assistant", messageID: "restored-message", text: "old attachment"}
+	m.items = []historyCell{old}
 	m.snapshot = protocolSnapshot(source.SessionID(), protocol.MessageView{
 		ID: old.messageID, Role: "assistant", Content: old.text,
 	})
@@ -526,7 +653,7 @@ func TestResumeSameSessionReprimesInlineTranscript(t *testing.T) {
 	if _, printed := got.inline.printed[itemIdentity(old, 0)]; printed {
 		t.Fatal("same-session resume retained the old attachment's printed identity")
 	}
-	if cmd := got.flushInline(); cmd == nil {
+	if cmd := planTestHistory(&got); cmd == nil {
 		t.Fatal("restored same-session history was not queued to native scrollback")
 	}
 }

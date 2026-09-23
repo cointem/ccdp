@@ -102,12 +102,13 @@ func TestTurnAdmissionCancellationIsNotClearedByRunTurn(t *testing.T) {
 				t.Fatal(err)
 			}
 			ag.mu.Lock()
+			binding := modelBinding{model: "cancel-model", provider: client.Name(), endpoint: server.URL, client: client, version: 1}
 			ag.client = client
-			ag.primaryClient = client
+			ag.primaryBinding = binding
 			ag.activeModel = "cancel-model"
-			ag.activeBinding = modelBinding{model: "cancel-model", provider: client.Name(), endpoint: server.URL, client: client, version: 1}
 			// This locked state is the deterministic barrier between input
 			// admission and the new goroutine's first cancellation check.
+			ag.activeBinding = binding
 			ag.interruptFlag = !tc.stop
 			ag.stop = tc.stop
 			ag.mu.Unlock()

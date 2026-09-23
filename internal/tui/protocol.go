@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,7 +16,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"ccdp/internal/agent"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 )
@@ -40,15 +39,19 @@ func nextUICommandID() protocol.CommandID {
 // TUI. Events are previews; a state snapshot is authoritative and is copied
 // before it is retained by the Model.
 func (m *Model) applySnapshot(snapshot protocol.SessionView) {
-	if m.hasSnapshot && snapshot.SessionID.String() == m.sessionID &&
+	if m.hasSnapshot && snapshot.SessionID.String() == m.sessionID && snapshot.RunID == m.snapshot.RunID &&
 		snapshotRevisionOlder(snapshot.Revision, m.snapshot.Revision) {
 		// A delayed resync must not roll settings, activity, or pending inputs
 		// back over a newer snapshot. Equal revisions are still accepted because
 		// runtime phase and decision state may change without a log append.
 		return
 	}
-	previous := m.snapshot
-	hadSnapshot := m.hasSnapshot
+	// Queue/settings refreshes are not evidence of model output. Preserve
+	// the last progress time when the runtime phase and transcript are unchanged.
+	sameProgress := m.hasSnapshot && snapshot.SessionID == m.snapshot.SessionID &&
+		snapshot.RunID == m.snapshot.RunID && snapshot.Busy == m.snapshot.Busy &&
+		snapshot.Phase == m.snapshot.Phase && reflect.DeepEqual(snapshot.Transcript, m.snapshot.Transcript)
+	previousActivity := m.activity
 	previousSession := m.sessionID
 	sessionChanged := previousSession != "" && previousSession != snapshot.SessionID.String()
 	m.snapshot = snapshot
@@ -72,6 +75,10 @@ func (m *Model) applySnapshot(snapshot protocol.SessionView) {
 	}
 	m.planMode = snapshot.Settings.ExecutionMode == protocol.ExecutionModePlan
 	incomingActivity := m.activityForSnapshot(snapshot)
+	if sameProgress && incomingActivity.Phase == previousActivity.Phase && !previousActivity.UpdatedAt.IsZero() {
+		incomingActivity.UpdatedAt = previousActivity.UpdatedAt
+		incomingActivity.StartedAt = previousActivity.StartedAt
+	}
 	if current, ok := m.operation(m.latestOperation); ok && current.Active() &&
 		(incomingActivity.Phase == ActivityIdle || incomingActivity.Phase == "") {
 		// An idle snapshot can race the command receipt. Keep the submission
@@ -81,18 +88,21 @@ func (m *Model) applySnapshot(snapshot protocol.SessionView) {
 	} else {
 		m.setActivity(incomingActivity)
 	}
-	m.usage = agent.Usage{
+	m.usage = protocol.UsageSnapshot{
 		InputTokens: snapshot.Usage.InputTokens, OutputTokens: snapshot.Usage.OutputTokens,
-		CachedTokens: snapshot.Usage.CachedTokens, Cost: snapshot.Usage.Cost,
+		CachedTokens: snapshot.Usage.CachedTokens, Cache: snapshot.Usage.Cache, Cost: snapshot.Usage.Cost,
 		TurnCount: snapshot.Usage.TurnCount,
 	}
-	if m.routing != nil && snapshot.Transcript != nil {
-		// Keep the prior typed rows until alias reconciliation has transferred
-		// native-print acknowledgements from stream IDs to committed IDs.
-		m.applyTranscript(snapshot.Transcript)
-	} else if !hadSnapshot || sessionChanged || !sameHistory(previous.History, snapshot.History) {
-		m.rebuildHistory(snapshot.History)
+	// A conversation reset (/clear, a rewind, a replaced history projection)
+	// reaches the UI as a same-session snapshot with no transcript while rows of
+	// the discarded conversation are still on screen. Only the runtime decides
+	// that; the UI merely re-baselines, since native scrollback rows cannot be
+	// un-printed by a managed-frame repaint. A session swap is excluded because
+	// it owns the presentation transition itself.
+	if !sessionChanged && len(m.confirmedItems) > 0 && len(snapshot.Transcript) == 0 {
+		m.resetNativeHistory()
 	}
+	m.applyTranscript(snapshot.Transcript)
 	m.associateInputOperationsFromSnapshot(snapshot)
 	if snapshot.LastTurn != nil && snapshot.Phase == protocol.PhaseIdle && !snapshot.Busy {
 		m.finishInputOperations(snapshot.LastTurn.TurnID, snapshot.LastTurn.Status, snapshot.LastTurn.Error)
@@ -108,9 +118,10 @@ func (m *Model) applySnapshot(snapshot protocol.SessionView) {
 	if snapshot.Approval != nil {
 		m.approval = approvalRequestFromView(snapshot.Approval)
 	} else if snapshot.Plan != nil {
-		m.approval = &agent.ApprovalRequest{ID: snapshot.Plan.ID, Tool: "Plan", Command: snapshot.Plan.Text, Reason: "Approve this plan and start executing?"}
-	} else if snapshot.Phase != protocol.PhaseWaitingApproval {
+		m.approval = &approvalPrompt{ID: snapshot.Plan.ID, Tool: "Plan", Command: snapshot.Plan.Text, Reason: "Approve this plan and start executing?"}
+	} else {
 		m.approval = nil
+		m.clearDecisionNotices()
 	}
 	if snapshot.Revision.LogSeq > m.watchCursor.LogSeq {
 		m.watchCursor.LogSeq = snapshot.Revision.LogSeq
@@ -118,86 +129,15 @@ func (m *Model) applySnapshot(snapshot protocol.SessionView) {
 	m.watchCursor.ViewGeneration = snapshot.Revision.ViewGeneration
 }
 
-func sameHistory(a, b []protocol.MessageView) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].ID != b[i].ID || a[i].Role != b[i].Role || a[i].Content != b[i].Content {
-			return false
-		}
-		if len(a[i].ToolCallIDs) != len(b[i].ToolCallIDs) {
-			return false
-		}
-		for j := range a[i].ToolCallIDs {
-			if a[i].ToolCallIDs[j] != b[i].ToolCallIDs[j] {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func (m *Model) rebuildHistory(history []protocol.MessageView) {
-	items := make([]logItem, 0, len(history))
-	for _, message := range history {
-		kind := "system"
-		switch strings.ToLower(message.Role) {
-		case "user":
-			kind = "user"
-		case "assistant":
-			kind = "assistant"
-		case "tool":
-			kind = "tool"
-		}
-		if message.Content != "" {
-			items = append(items, logItem{kind: kind, text: message.Content, messageID: message.ID})
-		}
-	}
-	m.confirmedItems = items
-	m.composeItems()
-	m.streaming = false
-	m.render()
-	if m.followOutput {
-		m.viewport.GotoBottom()
-	}
-}
-
 func (m *Model) composeItems() {
-	// Reports are anchored at insertion time to the nearest confirmed message
-	// (or to its ordinal when an event has no durable message id). Merge them
-	// around the confirmed layer so a resync cannot move a /config result or an
-	// error behind all later turns.
-	buckets := make(map[int][]logItem)
-	for _, report := range m.reports {
-		position := report.reportIndex
-		if position < 0 {
-			position = 0
-		}
-		if report.reportAnchor != "" {
-			position = len(m.confirmedItems)
-			for i, item := range m.confirmedItems {
-				if item.messageID == report.reportAnchor {
-					position = i + 1
-					break
-				}
-			}
-		}
-		if position > len(m.confirmedItems) {
-			position = len(m.confirmedItems)
-		}
-		buckets[position] = append(buckets[position], report)
-	}
-	m.items = make([]logItem, 0, len(m.confirmedItems)+len(m.reports))
-	for i := 0; i <= len(m.confirmedItems); i++ {
-		m.items = append(m.items, buckets[i]...)
-		if i < len(m.confirmedItems) {
-			m.items = append(m.items, m.confirmedItems[i])
-		}
-	}
+	m.CellStore.compose()
+	m.attachAgentMarkers()
 }
 
-func (m *Model) appendTranscript(item logItem) {
+func (m *Model) appendTranscript(item historyCell) {
+	if item.messageID == "" && item.reportID == "" {
+		item.reportID = nextUICommandID().String()
+	}
 	m.confirmedItems = append(m.confirmedItems, item)
 	m.composeItems()
 }
@@ -226,7 +166,7 @@ func (m *Model) hasTurnError(turnID protocol.TurnID, text string) bool {
 // Replace the live error report with its durable row without printing it a
 // second time. Matching both turn and source preserves equal errors in other
 // turns and distinct diagnostics from the same turn.
-func (m *Model) reconcileErrorReport(item logItem) {
+func (m *Model) reconcileErrorReport(item historyCell) {
 	if item.kind != "error" || item.turnID == "" {
 		return
 	}
@@ -248,7 +188,7 @@ func (m *Model) reconcileErrorReport(item logItem) {
 	m.reports = kept
 }
 
-func (m *Model) addReport(item logItem) {
+func (m *Model) addReport(item historyCell) {
 	if item.reportID == "" {
 		item.reportID = nextUICommandID().String()
 	} else {
@@ -267,7 +207,7 @@ func (m *Model) addReport(item logItem) {
 	}
 	m.reports = append(m.reports, item)
 	if m.routing != nil && len(m.reports) > 128 {
-		m.reports = append([]logItem(nil), m.reports[len(m.reports)-128:]...)
+		m.reports = append([]historyCell(nil), m.reports[len(m.reports)-128:]...)
 	}
 	m.composeItems()
 }
@@ -321,7 +261,7 @@ func (m *Model) applyQueryReport(msg queryReportMsg) {
 		m.clearNotice(msg.commandID)
 	}
 	if msg.err != nil {
-		m.addReport(logItem{kind: "error", text: "query failed: " + msg.err.Error(), reportID: msg.commandID.String()})
+		m.addReport(historyCell{kind: "error", text: "query failed: " + msg.err.Error(), reportID: msg.commandID.String()})
 		m.addNotice(Notice{CommandID: msg.commandID, Severity: NoticeError, Text: "query failed: " + msg.err.Error(), Sticky: true})
 		return
 	}
@@ -335,12 +275,12 @@ func (m *Model) applyQueryReport(msg queryReportMsg) {
 	if m.hasSnapshot && msg.report.Revision.LogSeq != 0 && msg.report.Revision.LogSeq < m.snapshot.Revision.LogSeq {
 		text = fmt.Sprintf("[report from revision %d; current revision %d]\n%s", msg.report.Revision.LogSeq, m.snapshot.Revision.LogSeq, text)
 	}
-	m.addReport(logItem{kind: "system", text: text, reportID: msg.commandID.String()})
+	m.addReport(historyCell{kind: "system", text: text, reportID: msg.commandID.String()})
 }
 
 // openWatchCmd establishes a new terminal subscription. Watch itself emits
 // an atomic initial snapshot, so resync recovery never has a snapshot/watch
-// race. Errors intentionally stop retries; callers can choose when to retry.
+// race. Connection recovery retries observation only, never submissions.
 func (m Model) openWatchCmd() tea.Cmd {
 	client := m.client
 	if client == nil {
@@ -381,7 +321,7 @@ func (m *Model) handleWatchOpened(msg watchOpenedMsg) (tea.Model, tea.Cmd) {
 	}
 	if msg.err != nil {
 		m.pushStatus("watch unavailable: " + msg.err.Error())
-		return m, nil
+		return m, m.scheduleReconnect()
 	}
 	m.subscription = msg.sub
 	return m, readWatchCmd(msg.sub, msg.sessionID, msg.generation)
@@ -391,12 +331,11 @@ func (m *Model) handleWatchClosed(msg watchClosedMsg) (tea.Model, tea.Cmd) {
 	if msg.generation != m.watchGeneration || msg.sessionID.String() != m.sessionID {
 		return m, nil
 	}
-	if m.subscription == msg.sub {
-		m.subscription = nil
+	if m.subscription != msg.sub {
+		return m, nil
 	}
-	// A closed channel is terminal. Do not immediately retry: that would
-	// busy-loop after a runtime shutdown or a permanently failed adapter.
-	return m, nil
+	m.subscription = nil
+	return m, m.scheduleReconnect()
 }
 
 func (m *Model) handleWatchUpdate(msg watchUpdateMsg) (tea.Model, tea.Cmd) {
@@ -417,7 +356,15 @@ func (m *Model) handleWatchUpdate(msg watchUpdateMsg) (tea.Model, tea.Cmd) {
 		m.watchGeneration++
 		return m, m.openWatchCmd()
 	}
+	if u.Child != nil {
+		// The root stream multiplexes each child's current session row. Fold it
+		// into the directory so the parent's Task marker tracks the child live;
+		// the child's own transcript never enters the parent conversation.
+		m.applyChildUpdate(u.Child.Session)
+	}
 	if u.Snapshot != nil && (u.Type == protocol.UpdateSnapshot || u.Type == protocol.UpdateState) {
+		m.watchDisconnected = false
+		m.watchRetry = 0
 		m.applySnapshot(*u.Snapshot)
 	}
 	if u.Receipt != nil && u.Type == protocol.UpdateReceipt {
@@ -426,8 +373,16 @@ func (m *Model) handleWatchUpdate(msg watchUpdateMsg) (tea.Model, tea.Cmd) {
 	if u.Event != nil {
 		m.handleProtocolEvent(*u.Event)
 	}
-	m.render()
-	return m, tea.Batch(readWatchCmd(msg.sub, msg.sessionID, msg.generation), m.flushInline())
+	resetNativeHistory := m.nativeHistoryResetPending
+	m.nativeHistoryResetPending = false
+	m.renderVisibleTranscript()
+	cmds := []tea.Cmd{readWatchCmd(msg.sub, msg.sessionID, msg.generation), m.flushInline()}
+	if resetNativeHistory {
+		// The erase sequence is written before the renderer repaints, so the
+		// discarded conversation cannot reappear in a later frame.
+		cmds = append(cmds, m.eraseNativeHistory())
+	}
+	return m, tea.Batch(cmds...)
 }
 
 // handleProtocolEvent updates transient presentation only. Confirmed model,
@@ -441,13 +396,19 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 	// its phase still needs to be visible to the renderer.
 	m.updateActivityFromEvent(ev)
 	m.associateInputOperationFromEvent(ev)
-	if m.routing != nil && ev.Transcript != nil {
+	if ev.Transcript != nil && ev.Transcript.ID != "" {
 		switch ev.Kind {
 		case protocol.EventStream:
 			m.upsertTranscript(*ev.Transcript)
+			if ev.Text == "" {
+				// Reasoning-close signal: it finalizes the thinking cell, it is
+				// not answer text, so it must not (re)mark the turn as streaming.
+				m.streaming = false
+				return
+			}
 			m.streaming, m.turnDone = true, false
 			return
-		case protocol.EventToolStarted, protocol.EventToolProgress, protocol.EventToolResult:
+		case protocol.EventReasoning, protocol.EventToolStarted, protocol.EventToolProgress, protocol.EventToolResult:
 			m.upsertTranscript(*ev.Transcript)
 			m.streaming = false
 			return
@@ -458,46 +419,16 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 		if !m.inline.primed {
 			m.inline.prime(m.items)
 		}
-		// A new user turn establishes a new provisional association space. An
-		// id-less assistant from an earlier failed/legacy turn must not bridge
-		// into this turn merely because its ordinal and text happen to match.
-		m.inline.resetLegacyAssociations()
 		if ev.MessageID != "" {
-			for i := range m.confirmedItems {
-				if m.confirmedItems[i].messageID == ev.MessageID {
-					// The durable snapshot may have arrived before the event. Update
-					// its text in place instead of rendering the same input twice.
-					m.confirmedItems[i].text = ev.Text
-					m.composeItems()
-					m.busy, m.streaming, m.turnDone = true, false, false
-					m.turnFailed, m.interruptRequested = false, false
-					m.turnStarted = now()
-					return
-				}
-			}
+			m.upsertTranscript(protocol.TranscriptItem{ID: ev.MessageID, Kind: "user", TurnID: ev.TurnID, Text: ev.Text, Status: "completed"})
 		}
-		m.appendTranscript(logItem{kind: "user", text: ev.Text, messageID: ev.MessageID})
 		m.busy, m.streaming, m.turnDone = true, false, false
 		m.turnFailed, m.interruptRequested = false, false
 		m.turnStarted = now()
-	case protocol.EventStream:
-		if !m.inline.primed {
-			m.inline.prime(m.items)
-		}
-		if !m.streaming {
-			m.appendTranscript(logItem{kind: "assistant"})
-			m.streaming, m.turnDone = true, false
-		}
-		if len(m.confirmedItems) > 0 {
-			m.confirmedItems[len(m.confirmedItems)-1].text += ev.Text
-			m.composeItems()
-		}
-	case protocol.EventReasoning:
-		m.appendReasoning(ev.Text)
-	case protocol.EventToolStarted:
-		m.appendProtocolTool(ev.Tool, "running")
-	case protocol.EventToolProgress:
-		m.appendProtocolToolProgress(ev.Tool)
+	case protocol.EventStream, protocol.EventReasoning, protocol.EventToolStarted, protocol.EventToolProgress:
+		// Transcript events must carry an identified cumulative projection.
+		// Missing projections never create a second, id-less transcript.
+		return
 	case protocol.EventToolResult:
 		operationReport := false
 		if ev.Tool != nil {
@@ -515,10 +446,8 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 			if text == "" {
 				text = "(empty query result)"
 			}
-			m.addReport(logItem{kind: kind, text: text, reportID: ev.Tool.ID.String()})
+			m.addReport(historyCell{kind: kind, text: text, reportID: ev.Tool.ID.String()})
 			delete(m.operationReports, protocol.CommandID(ev.Tool.ID.String()))
-		} else {
-			m.updateProtocolTool(ev.Tool)
 		}
 	case protocol.EventStatus:
 		if strings.TrimSpace(ev.Text) != "" {
@@ -536,28 +465,35 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 			if ev.TurnID != "" {
 				id = fmt.Sprintf("error-event:%s:%x", canonicalUITurn(ev.TurnID), sha256.Sum256([]byte(text)))
 			}
-			m.addReport(logItem{kind: "error", text: text, turnID: ev.TurnID, reportID: id})
+			m.addReport(historyCell{kind: "error", text: text, turnID: ev.TurnID, reportID: id})
 		}
 		m.turnFailed = true
 	case protocol.EventApprovalRequest:
 		if ev.Approval != nil {
+			m.clearDecisionNotices()
 			m.approval = approvalRequestFromView(ev.Approval)
-			m.approvalScroll = 0
+			m.approvalState.Offset = 0
 			m.addNotice(Notice{Severity: NoticeDecision, Text: "awaiting approval…", Sticky: true})
+			m.notifyUser("ccdp needs your decision", ev.Approval.Tool)
 		}
 	case protocol.EventQuestionRequest:
 		m.setQuestion(ev.Question)
+		if ev.Question != nil {
+			m.notifyUser("ccdp has a question", "waiting for your answer")
+		}
 	case protocol.EventPlanReady:
 		if ev.Plan != nil {
-			m.addReport(logItem{kind: "system", text: "── plan proposed ──"})
-			m.addReport(logItem{kind: "assistant", text: ev.Plan.Text})
-			m.approval = &agent.ApprovalRequest{ID: ev.Plan.ID, Tool: "Plan", Command: ev.Plan.Text, Reason: "Approve this plan and start executing?"}
-			m.approvalScroll = 0
+			m.clearDecisionNotices()
+			m.addReport(historyCell{kind: "system", text: "── plan proposed ──"})
+			m.addReport(historyCell{kind: "assistant", text: ev.Plan.Text})
+			m.approval = &approvalPrompt{ID: ev.Plan.ID, Tool: "Plan", Command: ev.Plan.Text, Reason: "Approve this plan and start executing?"}
+			m.approvalState.Offset = 0
 			m.addNotice(Notice{Severity: NoticeDecision, Text: "awaiting plan approval…", Sticky: true})
+			m.notifyUser("ccdp needs your decision", "a plan is ready to approve")
 		}
 	case protocol.EventUsage:
 		if ev.Usage != nil {
-			m.usage = agent.Usage{InputTokens: ev.Usage.InputTokens, OutputTokens: ev.Usage.OutputTokens, CachedTokens: ev.Usage.CachedTokens, Cost: ev.Usage.Cost, TurnCount: ev.Usage.TurnCount}
+			m.usage = protocol.UsageSnapshot{InputTokens: ev.Usage.InputTokens, OutputTokens: ev.Usage.OutputTokens, CachedTokens: ev.Usage.CachedTokens, Cache: ev.Usage.Cache, Cost: ev.Usage.Cost, TurnCount: ev.Usage.TurnCount}
 		}
 	case protocol.EventTurnDone:
 		outcome := protocol.TurnSucceeded
@@ -572,7 +508,7 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 		m.finishActivity("", ActivityCompleted, "")
 		m.turnFailed = m.turnFailed || m.interruptRequested
 		if !m.turnStarted.IsZero() && now().Sub(m.turnStarted) > 15_000_000_000 {
-			fmt.Fprint(osStdout(), "\a")
+			m.notifyUser("ccdp finished", "a turn completed")
 		}
 	case protocol.EventStateChanged:
 		// The accompanying state snapshot is the authority. Do not mutate
@@ -593,10 +529,13 @@ func (m *Model) associateInputOperationFromEvent(ev protocol.EventView) {
 			continue
 		}
 		matches := candidate.InputText == ev.Text
-		// Image-only input is expanded to a Markdown locator at runtime. There
-		// is no plain text to compare, so a sole empty-text submit is the safe
-		// fallback; normal text submissions always use the exact comparison.
-		if !matches && candidate.InputText == "" {
+		if candidate.InputID != "" && ev.MessageID != "" {
+			matches = protocol.InputMessageID(candidate.InputID) == ev.MessageID
+		}
+		// Older events without message identity use the legacy text fallback.
+		// Identity-bearing events must never match another input by text,
+		// including image-only submissions whose text is expanded at runtime.
+		if !matches && candidate.InputText == "" && ev.MessageID == "" {
 			matches = true
 		}
 		if !matches {
@@ -622,7 +561,11 @@ func (m *Model) associateInputOperationsFromSnapshot(snapshot protocol.SessionVi
 			continue
 		}
 		for _, candidate := range m.activeInputOperations() {
-			if candidate.TurnID != "" || candidate.InputText != item.Text {
+			matches := candidate.InputText == item.Text
+			if candidate.InputID != "" && item.ID != "" {
+				matches = protocol.InputMessageID(candidate.InputID) == item.ID
+			}
+			if candidate.TurnID != "" || !matches {
 				continue
 			}
 			candidate.TurnID = item.TurnID
@@ -685,8 +628,7 @@ func (m *Model) finishInputOperations(turnID protocol.TurnID, outcome protocol.T
 		// Provider failure or cancellation must not put a sent message back in
 		// the composer (or reuse its command ID as an unaccepted retry). Only
 		// submission rejection/transport failure restores an unsent draft.
-		delete(m.pendingSubmissions, op.CommandID)
-		delete(m.pendingImages, op.CommandID)
+		m.consumeSubmission(op.CommandID)
 		if op.CommandID == m.retryCommandID {
 			m.retryCommandID, m.retryDraft, m.retryImages = "", "", nil
 		}
@@ -712,7 +654,7 @@ func (m *Model) finishInputOperations(turnID protocol.TurnID, outcome protocol.T
 	}
 }
 
-func approvalRequestFromView(view *protocol.ApprovalView) *agent.ApprovalRequest {
+func approvalRequestFromView(view *protocol.ApprovalView) *approvalPrompt {
 	if view == nil {
 		return nil
 	}
@@ -730,32 +672,12 @@ func approvalRequestFromView(view *protocol.ApprovalView) *agent.ApprovalRequest
 			command = string(view.Args)
 		}
 	}
-	return &agent.ApprovalRequest{ID: view.ID, Tool: view.Tool, Command: command, Reason: view.Reason}
+	return &approvalPrompt{ID: view.ID, Tool: view.Tool, Command: command, Reason: view.Reason}
 }
 
 // Small indirections keep protocol projection testable without binding the
 // event path to wall-clock or process-global stdout in tests.
 var now = func() time.Time { return time.Now() }
-var osStdout = func() *os.File { return os.Stdout }
-
-func agentUsageFromSnapshot(usage protocol.UsageSnapshot) agent.Usage {
-	return agent.Usage{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
-		CachedTokens: usage.CachedTokens, Cost: usage.Cost, TurnCount: usage.TurnCount}
-}
-
-func (m *Model) appendReasoning(text string) {
-	for i := len(m.confirmedItems) - 1; i >= 0; i-- {
-		if m.confirmedItems[i].kind == "thinking" {
-			m.confirmedItems[i].text += text
-			m.composeItems()
-			return
-		}
-		if m.confirmedItems[i].kind == "assistant" || m.confirmedItems[i].kind == "user" || m.confirmedItems[i].kind == "tool" {
-			break
-		}
-	}
-	m.appendTranscript(logItem{kind: "thinking", text: text})
-}
 
 func protocolToolArgs(t *protocol.ToolView) map[string]any {
 	if t == nil || len(t.Args) == 0 {
@@ -766,55 +688,14 @@ func protocolToolArgs(t *protocol.ToolView) map[string]any {
 	return args
 }
 
-func (m *Model) appendProtocolTool(t *protocol.ToolView, status string) {
-	if t == nil {
-		return
-	}
-	args := protocolToolArgs(t)
-	text, meta := renderToolText(t.Name, args, status, t.Output)
-	m.appendTranscript(logItem{kind: "tool", toolID: t.ID.String(), status: status, text: text, toolMeta: meta,
-		toolName: t.Name, toolArgs: args, toolArgsRaw: string(t.Args), toolOutput: t.Output})
-}
-
-func (m *Model) appendProtocolToolProgress(t *protocol.ToolView) {
-	if t == nil {
-		return
-	}
-	for i := len(m.confirmedItems) - 1; i >= 0; i-- {
-		if m.confirmedItems[i].kind == "tool" && m.confirmedItems[i].toolID == t.ID.String() && m.confirmedItems[i].status == "running" {
-			m.confirmedItems[i].text += t.Output + "\n"
-			m.confirmedItems[i].toolOutput += t.Output + "\n"
-			m.composeItems()
-			return
-		}
-	}
-	m.appendProtocolTool(t, "running")
-}
-
-func (m *Model) updateProtocolTool(t *protocol.ToolView) {
-	if t == nil {
-		return
-	}
-	for i := len(m.confirmedItems) - 1; i >= 0; i-- {
-		if m.confirmedItems[i].kind == "tool" && m.confirmedItems[i].toolID == t.ID.String() {
-			m.confirmedItems[i].status = t.Status
-			args := protocolToolArgs(t)
-			m.confirmedItems[i].text, m.confirmedItems[i].toolMeta = renderToolText(t.Name, args, t.Status, t.Output)
-			m.confirmedItems[i].toolName = t.Name
-			m.confirmedItems[i].toolArgs = args
-			m.confirmedItems[i].toolArgsRaw = string(t.Args)
-			m.confirmedItems[i].toolOutput = t.Output
-			m.composeItems()
-			return
-		}
-	}
-	m.appendProtocolTool(t, t.Status)
-}
-
 // submitCommand is the only mutation entry used by the TUI. A missing client
 // is an explicit unavailable state; it never falls back to a second control
 // channel or optimistically edits confirmed runtime state.
 func (m *Model) submitCommand(cmd protocol.Command, purpose string) tea.Cmd {
+	if m.watchDisconnected {
+		m.pushStatus("connection unavailable; command not submitted · /reconnect")
+		return nil
+	}
 	if cmd.ID == "" {
 		cmd.ID = nextUICommandID()
 	}
@@ -869,16 +750,16 @@ func commandProducesReport(kind protocol.CommandType) bool {
 }
 
 func commandNeedsRevision(kind protocol.CommandType) bool {
+	// Settings and environmental commands (workspace, reload, trust, memory, save,
+	// workflows) are excluded: they merge against live authoritative state,
+	// so pinning them to UI snapshot's LogSeq would cause spurious stale_revision
+	// rejections during an active turn or after an asynchronous tool log increment.
+	// Only explicit history-destructive CAS commands require revision locking.
 	switch kind {
-	case protocol.CommandSetExecutionMode, protocol.CommandSetPermissionPolicy,
-		protocol.CommandSetSandboxPolicy, protocol.CommandClearConversation,
-		protocol.CommandRemoveMessages, protocol.CommandRewindConversation,
-		protocol.CommandFork, protocol.CommandExternal, protocol.CommandApply,
-		protocol.CommandCheckpoint, protocol.CommandExport, protocol.CommandInit,
-		protocol.CommandRunWorkflow,
-		protocol.CommandSetWorkspace, protocol.CommandReloadSettings,
-		protocol.CommandTrustProject, protocol.CommandClearMemory,
-		protocol.CommandSaveSession:
+	case protocol.CommandClearConversation,
+		protocol.CommandRemoveMessages,
+		protocol.CommandRewindConversation,
+		protocol.CommandFork:
 		return true
 	default:
 		return false
@@ -944,6 +825,10 @@ func (m *Model) applyReceipt(receipt protocol.Receipt, purpose string) {
 		}
 		message := "command rejected"
 		if receipt.Error != nil {
+			if strings.Contains(receipt.Error.Message, "superseded") {
+				// Cleanly superseded by a subsequent user action; do not pollute UI logs.
+				return
+			}
 			message += ": " + receipt.Error.Error()
 		}
 		m.pushLog("error", message)
@@ -971,19 +856,20 @@ func (m *Model) applyReceipt(receipt protocol.Receipt, purpose string) {
 	if knownOperation {
 		m.updateOperation(receipt.CommandID, OperationApplied, receipt)
 	}
-	if m.pendingSubmissions != nil {
-		delete(m.pendingSubmissions, receipt.CommandID)
-	}
-	delete(m.pendingImages, receipt.CommandID)
+	m.consumeSubmission(receipt.CommandID)
 	if receipt.CommandID == m.retryCommandID {
 		m.retryCommandID = ""
 		m.retryDraft = ""
 		m.retryImages = nil
 	}
 	if m.approvalPending && receipt.CommandID == m.pendingApprovalCommand {
-		m.approval = nil
+		if m.pendingApprovalKey == m.approvalKey() {
+			m.approval = nil
+			m.clearDecisionNotices()
+		}
 		m.approvalPending = false
 		m.pendingApprovalCommand = ""
+		m.pendingApprovalKey = ""
 	}
 	if knownOperation && currentOperation {
 		m.finishActivity(receipt.CommandID, ActivityCompleted, purpose)
@@ -992,15 +878,6 @@ func (m *Model) applyReceipt(receipt protocol.Receipt, purpose string) {
 			m.addNotice(Notice{CommandID: receipt.CommandID, Severity: NoticeSuccess, Text: purpose, Sticky: false})
 		}
 	}
-}
-
-func (m Model) hasOtherActiveOperation(commandID protocol.CommandID) bool {
-	for id, op := range m.operations {
-		if id != commandID && op.Active() {
-			return true
-		}
-	}
-	return false
 }
 
 func (m Model) operationOwnsPresentation(commandID protocol.CommandID) bool {
@@ -1034,36 +911,17 @@ func receiptKey(receipt protocol.Receipt) string {
 	return fmt.Sprintf("%s|%d|%d|%s", receipt.Status, receipt.Revision.LogSeq, receipt.Revision.ViewGeneration, errorText)
 }
 
-func (m *Model) rememberSubmission(commandID protocol.CommandID, text string) {
-	if commandID == "" || text == "" {
-		return
-	}
-	if m.pendingSubmissions == nil {
-		m.pendingSubmissions = make(map[protocol.CommandID]string)
-	}
-	m.pendingSubmissions[commandID] = text
-}
-
 // restoreFailedSubmission handles a terminal submission failure, whether it
 // arrived as a transport error or a rejected receipt. There is no pending
 // runtime operation to await after either outcome, so its marker is removed
 // before the UI is made resumable.
 func (m *Model) restoreFailedSubmission(commandID protocol.CommandID) {
-	if m.pendingSubmissions == nil {
+	op, ok := m.operations[commandID]
+	if !ok || !op.Recoverable {
 		return
 	}
-	text, ok := m.pendingSubmissions[commandID]
-	if !ok {
-		return
-	}
-	delete(m.pendingSubmissions, commandID)
-	images := m.pendingImages[commandID]
-	delete(m.pendingImages, commandID)
-	m.restoreSubmissionDraft(commandID, text, images)
-}
-
-func (m *Model) restoreSubmissionText(commandID protocol.CommandID, text string) {
-	m.restoreSubmissionDraft(commandID, text, nil)
+	m.consumeSubmission(commandID)
+	m.restoreSubmissionDraft(commandID, op.InputText, op.InputImages)
 }
 
 func (m *Model) restoreSubmissionDraft(commandID protocol.CommandID, text string, images []protocol.InputImage) {
@@ -1111,6 +969,45 @@ func (m Model) permissionPolicy() protocol.PermissionPolicy {
 	return protocol.PermissionPolicy{Mode: string(m.mode)}
 }
 
+// cyclePermissionMode advances the permission mode through the approval-strictness
+// ring on shift+tab, mirroring the sibling CLIs. Plan is deliberately excluded: it
+// is an execution-mode dimension toggled by /plan, not a permission level, so a
+// mode outside the ring restarts at default. The change applies immediately; the
+// local mode updates optimistically and the next snapshot confirms it.
+func (m *Model) cyclePermissionMode() tea.Cmd {
+	// m.mode is refreshed from every authoritative snapshot, so cycling off it
+	// keeps rapid shift+tab presses chained correctly even before the round-trip
+	// for the previous change lands. Only fall back to the snapshot when no mode
+	// has been resolved locally yet.
+	current := m.mode
+	if current == "" && m.hasSnapshot {
+		current = permissions.Mode(m.snapshot.Settings.Permission.Mode)
+	}
+	ring := []permissions.Mode{permissions.ModeDefault, permissions.ModeAcceptEdits, permissions.ModeBypass}
+	next := ring[0]
+	for i, mode := range ring {
+		if mode == current {
+			next = ring[(i+1)%len(ring)]
+			break
+		}
+	}
+	policy := m.permissionPolicy()
+	policy.Mode = string(next)
+	m.mode = next
+	return m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+next.Label())
+}
+
+// modeActive reports whether a non-default permission mode is confirmed, so the
+// footer can advertise the shift+tab cycle hint only when it is relevant.
+func (m *Model) modeActive() bool {
+	mode := m.mode
+	if m.hasSnapshot && m.snapshot.Settings.Permission.Mode != "" {
+		mode = permissions.Mode(m.snapshot.Settings.Permission.Mode)
+	}
+	return mode != "" && mode != permissions.ModeDefault
+}
+
 func (m Model) availableModels() []string {
 	if m.hasSnapshot {
 		seen := make(map[string]bool)
@@ -1152,38 +1049,6 @@ func (m Model) historyPreview() (int, []string) {
 	return len(m.snapshot.History), previews
 }
 
-func (m *Model) Close() error {
-	if m.watchCancel != nil {
-		m.watchCancel()
-	}
-	var closeErr error
-	if m.subscription != nil {
-		closeErr = m.subscription.Close()
-		m.subscription = nil
-	}
-	if m.resumeTask != nil {
-		m.resumeTask.cancelIfNotStarted()
-		m.resumeTask.waitAndCloseUnclaimed()
-	}
-	for _, retired := range m.retiredAgents {
-		if retired != nil {
-			retired.Close()
-		}
-	}
-	m.retiredAgents = nil
-	return closeErr
-}
-
-// CurrentAgent returns the live runtime handle currently owned by the TUI.
-// It is used by the CLI shutdown path after a resume/fork session swap so the
-// final session, rather than the original startup handle, is saved and closed.
-func (m Model) CurrentAgent() *agent.Agent { return m.ag }
-
-func parseRewindOption(id string) (int, bool) {
-	n, err := strconv.Atoi(strings.TrimPrefix(id, "keep:"))
-	return n, err == nil && strings.HasPrefix(id, "keep:") && n >= 0
-}
-
 func (m *Model) executeSelectorAction(action selectorAction, optionID string) tea.Cmd {
 	switch action.Kind {
 	case selectorEffort, selectorVerbosity:
@@ -1209,7 +1074,7 @@ func (m *Model) executeSelectorAction(action selectorAction, optionID string) te
 		policy := m.permissionPolicy()
 		policy.Mode = optionID
 		return m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
-			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+optionID)
+			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+permissions.Mode(optionID).Label())
 	case selectorPlan:
 		mode := protocol.ExecutionModeExecute
 		if optionID == "on" || optionID == string(protocol.ExecutionModePlan) {
@@ -1235,233 +1100,19 @@ func (m *Model) executeSelectorAction(action selectorAction, optionID string) te
 	return nil
 }
 
-func (t *resumeTaskState) begin() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.canceled {
-		return false
-	}
-	t.started = true
-	return true
-}
-
-func (t *resumeTaskState) finish(candidate *agent.Agent) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if candidate != nil {
-		t.candidate = candidate
-	}
-	if !t.finished {
-		t.finished = true
-		close(t.done)
-	}
-}
-
-func (t *resumeTaskState) cancelIfNotStarted() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.started {
-		return false
-	}
-	t.canceled = true
-	if !t.finished {
-		t.finished = true
-		close(t.done)
-	}
-	return true
-}
-
-func (t *resumeTaskState) waitAndCloseUnclaimed() {
-	t.mu.Lock()
-	started := t.started
-	done := t.done
-	t.mu.Unlock()
-	if started {
-		<-done
-	}
-	t.mu.Lock()
-	candidate := t.candidate
-	claimed := t.claimed
-	if candidate != nil && !claimed {
-		t.claimed = true
-	}
-	t.mu.Unlock()
-	if candidate != nil && !claimed {
-		candidate.Close()
-	}
-}
-
-func (t *resumeTaskState) claim() {
-	if t == nil {
-		return
-	}
-	t.mu.Lock()
-	t.claimed = true
-	t.mu.Unlock()
-}
-
-func (m *Model) openResumeSession(id string) tea.Cmd {
-	if m.routing != nil && m.sessionID != m.routing.rootID {
-		m.pushStatus("return to /root before resuming another root session")
+func (m *Model) pendingChildApproval() *protocol.ChildSession {
+	if m == nil || m.routing == nil {
 		return nil
 	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		m.pushLog("error", "resume requires a session id")
-		return nil
-	}
-	source := m.ag
-	if source == nil {
-		m.pushLog("error", "resume requires an agent session opener")
-		return nil
-	}
-	if m.resumePending {
-		m.pushStatus("resume is already opening; please wait")
-		return nil
-	}
-	if m.busy || len(m.pendingSubmissions) > 0 {
-		m.pushStatus("resume is unavailable while a turn or submission is active")
-		return nil
-	}
-	expectedSessionID := m.sessionID
-	expectedGeneration := m.watchGeneration
-	task := &resumeTaskState{done: make(chan struct{})}
-	m.resumeTask = task
-	m.resumePending = true
-	m.pushStatus("opening session " + id + "…")
-	return func() tea.Msg {
-		if !task.begin() {
-			task.finish(nil)
-			return resumeOpenedMsg{source: source, task: task, expectedSessionID: expectedSessionID,
-				expectedGeneration: expectedGeneration, err: context.Canceled}
+	for i := range m.routing.rows {
+		if childAwaitingApproval(m.routing.rows[i]) {
+			return &m.routing.rows[i]
 		}
-		candidate, err := source.OpenSession(id)
-		if err != nil {
-			task.finish(nil)
-			return resumeOpenedMsg{source: source, expectedSessionID: expectedSessionID,
-				task: task, expectedGeneration: expectedGeneration, err: err}
-		}
-		if candidate == nil {
-			task.finish(nil)
-			return resumeOpenedMsg{source: source, expectedSessionID: expectedSessionID,
-				task: task, expectedGeneration: expectedGeneration, err: fmt.Errorf("session opener returned a nil handle")}
-		}
-		snapshot, snapshotErr := candidate.Snapshot(context.Background())
-		if snapshotErr != nil {
-			candidate.Close()
-			task.finish(candidate)
-			return resumeOpenedMsg{source: source, expectedSessionID: expectedSessionID,
-				task: task, expectedGeneration: expectedGeneration, err: snapshotErr}
-		}
-		task.finish(candidate)
-		return resumeOpenedMsg{candidate: candidate, snapshot: snapshot, source: source,
-			task: task, expectedSessionID: expectedSessionID, expectedGeneration: expectedGeneration}
 	}
+	return nil
 }
 
-func (m *Model) handleResumeOpened(msg resumeOpenedMsg) (tea.Model, tea.Cmd) {
-	valid := msg.expectedGeneration == m.watchGeneration &&
-		msg.expectedSessionID == m.sessionID && msg.source == m.ag
-	if !valid {
-		if msg.source == m.ag {
-			m.resumePending = false
-		}
-		if msg.candidate != nil {
-			return m, closeResumeCandidateCmd(msg.candidate)
-		}
-		return m, nil
-	}
-	m.resumePending = false
-	if msg.err != nil {
-		m.pushLog("error", "resume failed: "+msg.err.Error())
-		return m, nil
-	}
-	if msg.candidate == nil {
-		m.pushLog("error", "resume failed: session opener returned no handle")
-		return m, nil
-	}
-	if m.busy || len(m.pendingSubmissions) > 0 {
-		m.pushStatus("resume cancelled: a turn or submission became active")
-		return m, closeResumeCandidateCmd(msg.candidate)
-	}
-	if msg.task != nil {
-		msg.task.claim()
-	}
-
-	old := m.ag
-	if m.watchCancel != nil {
-		m.watchCancel()
-	}
-	if m.subscription != nil {
-		_ = m.subscription.Close()
-	}
-	m.subscription = nil
-	m.watchGeneration++
-	// OpenSession succeeded and the request is still in the original scope;
-	// it is now safe to release the old handle. A stale result above closes the
-	// candidate instead and leaves this session untouched.
-	var cleanup tea.Cmd
-	if old != nil && old != msg.candidate {
-		m.retiredAgents = append(m.retiredAgents, old)
-		cleanup = closeResumeCandidateCmd(old)
-	}
-
-	m.ag = msg.candidate
-	m.client = msg.candidate
-	m.watchCtx, m.watchCancel = context.WithCancel(context.Background())
-	// A resumed handle is a new UI attachment even when the persisted session
-	// ID is unchanged.  Clear inline identities before rebuilding the
-	// authoritative history; otherwise the old attachment's printed IDs make
-	// restored messages disappear from the native transcript.
-	m.inline.forgetAll()
-	m.watchCursor = protocol.Cursor{}
-	m.snapshot = protocol.SessionView{}
-	m.hasSnapshot = false
-	m.sessionID = msg.snapshot.SessionID.String()
-	if m.sessionID == "" {
-		m.sessionID = msg.candidate.SessionID()
-	}
-	m.reportGeneration++
-	m.pendingSubmissions = nil
-	m.pendingImages = nil
-	m.inputImages = nil
-	m.retryImages = nil
-	m.historyImages = nil
-	m.expiredHistoryImages = nil
-	m.missingHistoryImages = false
-	m.pasteRequest = ""
-	m.receiptKeys = nil
-	m.receiptOrder = nil
-	m.retryCommandID = ""
-	m.retryDraft = ""
-	m.pendingApprovalCommand = ""
-	m.approval = nil
-	m.approvalPending = false
-	m.confirmedItems = nil
-	m.reports = nil
-	m.items = nil
-	m.streaming = false
-	m.busy = false
-	m.workspace = msg.candidate.WorkspaceLabel()
-	m.customCmds = loadCustomCommands(m.workspace)
-	m.applySnapshot(msg.snapshot)
-	// applySnapshot cannot infer attachment boundaries from the session ID
-	// alone.  Prime and show the restored baseline explicitly so it is emitted
-	// once on the first real window/flush, including same-session resumes.
-	m.inline.prime(m.items)
-	m.inline.showInitialFrame()
-	m.pushStatus("resumed session " + m.sessionID)
-	m.ag.SetChildInteraction(true)
-	m.installSessionRouting(m.ag.Sessions())
-	return m, tea.Batch(cleanup, m.openWatchCmd(), m.loadAgentCatalog(false), agentCatalogTickCmd(m.routing.directory))
-}
-
-func closeResumeCandidateCmd(candidate *agent.Agent) tea.Cmd {
-	if candidate == nil {
-		return nil
-	}
-	return func() tea.Msg {
-		candidate.Close()
-		return resumeCandidateClosedMsg{}
-	}
+func parseRewindOption(id string) (int, bool) {
+	n, err := strconv.Atoi(strings.TrimPrefix(id, "keep:"))
+	return n, err == nil && strings.HasPrefix(id, "keep:") && n >= 0
 }

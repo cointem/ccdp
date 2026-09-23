@@ -7,7 +7,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
-	"ccdp/internal/agent"
 	"ccdp/internal/protocol"
 )
 
@@ -60,7 +59,7 @@ func TestContextStatusShowsUsedAndCapacity(t *testing.T) {
 
 func TestContextStatusPrefersSnapshotOverUsage(t *testing.T) {
 	m := newContextStatusModel(t, 42, 100000)
-	m.usage = agent.Usage{InputTokens: 190000, OutputTokens: 9000}
+	m.usage = protocol.UsageSnapshot{InputTokens: 190000, OutputTokens: 9000}
 	got := sanitizeANSI(m.renderHeader())
 	if !strings.Contains(got, "42/100k") {
 		t.Fatalf("header=%q, want snapshot context estimate", got)

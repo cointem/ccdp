@@ -113,13 +113,17 @@ func TestM1StepFreezesModelClientAndConfigAcrossStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if receipt.Status != protocol.ReceiptScheduled {
-		t.Fatalf("model change while streaming = %s, want scheduled", receipt.Status)
+	if receipt.Status != protocol.ReceiptApplied {
+		t.Fatalf("model change while streaming = %s, want applied", receipt.Status)
 	}
+	// Immediate application moves the live binding now, but the in-flight first
+	// step already captured its own model-a client/config at the step boundary,
+	// so the first request it is streaming is undisturbed (verified above) and
+	// the change applied immediately.
 	ag.mu.Lock()
-	if ag.activeBinding.model != "model-a" || ag.pendingBinding == nil || ag.pendingBinding.model != "model-b" {
+	if ag.activeBinding.model != "model-b" {
 		ag.mu.Unlock()
-		t.Fatalf("model barrier not preserved: active=%q pending=%+v", ag.activeBinding.model, ag.pendingBinding)
+		t.Fatalf("model did not apply immediately: active=%q", ag.activeBinding.model)
 	}
 	ag.mu.Unlock()
 	close(releaseFirst)
@@ -298,11 +302,13 @@ func TestM1ModeAndSandboxOnlyPreserveExistingRules(t *testing.T) {
 	ag.mu.Unlock()
 }
 
-func TestM1SafetyChangesRejectWhileBusy(t *testing.T) {
+// TestM1SafetyChangesApplyImmediatelyWhileBusy covers the discrete-decision lane:
+// execution (plan) mode, permission policy and sandbox policy land on live state
+// at once even while a turn runs, because each provider request froze its own
+// config and each gate reads the mode atomically. Nothing is staged.
+func TestM1SafetyChangesApplyImmediatelyWhileBusy(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	ag.mu.Lock()
-	originalMode := ag.planMode
-	originalSandbox := ag.cfg.SandboxMode
 	ag.busy = true
 	ag.mu.Unlock()
 	session := protocol.SessionID(ag.SessionID())
@@ -313,16 +319,22 @@ func TestM1SafetyChangesRejectWhileBusy(t *testing.T) {
 	}
 	for _, command := range commands {
 		receipt := ag.applyCommand(command)
-		if !receipt.Rejected() || receipt.Error == nil || receipt.Error.Code != protocol.ErrorBusy {
-			t.Fatalf("busy safety command %s = %+v", command.ID, receipt)
+		if receipt.Rejected() || receipt.Status != protocol.ReceiptApplied {
+			t.Fatalf("busy safety command %s = %+v, want applied", command.ID, receipt)
 		}
 	}
+	// The discrete lane mutates live state immediately.
 	ag.mu.Lock()
-	if ag.planMode != originalMode || ag.cfg.SandboxMode != originalSandbox {
-		ag.mu.Unlock()
-		t.Fatalf("busy safety command mutated state: plan=%v sandbox=%s", ag.planMode, ag.cfg.SandboxMode)
+	defer ag.mu.Unlock()
+	if !ag.planMode {
+		t.Fatal("plan mode did not apply immediately")
 	}
-	ag.mu.Unlock()
+	if ag.cfg.PermissionMode != string(permissions.ModeBypass) {
+		t.Fatalf("permission mode did not apply immediately: %s", ag.cfg.PermissionMode)
+	}
+	if ag.cfg.SandboxMode != string(sandbox.ModeNone) {
+		t.Fatalf("sandbox mode did not apply immediately: %s", ag.cfg.SandboxMode)
+	}
 }
 
 func TestM1PlanApprovalRestoresPermissionAndRejectStaysDrafting(t *testing.T) {

@@ -1,17 +1,6 @@
 package agent
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"sort"
-	"strings"
-	"sync"
-	"time"
-
 	"ccdp/internal/config"
 	"ccdp/internal/hooks"
 	"ccdp/internal/mcp"
@@ -20,6 +9,17 @@ import (
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 	"ccdp/internal/tools"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 )
 
 // SessionSupervisor owns runs, never the UI. Agent remains the sole writer of
@@ -41,21 +41,23 @@ type SessionSupervisor struct {
 }
 
 type managedRun struct {
-	mu          sync.Mutex
-	fact        session.ChildRunRecorded
-	parent      *Agent
-	agent       *Agent
-	cancel      context.CancelFunc
-	done        chan struct{}
-	cfg         config.Config
-	opts        Options
-	lease       *mcp.StepLease
-	toolLease   *tools.Lease
-	preHooks    []plugin.PreToolHook
-	final       protocol.SessionView
-	memory      []session.Record
-	memoryBlobs *memoryRequestArtifacts
-	err         error
+	initialInput     *protocol.SubmitInput
+	initialCommandID protocol.CommandID
+	mu               sync.Mutex
+	fact             session.ChildRunRecorded
+	parent           *Agent
+	agent            *Agent
+	cancel           context.CancelFunc
+	done             chan struct{}
+	cfg              config.Config
+	opts             Options
+	lease            *mcp.StepLease
+	toolLease        *tools.Lease
+	preHooks         []plugin.PreToolHook
+	final            protocol.SessionView
+	memory           []session.Record
+	memoryBlobs      *memoryRequestArtifacts
+	err              error
 }
 
 func newSessionSupervisor(root *Agent) *SessionSupervisor {
@@ -300,38 +302,7 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 		r.mu.Unlock()
 		executionErr := err
 		child.finalizeRun = func(cleanupErr error) error {
-			cleanupErr = errors.Join(cleanupErr, child.cancelRunInputs(string(r.fact.Child.Run.ID)))
-			outcomeErr := errors.Join(executionErr, cleanupErr)
-			usage := child.Usage()
-			if initial != nil {
-				usage.InputTokens -= initial.Usage.InputTokens
-				usage.OutputTokens -= initial.Usage.OutputTokens
-				usage.CachedTokens -= initial.Usage.CachedTokens
-				usage.Cost -= initial.Usage.Cost
-				usage.TurnCount -= initial.Usage.TurnCount
-			}
-			r.mu.Lock()
-			setRunOutcome(r, output, outcomeErr, ctx)
-			r.fact.Child.Run.Usage = protocol.UsageSnapshot{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, CachedTokens: usage.CachedTokens, Cost: usage.Cost, TurnCount: usage.TurnCount}
-			fact := r.fact
-			r.mu.Unlock()
-			p := child.persistenceHandle()
-			if p == nil {
-				return errors.New("child result writer unavailable")
-			}
-			_, writeErr := p.commitEvents("run-outbox-"+string(fact.Child.Run.ID), fact)
-			if child.cfg.NoSessionPersistence {
-				records, readErr := p.Read(session.Beginning)
-				p.mu.Lock()
-				blobs := p.memoryArtifacts
-				p.mu.Unlock()
-				r.mu.Lock()
-				r.memory = records
-				r.memoryBlobs = blobs
-				r.mu.Unlock()
-				writeErr = errors.Join(writeErr, readErr)
-			}
-			return writeErr
+			return errors.Join(cleanupErr, s.finalizeChildRun(r, child, initial, output, executionErr, ctx))
 		}
 		err = errors.Join(err, child.CloseContext(context.Background()))
 		final, _ := child.Snapshot(context.Background())
@@ -341,7 +312,7 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 		final.History = nil
 		r.final = final
 		if !child.cfg.NoSessionPersistence {
-			r.final = protocol.SessionView{}
+			r.final = protocol.SessionView{SessionID: final.SessionID, Revision: final.Revision, Settings: final.Settings, Usage: final.Usage, ContextUsedTokens: final.ContextUsedTokens, LastTurn: final.LastTurn}
 		}
 		r.agent = nil
 		r.mu.Unlock()
@@ -368,12 +339,55 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 	// Retain only immutable data after settlement. Cold continuation rebinds
 	// capabilities explicitly, not by retaining closed providers and transports.
 	r.mu.Lock()
+	r.initialInput = nil
 	r.opts = Options{}
 	r.toolLease = nil
 	r.preHooks = nil
 	r.cfg = config.Config{}
 	r.lease = nil
 	r.mu.Unlock()
+}
+
+// finalizeChildRun folds a child's outcome and incremental usage into its run
+// fact, writes the run-outbox so a cold continuation can deliver it, and (for
+// no-session children) captures the in-memory artifact blobs.
+func (s *SessionSupervisor) finalizeChildRun(r *managedRun, child *Agent, initial *SessionSnapshot, output string, executionErr error, ctx context.Context) error {
+	cleanupErr := child.cancelRunInputs(string(r.fact.Child.Run.ID))
+	outcomeErr := errors.Join(executionErr, cleanupErr)
+	usage := child.Usage()
+	if initial != nil {
+		usage.InputTokens -= initial.Usage.InputTokens
+		usage.OutputTokens -= initial.Usage.OutputTokens
+		usage.CachedTokens -= initial.Usage.CachedTokens
+		usage.Cost -= initial.Usage.Cost
+		usage.TurnCount -= initial.Usage.TurnCount
+	}
+	r.mu.Lock()
+	setRunOutcome(r, output, outcomeErr, ctx)
+	r.fact.Child.Run.Usage = protocol.UsageSnapshot{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, CachedTokens: usage.CachedTokens, Cost: usage.Cost, TurnCount: usage.TurnCount}
+	r.fact.Child.Run.ToolUses = child.ToolUses()
+	fact := r.fact
+	r.mu.Unlock()
+	p := child.persistenceHandle()
+	if p == nil {
+		return errors.New("child result writer unavailable")
+	}
+	child.mu.Lock()
+	settings, settingsRevision := child.sessionSettingsLocked(), child.settingsRev
+	child.mu.Unlock()
+	_, writeErr := p.commitEvents("run-outbox-"+string(fact.Child.Run.ID), session.SettingsChanged{Revision: settingsRevision, Settings: settings}, fact)
+	if child.cfg.NoSessionPersistence {
+		records, readErr := p.Read(session.Beginning)
+		p.mu.Lock()
+		blobs := p.memoryArtifacts
+		p.mu.Unlock()
+		r.mu.Lock()
+		r.memory = records
+		r.memoryBlobs = blobs
+		r.mu.Unlock()
+		writeErr = errors.Join(writeErr, readErr)
+	}
+	return writeErr
 }
 
 func setRunOutcome(r *managedRun, output string, err error, ctx context.Context) {
@@ -423,7 +437,7 @@ func (s *SessionSupervisor) recordOutcome(r *managedRun) error {
 	usage.TurnCount += u.TurnCount
 	fact := r.fact
 	fact.UsageAccounted = true
-	_, err = p.commitEvents("child-outcome-"+string(fact.Child.Run.ID), fact, session.UsageChanged{Usage: session.Usage{InputTokens: int64(usage.InputTokens), OutputTokens: int64(usage.OutputTokens), CachedTokens: int64(usage.CachedTokens), TotalTokens: int64(usage.InputTokens + usage.OutputTokens), Cost: usage.Cost, TurnCount: int64(usage.TurnCount)}})
+	_, err = p.commitEvents("child-outcome-"+string(fact.Child.Run.ID), fact, session.UsageChanged{Usage: session.Usage{InputTokens: int64(usage.InputTokens), OutputTokens: int64(usage.OutputTokens), CachedTokens: int64(usage.CachedTokens), Cache: usage.Cache, TotalTokens: int64(usage.InputTokens + usage.OutputTokens), Cost: usage.Cost, TurnCount: int64(usage.TurnCount)}})
 	if err != nil {
 		return err
 	}
@@ -487,6 +501,10 @@ func (s *SessionSupervisor) drive(r *managedRun, child *Agent, ctx context.Conte
 	}
 	defer func() { _ = sub.Close() }()
 	cmd := protocol.NewSubmitInput(protocol.CommandID("run-input-"+string(r.fact.Child.Run.ID)), protocol.SessionID(child.sessionID), protocol.InputID("run-input-"+string(r.fact.Child.Run.ID)), text, protocol.InputFollowup)
+	if r.initialInput != nil {
+		cmd.ID = r.initialCommandID
+		cmd.Input = r.initialInput
+	}
 	receipt, err := child.Submit(ctx, cmd)
 	if err != nil {
 		return "", err
@@ -503,7 +521,7 @@ func (s *SessionSupervisor) drive(r *managedRun, child *Agent, ctx context.Conte
 				return childRunOutput(child, previous), errors.New("child observation ended before run settled")
 			}
 			r.mu.Lock()
-			row := r.fact.Child
+			row := s.childRowLocked(r)
 			r.mu.Unlock()
 			s.publishChild(row, &update)
 			if update.Type == protocol.UpdateResyncRequired {
@@ -600,26 +618,8 @@ func (s *SessionSupervisor) ListChildren(ctx context.Context) ([]protocol.ChildS
 	rows := make([]protocol.ChildSession, 0, len(runs))
 	for _, r := range runs {
 		r.mu.Lock()
-		row := r.fact.Child
-		row.Title = truncateUTF8Bytes(row.Title, 512)
-		row.Run.Output = truncateUTF8Bytes(row.Run.Output, 2048)
-		row.DeliveryPending = row.Run.WaitPolicy == "notify" && !r.fact.Delivered
-		row.Capabilities = protocol.AgentCapabilities{Observe: true, Continue: !row.Run.Active() && row.Purpose == childPurposeTask, Cancel: row.Run.Active()}
-		if r.agent != nil && row.Run.Status == "running" {
-			row.Capabilities.Send = row.Purpose == childPurposeTask
-			row.Capabilities.Interrupt = true
-			r.agent.mu.Lock()
-			if pending := r.agent.pendingApproval; pending != nil {
-				row.Approval = &protocol.ApprovalView{ID: pending.ID, Tool: pending.Tool, Reason: pending.Reason, Args: approvalArgsView(pending)}
-			}
-			r.agent.mu.Unlock()
-			if row.Approval != nil {
-				row.Run.Status = "waiting_approval"
-				row.Capabilities.Approve = !r.opts.NonInteractive
-			}
-		}
+		rows = append(rows, s.childRowLocked(r))
 		r.mu.Unlock()
-		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
@@ -628,6 +628,50 @@ func (s *SessionSupervisor) ListChildren(ctx context.Context) ([]protocol.ChildS
 		return rows[i].CreatedAt.Before(rows[j].CreatedAt)
 	})
 	return rows, nil
+}
+
+// childRowLocked projects a managed run into the enriched directory row the
+// frontend consumes: bounded Title/Output, the notify delivery-pending flag,
+// live capabilities, and any approval the child is currently blocked on. It is
+// the single source of that enrichment, shared by ListChildren and the child
+// event stream so a root watcher learns approval/capability changes from events
+// rather than polling. Callers must hold r.mu; the child agent's own lock is
+// taken internally.
+func (s *SessionSupervisor) childRowLocked(r *managedRun) protocol.ChildSession {
+	row := r.fact.Child
+	row.Title = truncateUTF8Bytes(row.Title, 512)
+	row.Run.Output = truncateUTF8Bytes(row.Run.Output, 2048)
+	row.DeliveryPending = row.Run.WaitPolicy == "notify" && !r.fact.Delivered
+	row.Capabilities = protocol.AgentCapabilities{Observe: true, Continue: !row.Run.Active() && row.Purpose == childPurposeTask, Cancel: row.Run.Active()}
+	if r.agent != nil && row.Run.Status == "running" {
+		row.Capabilities.Send = row.Purpose == childPurposeTask
+		row.Capabilities.Interrupt = true
+		r.agent.mu.Lock()
+		if pending := r.agent.pendingApproval; pending != nil {
+			row.Approval = &protocol.ApprovalView{ID: pending.ID, Tool: pending.Tool, Reason: pending.Reason, Args: approvalArgsView(pending)}
+		}
+		r.agent.mu.Unlock()
+		if row.Approval != nil {
+			row.Run.Status = "waiting_approval"
+			row.Capabilities.Approve = !r.opts.NonInteractive
+		}
+	}
+	// Fold the child's live usage into the row so a root watcher sees token
+	// counts tick during the run instead of only at settlement. Usage() takes the
+	// agent lock internally, so this stays outside the pendingApproval critical
+	// section above. The baseline subtraction mirrors the cold-recovery path.
+	if r.agent != nil && row.Run.Active() {
+		u, b := r.agent.Usage(), r.fact.UsageBaseline
+		row.Run.Usage = protocol.UsageSnapshot{
+			InputTokens:  max(0, u.InputTokens-b.InputTokens),
+			OutputTokens: max(0, u.OutputTokens-b.OutputTokens),
+			CachedTokens: max(0, u.CachedTokens-b.CachedTokens),
+			Cost:         max(0, u.Cost-b.Cost),
+			TurnCount:    max(0, u.TurnCount-b.TurnCount),
+		}
+		row.Run.ToolUses = r.agent.ToolUses()
+	}
+	return row
 }
 
 func (s *SessionSupervisor) OpenReader(ctx context.Context, id protocol.SessionID) (protocol.SessionClient, error) {
@@ -718,7 +762,16 @@ func (s *SessionSupervisor) Control(ctx context.Context, c protocol.AgentControl
 }
 
 func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c protocol.AgentControl) (protocol.RunView, error) {
-	if strings.TrimSpace(c.Text) == "" {
+	if c.Input != nil {
+		cmd := protocol.Command{ID: c.ID, SessionID: c.SessionID, Type: protocol.CommandSubmitInput, Input: c.Input}
+		normalized, err := cmd.Normalize()
+		if err != nil {
+			return protocol.RunView{}, err
+		}
+		c.Input = normalized.Input
+		c.Text = c.Input.Text
+	}
+	if strings.TrimSpace(c.Text) == "" && (c.Input == nil || len(c.Input.Images) == 0) {
 		return protocol.RunView{}, errors.New("continue requires a message")
 	}
 	r.mu.Lock()
@@ -781,11 +834,11 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 	// A continuation starts a new run, never replays uncertain pending tools
 	// or previously accepted inputs from the interrupted run.
 	initial.Pending, initial.PendingInputs, initial.PendingCommands = nil, nil, nil
-	initial.PendingSettings, initial.Settings = nil, nil
+	initial.Settings = nil
 	cfg.SessionID = string(row.SessionID)
 	runCtx, cancel := context.WithCancel(s.root.rootCtx)
 	row.Run = protocol.RunView{ID: protocol.RunID("continue-" + string(c.ID)), Status: "queued", WaitPolicy: "notify"}
-	next := &managedRun{fact: session.ChildRunRecorded{Version: 1, Child: row, SystemPrompt: system, BindingDigest: digest, CommandID: string(c.ID), CommandDigest: commandDigest}, parent: r.parent, cfg: cfg, opts: opts, lease: lease, toolLease: catalog, preHooks: hooks, cancel: cancel, done: make(chan struct{})}
+	next := &managedRun{initialInput: c.Input, initialCommandID: c.ID, fact: session.ChildRunRecorded{Version: 1, Child: row, SystemPrompt: system, BindingDigest: digest, CommandID: string(c.ID), CommandDigest: commandDigest}, parent: r.parent, cfg: cfg, opts: opts, lease: lease, toolLease: catalog, preHooks: hooks, cancel: cancel, done: make(chan struct{})}
 	u := initial.Usage
 	next.fact.UsageBaseline = protocol.UsageSnapshot{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CachedTokens: u.CachedTokens, Cost: u.Cost, TurnCount: u.TurnCount}
 	s.mu.Lock()
@@ -808,4 +861,227 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 	s.mu.Unlock()
 	go s.execute(next, runCtx, c.Text, initial)
 	return row.Run, nil
+}
+
+func (s *SessionSupervisor) stopTree(ctx context.Context, id protocol.CommandID) error {
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return errors.New("tree stop already in progress")
+	}
+	s.stopping = true
+	for _, r := range s.children {
+		r.mu.Lock()
+		if r.cancel != nil {
+			r.cancel()
+		}
+		r.mu.Unlock()
+	}
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.stopping = false; s.mu.Unlock() }()
+	receipt, err := s.root.Submit(ctx, protocol.Command{ID: id, SessionID: protocol.SessionID(s.root.sessionID), Type: protocol.CommandStop})
+	if err != nil {
+		return err
+	}
+	if receipt.Rejected() {
+		return errors.New("root rejected tree stop")
+	}
+	if err := s.root.WaitChildren(ctx); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		view, err := s.root.Snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		if !view.Busy {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *SessionSupervisor) publishChild(row protocol.ChildSession, event *protocol.Update) {
+	if event != nil {
+		if event.Event == nil && event.Type != protocol.UpdateResyncRequired {
+			return
+		}
+		copy := *event
+		copy.Snapshot, copy.Child = nil, nil
+		event = &copy
+	}
+	root := s.root
+	root.watchMu.Lock()
+	defer root.watchMu.Unlock()
+	update := protocol.Update{Type: protocol.UpdateChild, Child: &protocol.ChildUpdate{Session: row, Update: event}}
+	root.stampUpdateLocked(&update)
+	for _, w := range root.watchers {
+		root.sendWatcherLocked(w, update)
+	}
+}
+
+func (s *SessionSupervisor) publishChildOutcome(r *managedRun) {
+	r.mu.Lock()
+	row := s.childRowLocked(r)
+	r.mu.Unlock()
+	s.publishChild(row, nil)
+	r.parent.publishState()
+}
+
+// In-process continuation preserves the same log and artifacts even when
+// persistence is disabled. It never creates a hidden on-disk session.
+func (p *sessionPersistence) restoreMemoryRun(records []session.Record, blobs *memoryRequestArtifacts) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	store := session.NewMemoryStore()
+	for i := 0; i < len(records); {
+		batch := session.Batch{TransactionID: records[i].TransactionID}
+		for i < len(records) && records[i].TransactionID == batch.TransactionID {
+			batch.Events = append(batch.Events, records[i].Event)
+			i++
+		}
+		if _, err := store.Commit(store.CurrentCursor(), batch); err != nil {
+			_ = store.Close()
+			return err
+		}
+	}
+	_ = p.store.Close()
+	p.store = store
+	p.memoryArtifacts = blobs
+	p.projection = nil
+	p.projectionCursor = 0
+	p.transcript = transcriptFromRecords(records)
+	return nil
+}
+
+// Reconcile the child's durable outbox with the parent's catalog. This is a
+// read-only pass: constructing an observer never wakes a model or runs a tool.
+func (s *SessionSupervisor) readChildOutboxes() {
+	for _, r := range s.runs {
+		if r.fact.UsageAccounted {
+			continue
+		}
+		// An uncompleted run is reported as uncertain, never restarted. A
+		// discovered terminal child outbox below replaces this synthetic result.
+		if r.fact.Child.Run.Status == "unknown" {
+			r.fact.DeliveryID = "child-result-" + string(r.fact.Child.Run.ID)
+		}
+		store, err := session.OpenJSONLReadOnly(s.sessionDir, string(r.fact.Child.SessionID))
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				r.fact.Child.Run.Error = fmt.Sprintf("child history unavailable: %v", err)
+				r.err = err
+			}
+			continue
+		} // a queued child may never have been constructed
+		records, err := store.Read(session.Beginning)
+		_ = store.Close()
+		if err != nil {
+			r.fact.Child.Run.Error = fmt.Sprintf("child history unavailable: %v", err)
+			continue
+		}
+		found := false
+		for _, record := range records {
+			fact, ok := record.Event.(*session.ChildRunRecorded)
+			if ok && fact.Child.Run.ID == r.fact.Child.Run.ID && fact.Child.SessionID == r.fact.Child.SessionID && fact.Child.ParentSessionID == r.fact.Child.ParentSessionID && !fact.Child.Run.Active() {
+				r.fact = *fact
+				found = true
+			}
+		}
+		if !found {
+			if snapshot, err := snapshotFromRecords(records, string(r.fact.Child.SessionID)); err == nil {
+				u, b := snapshot.Usage, r.fact.UsageBaseline
+				r.fact.Child.Run.Usage = protocol.UsageSnapshot{InputTokens: max(0, u.InputTokens-b.InputTokens), OutputTokens: max(0, u.OutputTokens-b.OutputTokens), CachedTokens: max(0, u.CachedTokens-b.CachedTokens), Cost: max(0, u.Cost-b.Cost), TurnCount: max(0, u.TurnCount-b.TurnCount)}
+			}
+		}
+	}
+}
+
+// Execution startup, not observation, owns recovery delivery. Every retry
+// uses the original DeliveryID; parent command admission persists deduplication.
+func (s *SessionSupervisor) startRecovery() {
+	s.recoverOnce.Do(func() {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
+		}
+		s.wg.Add(1)
+		s.mu.Unlock()
+		go func() {
+			defer s.wg.Done()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				s.mu.Lock()
+				runs := make([]*managedRun, 0, len(s.runs))
+				for _, r := range s.runs {
+					runs = append(runs, r)
+				}
+				s.mu.Unlock()
+				for _, r := range runs {
+					if s.root.rootCtx.Err() != nil {
+						return
+					}
+					select {
+					case <-r.done:
+					default:
+						continue
+					}
+					r.mu.Lock()
+					if r.fact.DeliveryID != "" && !r.fact.UsageAccounted {
+						if err := s.recordOutcome(r); err != nil {
+							r.err = err
+						}
+					}
+					r.mu.Unlock()
+					s.deliver(r)
+				}
+				select {
+				case <-s.root.rootCtx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	})
+}
+
+// WaitChildren lets headless clients keep the application alive until explicit
+// background work settles. Observing a terminal page does not call this.
+func (a *Agent) WaitChildren(ctx context.Context) error {
+	if a.supervisor == nil {
+		return nil
+	}
+	s := a.supervisor
+	for {
+		s.mu.Lock()
+		runs := make([]*managedRun, 0, len(s.children))
+		for _, r := range s.children {
+			runs = append(runs, r)
+		}
+		s.mu.Unlock()
+		active := false
+		for _, r := range runs {
+			select {
+			case <-r.done:
+			default:
+				active = true
+				select {
+				case <-r.done:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+		if !active {
+			return nil
+		}
+	}
 }

@@ -107,6 +107,9 @@ func (t *GitStatusTool) Run(ctx *Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if code != 0 {
+		return truncateGit(out), fmt.Errorf("git %s failed (exit %d)", strings.Join(args, " "), code)
+	}
 	return fmt.Sprintf("git %s (exit %d)\n%s", strings.Join(args, " "), code, truncateGit(out)), nil
 }
 
@@ -165,6 +168,9 @@ func (t *GitDiffTool) Run(ctx *Context) (string, error) {
 	out, code, err := runGit(ctx, args...)
 	if err != nil {
 		return "", err
+	}
+	if code != 0 {
+		return truncateGit(out), fmt.Errorf("git %s failed (exit %d)", strings.Join(args, " "), code)
 	}
 	if strings.TrimSpace(out) == "" {
 		return fmt.Sprintf("git %s (exit %d): no changes", strings.Join(args, " "), code), nil
@@ -238,6 +244,9 @@ func (t *GitLogTool) Run(ctx *Context) (string, error) {
 	out, code, err := runGit(ctx, args...)
 	if err != nil {
 		return "", err
+	}
+	if code != 0 {
+		return truncateGit(out), fmt.Errorf("git %s failed (exit %d)", strings.Join(args, " "), code)
 	}
 	if strings.TrimSpace(out) == "" {
 		return fmt.Sprintf("git %s (exit %d): no commits", strings.Join(args, " "), code), nil

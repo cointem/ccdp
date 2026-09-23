@@ -63,7 +63,7 @@ func TestOutputReaderReplacesPagesAndCanReturn(t *testing.T) {
 func TestReaderJoinsPrintBarrierAndSuspendsNativeFlush(t *testing.T) {
 	m, _ := routingTestModel()
 	defer m.Close()
-	m.items = []logItem{{kind: "assistant", text: "ROOT-UNPRINTED", messageID: "reply"}}
+	m.items = []historyCell{{kind: "assistant", text: "ROOT-UNPRINTED", messageID: "reply"}}
 	m.confirmedItems = m.items
 	m.inline.prime(nil)
 	m.inline.primed = true
@@ -72,7 +72,7 @@ func TestReaderJoinsPrintBarrierAndSuspendsNativeFlush(t *testing.T) {
 	if cmd := m.openTranscriptReader(); cmd != nil || !m.reader.enterPending {
 		t.Fatal("reader crossed an outstanding native print")
 	}
-	if cmd := m.flushInline(); cmd != nil {
+	if cmd := planTestHistory(&m); cmd != nil {
 		t.Fatal("reader diverted root transcript into alternate-screen scrollback")
 	}
 	m.routing.printing = false
@@ -84,7 +84,7 @@ func TestReaderJoinsPrintBarrierAndSuspendsNativeFlush(t *testing.T) {
 	if got := fmt.Sprintf("%T", cmd()); !strings.Contains(strings.ToLower(got), "enteraltscreen") {
 		t.Fatalf("reader barrier produced %s", got)
 	}
-	if cmd := m.flushInline(); cmd != nil {
+	if cmd := planTestHistory(&m); cmd != nil {
 		t.Fatal("active reader emitted a native transcript print")
 	}
 	if !m.reader.screenEntered || m.reader.enterPending {

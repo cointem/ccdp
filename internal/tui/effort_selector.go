@@ -11,7 +11,7 @@ import (
 )
 
 // Provider-default is a reset, not a level of reasoning intensity.
-var effortOptions = []selectorOption{
+var effortOptions = []SelectorOption{
 	{ID: "default", Label: "default", Description: "由模型默认配置决定"},
 	{ID: "none", Label: "none", Description: "关闭显式推理"},
 	{ID: "minimal", Label: "minimal", Description: "最少推理"},
@@ -24,11 +24,11 @@ var effortOptions = []selectorOption{
 }
 
 func (m *Model) startGenerationSelector(name string) tea.Cmd {
-	options := append([]selectorOption(nil), effortOptions...)
+	options := append([]SelectorOption(nil), effortOptions...)
 	current, kind, title := m.snapshot.Settings.ReasoningEffort, selectorEffort, "Reasoning effort"
 	if name == "verbosity" {
 		current, kind, title = m.snapshot.Settings.Verbosity, selectorVerbosity, "Response verbosity"
-		options = []selectorOption{{ID: "default", Label: "default", Description: "使用模型默认配置"}, {ID: "low", Label: "low", Description: "简短"}, {ID: "medium", Label: "medium", Description: "适中"}, {ID: "high", Label: "high", Description: "详细"}}
+		options = []SelectorOption{{ID: "default", Label: "default", Description: "使用模型默认配置"}, {ID: "low", Label: "low", Description: "简短"}, {ID: "medium", Label: "medium", Description: "适中"}, {ID: "high", Label: "high", Description: "详细"}}
 	}
 	if current == "" {
 		current = "default"
@@ -67,25 +67,24 @@ func (a effortMotion) position() float64 {
 }
 func (m *Model) adjustEffort(msg tea.KeyMsg) tea.Cmd {
 	p := m.picker
-	next := p.index
+	next := p.Index
 	switch msg.String() {
 	case "left":
 		next = max(0, next-1)
 	case "right":
-		next = min(len(p.options)-1, next+1)
+		next = min(len(p.Options)-1, next+1)
 	case "home":
 		next = 0
 	case "end":
-		next = len(p.options) - 1
+		next = len(p.Options) - 1
 	default:
 		return nil
 	}
-	if next == p.index {
+	if next == p.Index {
 		return nil
 	}
 	from := p.effortMotion.position()
-	p.index = next
-	p.selector.Index = next
+	p.Index = next
 	p.effortMotion = effortMotion{token: nextUICommandID(), from: from, to: float64(next)}
 	return effortTick(p.effortMotion.token)
 }
@@ -107,71 +106,54 @@ func (m *Model) advanceEffortMotion(msg effortTickMsg) tea.Cmd {
 func (m *Model) renderEffortSelector() string {
 	p := m.picker
 	width := max(1, m.width-2)
-	current := m.snapshot.Settings.ReasoningEffort
-	if current == "" {
-		current = "default"
-	}
-	rows := []string{styleModalTitle.Render(truncateDisplay("Effort · current "+current, width))}
-	// Show a sliding neighbourhood on narrow terminals, keeping navigation
-	// horizontal instead of wrapping the options into a vertical menu.
-	first, last := p.index, p.index+1
-	measure := func(a, b int) int {
-		n := 0
-		for i := a; i < b; i++ {
-			n += len(p.options[i].Label) + 3
-		}
-		return n + 4
-	}
-	for first > 0 || last < len(p.options) {
-		moved := false
-		if first > 0 && measure(first-1, last) <= width {
-			first--
-			moved = true
-		}
-		if last < len(p.options) && measure(first, last+1) <= width {
-			last++
-			moved = true
-		}
-		if !moved {
-			break
-		}
-	}
-	labels := []string{}
+	// Equal-width stops keep the pointer directly above its label. Narrow
+	// terminals show a moving window instead of wrapping the scale.
+	slot := 9
+	count := min(len(p.Options), max(1, min(90, width)/slot))
+	first := max(0, min(p.Index-count/2, len(p.Options)-count))
+	last := first + count
+	scaleWidth := count * slot
+	centers := func(i int) int { return (i-first)*slot + slot/2 }
+	pointer := int(math.Round((p.effortMotion.position()-float64(first))*float64(slot))) + slot/2
+	pointer = max(0, min(scaleWidth-1, pointer))
+	axis := styleDivider.Render(strings.Repeat("─", pointer)) + styleBrand.Render("▲") + styleDivider.Render(strings.Repeat("─", scaleWidth-pointer-1))
+	var labels strings.Builder
 	for i := first; i < last; i++ {
-		label := p.options[i].Label
-		if i == p.index {
-			label = styleCmdSugSel.Render("[" + label + "]")
-		} else {
-			label = styleHints.Render(" " + label + " ")
+		label := p.Options[i].Label
+		styled := styleHints
+		if i == p.Index {
+			styled = styleBrand
 		}
-		labels = append(labels, label)
+		left := centers(i) - (i-first)*slot - lipgloss.Width(label)/2
+		labels.WriteString(strings.Repeat(" ", max(0, left)) + styled.Render(label) + strings.Repeat(" ", max(0, slot-left-lipgloss.Width(label))))
 	}
-	left, right := " ", " "
+	leftEnd, rightEnd := "Faster", "Smarter"
 	if first > 0 {
-		left = "‹"
+		leftEnd = "‹ " + leftEnd
 	}
-	if last < len(p.options) {
-		right = "›"
+	if last < len(p.Options) {
+		rightEnd += " ›"
 	}
-	rows = append(rows, truncateDisplay(left+strings.Join(labels, " ")+right, width))
-	if p.index == 0 {
-		rows = append(rows, styleHints.Render("model default"))
-	} else {
-		cells := min(24, max(8, width-3))
-		ratio := max(0, p.effortMotion.position()-1) / float64(len(p.options)-2)
-		filled := min(cells, int(math.Round(ratio*float64(cells))))
-		rows = append(rows, styleRunning.Render(strings.Repeat("━", filled))+styleHints.Render(strings.Repeat("─", cells-filled)))
+	ends := leftEnd + strings.Repeat(" ", max(1, scaleWidth-lipgloss.Width(leftEnd)-lipgloss.Width(rightEnd))) + rightEnd
+	if count == 1 {
+		ends = "Effort"
 	}
-	selected := p.options[p.index]
+	center := func(text string) string { return lipgloss.NewStyle().Width(width).Align(lipgloss.Center).Render(text) }
+	selected := p.Options[p.Index]
 	note := selected.Description
-	if selected.ID == current {
-		note += " · ✓"
+	if selected.ID == m.snapshot.Settings.ReasoningEffort || selected.ID == "default" && m.snapshot.Settings.ReasoningEffort == "" {
+		note += " · current"
 	}
-	rows = append(rows, styleStatus.Render(truncateDisplay(note, width)))
+	warning := "更高强度可能增加 token 用量和响应时间"
 	hint := "←/→ adjust · Enter confirm · Esc cancel"
 	if width < 40 {
 		hint = "←/→ · Enter 确认 · Esc 取消"
 	}
-	rows = append(rows, styleHints.Render(lipgloss.NewStyle().Width(width).Render(hint)))
+	rows := []string{styleBrand.Render(strings.Repeat("─", width)), styleBrand.Render("Effort"), "",
+		center(styleHints.Render(ends)), center(axis), center(labels.String()),
+		center(styleStatus.Render(note)), center(styleHints.Render(warning)), "", styleHints.Render(hint)}
+	if m.height > 0 && m.height < 18 {
+		rows = []string{styleBrand.Render("Effort"), center(styleHints.Render(ends)), center(axis), center(labels.String()), styleHints.Render(hint)}
+	}
 	return strings.Join(rows, "\n")
 }

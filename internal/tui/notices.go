@@ -40,6 +40,19 @@ func (n Notice) Expired(at time.Time) bool {
 	return !n.Sticky && !n.ExpiresAt.IsZero() && !at.Before(n.ExpiresAt)
 }
 
+// composerFeedback reports whether a notice answers a submitted command rather
+// than the conversation: a plain acknowledgement ("effort → xhigh", "history
+// cleared") carrying the id of the command that produced it. Receipts belong to
+// the input's hint lane, because next to the prompt they cannot be mistaken for
+// one more row of output. Decisions, errors, warnings and free-standing status
+// messages stay in the status lane.
+func (n Notice) composerFeedback() bool {
+	if n.CommandID == "" || n.Sticky {
+		return false
+	}
+	return n.Severity == NoticeInfo || n.Severity == NoticeSuccess
+}
+
 type noticeTickMsg struct{ at time.Time }
 
 const (
@@ -51,7 +64,16 @@ func noticeTickCmd() tea.Cmd {
 	return tea.Tick(noticeTickInterval, func(at time.Time) tea.Msg { return noticeTickMsg{at: at} })
 }
 
+type noticeStore struct{ notices []Notice }
+
 func (m *Model) addNotice(notice Notice) {
+	if notice.SessionID == "" {
+		notice.SessionID = protocol.SessionID(m.sessionID)
+	}
+	m.noticeStore.add(notice)
+}
+
+func (m *noticeStore) add(notice Notice) {
 	if strings.TrimSpace(notice.Text) == "" {
 		return
 	}
@@ -60,9 +82,6 @@ func (m *Model) addNotice(notice Notice) {
 	}
 	if notice.CreatedAt.IsZero() {
 		notice.CreatedAt = now()
-	}
-	if notice.SessionID == "" {
-		notice.SessionID = protocol.SessionID(m.sessionID)
 	}
 	if notice.Severity == "" {
 		notice.Severity = NoticeInfo
@@ -76,7 +95,6 @@ func (m *Model) addNotice(notice Notice) {
 		for i := range m.notices {
 			if m.notices[i].CommandID == notice.CommandID {
 				m.notices[i] = notice
-				m.syncLegacyStatus()
 				return
 			}
 		}
@@ -85,19 +103,9 @@ func (m *Model) addNotice(notice Notice) {
 	if len(m.notices) > 32 {
 		m.notices = append([]Notice(nil), m.notices[len(m.notices)-32:]...)
 	}
-	m.syncLegacyStatus()
 }
 
-func (m *Model) noticeForCommand(commandID protocol.CommandID) (Notice, bool) {
-	for i := len(m.notices) - 1; i >= 0; i-- {
-		if m.notices[i].CommandID == commandID {
-			return m.notices[i], true
-		}
-	}
-	return Notice{}, false
-}
-
-func (m *Model) latestNotice() (Notice, bool) {
+func (m *noticeStore) latestNotice() (Notice, bool) {
 	nowAt := now()
 	for i := len(m.notices) - 1; i >= 0; i-- {
 		if !m.notices[i].Expired(nowAt) {
@@ -107,7 +115,35 @@ func (m *Model) latestNotice() (Notice, bool) {
 	return Notice{}, false
 }
 
-func (m *Model) expireNotices(at time.Time) bool {
+// latestStatusNotice returns the newest live notice that belongs to the status
+// lane. Command receipts are excluded because the composer renders them instead.
+func (m *noticeStore) latestStatusNotice() (Notice, bool) {
+	nowAt := now()
+	for i := len(m.notices) - 1; i >= 0; i-- {
+		notice := m.notices[i]
+		if notice.Expired(nowAt) || notice.composerFeedback() {
+			continue
+		}
+		return notice, true
+	}
+	return Notice{}, false
+}
+
+// latestFeedback returns the newest live command receipt for the composer's
+// hint lane.
+func (m *noticeStore) latestFeedback() (Notice, bool) {
+	nowAt := now()
+	for i := len(m.notices) - 1; i >= 0; i-- {
+		notice := m.notices[i]
+		if notice.Expired(nowAt) || !notice.composerFeedback() {
+			continue
+		}
+		return notice, true
+	}
+	return Notice{}, false
+}
+
+func (m *noticeStore) expireNotices(at time.Time) bool {
 	if len(m.notices) == 0 {
 		return false
 	}
@@ -121,26 +157,10 @@ func (m *Model) expireNotices(at time.Time) bool {
 		kept = append(kept, notice)
 	}
 	m.notices = kept
-	if changed {
-		m.syncLegacyStatus()
-	}
 	return changed
 }
 
-// syncLegacyStatus keeps old in-package callers working while all new
-// presentation reads notices. It only changes the compatibility field when a
-// notice owns it, so a runtime test that sets status directly remains intact.
-func (m *Model) syncLegacyStatus() {
-	if notice, ok := m.latestNotice(); ok {
-		m.status = notice.Text
-		return
-	}
-	if m.status != "" {
-		m.status = ""
-	}
-}
-
-func (m *Model) clearNotice(commandID protocol.CommandID) {
+func (m *noticeStore) clearNotice(commandID protocol.CommandID) {
 	if commandID == "" {
 		return
 	}
@@ -151,10 +171,9 @@ func (m *Model) clearNotice(commandID protocol.CommandID) {
 		}
 	}
 	m.notices = kept
-	m.syncLegacyStatus()
 }
 
-func (m *Model) clearTransientNotices() {
+func (m *noticeStore) clearTransientNotices() {
 	kept := m.notices[:0]
 	for _, notice := range m.notices {
 		if !notice.Sticky {
@@ -163,14 +182,25 @@ func (m *Model) clearTransientNotices() {
 		kept = append(kept, notice)
 	}
 	m.notices = kept
-	m.syncLegacyStatus()
 }
 
-func (m Model) visibleNotices() []Notice {
+func (m *noticeStore) clearDecisionNotices() {
+	kept := m.notices[:0]
+	for _, notice := range m.notices {
+		if notice.Severity != NoticeDecision {
+			kept = append(kept, notice)
+		}
+	}
+	m.notices = kept
+}
+
+func (m Model) visibleNotices() []Notice { return m.noticeStore.visible(m.sessionID) }
+
+func (m noticeStore) visible(sessionID string) []Notice {
 	at := now()
 	out := make([]Notice, 0, len(m.notices))
 	for _, notice := range m.notices {
-		if notice.SessionID != "" && m.sessionID != "" && notice.SessionID.String() != m.sessionID {
+		if notice.SessionID != "" && sessionID != "" && notice.SessionID.String() != sessionID {
 			continue
 		}
 		if !notice.Expired(at) {
@@ -229,6 +259,8 @@ type Operation struct {
 	// intentionally has no second applied receipt, so the TUI closes that
 	// operation when the associated turn reaches its terminal boundary.
 	InputID          protocol.InputID
+	InputImages      []protocol.InputImage
+	Recoverable      bool
 	InputText        string
 	TurnID           protocol.TurnID
 	Type             protocol.CommandType
@@ -247,16 +279,22 @@ func (o Operation) Active() bool {
 	return o.State == OperationPending || o.State == OperationQueued
 }
 
+type operationStore struct {
+	operations      map[protocol.CommandID]Operation
+	operationSeq    uint64
+	latestOperation protocol.CommandID
+}
+
 func (m *Model) registerOperation(cmd protocol.Command, purpose string) {
-	if cmd.ID == "" {
-		return
-	}
-	// A fresh user turn supersedes the visibility of a previous command's
-	// terminal error. The durable error report remains in the transcript, but
-	// the status lane must describe the operation the user is acting on now.
-	// Command-less notices are connection/runtime state and intentionally stay.
 	if cmd.Type == protocol.CommandSubmitInput || cmd.Input != nil {
 		m.retireTerminalErrorNotices(cmd.ID)
+	}
+	m.operationStore.register(cmd, purpose)
+}
+
+func (m *operationStore) register(cmd protocol.Command, purpose string) {
+	if cmd.ID == "" {
+		return
 	}
 	if m.operations == nil {
 		m.operations = make(map[protocol.CommandID]Operation)
@@ -268,6 +306,8 @@ func (m *Model) registerOperation(cmd protocol.Command, purpose string) {
 		Purpose: purpose, State: OperationPending, StartedAt: when, UpdatedAt: when, Order: m.operationSeq}
 	if cmd.Input != nil {
 		op.InputID, op.InputText = cmd.Input.ID, cmd.Input.Text
+		op.InputImages = cloneInputImages(cmd.Input.Images)
+		op.Recoverable = true
 	}
 	m.operations[cmd.ID] = op
 	m.latestOperation = cmd.ID
@@ -298,7 +338,6 @@ func (m *Model) retireTerminalErrorNotices(current protocol.CommandID) {
 	}
 	if changed {
 		m.notices = kept
-		m.syncLegacyStatus()
 	}
 }
 
@@ -306,7 +345,7 @@ func (m *Model) retireTerminalErrorNotices(current protocol.CommandID) {
 // still receive a receipt. Active operations and the latest terminal owner
 // remain available for stale-receipt ownership checks; old terminal records
 // carry no additional authority once their receipt has been observed.
-func (m *Model) pruneOperations() {
+func (m *operationStore) pruneOperations() {
 	if len(m.operations) <= maxOperationHistory {
 		return
 	}
@@ -336,12 +375,12 @@ func (m *Model) pruneOperations() {
 	}
 }
 
-func (m *Model) operation(commandID protocol.CommandID) (Operation, bool) {
+func (m *operationStore) operation(commandID protocol.CommandID) (Operation, bool) {
 	op, ok := m.operations[commandID]
 	return op, ok
 }
 
-func (m *Model) updateOperation(commandID protocol.CommandID, state OperationState, receipt protocol.Receipt) (Operation, bool) {
+func (m *operationStore) updateOperation(commandID protocol.CommandID, state OperationState, receipt protocol.Receipt) (Operation, bool) {
 	op, ok := m.operations[commandID]
 	if !ok {
 		return Operation{}, false
@@ -361,10 +400,6 @@ func (m *Model) updateOperation(commandID protocol.CommandID, state OperationSta
 	return op, true
 }
 
-func (m Model) pendingOperations() []Operation {
-	return m.activeOperations()
-}
-
 func (m Model) PendingInputs() []protocol.InputView {
 	return append([]protocol.InputView(nil), m.pendingInputs...)
 }
@@ -373,11 +408,30 @@ func (m Model) Activity() Activity { return m.activity }
 
 func (m Model) Notices() []Notice { return m.visibleNotices() }
 
-func (m Model) Operations() []Operation {
+func (m operationStore) Operations() []Operation {
 	out := make([]Operation, 0, len(m.operations))
 	for _, op := range m.operations {
+		op.InputImages = cloneInputImages(op.InputImages)
 		out = append(out, op)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Order < out[j].Order })
 	return out
+}
+
+func (m operationStore) pendingSubmissionCount() int {
+	n := 0
+	for _, op := range m.operations {
+		if op.Recoverable {
+			n++
+		}
+	}
+	return n
+}
+
+func (m *operationStore) consumeSubmission(id protocol.CommandID) {
+	if op, ok := m.operations[id]; ok {
+		op.Recoverable = false
+		op.InputImages = nil
+		m.operations[id] = op
+	}
 }

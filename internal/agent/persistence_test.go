@@ -113,9 +113,12 @@ func TestLegacyResumeImportIsExplicitAndReadOnlyListing(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(legacyPath)
-	listed, err := ListSessions(cfg.SessionDir)
+	listed, issues, err := ListSessions(cfg.SessionDir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("session listing reported issues: %+v", issues)
 	}
 	if len(listed) != 1 || listed[0].ID != snap.ID {
 		t.Fatalf("legacy list = %+v", listed)
@@ -717,5 +720,34 @@ func TestAgentSaveStopsAfterDurableWriteFailure(t *testing.T) {
 	}
 	if err := ag.Save(); !errors.Is(err, session.ErrPersistenceFailed) {
 		t.Fatalf("second Save error = %v, want poisoned writer", err)
+	}
+}
+
+func TestListSessionsSkipsDamagedSessionAndReportsIt(t *testing.T) {
+	cfg := testPersistenceConfig(t)
+	good, err := openSessionPersistence(&cfg, "readable", time.Unix(100, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := good.close(); err != nil {
+		t.Fatal(err)
+	}
+	damaged := filepath.Join(cfg.SessionDir, "damaged")
+	if err := os.MkdirAll(damaged, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(damaged, "events.v1.jsonl"), []byte("{not-json}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, issues, err := ListSessions(cfg.SessionDir)
+	if err != nil {
+		t.Fatalf("one damaged session failed the whole listing: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "readable" {
+		t.Fatalf("recoverable sessions = %+v", sessions)
+	}
+	if len(issues) != 1 || issues[0].ID != "damaged" || issues[0].Reason == "" {
+		t.Fatalf("skipped sessions were not reported: %+v", issues)
 	}
 }

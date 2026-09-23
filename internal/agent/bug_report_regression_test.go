@@ -57,41 +57,43 @@ func TestResumeRestoresRuntimeSequences(t *testing.T) {
 	}
 }
 
-// TestSupersededSettingsCandidateIsNotReapplied keeps the staged model state
-// machine finite and verifies that an idle replacement clears the candidate
-// rather than replaying it at the next step.
-func TestSupersededSettingsCandidateIsNotReapplied(t *testing.T) {
+// TestConsecutiveModelChangesLeaveNoStaleCandidate verifies that back-to-back
+// model changes apply immediately (even while busy) and the last one wins, with
+// no stale staged candidate surviving into replay.
+func TestConsecutiveModelChangesLeaveNoStaleCandidate(t *testing.T) {
 	provider := &formalCompletionProvider{}
 	a := newJournalRuntimeAgent(t, provider)
-	oldModel := a.configSnapshot().Model
-	a.models.Route("bug-stage-model", provider.Name())
+	a.models.Route("bug-first-model", provider.Name())
+	a.models.Route("bug-second-model", provider.Name())
 	a.mu.Lock()
 	a.busy = true
 	a.mu.Unlock()
-	staged := a.applyCommand(protocol.NewSetModel("bug-stage-command", protocol.SessionID(a.SessionID()), "bug-stage-model"))
-	if staged.Rejected() || staged.Status != protocol.ReceiptScheduled {
-		t.Fatalf("staged model receipt=%+v", staged)
+	defer func() {
+		a.mu.Lock()
+		a.busy = false
+		a.mu.Unlock()
+	}()
+
+	first := a.applyCommand(protocol.NewSetModel("bug-first-command", protocol.SessionID(a.SessionID()), "bug-first-model"))
+	if first.Rejected() || first.Status != protocol.ReceiptApplied {
+		t.Fatalf("first model receipt=%+v, want applied", first)
+	}
+	second := a.applyCommand(protocol.NewSetModel("bug-second-command", protocol.SessionID(a.SessionID()), "bug-second-model"))
+	if second.Rejected() || second.Status != protocol.ReceiptApplied {
+		t.Fatalf("second model receipt=%+v, want applied", second)
 	}
 	a.mu.Lock()
-	a.busy = false
-	a.mu.Unlock()
-	active := a.applyCommand(protocol.NewSetModel("bug-idle-command", protocol.SessionID(a.SessionID()), oldModel))
-	if active.Rejected() || active.Status != protocol.ReceiptApplied {
-		t.Fatalf("idle replacement receipt=%+v", active)
-	}
-	a.mu.Lock()
-	pending := a.pendingBinding
 	activeModel := a.activeBinding.model
 	a.mu.Unlock()
-	if pending != nil || activeModel != oldModel {
-		t.Fatalf("superseded candidate remained: pending=%+v active=%q", pending, activeModel)
+	if activeModel != "bug-second-model" {
+		t.Fatalf("last model did not win cleanly: active=%q", activeModel)
 	}
 	replayed, err := SessionSnapshotProjection(a.persistenceHandle().Store(), a.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replayed.PendingSettings != nil || replayed.Model != oldModel {
-		t.Fatalf("replayed settings retained stale candidate: model=%q pending=%+v", replayed.Model, replayed.PendingSettings)
+	if replayed.Model != "bug-second-model" {
+		t.Fatalf("replayed settings retained stale candidate: model=%q", replayed.Model)
 	}
 }
 

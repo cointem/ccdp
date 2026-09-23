@@ -29,6 +29,7 @@ type readerMatch struct{ entry, line int }
 // A reader owns a bounded output page, never the terminal's native history.
 // Original source is separate from its sanitized, width-dependent projection.
 type readerState struct {
+	workspace                   string
 	kind                        readerKind
 	title                       string
 	sessionID                   protocol.SessionID
@@ -97,7 +98,16 @@ func (r *readerState) entryLines(entry readerEntry, width int) []string {
 	}
 	text = sanitizeANSI(text)
 	if !r.rawMode && entry.Kind == "assistant" {
-		text = renderMarkdown(text, width)
+		text = renderMarkdown(text, width, r.workspace)
+	} else if !r.rawMode && entry.Kind == "thinking" {
+		header := styleBrand.Render("Thought Process:")
+		lines := strings.Split(text, "\n")
+		var rows []string
+		rows = append(rows, header)
+		for _, line := range lines {
+			rows = append(rows, styleStatus.Render("│ ")+styleHints.Render(line))
+		}
+		text = strings.Join(rows, "\n")
 	} else if !r.rawMode && isUnifiedDiff(sanitizeANSI(entry.RawText)) {
 		text = sanitizeANSI(entry.ToolName+"\n"+entry.ToolArgs) + "\n\n" + renderDiff(sanitizeANSI(entry.RawText), width)
 	}
@@ -134,11 +144,7 @@ func (r *readerState) moveEntry(delta int) {
 	r.offset = 0
 	r.rebuildLines(max(1, r.width))
 }
-func (r *readerState) ensureMatchForEntry() {
-	if r != nil && r.search != "" {
-		r.matches = r.findMatches()
-	}
-}
+
 func (r *readerState) findMatches() []int {
 	if r == nil || r.search == "" {
 		return nil
@@ -224,39 +230,41 @@ func (r *readerState) hint() string {
 	}
 	return "↑↓ scroll · ←→ entries · / search · n next · o raw · c copy · esc back"
 }
+
+// Both the native transcript and the reader derive from the same typed
+// source. Prefer live cells over an older snapshot during an active stream.
 func transcriptReaderEntries(m *Model) []readerEntry {
 	if m == nil {
 		return nil
 	}
-	if len(m.snapshot.Transcript) > 0 {
+	items := m.confirmedItems
+	if len(items) == 0 && len(m.snapshot.Transcript) > 0 {
 		return readerEntriesFromTranscript(m.snapshot.Transcript)
 	}
-	items := m.confirmedItems
 	if len(items) == 0 {
 		items = m.items
 	}
 	entries := make([]readerEntry, 0, len(items))
 	for _, item := range items {
-		if item.kind == "welcome" {
-			continue
+		if item.kind != "welcome" {
+			entries = append(entries, item.readerEntry())
 		}
-		text, raw := item.text, item.text
-		if item.kind == "tool" && item.toolName != "" {
-			raw = item.toolOutput
-			text = item.toolName + "\n" + item.toolArgsRaw + "\n\n" + raw
-		}
-		entries = append(entries, readerEntry{ID: item.messageID, Kind: item.kind, Text: text, RawText: raw, ToolName: item.toolName, ToolArgs: item.toolArgsRaw, Truncated: item.toolTruncated})
 	}
 	return entries
+}
+func (item historyCell) readerEntry() readerEntry {
+	text := item.text
+	if item.kind == "tool" {
+		text = item.toolName + "\n" + item.toolArgsRaw + "\n\n" + item.text
+	}
+	return readerEntry{ID: item.messageID, Kind: item.kind, Label: item.toolName, Text: text,
+		RawText: item.text, ToolName: item.toolName, ToolArgs: item.toolArgsRaw,
+		CallID: protocol.CallID(item.toolID), Truncated: item.toolTruncated, OutputMore: item.toolTruncated}
 }
 func readerEntriesFromTranscript(items []protocol.TranscriptItem) []readerEntry {
 	entries := make([]readerEntry, 0, len(items))
 	for _, item := range items {
-		text := item.Text
-		if item.Kind == "tool" {
-			text = item.Tool + "\n" + string(item.Args) + "\n\n" + item.Text
-		}
-		entries = append(entries, readerEntry{ID: item.ID, Kind: item.Kind, Label: item.Tool, Text: text, RawText: item.Text, ToolName: item.Tool, ToolArgs: string(item.Args), CallID: item.CallID, Truncated: item.Truncated, OutputMore: item.Truncated})
+		entries = append(entries, projectTranscriptCell(item).readerEntry())
 	}
 	return entries
 }
@@ -291,7 +299,7 @@ func (m *Model) openTranscriptReader() tea.Cmd {
 	}
 	m.readerSeq++
 	m.readerRequest = m.readerSeq
-	m.reader = &readerState{kind: readerTranscript, title: "Transcript details", sessionID: protocol.SessionID(m.sessionID), entries: entries, index: len(entries) - 1, request: m.readerRequest, returnOffset: m.viewport.YOffset, returnFollow: m.followOutput, historyMore: m.snapshot.TranscriptMore}
+	m.reader = &readerState{workspace: m.workspace, kind: readerTranscript, title: "Transcript details", sessionID: protocol.SessionID(m.sessionID), entries: entries, index: len(entries) - 1, request: m.readerRequest, returnOffset: m.viewport.YOffset, returnFollow: m.followOutput, historyMore: m.snapshot.TranscriptMore}
 	return m.enterReaderScreen()
 }
 func (m *Model) openOutputReader(msg agentOutputMsg) tea.Cmd {
@@ -299,7 +307,7 @@ func (m *Model) openOutputReader(msg agentOutputMsg) tea.Cmd {
 		return nil
 	}
 	previous := m.reader
-	r := &readerState{kind: readerOutput, title: "Saved output", sessionID: protocol.SessionID(msg.sessionID), itemID: msg.itemID, text: msg.page.Text, rawText: msg.page.Text, pageOffset: msg.offset, next: msg.page.Next, total: msg.page.Total, more: msg.page.More, request: msg.request, returnOffset: m.viewport.YOffset, returnFollow: m.followOutput}
+	r := &readerState{workspace: m.workspace, kind: readerOutput, title: "Saved output", sessionID: protocol.SessionID(msg.sessionID), itemID: msg.itemID, text: msg.page.Text, rawText: msg.page.Text, pageOffset: msg.offset, next: msg.page.Next, total: msg.page.Total, more: msg.page.More, request: msg.request, returnOffset: m.viewport.YOffset, returnFollow: m.followOutput}
 	if previous != nil {
 		r.returnReader = previous
 		r.screenEntered = previous.screenEntered
@@ -350,7 +358,7 @@ func (m *Model) copyReaderSource() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), clipboardWriteTimeout)
 		defer cancel()
-		err := writeClipboard(ctx, writer, text)
+		err := writer.WriteAllContext(ctx, text)
 		return clipboardResultMsg{sessionID: sid, generation: generation, err: err}
 	}
 }
@@ -474,7 +482,7 @@ func (m *Model) handleReaderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
-func readerEntryPage(r *readerState) int { return 1 }
+
 func readerLinePage(r *readerState) int {
 	if r == nil {
 		return 1
@@ -533,12 +541,7 @@ func (m *Model) readerHint() string {
 	}
 	return "esc back · " + strings.TrimSuffix(r.hint(), " · esc back")
 }
-func (m *Model) readerCopyText() string {
-	if m.reader == nil {
-		return ""
-	}
-	return m.reader.sourceText()
-}
+
 func (m *Model) readerStatus() string {
 	if m.reader == nil {
 		return ""
@@ -561,4 +564,3 @@ func (m *Model) readerStatus() string {
 	}
 	return ""
 }
-func readerWidth(text string) int { return lipgloss.Width(text) }

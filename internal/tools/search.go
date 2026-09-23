@@ -2,15 +2,10 @@ package tools
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
-	"syscall"
-
-	"ccdp/internal/sandbox"
 )
 
 // ---------- Glob ----------
@@ -127,12 +122,21 @@ func NewGrepTool() *GrepTool { return &GrepTool{} }
 func (t *GrepTool) Name() string { return "Grep" }
 
 func (t *GrepTool) Description() string {
-	return `Search the contents of files for a regular expression. Supports an optional
-glob to restrict which files are searched. Returns matching lines with line
-numbers. Cap at 200 results.`
+	return `Search file contents with a regular expression (ripgrep syntax).
+Files ignored by .gitignore and VCS/dependency/cache directories are skipped.
+Output modes: "content" (default) prints matching lines with line numbers,
+"files_with_matches" prints only paths, "count" prints matches per file.
+Use -A/-B/-C for surrounding context, glob or type to restrict files, and
+head_limit/offset to page through results (200 lines by default).`
 }
 
 func (t *GrepTool) Parameters() map[string]any {
+	intArg := func(desc string) map[string]any {
+		return map[string]any{"type": "integer", "description": desc}
+	}
+	boolArg := func(desc string) map[string]any {
+		return map[string]any{"type": "boolean", "description": desc}
+	}
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -142,12 +146,30 @@ func (t *GrepTool) Parameters() map[string]any {
 			},
 			"path": map[string]any{
 				"type":        "string",
-				"description": "Optional directory to search (default: current working directory).",
+				"description": "Directory to search (default: current working directory).",
 			},
 			"glob": map[string]any{
 				"type":        "string",
-				"description": "Optional glob restricting file types, e.g. *.go or **/*.ts.",
+				"description": `Glob restricting files, e.g. "*.go" or "**/*.ts". Prefix with "!" to exclude.`,
 			},
+			"type": map[string]any{
+				"type":        "string",
+				"description": "File type to restrict the search, e.g. go, ts, py, rust, json.",
+			},
+			"output_mode": map[string]any{
+				"type":        "string",
+				"enum":        []string{grepModeContent, grepModeFiles, grepModeCount},
+				"description": "Output format (default: content).",
+			},
+			"-A":         intArg("Lines to show after each match (rg -A)."),
+			"-B":         intArg("Lines to show before each match (rg -B)."),
+			"-C":         intArg("Lines to show before and after each match (rg -C)."),
+			"-i":         boolArg("Case-insensitive search."),
+			"-n":         boolArg("Show line numbers (default: true)."),
+			"-o":         boolArg("Print only the matched part, one match per line."),
+			"multiline":  boolArg("Enable multiline mode where . matches newlines and patterns can span lines."),
+			"head_limit": intArg("Limit output to the first N lines/entries (0 uses the default 200)."),
+			"offset":     intArg("Skip the first N lines/entries before applying head_limit."),
 		},
 		"required": []string{"pattern"},
 	}
@@ -158,104 +180,79 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 		return "", err
 	}
 	pattern := StringArg(ctx.Args, "pattern", "")
-	if pattern == "" {
+	if strings.TrimSpace(pattern) == "" {
 		return "", fmt.Errorf("Grep: missing pattern")
-	}
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return "", fmt.Errorf("Grep: bad regex: %w", err)
 	}
 	base := ctx.WorkingDir
 	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
-		var err error
-		base, err = ctx.ResolveRead(rawPath)
+		resolved, err := ctx.ResolveRead(rawPath)
 		if err != nil {
 			return "", err
 		}
+		base = resolved
 	}
-	glob := StringArg(ctx.Args, "glob", "")
-
-	var globRE *regexp.Regexp
-	if glob != "" {
-		globRE = regexp.MustCompile(translateGlob(glob))
+	info, err := os.Stat(base)
+	if err != nil {
+		return "", fmt.Errorf("Grep: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("Grep: path %q is not a directory", base)
 	}
 
-	var sb strings.Builder
-	count := 0
-	const max = 200
-
-	_ = filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
-		if count >= max {
-			return filepath.SkipAll
+	mode := StringArg(ctx.Args, "output_mode", grepModeContent)
+	switch mode {
+	case grepModeContent, grepModeFiles, grepModeCount:
+	default:
+		return "", fmt.Errorf("Grep: unknown output_mode %q", mode)
+	}
+	headLimit, err := IntArgChecked(ctx.Args, "head_limit", 0)
+	if err != nil {
+		return "", fmt.Errorf("Grep: %w", err)
+	}
+	offset, err := IntArgChecked(ctx.Args, "offset", 0)
+	if err != nil {
+		return "", fmt.Errorf("Grep: %w", err)
+	}
+	contextLines := IntArg(ctx.Args, "-C", 0)
+	before := IntArg(ctx.Args, "-B", 0)
+	after := IntArg(ctx.Args, "-A", 0)
+	if contextLines > 0 {
+		if before == 0 {
+			before = contextLines
 		}
-		if err != nil || info.IsDir() {
-			return nil
-		}
-		if globRE != nil && !globRE.MatchString(info.Name()) && !globRE.MatchString(path) {
-			return nil
-		}
-		// Skip binary-ish and large files quickly. Read through a bounded
-		// reader; os.ReadFile would allocate the whole file before limits apply.
-		if info.Size() > int64(ctx.readLimit()) {
-			return nil
-		}
-		readPath := path
-		if ctx.Sandbox != nil {
-			readPath, err = ctx.Sandbox.ResolveRead(path)
-			if err != nil {
-				return nil
-			}
-		}
-		flags := os.O_RDONLY
-		if ctx.Sandbox != nil && ctx.Sandbox.CurrentMode() == sandbox.ModeStrict {
-			flags |= syscall.O_NOFOLLOW
-		}
-		f, err := os.OpenFile(readPath, flags, 0)
-		if err != nil {
-			return nil
-		}
-		data, err := io.ReadAll(io.LimitReader(f, int64(ctx.readLimit())+1))
-		_ = f.Close()
-		if err != nil || len(data) > ctx.readLimit() {
-			return nil
-		}
-		lines := strings.Split(string(data), "\n")
-		for i, line := range lines {
-			if len(line) > 1000 {
-				continue
-			}
-			if re.MatchString(line) {
-				rel, _ := filepath.Rel(base, path)
-				fmt.Fprintf(&sb, "%s:%d:%s\n", rel, i+1, line)
-				count++
-				if count >= max {
-					return filepath.SkipAll
-				}
-			}
-		}
-		return nil
-	})
-
-	return boundedToolString(ctx, fmt.Sprintf("%d match(es):\n%s", count, sb.String())), nil
-}
-
-// translateGlob converts a simple glob into a regex for matching file names.
-func translateGlob(g string) string {
-	g = strings.TrimPrefix(g, "**/")
-	var sb strings.Builder
-	sb.WriteString("^")
-	for _, r := range g {
-		switch r {
-		case '*':
-			sb.WriteString(".*")
-		case '?':
-			sb.WriteString(".")
-		default:
-			sb.WriteString(regexp.QuoteMeta(string(r)))
+		if after == 0 {
+			after = contextLines
 		}
 	}
-	sb.WriteString("$")
-	return sb.String()
+
+	req := &grepRequest{
+		pattern:    pattern,
+		base:       base,
+		outputMode: mode,
+		ignoreCase: BoolArg(ctx.Args, "-i", false),
+		multiline:  BoolArg(ctx.Args, "multiline", false),
+		onlyMatch:  BoolArg(ctx.Args, "-o", false),
+		before:     before,
+		after:      after,
+		maxLines:   headLimit,
+		offset:     offset,
+	}
+	if glob := StringArg(ctx.Args, "glob", ""); glob != "" {
+		req.globs = []string{glob}
+	}
+	if typ := StringArg(ctx.Args, "type", ""); typ != "" {
+		for _, part := range strings.Split(typ, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				req.types = append(req.types, part)
+			}
+		}
+	}
+
+	out, err := searchGrep(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	return boundedToolString(ctx, out), nil
 }
 
 // ---------- LS ----------

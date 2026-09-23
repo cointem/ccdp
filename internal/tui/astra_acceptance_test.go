@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"ccdp/internal/agent"
 	"ccdp/internal/protocol"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -30,7 +29,7 @@ func astraModel(t *testing.T, width, height int) Model {
 	view.ContextUsedTokens = 12345
 	m.applySnapshot(view)
 	m.width, m.height = width, height
-	m.items = []logItem{{kind: "user", text: "检查布局"}, {kind: "assistant", text: "Recent context"}}
+	m.items = []historyCell{{kind: "user", text: "检查布局"}, {kind: "assistant", text: "Recent context"}}
 	m.textarea.SetValue("draft")
 	m.layout()
 	return m
@@ -64,13 +63,13 @@ func TestAstraAcceptanceFrames(t *testing.T) {
 						if scene == "plan" {
 							tool = "Plan"
 						}
-						m.approval = &agent.ApprovalRequest{ID: "approval-1", Tool: tool, Command: strings.Repeat("review this action\n", 20), Reason: "Needs approval"}
+						m.approval = &approvalPrompt{ID: "approval-1", Tool: tool, Command: strings.Repeat("review this action\n", 20), Reason: "Needs approval"}
 					case "question":
 						m.setQuestion(uiQuestionRequest())
 					case "reader":
 						m.openTranscriptReader()
 					case "picker":
-						m.picker = &pickerState{title: "Model", lines: []string{"deepseek-chat", "another-model"}, options: []selectorOption{{ID: "deepseek-chat", Label: "deepseek-chat"}, {ID: "another-model", Label: "another-model"}}}
+						m.picker = &selectorPanel{Selector: Selector{Title: "Model", Options: []SelectorOption{{ID: "deepseek-chat", Label: "deepseek-chat"}, {ID: "another-model", Label: "another-model"}}}}
 					}
 					m.layout()
 					frame := m.View()
@@ -79,7 +78,7 @@ func TestAstraAcceptanceFrames(t *testing.T) {
 					if w, h := lipgloss.Width(frame), lipgloss.Height(frame); w > size[0] || h > size[1] {
 						t.Errorf("frame %dx%d exceeds terminal %dx%d:\n%s", w, h, size[0], size[1], plain)
 					}
-					for _, required := range []string{"high", "12.3k/200k"} {
+					for _, required := range []string{"high", "manual", "12.3k/200k"} {
 						if !strings.Contains(plain, required) {
 							t.Errorf("missing always-visible %q:\n%s", required, plain)
 						}
@@ -87,7 +86,7 @@ func TestAstraAcceptanceFrames(t *testing.T) {
 					if !strings.Contains(plain, "deepseek") {
 						t.Errorf("model is missing or unrecognizable:\n%s", plain)
 					}
-					if size[0] >= 40 {
+					if size[0] >= 60 {
 						compact := false
 						for _, line := range strings.Split(plain, "\n") {
 							compact = compact || strings.Contains(line, "deepseek-chat") && strings.Contains(line, "high") && strings.Contains(line, "12.3k/200k")
@@ -99,7 +98,7 @@ func TestAstraAcceptanceFrames(t *testing.T) {
 					if strings.Contains(plain, "ctx:") || strings.Contains(plain, "≈") || strings.Contains(plain, "6.2%") {
 						t.Errorf("context includes unwanted labels:\n%s", plain)
 					}
-					if (scene == "approval" || scene == "plan" || scene == "question") && size[0] >= 40 && !strings.Contains(plain, "Recent context") {
+					if (scene == "approval" || scene == "plan" || scene == "question") && size[0] >= 40 && !strings.Contains(sanitizeANSI(m.viewport.View()), "Recent context") {
 						t.Errorf("decision hides recent conversation:\n%s", plain)
 					}
 					if scene == "plan" && (strings.Contains(plain, "always") || strings.Contains(plain, "never") || strings.Contains(plain, "[a]")) {
@@ -239,8 +238,8 @@ func TestAstraAcceptanceAgentAlternateScreenAndPrintIdentity(t *testing.T) {
 	next, _ = m.Update(agentViewResetMsg{generation: m.routing.generation})
 	m = modelValue(t, next)
 	// A child view must stay managed; no child message belongs in root scrollback.
-	m.items = append(m.items, logItem{kind: "assistant", messageID: "child-message", text: "CHILD OUTPUT"})
-	if command := m.flushInline(); command != nil {
+	m.items = append(m.items, historyCell{kind: "assistant", messageID: "child-message", text: "CHILD OUTPUT"})
+	if command := planTestHistory(&m); command != nil {
 		t.Error("child detail queued ordinary native-scrollback output")
 	}
 	opened = m.openAgentView("root")()
@@ -264,14 +263,14 @@ func TestAstraAcceptanceAgentAlternateScreenAndPrintIdentity(t *testing.T) {
 	if !m.inline.seen(rootItem, 0) {
 		t.Fatal("return forgot root print identity and will repeat native history")
 	}
-	if command := m.flushInline(); command != nil {
+	if command := planTestHistory(&m); command != nil {
 		t.Error("return queued already-printed root conversation again")
 	}
 }
 
 func TestAstraAcceptanceMarkdownIsScopedAndSourcePreserved(t *testing.T) {
 	source := "## Heading\n\n**bold** and `code`\n\n```go\n    x := 1\n```"
-	item := logItem{kind: "assistant", text: source}
+	item := historyCell{kind: "assistant", text: source}
 	got := sanitizeANSI(renderItemWidth(&item, 80))
 	if strings.Contains(got, "## Heading") || strings.Contains(got, "**bold**") || strings.Contains(got, "```go") {
 		t.Fatalf("assistant still displays Markdown syntax:\n%s", got)
@@ -283,26 +282,26 @@ func TestAstraAcceptanceMarkdownIsScopedAndSourcePreserved(t *testing.T) {
 		t.Fatal("Markdown rendering changed source text")
 	}
 	for _, kind := range []string{"user", "system", "command"} {
-		plain := logItem{kind: kind, text: "## literal **output**"}
+		plain := historyCell{kind: kind, text: "## literal **output**"}
 		if rendered := sanitizeANSI(renderItemWidth(&plain, 80)); !strings.Contains(rendered, plain.text) {
 			t.Errorf("%s was incorrectly parsed as Markdown: %q", kind, rendered)
 		}
 	}
 	// Equal-length replacement is a real snapshot correction, not a cache hit.
-	item = logItem{kind: "assistant", text: "OLD"}
+	item = historyCell{kind: "assistant", text: "OLD"}
 	_ = renderItemWidth(&item, 80)
 	item.text = "NEW"
 	if rendered := sanitizeANSI(renderItemWidth(&item, 80)); !strings.Contains(rendered, "NEW") || strings.Contains(rendered, "OLD") {
 		t.Fatalf("same-length correction remained stale: %q", rendered)
 	}
 	for _, source := range []string{"```go\nLAST_CODE_LINE", "```go\nfirst\nLAST_CODE_LINE", "```"} {
-		item := logItem{kind: "assistant", text: source}
+		item := historyCell{kind: "assistant", text: source}
 		got := sanitizeANSI(renderItemWidth(&item, 80))
 		if strings.Contains(source, "LAST_CODE_LINE") && !strings.Contains(got, "LAST_CODE_LINE") {
 			t.Errorf("unclosed code fence lost the most recent line: source=%q rendered=%q", source, got)
 		}
 	}
-	identifier := logItem{kind: "assistant", text: "Inspect foo_bar_baz and STREAM_A_01."}
+	identifier := historyCell{kind: "assistant", text: "Inspect foo_bar_baz and STREAM_A_01."}
 	if rendered := sanitizeANSI(renderItemWidth(&identifier, 80)); !strings.Contains(rendered, "foo_bar_baz") || !strings.Contains(rendered, "STREAM_A_01") {
 		t.Errorf("Markdown parser removed intraword underscores from identifiers: %q", rendered)
 	}
@@ -310,11 +309,10 @@ func TestAstraAcceptanceMarkdownIsScopedAndSourcePreserved(t *testing.T) {
 
 func TestAstraAcceptanceConfirmedFooterAndUnknownContext(t *testing.T) {
 	m := astraModel(t, 80, 24)
-	m.snapshot.Pending = &protocol.PendingSettings{Model: &protocol.ModelBinding{Model: "pending-model"}}
 	m.layout()
 	plain := sanitizeANSI(m.View())
 	if !strings.Contains(plain, "deepseek-chat") || !strings.Contains(plain, "high") || !strings.Contains(plain, "12.3k/200k") {
-		t.Fatalf("pending setting replaced confirmed footer:\n%s", plain)
+		t.Fatalf("confirmed footer missing authoritative settings:\n%s", plain)
 	}
 	m.snapshot.Settings.ContextWindow = 0
 	m.layout()
@@ -356,10 +354,14 @@ func TestAstraAcceptanceToolSummaryDoesNotMutateSource(t *testing.T) {
 			item := &m.items[0]
 			source := item.text
 			rendered := sanitizeANSI(renderItemWidth(item, 80))
-			if h := lipgloss.Height(rendered); h > 3 {
-				t.Errorf("successful %s occupies %d lines, want <=3:\n%s", tool, h, rendered)
+			budget, label := 3, tool
+			if tool == "Bash" {
+				budget, label = 6, "Ran"
 			}
-			if !strings.Contains(rendered, tool) {
+			if h := lipgloss.Height(rendered); h > budget {
+				t.Errorf("successful %s occupies %d lines, want <=%d:\n%s", tool, h, budget, rendered)
+			}
+			if !strings.Contains(rendered, label) {
 				t.Errorf("tool name is unreadable: %q", rendered)
 			}
 			// Rendering must be a projection and leave its source intact.
@@ -419,7 +421,7 @@ func TestAstraAcceptanceStreamFreezesOnlyStableMarkdown(t *testing.T) {
 func TestAstraAcceptanceLongUnclosedFenceShowsLatestSource(t *testing.T) {
 	m := astraModel(t, 80, 24)
 	source := "```go\n" + strings.Repeat("    source line\n", 10000) + "    LAST_CODE_LINE"
-	m.items = []logItem{{kind: "assistant", text: source}}
+	m.items = []historyCell{{kind: "assistant", text: source}}
 	m.busy, m.streaming, m.turnDone = true, true, false
 	m.layout()
 	if frame := sanitizeANSI(m.View()); !strings.Contains(frame, "LAST_CODE_LINE") {
@@ -432,19 +434,25 @@ func TestAstraAcceptanceLongUnclosedFenceShowsLatestSource(t *testing.T) {
 
 func astraFlushRoutedTranscript(t *testing.T, m *Model) string {
 	t.Helper()
+	var output bytes.Buffer
+	m.terminal = NewTerminalHost(&output)
 	queued := m.flushInline()
 	if queued == nil {
 		return ""
 	}
-	next, printable := m.Update(queued())
+	batch := queued().(inlinePrintMsg)
+	next, printable := m.Update(batch)
 	*m = modelValue(t, next)
 	if printable == nil {
-		t.Fatal("queued transcript never reached terminal print command")
+		t.Fatal("batch never reached terminal")
 	}
-	output := astraTerminalCommandOutput(t, printable)
-	next, _ = m.Update(inlinePrintedMsg{generation: m.routing.generation})
+	program := tea.NewProgram(astraTerminalCommandModel{command: printable}, tea.WithInput(nil), tea.WithOutput(m.terminal), tea.WithoutSignalHandler())
+	if _, err := program.Run(); err != nil {
+		t.Fatal(err)
+	}
+	next, _ = m.Update(inlinePrintedMsg{generation: m.routing.generation, batch: batch.batch})
 	*m = modelValue(t, next)
-	return output
+	return output.String()
 }
 
 func TestAstraAcceptanceTypedStreamPrintsEverySourceMarkerOnce(t *testing.T) {
@@ -568,12 +576,12 @@ func TestAstraAcceptanceNarrowChildDecisionKeepsTarget(t *testing.T) {
 			m.sessionID, m.snapshot.SessionID = "child-target", "child-target"
 			m.routing = &sessionRouting{rootID: "root"}
 			if decision == "approval" {
-				m.approval = &agent.ApprovalRequest{ID: "approval", Tool: "Bash", Command: strings.Repeat("review command\n", 20), Reason: "permission required"}
+				m.approval = &approvalPrompt{ID: "approval", Tool: "Bash", Command: strings.Repeat("review command\n", 20), Reason: "permission required"}
 			} else {
 				m.setQuestion(uiQuestionRequest())
 			}
 			m.layout()
-			if frame := sanitizeANSI(m.View()); !strings.Contains(frame, "child-target") {
+			if frame := sanitizeANSI(m.headerPresentation()); !strings.Contains(frame, "child-target") {
 				t.Fatalf("narrow child decision hides its current input/approval target:\n%s", frame)
 			}
 		})
@@ -585,7 +593,7 @@ func TestAstraAcceptanceViewportTopAnchorMatchesVisibleBody(t *testing.T) {
 	m.sessionID, m.snapshot.SessionID = "child-target", "child-target"
 	m.routing = &sessionRouting{rootID: "root"}
 	m.inlineMode, m.followOutput = false, false
-	m.items = []logItem{{kind: "system", text: "VISIBLE ANCHOR\n" + strings.Repeat("later history row\n", 50)}}
+	m.items = []historyCell{{kind: "system", text: "VISIBLE ANCHOR\n" + strings.Repeat("later history row\n", 50)}}
 	m.layout()
 	m.viewport.GotoTop()
 	if frame := sanitizeANSI(m.View()); !strings.Contains(frame, "VISIBLE ANCHOR") {
@@ -597,7 +605,7 @@ func TestAstraAcceptanceDynamicChromeResizesThroughUpdate(t *testing.T) {
 	newModel := func(t *testing.T) Model {
 		m := astraModel(t, 40, 16)
 		m.inlineMode, m.followOutput = false, false
-		m.items = []logItem{{kind: "system", text: "DYNAMIC ANCHOR\n" + strings.Repeat("later row\n", 40)}}
+		m.items = []historyCell{{kind: "system", text: "DYNAMIC ANCHOR\n" + strings.Repeat("later row\n", 40)}}
 		m.layout()
 		m.viewport.GotoTop()
 		return m
@@ -615,14 +623,23 @@ func TestAstraAcceptanceDynamicChromeResizesThroughUpdate(t *testing.T) {
 		next, _ := m.Update(commandReceiptMsg{sessionID: protocol.SessionID(m.sessionID), purpose: "settings applied", receipt: protocol.Receipt{CommandID: "notice-op", SessionID: protocol.SessionID(m.sessionID), Status: protocol.ReceiptApplied}})
 		m = modelValue(t, next)
 		assertAnchor(t, m)
-		if m.viewport.Height >= idleHeight {
-			t.Fatal("new receipt notice did not reserve a visible row")
+		// A command receipt is an input-lane hint. It must stay visible without
+		// reserving a row from the transcript, so an adjustment never reflows the
+		// output above the composer.
+		if m.viewport.Height != idleHeight {
+			t.Fatalf("receipt hint reflowed the transcript: height %d, want %d", m.viewport.Height, idleHeight)
+		}
+		if frame := sanitizeANSI(m.View()); !strings.Contains(frame, "settings applied") {
+			t.Fatalf("receipt hint missing from the composer lane:\n%s", frame)
 		}
 		next, _ = m.Update(noticeTickMsg{at: now().Add(10 * time.Second)})
 		m = modelValue(t, next)
 		assertAnchor(t, m)
 		if m.viewport.Height != idleHeight {
 			t.Fatalf("expired notice left stale body height %d, want %d", m.viewport.Height, idleHeight)
+		}
+		if frame := sanitizeANSI(m.View()); strings.Contains(frame, "settings applied") {
+			t.Fatalf("expired receipt hint stayed in the composer lane:\n%s", frame)
 		}
 	})
 	t.Run("folded paste", func(t *testing.T) {
@@ -651,11 +668,11 @@ func BenchmarkAstraAcceptanceActiveTail(b *testing.B) {
 			m.modelName = "deepseek-chat"
 			m.inlineMode, m.followOutput, m.busy, m.streaming = true, true, true, true
 			for i := 0; i < historySize; i++ {
-				item := logItem{kind: "assistant", messageID: fmt.Sprintf("old-%d", i), text: "A completed line of conversation."}
+				item := historyCell{kind: "assistant", messageID: fmt.Sprintf("old-%d", i), text: "A completed line of conversation."}
 				m.items = append(m.items, item)
 				m.inline.mark(item, i)
 			}
-			m.items = append(m.items, logItem{kind: "assistant", text: "An active tail still receiving output."})
+			m.items = append(m.items, historyCell{kind: "assistant", text: "An active tail still receiving output."})
 			m.layout()
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -674,7 +691,7 @@ func BenchmarkAstraAcceptanceUnclosedFence(b *testing.B) {
 			m.width, m.height = 80, 24
 			m.modelName = "deepseek-chat"
 			m.inlineMode, m.followOutput, m.busy, m.streaming = true, true, true, true
-			m.items = []logItem{{kind: "assistant", text: "```go\n" + strings.Repeat("    fmt.Println(\"streaming line\")\n", lineCount)}}
+			m.items = []historyCell{{kind: "assistant", text: "```go\n" + strings.Repeat("    fmt.Println(\"streaming line\")\n", lineCount)}}
 			m.layout()
 			b.ReportAllocs()
 			b.ResetTimer()

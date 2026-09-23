@@ -2,6 +2,9 @@ package tui
 
 import (
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type diffLineKind uint8
@@ -173,7 +176,16 @@ func renderDiff(source string, width int) string {
 			name = "changed file"
 		}
 		rows = append(rows, styleAssistant.Bold(true).Render("✎ "+truncateDisplay(name, max(1, width-2))))
-		for _, line := range file.lines {
+		for li := 0; li < len(file.lines); li++ {
+			line := file.lines[li]
+			// Pair deletion followed directly by addition for word-level diff
+			if line.kind == diffDeletion && li+1 < len(file.lines) && file.lines[li+1].kind == diffAddition {
+				nextLine := file.lines[li+1]
+				delRow, addRow := renderDiffLineWordPair(line, nextLine, width)
+				rows = append(rows, delRow, addRow)
+				li++ // skip nextLine since processed
+				continue
+			}
 			rows = append(rows, renderDiffLine(line, width))
 		}
 	}
@@ -187,9 +199,9 @@ func renderDiffLine(line diffLine, width int) string {
 	mark, style := " ", styleAssistant
 	switch line.kind {
 	case diffAddition:
-		mark, style = "+", styleToolOK
+		mark, style = "+", styleToolOK.Background(theme.Added).Width(max(1, width))
 	case diffDeletion:
-		mark, style = "-", styleToolErr
+		mark, style = "-", styleToolErr.Background(theme.Removed).Width(max(1, width))
 	}
 	gutter := "      "
 	if line.oldNo > 0 || line.newNo > 0 {
@@ -197,7 +209,132 @@ func renderDiffLine(line diffLine, width int) string {
 	}
 	text := strings.TrimPrefix(line.text, mark)
 	row := gutter + mark + " " + text
-	return style.Render(truncateDisplay(row, max(1, width)))
+	return style.Render(ansi.Truncate(row, max(1, width), "…"))
+}
+
+type diffWordSegment struct {
+	text    string
+	changed bool
+}
+
+// tokenizeWords splits a line into alternating words and non-word tokens (spaces, symbols).
+func tokenizeWords(s string) []string {
+	if s == "" {
+		return nil
+	}
+	tokens := make([]string, 0, 8)
+	var cur strings.Builder
+	isWordChar := func(r rune) bool {
+		return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_'
+	}
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return nil
+	}
+	inWord := isWordChar(runes[0])
+	for _, r := range runes {
+		w := isWordChar(r)
+		if w != inWord {
+			tokens = append(tokens, cur.String())
+			cur.Reset()
+			inWord = w
+		}
+		cur.WriteRune(r)
+	}
+	if cur.Len() > 0 {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
+}
+
+// wordDiff computes token-level diff between oldLine and newLine using LCS.
+func wordDiff(oldText, newText string) ([]diffWordSegment, []diffWordSegment) {
+	oldTokens := tokenizeWords(oldText)
+	newTokens := tokenizeWords(newText)
+
+	// Bounded matrix: if too many tokens, fallback to unchanged
+	if len(oldTokens) > 150 || len(newTokens) > 150 {
+		return []diffWordSegment{{text: oldText, changed: false}}, []diffWordSegment{{text: newText, changed: false}}
+	}
+
+	m, n := len(oldTokens), len(newTokens)
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+	for i := 0; i < m; i++ {
+		for j := 0; j < n; j++ {
+			if oldTokens[i] == newTokens[j] {
+				dp[i+1][j+1] = dp[i][j] + 1
+			} else if dp[i+1][j] >= dp[i][j+1] {
+				dp[i+1][j+1] = dp[i+1][j]
+			} else {
+				dp[i+1][j+1] = dp[i][j+1]
+			}
+		}
+	}
+
+	// Backtrack to find unchanged vs changed tokens
+	oldChanged := make([]bool, m)
+	newChanged := make([]bool, n)
+	i, j := m, n
+	for i > 0 || j > 0 {
+		if i > 0 && j > 0 && oldTokens[i-1] == newTokens[j-1] {
+			oldChanged[i-1] = false
+			newChanged[j-1] = false
+			i--
+			j--
+		} else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
+			newChanged[j-1] = true
+			j--
+		} else if i > 0 && (j == 0 || dp[i][j-1] < dp[i-1][j]) {
+			oldChanged[i-1] = true
+			i--
+		}
+	}
+
+	buildSegments := func(tokens []string, changed []bool) []diffWordSegment {
+		segs := make([]diffWordSegment, 0, len(tokens))
+		for k, t := range tokens {
+			segs = append(segs, diffWordSegment{text: t, changed: changed[k]})
+		}
+		return segs
+	}
+
+	return buildSegments(oldTokens, oldChanged), buildSegments(newTokens, newChanged)
+}
+
+func renderDiffLineWordPair(delLine, addLine diffLine, width int) (string, string) {
+	delGutter := "      "
+	if delLine.oldNo > 0 || delLine.newNo > 0 {
+		delGutter = formatDiffNumber(delLine.oldNo) + " " + formatDiffNumber(delLine.newNo) + " "
+	}
+	addGutter := "      "
+	if addLine.oldNo > 0 || addLine.newNo > 0 {
+		addGutter = formatDiffNumber(addLine.oldNo) + " " + formatDiffNumber(addLine.newNo) + " "
+	}
+
+	delRaw := strings.TrimPrefix(delLine.text, "-")
+	addRaw := strings.TrimPrefix(addLine.text, "+")
+
+	delSegs, addSegs := wordDiff(delRaw, addRaw)
+
+	renderSegs := func(gutter, mark string, baseStyle, highlightStyle lipgloss.Style, segs []diffWordSegment) string {
+		var row strings.Builder
+		row.WriteString(baseStyle.Render(gutter + mark + " "))
+		for _, s := range segs {
+			if s.changed {
+				row.WriteString(highlightStyle.Render(s.text))
+			} else {
+				row.WriteString(baseStyle.Render(s.text))
+			}
+		}
+		return ansi.Truncate(row.String(), max(1, width), "…")
+	}
+
+	delOut := renderSegs(delGutter, "-", styleToolErr, styleDiffRemovedWord, delSegs)
+	addOut := renderSegs(addGutter, "+", styleToolOK, styleDiffAddedWord, addSegs)
+	return delOut, addOut
 }
 
 func formatDiffNumber(value int) string {

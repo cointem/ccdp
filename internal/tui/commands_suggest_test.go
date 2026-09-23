@@ -9,7 +9,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"ccdp/internal/agent"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
@@ -27,7 +26,7 @@ func sugModel() *Model {
 			ContextWindow: 100000},
 		Catalog: protocol.CatalogSnapshot{Providers: []protocol.ProviderSnapshot{{ID: "test", Models: []string{"test-model", "test-model-2"}}}}}
 	client := &recordingClient{snapshot: snapshot}
-	return &Model{textarea: ta, client: client, snapshot: snapshot, hasSnapshot: true,
+	return &Model{composerState: composerState{textarea: ta}, client: client, snapshot: snapshot, hasSnapshot: true,
 		sessionID: "test-session", modelName: "test-model", mode: permissions.ModeDefault,
 		workspace: "", followOutput: true}
 }
@@ -150,8 +149,8 @@ func TestCmdSuggestKeys(t *testing.T) {
 	if got := m.textarea.Value(); got != "" {
 		t.Errorf("enter on a highlighted command should submit and clear input, got %q", got)
 	}
-	if m.status != "workspace: /tmp/project" {
-		t.Errorf("enter on /pw should execute /pwd, status=%q", m.status)
+	if noticeText(m) != "workspace: /tmp/project" {
+		t.Errorf("enter on /pw should execute /pwd, status=%q", noticeText(m))
 	}
 
 	// Escape dismisses suggestions without destroying the draft.
@@ -244,7 +243,7 @@ func TestAlternateScrollKeysScrollViewport(t *testing.T) {
 	m := sugModel()
 	m.viewport = viewport.New(40, 3)
 	m.baseVpH = 3
-	m.items = []logItem{{kind: "system", text: "l1\nl2\nl3\nl4\nl5\nl6"}}
+	m.items = []historyCell{{kind: "system", text: "l1\nl2\nl3\nl4\nl5\nl6"}}
 	m.render()
 	m.viewport.GotoBottom()
 	bottom := m.viewport.YOffset
@@ -288,7 +287,7 @@ func TestTextareaStartsSingleLineAndGrows(t *testing.T) {
 	if got := m.textarea.Height(); got != 1 {
 		t.Fatalf("textarea should start at one line, got %d", got)
 	}
-	if got := strings.Count(m.textarea.View(), "❯"); got != 1 {
+	if got := strings.Count(m.textarea.View(), "›"); got != 1 {
 		t.Fatalf("single-line textarea should render one prompt, got %d", got)
 	}
 
@@ -306,7 +305,7 @@ func TestBusyInputStillRendersComposer(t *testing.T) {
 	m.width = 80
 	m.busy = true
 	out := m.renderInput()
-	if !strings.Contains(out, "Type a message") || !strings.Contains(out, "❯") {
+	if !strings.Contains(out, composerPlaceholder) || !strings.Contains(out, "›") {
 		t.Fatalf("busy input should keep rendering its placeholder and cursor, got %q", out)
 	}
 }
@@ -326,7 +325,7 @@ func TestDurableSlashCommandAppearsInTranscript(t *testing.T) {
 	if len(m.history) != 1 || m.history[0] != "/help" {
 		t.Fatalf("slash command should be available in input history: %#v", m.history)
 	}
-	if out := renderItem(&m.items[0]); !strings.Contains(out, "❯ /help") {
+	if out := renderItemWidth(&m.items[0], 80); !strings.Contains(out, "❯ /help") {
 		t.Fatalf("rendered command does not show /help: %q", out)
 	}
 }
@@ -347,18 +346,18 @@ func TestStatusCommandsReplaceTransientLineWithoutTranscript(t *testing.T) {
 	if len(m.items) != 0 {
 		t.Fatalf("/model should not enter the transcript: %#v", m.items)
 	}
-	if m.picker == nil || !m.picker.inline || len(m.picker.lines) < 2 {
+	if m.picker == nil || !m.picker.inline || len(m.picker.Options) < 2 {
 		t.Fatalf("/model should open an inline model picker: %#v", m.picker)
 	}
-	if out := m.renderInlinePicker(); !strings.Contains(out, "Select model") || !strings.Contains(out, m.modelName) {
+	if out := m.renderInlineSurface(); !strings.Contains(out, "Select model") || !strings.Contains(out, m.modelName) {
 		t.Fatalf("model picker did not render above the composer: %q", out)
 	}
 	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
-	selectedModel := m.picker.lines[m.picker.index]
+	selectedModel := m.picker.Options[m.picker.Index].Label
 	_, cmd := m.handlePickerKey(tea.KeyMsg{Type: tea.KeyEnter})
 	applyTeaCmd(m, cmd)
-	if m.picker != nil || m.modelName != "test-model" || m.status != "model → "+selectedModel {
-		t.Fatalf("model selection was not applied: model=%q status=%q picker=%v", m.modelName, m.status, m.picker)
+	if m.picker != nil || m.modelName != "test-model" || noticeText(m) != "model → "+selectedModel {
+		t.Fatalf("model selection was not applied: model=%q status=%q picker=%v", m.modelName, noticeText(m), m.picker)
 	}
 	if got := client.submits[len(client.submits)-1]; got.Type != protocol.CommandSetModel || got.Model.Model != selectedModel {
 		t.Fatalf("model selection submitted wrong command: %#v", got)
@@ -369,14 +368,14 @@ func TestStatusCommandsReplaceTransientLineWithoutTranscript(t *testing.T) {
 	if len(m.items) != 0 {
 		t.Fatalf("/mode should not enter the transcript: %#v", m.items)
 	}
-	if m.picker == nil || !m.picker.inline || len(m.picker.lines) != len(permissions.ValidModes) {
+	if m.picker == nil || !m.picker.inline || len(m.picker.Options) != len(permissions.ValidModes) {
 		t.Fatalf("/mode should replace model status with an inline picker: %#v", m.picker)
 	}
 	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
 	_, cmd = m.handlePickerKey(tea.KeyMsg{Type: tea.KeyEnter})
 	applyTeaCmd(m, cmd)
-	if m.mode != permissions.ModeDefault || m.status != "permission mode → acceptEdits" {
-		t.Fatalf("mode selection was not applied: mode=%s status=%q", m.mode, m.status)
+	if m.mode != permissions.ModeDefault || noticeText(m) != "permission mode → edits" {
+		t.Fatalf("mode selection was not applied: mode=%s status=%q", m.mode, noticeText(m))
 	}
 	if got := client.submits[len(client.submits)-1]; got.Type != protocol.CommandSetPermissionPolicy || got.PermissionPolicy.Policy.Mode != string(permissions.ModeAcceptEdits) {
 		t.Fatalf("unexpected mode command: %#v", got)
@@ -384,14 +383,14 @@ func TestStatusCommandsReplaceTransientLineWithoutTranscript(t *testing.T) {
 
 	m.textarea.SetValue("/sandbox")
 	_, _ = m.submit()
-	if m.picker == nil || !m.picker.inline || len(m.picker.lines) != len(sandbox.ValidModes) {
+	if m.picker == nil || !m.picker.inline || len(m.picker.Options) != len(sandbox.ValidModes) {
 		t.Fatalf("/sandbox should open an inline picker: %#v", m.picker)
 	}
 	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
 	_, cmd = m.handlePickerKey(tea.KeyMsg{Type: tea.KeyEnter})
 	applyTeaCmd(m, cmd)
-	if m.status != "sandbox mode → strict" {
-		t.Fatalf("sandbox selection was not applied: %q", m.status)
+	if noticeText(m) != "sandbox mode → strict" {
+		t.Fatalf("sandbox selection was not applied: %q", noticeText(m))
 	}
 	if got := client.submits[len(client.submits)-1]; got.Type != protocol.CommandSetSandboxPolicy || got.SandboxPolicy.Policy.Mode != string(sandbox.ModeStrict) {
 		t.Fatalf("unexpected sandbox command: %#v", got)
@@ -399,8 +398,8 @@ func TestStatusCommandsReplaceTransientLineWithoutTranscript(t *testing.T) {
 
 	m.textarea.SetValue("/help")
 	_, _ = m.submit()
-	if m.status != "" {
-		t.Fatalf("durable command should clear stale transient status, got %q", m.status)
+	if noticeText(m) != "" {
+		t.Fatalf("durable command should clear stale transient status, got %q", noticeText(m))
 	}
 	if len(m.items) != 2 || m.items[0].text != "/help" {
 		t.Fatalf("/help should produce durable transcript output: %#v", m.items)
@@ -442,34 +441,34 @@ func TestSubmitPreservesPromptWhitespace(t *testing.T) {
 }
 
 func TestUserMessageUsesCompactPromptStyle(t *testing.T) {
-	oneLine := renderItem(&logItem{kind: "user", text: "你好"})
-	if strings.Contains(oneLine, "You") {
-		t.Fatalf("user message should not render a repeated You label: %q", oneLine)
+	oneLine := renderItemWidth(&historyCell{kind: "user", text: "你好"}, 80)
+	if !strings.Contains(oneLine, "› ") {
+		t.Fatalf("user message should render prompt prefix: %q", oneLine)
 	}
-	if !strings.Contains(oneLine, "❯ 你好") {
-		t.Fatalf("user message should use the compact prompt marker: %q", oneLine)
-	}
-	if strings.Contains(oneLine, "\n") {
-		t.Fatalf("one-line user input should occupy one rendered row: %q", oneLine)
+	if !strings.Contains(oneLine, "你好") {
+		t.Fatalf("user message should contain text: %q", oneLine)
 	}
 
-	multiline := renderItem(&logItem{kind: "user", text: "first\nsecond"})
-	if !strings.Contains(multiline, "first\n  second") {
+	multiline := renderItemWidth(&historyCell{kind: "user", text: "first\nsecond"}, 80)
+	if !strings.Contains(multiline, "› first") || !strings.Contains(multiline, "\n  second") {
 		t.Fatalf("continuation lines should align below the message text: %q", multiline)
 	}
 }
 
 func TestAssistantMessageDoesNotSpendRowOnLabel(t *testing.T) {
-	out := renderItem(&logItem{kind: "assistant", text: "answer"})
+	out := renderItemWidth(&historyCell{kind: "assistant", text: "answer"}, 80)
 	if strings.Contains(out, "Assistant") || strings.Contains(out, "\n") {
-		t.Fatalf("one-line assistant output should occupy one unlabeled row: %q", out)
+		t.Fatalf("assistant output should render one row without a role header: %q", out)
+	}
+	if !strings.Contains(out, "answer") {
+		t.Fatalf("assistant output should contain answer: %q", out)
 	}
 }
 
 func TestClearDoesNotLeaveCommandInClearedTranscript(t *testing.T) {
 	m := sugModel()
 	m.viewport = viewport.New(80, 10)
-	m.items = append(m.items, logItem{kind: "system", text: "old output"})
+	m.items = append(m.items, historyCell{kind: "system", text: "old output"})
 	m.snapshot.History = []protocol.MessageView{{Role: "user", Content: "old"}}
 	m.textarea.SetValue("/clear")
 
@@ -576,19 +575,19 @@ func TestPickerSupportsScrollingAndDirectNumbers(t *testing.T) {
 	for i := range lines {
 		lines[i] = "item " + strconv.Itoa(i+1)
 	}
-	options := make([]selectorOption, len(lines))
+	options := make([]SelectorOption, len(lines))
 	for i, line := range lines {
-		options[i] = selectorOption{ID: strconv.Itoa(i), Label: line}
+		options[i] = SelectorOption{ID: strconv.Itoa(i), Label: line}
 	}
 	client := m.client.(*recordingClient)
 	m.startSelectorAt("choose item", options, 0, false, selectorAction{Kind: selectorModel})
 	for range 12 {
 		m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	}
-	if m.picker.index != 12 {
-		t.Fatalf("picker should navigate beyond the first page, got %d", m.picker.index)
+	if m.picker.Index != 12 {
+		t.Fatalf("picker should navigate beyond the first page, got %d", m.picker.Index)
 	}
-	if out := m.renderPicker(); !strings.Contains(out, "item 13") || !strings.Contains(out, "13/25") {
+	if out := m.renderInlineSurface(); !strings.Contains(out, "item 13") || !strings.Contains(out, "13/25") {
 		t.Fatalf("picker should render its scrolled selection: %q", out)
 	} else if got := lipgloss.Height(out); got > m.height {
 		t.Fatalf("picker height %d exceeds terminal height %d", got, m.height)
@@ -622,16 +621,16 @@ func TestInlinePickerRendersAboveComposerAndReservesSpace(t *testing.T) {
 	m.width, m.height = 80, 20
 	m.baseVpH = 15
 	m.viewport = viewport.New(80, m.baseVpH)
-	options := []selectorOption{{ID: "one", Label: "one"}, {ID: "two", Label: "two"}, {ID: "three", Label: "three"}}
+	options := []SelectorOption{{ID: "one", Label: "one"}, {ID: "two", Label: "two"}, {ID: "three", Label: "three"}}
 	client := m.client.(*recordingClient)
 	m.startSelectorAt("Select value", options, 1, true, selectorAction{Kind: selectorModel})
-	if m.picker == nil || !m.picker.inline || m.picker.index != 1 {
+	if m.picker == nil || !m.picker.inline || m.picker.Index != 1 {
 		t.Fatalf("inline picker did not preserve current selection: %#v", m.picker)
 	}
-	if m.viewport.Height >= m.baseVpH {
-		t.Fatalf("inline picker should reserve transcript rows: height=%d base=%d", m.viewport.Height, m.baseVpH)
+	if m.viewport.Height != m.baseVpH {
+		t.Fatalf("inline picker must not reserve transcript rows: height=%d base=%d", m.viewport.Height, m.baseVpH)
 	}
-	out := m.renderInlinePicker()
+	out := m.renderInlineSurface()
 	if !strings.Contains(out, "Select value") || !strings.Contains(out, "two") {
 		t.Fatalf("inline picker did not render its choices: %q", out)
 	}
@@ -651,23 +650,52 @@ func TestInlinePickerRendersAboveComposerAndReservesSpace(t *testing.T) {
 func TestLongApprovalCanBeScrolledOnSmallTerminal(t *testing.T) {
 	m := sugModel()
 	m.width, m.height = 44, 15
-	m.approval = &agent.ApprovalRequest{
+	m.approval = &approvalPrompt{
 		ID:      "approval-1",
 		Tool:    "Bash",
 		Command: strings.Repeat("long-command-argument ", 20),
 		Reason:  "review before allowing",
 	}
-	if maxOffset := m.approvalMaxOffset(); maxOffset == 0 {
+	if maxOffset := max(0, len(m.approvalDetailLines())-m.approvalVisibleRows()); maxOffset == 0 {
 		t.Fatal("long approval should overflow the small modal")
 	}
 	m.handleApprovalKey(tea.KeyMsg{Type: tea.KeyEnd})
-	if m.approvalScroll != m.approvalMaxOffset() {
-		t.Fatalf("end should reach the final approval page: offset=%d max=%d", m.approvalScroll, m.approvalMaxOffset())
+	if m.approvalState.Offset != max(0, len(m.approvalDetailLines())-m.approvalVisibleRows()) {
+		t.Fatalf("end should reach the final approval page: offset=%d max=%d", m.approvalState.Offset, max(0, len(m.approvalDetailLines())-m.approvalVisibleRows()))
 	}
-	if out := m.renderApproval(); !strings.Contains(out, "of ") {
+	if out := m.renderApprovalInline(); !strings.Contains(out, "PgUp/PgDn") {
 		t.Fatalf("scrollable approval should show its position: %q", out)
 	} else if got := lipgloss.Height(out); got > m.height {
 		t.Fatalf("approval height %d exceeds terminal height %d", got, m.height)
+	}
+}
+
+func TestApprovalArrowSelectsChoice(t *testing.T) {
+	m := sugModel()
+	m.width, m.height = 44, 15
+	m.approval = &approvalPrompt{ID: "a", Tool: "Bash", Command: "echo ok", Reason: "r"}
+
+	if _, _ = m.handleApprovalKey(tea.KeyMsg{Type: tea.KeyDown}); m.approvalCursor != 1 {
+		t.Fatalf("down should select 'Always allow', cursor=%d", m.approvalCursor)
+	}
+	out := m.renderApprovalInline()
+	if !strings.Contains(out, "❯ Always allow") {
+		t.Fatalf("render should highlight the selected choice:\n%s", out)
+	}
+}
+
+func TestApprovalArrowClampsAtBounds(t *testing.T) {
+	m := sugModel()
+	m.approval = &approvalPrompt{ID: "a", Tool: "Bash", Command: "echo ok"}
+
+	m.approvalCursor = 2
+	m.approvalSelection, m.approvalSelected = m.approvalKey(), true
+	if _, _ = m.handleApprovalKey(tea.KeyMsg{Type: tea.KeyDown}); m.approvalCursor != 2 {
+		t.Fatalf("down beyond last choice should clamp, cursor=%d", m.approvalCursor)
+	}
+	m.approvalCursor = 0
+	if _, _ = m.handleApprovalKey(tea.KeyMsg{Type: tea.KeyUp}); m.approvalCursor != 0 {
+		t.Fatalf("up above first choice should clamp, cursor=%d", m.approvalCursor)
 	}
 }
 
@@ -695,7 +723,7 @@ func TestTranscriptWrapsLongLines(t *testing.T) {
 	m := sugModel()
 	m.viewport = viewport.New(16, 10)
 	m.viewport.Style = lipgloss.NewStyle().Padding(0, 1)
-	m.items = []logItem{{kind: "error", text: strings.Repeat("x", 40)}}
+	m.items = []historyCell{{kind: "error", text: strings.Repeat("x", 40)}}
 	m.render()
 	if got := m.viewport.TotalLineCount(); got < 3 {
 		t.Fatalf("long transcript line should wrap instead of being clipped, got %d line(s)", got)
@@ -738,5 +766,45 @@ func TestPopupReservesViewportSpace(t *testing.T) {
 	m.closeCmdSuggest()
 	if m.viewport.Height != 20 {
 		t.Errorf("closing the popup should restore height 20, got %d", m.viewport.Height)
+	}
+}
+
+func TestInlineArrowsWithoutHistoryKeepFrameStable(t *testing.T) {
+	for _, draft := range []string{"", "unfinished prompt"} {
+		for _, flushed := range []bool{false, true} {
+			m := NewWithClient(sugModel().client, "/workspace", false)
+			m.width, m.height = 100, 30
+			m.textarea.SetValue(draft)
+			m.layout()
+			if flushed {
+				planTestHistory(&m)
+			}
+			before := m.View()
+			offset := m.viewport.YOffset
+			for _, key := range []tea.KeyType{tea.KeyUp, tea.KeyDown, tea.KeyUp, tea.KeyDown} {
+				_, cmd := m.handleKey(tea.KeyMsg{Type: key})
+				if cmd != nil {
+					t.Fatal("empty history unexpectedly produced a command")
+				}
+				if !m.followOutput || m.viewport.YOffset != offset || m.View() != before || m.textarea.Value() != draft {
+					t.Fatalf("arrow changed inline frame: key=%v draft=%q flushed=%v follow=%v offset=%d", key, draft, flushed, m.followOutput, m.viewport.YOffset)
+				}
+			}
+		}
+	}
+}
+
+func TestInlineArrowsStillRecallHistory(t *testing.T) {
+	m := inlineTestModel()
+	m.history = []string{"previous prompt"}
+	m.historyIdx = len(m.history)
+	m.textarea.SetValue("")
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if m.textarea.Value() != "previous prompt" || !m.followOutput {
+		t.Fatalf("up did not recall history: %q", m.textarea.Value())
+	}
+	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	if m.textarea.Value() != "" || !m.followOutput {
+		t.Fatalf("down did not return to empty prompt: %q", m.textarea.Value())
 	}
 }

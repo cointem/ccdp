@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 	"ccdp/internal/tools"
 )
@@ -597,11 +598,13 @@ func (m *Manager) ToolNames() map[string][]string {
 }
 
 // RegisterTools wraps every advertised tool as a tools.Tool and registers it
-// into the registry under the "mcp" scope. On name collisions between servers,
-// the first registered server wins. The registry reference is kept so a
-// server's notifications/tools/list_changed can re-sync at runtime, and so a
-// dead server's tools are unregistered instead of lingering (a call into a
-// dead server would just fail with "server exited" forever).
+// into the registry under the "mcp" scope. Each tool is published under its
+// qualified name (`mcp__<server>__<tool>`), so a server can never shadow a
+// built-in tool or another server's tool by advertising a colliding raw name.
+// The registry reference is kept so a server's notifications/tools/list_changed
+// can re-sync at runtime, and so a dead server's tools are unregistered instead
+// of lingering (a call into a dead server would just fail with "server exited"
+// forever).
 func (m *Manager) RegisterTools(reg *tools.Registry) {
 	if reg == nil {
 		return
@@ -682,7 +685,11 @@ type mcpTool struct {
 	def    ToolDef
 }
 
-func (t *mcpTool) Name() string { return t.def.Name }
+// Name returns the qualified registry identity (`mcp__<server>__<tool>`), never
+// the raw server-supplied name. Qualifying the name is what prevents a server
+// from shadowing a built-in tool or another server's tool by advertising a
+// colliding name; the raw name (t.def.Name) is still what goes back on the wire.
+func (t *mcpTool) Name() string { return protocol.MCPToolName(t.client.Name(), t.def.Name) }
 
 func (t *mcpTool) Description() string {
 	d := t.def.Description

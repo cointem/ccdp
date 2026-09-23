@@ -78,7 +78,7 @@ func TestImagePasteSubmitRetryAndHistory(t *testing.T) {
 		t.Fatal("retry changed command/input identity or bytes")
 	}
 	m.applyReceipt(protocol.Receipt{CommandID: sent.ID, Status: protocol.ReceiptApplied}, "")
-	if len(m.pendingImages) != 0 {
+	if m.pendingSubmissionCount() != 0 {
 		t.Fatal("successful send retained pending images")
 	}
 	m.historyPrev()
@@ -153,14 +153,14 @@ func TestImagePasteFailureAndTextFallback(t *testing.T) {
 	m.clipboardReader = fakeClipboardReader{content: ClipboardContent{Text: "hello\n/world"}}
 	read := m.pasteClipboard()
 	m.applyClipboardRead(read().(clipboardReadMsg))
-	if m.textarea.Value() != "hello\n/world" || len(m.pendingSubmissions) > 0 {
+	if m.textarea.Value() != "hello\n/world" || m.pendingSubmissionCount() > 0 {
 		t.Fatal("text paste was not literal")
 	}
 	pasteTestImage(t, &m)
 	m.clipboardReader = fakeClipboardReader{err: errors.New("clipboard unavailable")}
 	read = m.pasteClipboard()
 	m.applyClipboardRead(read().(clipboardReadMsg))
-	if len(m.inputImages) != 1 || !strings.Contains(m.status, "paste failed") {
+	if len(m.inputImages) != 1 || !strings.Contains(noticeText(&m), "paste failed") {
 		t.Fatal("failed paste altered draft")
 	}
 	_, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ordinary paste"), Paste: true})
@@ -175,12 +175,15 @@ func TestImagePasteLimitsAndFailedDraftIsolation(t *testing.T) {
 		pasteTestImage(t, &m)
 	}
 	pasteTestImage(t, &m)
-	if len(m.inputImages) != protocol.MaxInputImages || !strings.Contains(m.status, "at most") {
+	if len(m.inputImages) != protocol.MaxInputImages || !strings.Contains(noticeText(&m), "at most") {
 		t.Fatal("image count not bounded")
 	}
 	_, _ = m.submit()
 	pasteTestImage(t, &m)
-	for id := range m.pendingSubmissions {
+	for id, op := range m.operations {
+		if !op.Recoverable {
+			continue
+		}
 		m.restoreFailedSubmission(id)
 		if len(m.inputImages) != 1 || len(m.retryImages) != protocol.MaxInputImages {
 			t.Fatal("failure overwrote new image draft")

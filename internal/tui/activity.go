@@ -187,15 +187,6 @@ func (m *Model) beginActivity(commandID protocol.CommandID, operationID protocol
 		OperationID: operationID, Phase: phase, Label: label, Detail: detail, StartedAt: when, UpdatedAt: when}
 }
 
-func (m *Model) activityForCommand(command protocol.Command, purpose string) Activity {
-	phase := ActivitySubmitting
-	label := "正在提交"
-	if command.Type == protocol.CommandSubmitInput {
-		label = "正在提交消息"
-	}
-	return Activity{SessionID: command.SessionID, CommandID: command.ID, Phase: phase, Label: label, Detail: purpose}
-}
-
 func (m *Model) updateActivityFromEvent(ev protocol.EventView) {
 	if ev.SessionID != "" && ev.SessionID.String() != m.sessionID {
 		return
@@ -254,10 +245,19 @@ func (m *Model) finishActivity(commandID protocol.CommandID, phase ActivityPhase
 	if commandID != "" && m.activity.CommandID != "" && m.activity.CommandID != commandID {
 		return
 	}
+	// A runtime event with no command owner is newer and more authoritative
+	// than a late UI command receipt. In particular, an approval receipt must
+	// not replace a tool-running activity that has already followed it.
+	if commandID != "" && m.activity.CommandID == "" && m.activity.Active() {
+		return
+	}
 	when := now()
 	m.activity.CommandID = commandID
 	m.activity.Phase = phase
 	m.activity.Detail = detail
+	if phase == ActivityCompleted {
+		m.activity.Label = ""
+	}
 	m.activity.UpdatedAt = when
 	if m.activity.StartedAt.IsZero() {
 		m.activity.StartedAt = when

@@ -232,7 +232,7 @@ func TestPreparedCallAdmissionKeepsUndescribedProviderCompatible(t *testing.T) {
 	}
 }
 
-func TestPreparedCallMaterializesDefaultOutputReservation(t *testing.T) {
+func TestPreparedCallKeepsEstimatedReservationOffWire(t *testing.T) {
 	provider := &boundedPreparedTestProvider{
 		preparedTestProvider: preparedTestProvider{name: "bounded"},
 		caps:                 Capabilities{ContextWindow: 100, SystemRole: true},
@@ -249,8 +249,8 @@ func TestPreparedCallMaterializesDefaultOutputReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if wire.MaxTokens == nil || *wire.MaxTokens != 25 {
-		t.Fatalf("default output reservation = %v, want 25 for a 100-token window", wire.MaxTokens)
+	if wire.MaxTokens != nil {
+		t.Fatalf("estimated reservation leaked onto wire: %v", wire.MaxTokens)
 	}
 	budget, err := AdmitRequest(provider, wire)
 	if err != nil {
@@ -262,8 +262,8 @@ func TestPreparedCallMaterializesDefaultOutputReservation(t *testing.T) {
 	if _, err := call.Stream(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if provider.got.MaxTokens == nil || *provider.got.MaxTokens != 25 {
-		t.Fatalf("provider received max_tokens = %v, want 25", provider.got.MaxTokens)
+	if provider.got.MaxTokens != nil {
+		t.Fatalf("provider received implicit max_tokens = %v", provider.got.MaxTokens)
 	}
 }
 
@@ -341,3 +341,19 @@ func TestAdmitRequestProviderImageReserveOverridesDefault(t *testing.T) {
 }
 
 func intPtrForTest(value int) *int { return &value }
+
+func TestPreparedCallPreservesExplicitOutputCap(t *testing.T) {
+	provider := &boundedPreparedTestProvider{preparedTestProvider: preparedTestProvider{name: "bounded"}, caps: Capabilities{ContextWindow: 1000000, Reasoning: true}}
+	cap := 32768
+	call, err := NewPreparedCall(provider, provider.Name(), "", CompletionRequest{Model: "m", MaxTokens: &cap})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer call.Close()
+	if _, err := call.Stream(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if provider.got.MaxTokens == nil || *provider.got.MaxTokens != cap {
+		t.Fatalf("explicit cap changed: %v", provider.got.MaxTokens)
+	}
+}

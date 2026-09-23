@@ -34,6 +34,30 @@ func (id StepID) String() string      { return string(id) }
 func (id AttemptID) String() string   { return string(id) }
 func (id CallID) String() string      { return string(id) }
 
+// MCPToolNamePrefix marks a registry name as belonging to a remote Model
+// Context Protocol (MCP) server. Qualifying every MCP tool as
+// `mcp__<server>__<tool>` (mirroring Claude Code and Codex) makes it impossible
+// for a server to shadow a built-in tool — or another server's tool — simply by
+// advertising a colliding name, and lets permission logic distinguish a
+// remote-provided tool from a local one by prefix alone.
+const MCPToolNamePrefix = "mcp__"
+
+// mcpToolNameSeparator divides the server segment from the tool segment inside
+// a qualified MCP tool name.
+const mcpToolNameSeparator = "__"
+
+// MCPToolName returns the namespaced registry name for a tool advertised by an
+// MCP server. The raw tool name is still what goes back to the server on the
+// wire; this qualified name is only the local registry/permission identity.
+func MCPToolName(server, tool string) string {
+	return MCPToolNamePrefix + server + mcpToolNameSeparator + tool
+}
+
+// IsMCPToolName reports whether a tool name is a namespaced MCP tool name.
+func IsMCPToolName(name string) bool {
+	return strings.HasPrefix(name, MCPToolNamePrefix)
+}
+
 // Revision is the independently advancing version set exposed to clients.
 // LogSeq is the durable ordering watermark. The other values scope prepared
 // work and UI views.
@@ -636,25 +660,18 @@ type ModelBinding struct {
 }
 
 type SettingsSnapshot struct {
-	ReasoningEffort string           `json:"reasoning_effort,omitempty"`
-	Verbosity       string           `json:"verbosity,omitempty"`
-	Revision        uint64           `json:"revision"`
-	Model           ModelBinding     `json:"model"`
-	ExecutionMode   ExecutionMode    `json:"execution_mode"`
-	Permission      PermissionPolicy `json:"permission"`
-	Sandbox         SandboxPolicy    `json:"sandbox"`
-	ContextWindow   int              `json:"context_window"`
-	MaxReplyTokens  int              `json:"max_reply_tokens"`
-	MaxTurns        int              `json:"max_turns"`
-	MaxBudgetUSD    float64          `json:"max_budget_usd"`
-}
-
-type PendingSettings struct {
-	Revision      uint64            `json:"revision"`
-	Model         *ModelBinding     `json:"model,omitempty"`
-	ExecutionMode *ExecutionMode    `json:"execution_mode,omitempty"`
-	Permission    *PermissionPolicy `json:"permission,omitempty"`
-	Sandbox       *SandboxPolicy    `json:"sandbox,omitempty"`
+	ReasoningEffort  string           `json:"reasoning_effort,omitempty"`
+	Verbosity        string           `json:"verbosity,omitempty"`
+	Revision         uint64           `json:"revision"`
+	Model            ModelBinding     `json:"model"`
+	ExecutionMode    ExecutionMode    `json:"execution_mode"`
+	Permission       PermissionPolicy `json:"permission"`
+	Sandbox          SandboxPolicy    `json:"sandbox"`
+	ContextWindow    int              `json:"context_window"`
+	CompactThreshold float64          `json:"compact_threshold,omitempty"`
+	MaxOutputTokens  int              `json:"max_output_tokens"`
+	MaxTurns         int              `json:"max_turns"`
+	MaxBudgetUSD     float64          `json:"max_budget_usd"`
 }
 
 type ProviderSnapshot struct {
@@ -686,12 +703,22 @@ type StepSnapshot struct {
 	Catalog   CatalogSnapshot  `json:"catalog"`
 }
 
+// CacheStats counts only requests owned by this session, excluding delegated work.
+type CacheStats struct {
+	InputTokens         int  `json:"input_tokens"`
+	CachedTokens        int  `json:"cached_tokens"`
+	ReportedInputTokens int  `json:"reported_input_tokens"`
+	Tracking            bool `json:"tracking,omitempty"`
+	UnknownHistory      bool `json:"unknown_history,omitempty"`
+}
+
 type UsageSnapshot struct {
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	CachedTokens int     `json:"cached_tokens,omitempty"`
-	Cost         float64 `json:"cost"`
-	TurnCount    int     `json:"turn_count"`
+	Cache        CacheStats `json:"cache,omitempty"`
+	InputTokens  int        `json:"input_tokens"`
+	OutputTokens int        `json:"output_tokens"`
+	CachedTokens int        `json:"cached_tokens,omitempty"`
+	Cost         float64    `json:"cost"`
+	TurnCount    int        `json:"turn_count"`
 }
 
 // TurnOutcome is the recoverable terminal state of the latest turn. Watch
@@ -713,11 +740,21 @@ type TurnOutcome struct {
 	Error  string            `json:"error,omitempty"`
 }
 
+type MessageViewToolCall struct {
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+}
+
+// MessageView is the credential-free snapshot of one conversation message. The
+// snapshot deliberately omits tool-call arguments (they may embed secrets); the
+// context-usage breakdown estimates their cost with a fixed allowance instead.
 type MessageView struct {
-	ID          string   `json:"id,omitempty"`
-	Role        string   `json:"role"`
-	Content     string   `json:"content,omitempty"`
-	ToolCallIDs []CallID `json:"tool_call_ids,omitempty"`
+	ID               string                `json:"id,omitempty"`
+	Role             string                `json:"role"`
+	Content          string                `json:"content,omitempty"`
+	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	ToolCalls        []MessageViewToolCall `json:"tool_calls,omitempty"`
+	ToolCallIDs      []CallID              `json:"tool_call_ids,omitempty"`
 }
 
 type InputView struct {
@@ -799,6 +836,14 @@ type EventView struct {
 	Error          string           `json:"error,omitempty"`
 }
 
+// TaskView projects one working task for read-only rendering. Status mirrors
+// the todo store vocabulary: pending | in_progress | completed.
+type TaskView struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Status string `json:"status"`
+}
+
 // SessionView is a read-only projection. Agent returns copies of all slices
 // and nested values so a client cannot mutate or race runtime state.
 type SessionView struct {
@@ -813,15 +858,21 @@ type SessionView struct {
 	Busy              bool             `json:"busy"`
 	Closing           bool             `json:"closing"`
 	Settings          SettingsSnapshot `json:"settings"`
-	Pending           *PendingSettings `json:"pending,omitempty"`
 	Catalog           CatalogSnapshot  `json:"catalog"`
 	Usage             UsageSnapshot    `json:"usage"`
 	ContextUsedTokens int              `json:"context_used_tokens"`
-	History           []MessageView    `json:"history,omitempty"`
-	PendingInputs     []InputView      `json:"pending_inputs,omitempty"`
-	Approval          *ApprovalView    `json:"approval,omitempty"`
-	Plan              *PlanView        `json:"plan,omitempty"`
-	LastTurn          *TurnOutcome     `json:"last_turn,omitempty"`
+	// SystemTokens / ToolsTokens / MessagesTokens split ContextUsedTokens into
+	// the exact context detail the UI shows. They always sum to
+	// ContextUsedTokens (system absorbs the remainder after messages/tools).
+	SystemTokens   int           `json:"system_tokens,omitempty"`
+	ToolsTokens    int           `json:"tools_tokens,omitempty"`
+	MessagesTokens int           `json:"messages_tokens,omitempty"`
+	History        []MessageView `json:"history,omitempty"`
+	PendingInputs  []InputView   `json:"pending_inputs,omitempty"`
+	Approval       *ApprovalView `json:"approval,omitempty"`
+	Plan           *PlanView     `json:"plan,omitempty"`
+	Tasks          []TaskView    `json:"tasks,omitempty"`
+	LastTurn       *TurnOutcome  `json:"last_turn,omitempty"`
 }
 
 type UpdateType string

@@ -40,9 +40,9 @@ func TestSanitizeANSI(t *testing.T) {
 }
 
 func TestRenderItemSanitizesText(t *testing.T) {
-	it := logItem{kind: "tool", status: "success",
+	it := historyCell{kind: "tool", status: "success",
 		text: "output \x1b]0;spoofed title\x07here \x1b[2J\x1b[Hwipe\r"}
-	out := renderItem(&it)
+	out := renderItemWidth(&it, 80)
 	// The rendered entry legitimately carries lipgloss styling (applied after
 	// sanitization), so instead of asserting "no ESC at all" assert that the
 	// injected sequences and control characters are gone while the content
@@ -60,9 +60,9 @@ func TestRenderItemSanitizesText(t *testing.T) {
 		t.Errorf("sanitized text lost content: %q", out)
 	}
 	// Cache: a second render with unchanged text reuses the sanitized copy.
-	it2 := logItem{kind: "error", text: "\x1b[31mbad\x1b[0m"}
-	_ = renderItem(&it2)
-	if it2.sanitizedLen != len(it2.text) || strings.ContainsRune(it2.sanitized, 0x1b) {
+	it2 := historyCell{kind: "error", text: "\x1b[31mbad\x1b[0m"}
+	_ = renderItemWidth(&it2, 80)
+	if it2.sanitizedSource != it2.text || strings.ContainsRune(it2.sanitized, 0x1b) {
 		t.Errorf("sanitize cache not populated: %+v", it2)
 	}
 }
@@ -76,22 +76,12 @@ func TestRenderItemStylesToolAfterSanitize(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.ANSI256)
 	t.Cleanup(func() { lipgloss.SetColorProfile(origProfile) })
 
-	// Construction keeps item.text plain: styles baked in there would be
-	// stripped by sanitizeANSI before ever reaching the terminal.
-	text, meta := renderToolText("Bash", map[string]any{"command": "git status"}, "success", "clean\n")
-	if !meta {
-		t.Fatal("expected a command meta line")
-	}
-	if containsESC(text) {
-		t.Errorf("renderToolText should not embed styles in item.text: %q", text)
-	}
-
-	it := logItem{kind: "tool", toolID: "t1", status: "success", text: text, toolMeta: meta}
-	out := renderItem(&it)
+	it := historyCell{kind: "tool", toolID: "t1", status: "success", text: "clean\n", toolName: "Bash", toolArgs: map[string]any{"command": "git status"}}
+	out := renderItemWidth(&it, 80)
 	if !containsESC(out) {
 		t.Error("expected styling applied after sanitization")
 	}
-	for _, want := range []string{"Bash", "$ git status", "clean"} {
+	for _, want := range []string{"Ran", "git status", "clean"} {
 		if !contains(out, want) {
 			t.Errorf("rendered tool entry lost %q: %q", want, out)
 		}

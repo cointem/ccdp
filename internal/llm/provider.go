@@ -77,12 +77,6 @@ func NewPreparedCall(provider Provider, providerName, endpoint string, req Compl
 	if providerName == "" {
 		providerName = provider.Name()
 	}
-	// Materialize the bounded provider-default output reservation before the
-	// first marshal.  This keeps the request admitted and the frozen manifest
-	// on the same wire contract; a nil MaxTokens must not let input consume the
-	// entire finite context window.
-	caps, described := ProviderCapabilitiesOf(provider)
-	req = requestWithProviderDefaults(req, caps, described)
 	// The serialized bytes are the sole frozen request source. In particular,
 	// do not clone through an unconstrained reflection walk first: cycles and
 	// unsupported values must be reported by this marshal instead of recursing

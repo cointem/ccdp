@@ -36,11 +36,6 @@ Reporting rules:
   files changed, evidence (commands/tests), and anything unfinished.
 - Never claim to have performed actions you did not perform.`
 
-// maxChildSteps is retained as a compatibility cap for callers that inspect
-// the old package constant. The actual loop is Agent.runTurn; child config is
-// capped to the same number by childOptionsFromParent/provider construction.
-const maxSubagentSteps = maxChildTurns
-
 func (a *Agent) runSubagents(tasks []tools.SubagentTask) ([]tools.SubagentResult, error) {
 	return a.runManagedTasks(tasks, "")
 }

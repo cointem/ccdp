@@ -39,7 +39,7 @@ func main() {
 		resumeFlag    = flag.String("r", "", "resume session by id")
 		continueFlag  = flag.Bool("c", false, "open the session picker on start (continue a session)")
 		replayFlag    = flag.String("replay", "", "print a saved session as a markdown replay and exit")
-		modeFlag      = flag.String("mode", "", "permission mode: default|acceptEdits|bypassPermissions")
+		modeFlag      = flag.String("mode", "", "permission mode: manual|edits|bypass (default: edits)")
 		listSessions  = flag.Bool("l", false, "list saved sessions and exit")
 		showVersion   = flag.Bool("version", false, "print version and exit")
 		noWarnMissing = flag.Bool("y", false, "do not prompt on missing config")
@@ -157,10 +157,13 @@ Flags:
 	}
 
 	if *listSessions {
-		sessions, err := agent.ListSessions(cfg.SessionDir)
+		sessions, issues, err := agent.ListSessions(cfg.SessionDir)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
+		}
+		for _, issue := range issues {
+			fmt.Fprintf(os.Stderr, "warning: skipping session %s: %s\n", issue.ID, issue.Reason)
 		}
 		if len(sessions) == 0 {
 			fmt.Println("no saved sessions")
@@ -184,8 +187,8 @@ Flags:
 		return
 	}
 
-	if cfg.APIKey == "" && !*noWarnMissing {
-		fmt.Fprintln(os.Stderr, "warning: no API key configured (CCDP_API_KEY or ~/.ccdp/config.json)")
+	if cfg.ResolveProvider(cfg.Model).APIKey == "" && !*noWarnMissing {
+		fmt.Fprintln(os.Stderr, "warning: no API key configured for the selected provider (api_key or api_key_env)")
 	}
 
 	var ag *agent.Agent
@@ -274,7 +277,7 @@ Flags:
 		os.Exit(code)
 	}
 
-	p := tea.NewProgram(
+	p := tui.NewProgram(
 		tui.NewWithResume(ag, *continueFlag),
 	)
 

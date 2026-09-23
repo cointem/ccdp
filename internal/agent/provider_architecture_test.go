@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -140,9 +141,9 @@ func TestStreamPreparedDoesNotRetryAfterSinkOnlyDelta(t *testing.T) {
 }
 
 func TestReloadRefreshesActiveProviderOperatorCaps(t *testing.T) {
-	cfg := isolatedTestConfig(t, "reload-caps-model")
+	cfg := isolatedTestConfig(t, "test/reload-caps-model")
 	cfg.ContextWindow = 8192
-	cfg.MaxReplyTokens = 512
+	cfg.Providers = map[string]config.ProviderConfig{"test": {BaseURL: cfg.BaseURL, WireAPI: "chat", ModelConfigs: map[string]config.ModelConfig{"reload-caps-model": {ContextWindow: 8192, MaxOutputTokens: 512}}}}
 	provider := &reloadCapabilityProvider{policyTestProvider{name: "reload-caps-provider"}}
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
@@ -157,7 +158,7 @@ func TestReloadRefreshesActiveProviderOperatorCaps(t *testing.T) {
 	// identity remains unchanged.
 	a.mu.Lock()
 	a.baseCfg.ContextWindow = 4096
-	a.baseCfg.MaxReplyTokens = 128
+	a.baseCfg.Providers["test"].ModelConfigs["reload-caps-model"] = config.ModelConfig{ContextWindow: 4096, MaxOutputTokens: 128}
 	a.mu.Unlock()
 	candidate, err := a.prepareSettingsCandidate(cfg.Workspace)
 	if err != nil {
@@ -338,23 +339,35 @@ func TestResolveProviderRefreshesStaleGeneratedHTTPBinding(t *testing.T) {
 	cfg := isolatedTestConfig(t, "reload-model")
 	cfg.BaseURL = "https://first.example/v1"
 	registry := plugin.NewModelRegistry()
-	first, firstEndpoint, firstKind, err := resolveProviderForModel(cfg, registry, cfg.Model)
+	first, err := resolveProviderForModel(cfg, registry, cfg.Model)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if firstKind != "http" || firstEndpoint != cfg.BaseURL {
-		t.Fatalf("first binding = %s/%s/%s", first.Name(), firstEndpoint, firstKind)
+	if first.routeKind != "http" || first.endpoint != cfg.BaseURL {
+		t.Fatalf("first binding = %s/%s/%s", first.client.Name(), first.endpoint, first.routeKind)
 	}
 	cfg.BaseURL = "https://second.example/v1"
-	second, secondEndpoint, secondKind, err := resolveProviderForModel(cfg, registry, cfg.Model)
+	second, err := resolveProviderForModel(cfg, registry, cfg.Model)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondKind != "http" || secondEndpoint != cfg.BaseURL || second == first {
-		t.Fatalf("stale generated adapter reused: first=%p/%s second=%p/%s", first, firstEndpoint, second, secondEndpoint)
+	if second.routeKind != "http" || second.endpoint != cfg.BaseURL || second.client == first.client {
+		t.Fatalf("stale generated adapter reused: first=%p/%s second=%p/%s", first.client, first.endpoint, second.client, second.endpoint)
 	}
-	if got, ok := registry.ResolveDefault(cfg.Model, cfg.BaseURL, cfg.APIKey); !ok || got != second {
+	if got, ok := registry.ResolveDefault(cfg.Model, plugin.HTTPBinding{Endpoint: cfg.BaseURL, APIKey: cfg.APIKey, Wire: second.wire}); !ok || got != second.client {
 		t.Fatalf("registry did not retain refreshed default binding: %v %v", got, ok)
+	}
+
+	// A wire-only change keeps the endpoint and credential but must not keep the
+	// adapter: the previous wire format would be sent to the same URL.
+	cfg.WireAPI = "responses"
+	cfg.Providers = nil
+	third, err := resolveProviderForModel(cfg, registry, cfg.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.client == second.client || third.wire != "responses" {
+		t.Fatalf("stale wire format reused: second=%s/%s third=%s/%s", second.client.Name(), second.wire, third.client.Name(), third.wire)
 	}
 }
 
@@ -392,5 +405,69 @@ func TestPreparedRequestJSONIsStableAfterCustomMarshal(t *testing.T) {
 	}
 	if string(wire) != string(manifest.RequestJSON) {
 		t.Fatalf("prepared request changed at provider boundary: %s != %s", wire, manifest.RequestJSON)
+	}
+}
+
+func TestResumeKeepsProviderScopedEndpointWithItsOwnCredential(t *testing.T) {
+	cfg := isolatedTestConfig(t, "served-model")
+	cfg.BaseURL = "https://top-level.example/v1"
+	cfg.APIKey = "top-level-key"
+	cfg.Providers = map[string]config.ProviderConfig{
+		"served": {BaseURL: "https://served.example/v1", APIKey: "served-key", Models: []string{"served-model"}},
+	}
+
+	applySessionSettingsToConfig(&cfg, session.Settings{Model: "served-model", Endpoint: "https://served.example/v1"})
+
+	if cfg.BaseURL != "https://top-level.example/v1" {
+		t.Fatalf("provider-scoped endpoint was promoted to top-level base_url: %q", cfg.BaseURL)
+	}
+	if resolved := cfg.ResolveProvider(cfg.Model); resolved.ID != "served" ||
+		resolved.BaseURL != "https://served.example/v1" || resolved.APIKey != "served-key" {
+		t.Fatalf("resumed model lost its provider record: %+v", resolved)
+	}
+
+	// The recorded endpoint is a fact about the last request, not a setting: the
+	// current config owns connection info for the unscoped model too.
+	applySessionSettingsToConfig(&cfg, session.Settings{Model: "unscoped-model", Endpoint: "https://stale.example/v1"})
+	if resolved := cfg.ResolveProvider("unscoped-model"); resolved.Served ||
+		resolved.BaseURL != "https://top-level.example/v1" || resolved.APIKey != "top-level-key" {
+		t.Fatalf("stale session endpoint overrode the current config: %+v", resolved)
+	}
+}
+
+func TestCatalogPublishesModelsForEachProvider(t *testing.T) {
+	cfg := isolatedTestConfig(t, "catalog-model")
+	cfg.Providers = map[string]config.ProviderConfig{
+		"zeta":  {BaseURL: "https://zeta.example/v1", APIKey: "k", Models: []string{"zeta-2", "zeta-1", "zeta-1"}},
+		"alpha": {BaseURL: "https://alpha.example/v1", APIKey: "k", Models: []string{"alpha-1"}},
+	}
+	ag, err := New(&cfg, make(chan Event, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ag.Close()
+
+	view, err := ag.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[string]string, len(view.Catalog.Providers))
+	for _, provider := range view.Catalog.Providers {
+		got[provider.ID] = strings.Join(provider.Models, ",")
+	}
+	if got["alpha"] != "alpha-1" || got["zeta"] != "zeta-1,zeta-2" {
+		t.Fatalf("configured provider models = %+v", got)
+	}
+	// The active model is bound to the unscoped top-level endpoint, so it is
+	// published under the fallback id and stays visible in the picker.
+	if got[defaultProviderID] != "catalog-model" {
+		t.Fatalf("active model not published: %+v", got)
+	}
+	var ids []string
+	for _, provider := range view.Catalog.Providers {
+		ids = append(ids, provider.ID)
+	}
+	if !sort.StringsAreSorted(ids) {
+		t.Fatalf("catalog providers not sorted by id: %v", ids)
 	}
 }

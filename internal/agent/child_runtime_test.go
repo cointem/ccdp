@@ -148,9 +148,12 @@ func TestTaskChildUsesRealLoopAndAggregatesUsageOnce(t *testing.T) {
 	if saved.Usage != a.Usage() {
 		t.Fatalf("replay/live divergence: %+v vs %+v", saved.Usage, a.Usage())
 	}
-	sessions, err := ListSessions(cfg.SessionDir)
+	sessions, issues, err := ListSessions(cfg.SessionDir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("session listing reported issues: %+v", issues)
 	}
 	if len(sessions) != 2 {
 		t.Fatalf("want independent parent + child, got %d", len(sessions))
@@ -578,11 +581,11 @@ func TestPreparedChildRequestRetainsFrozenWire(t *testing.T) {
 }
 
 func TestChildToolGateHardPolicies(t *testing.T) {
-	guardian := &Agent{childState: &childRuntimeState{
+	guardian := &Agent{childStateGroups: childStateGroups{childState: &childRuntimeState{
 		purpose:        childPurposeGuardian,
 		nonInteractive: true,
 		perms:          permissions.NewManager(permissions.ModeBypass, permissions.Policy{}),
-	}}
+	}}}
 	for _, name := range []string{"Write", "Edit", "Bash", "WebSearch", "Task", "EnterPlanMode", "ExitPlanMode", "unknown"} {
 		if denied, reason := ChildToolGate(guardian, messages.ToolCall{Name: name}); !denied || reason == "" {
 			t.Fatalf("guardian tool %q escaped hard gate: denied=%v reason=%q", name, denied, reason)
@@ -592,11 +595,11 @@ func TestChildToolGateHardPolicies(t *testing.T) {
 		t.Fatalf("guardian read unexpectedly denied: %q", reason)
 	}
 
-	task := &Agent{childState: &childRuntimeState{
+	task := &Agent{childStateGroups: childStateGroups{childState: &childRuntimeState{
 		purpose:        childPurposeTask,
 		nonInteractive: true,
 		perms:          permissions.NewManager(permissions.ModeDefault, permissions.Policy{}),
-	}}
+	}}}
 	if denied, reason := ChildToolGate(task, messages.ToolCall{Name: "Task"}); !denied || reason == "" {
 		t.Fatalf("nested Task escaped hard gate: denied=%v reason=%q", denied, reason)
 	}

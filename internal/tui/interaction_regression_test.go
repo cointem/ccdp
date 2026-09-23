@@ -13,7 +13,7 @@ import (
 func TestDisabledPickerOptionStaysOpenWithoutSubmitting(t *testing.T) {
 	m := sugModel()
 	m.width, m.height = 80, 24
-	options := []selectorOption{
+	options := []SelectorOption{
 		{ID: "blocked", Label: "blocked", Description: "requires a provider", Disabled: true},
 		{ID: "available", Label: "available"},
 	}
@@ -30,38 +30,37 @@ func TestDisabledPickerOptionStaysOpenWithoutSubmitting(t *testing.T) {
 	if got := client.submitCount(); got != 0 {
 		t.Fatalf("disabled picker option submitted %d commands", got)
 	}
-	if m.status != "requires a provider" {
-		t.Fatalf("disabled option reason = %q", m.status)
+	if m.modalErr != "requires a provider" {
+		t.Fatalf("disabled option reason = %q", m.modalErr)
 	}
 }
 
-func TestModelPickerMarksConfirmedAndPendingBindings(t *testing.T) {
+func TestModelPickerMarksConfirmedBinding(t *testing.T) {
 	m := sugModel()
-	m.snapshot.Pending = &protocol.PendingSettings{Model: &protocol.ModelBinding{Model: "pending-model"}}
-	m.snapshot.Catalog.Providers[0].Models = []string{"confirmed-model", "pending-model"}
+	m.snapshot.Catalog.Providers[0].Models = []string{"confirmed-model", "other-model"}
 	m.modelName = "confirmed-model"
 	m.snapshot.Settings.Model.Model = "confirmed-model"
 	m.hasSnapshot = true
 
 	model, _ := m.runCommand("/model")
 	*m = modelValue(t, model)
-	if m.picker == nil || len(m.picker.options) != 2 {
+	if m.picker == nil || len(m.picker.Options) != 2 {
 		t.Fatalf("model picker options = %#v", m.picker)
 	}
-	var confirmed, pending selectorOption
-	for _, option := range m.picker.options {
+	var confirmed, other SelectorOption
+	for _, option := range m.picker.Options {
 		switch option.ID {
 		case "confirmed-model":
 			confirmed = option
-		case "pending-model":
-			pending = option
+		case "other-model":
+			other = option
 		}
 	}
-	if !confirmed.Current || confirmed.Pending {
-		t.Fatalf("confirmed model metadata = %#v", confirmed)
+	if !confirmed.Current {
+		t.Fatalf("confirmed model not marked current: %#v", confirmed)
 	}
-	if pending.Current || !pending.Pending {
-		t.Fatalf("pending model metadata = %#v", pending)
+	if other.Current {
+		t.Fatalf("non-current model marked current: %#v", other)
 	}
 }
 
@@ -75,7 +74,10 @@ func TestFreshUserOperationRetiresOlderTerminalErrorNotice(t *testing.T) {
 
 	active := protocol.NewSubmitInput("active", protocol.SessionID(m.sessionID), "input-active", "second", protocol.InputSteer)
 	m.submitCommand(active, "second message")
-	if _, ok := m.noticeForCommand(failed.ID); ok {
+	for _, notice := range m.Notices() {
+		if notice.CommandID != failed.ID {
+			continue
+		}
 		t.Fatal("older terminal error notice remained after a new user operation")
 	}
 	if op, ok := m.operation(active.ID); !ok || !op.Active() {
@@ -107,8 +109,8 @@ func TestNoticeExpiryResumesAfterIdleQueue(t *testing.T) {
 	now = func() time.Time { return base.Add(4 * time.Second) }
 	model, _ = m.Update(spinner.TickMsg{})
 	*m = modelValue(t, model)
-	if len(m.notices) != 0 || m.status != "" {
-		t.Fatalf("notice added after idle did not expire on spinner tick: notices=%#v status=%q", m.notices, m.status)
+	if len(m.notices) != 0 || noticeText(m) != "" {
+		t.Fatalf("notice added after idle did not expire on spinner tick: notices=%#v status=%q", m.notices, noticeText(m))
 	}
 }
 
