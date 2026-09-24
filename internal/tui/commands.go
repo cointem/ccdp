@@ -46,7 +46,7 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	}
 	if m.routing != nil && m.sessionID != m.routing.rootID {
 		switch cmd {
-		case "pending", "tasks", "next", "reconnect", "agents", "agent", "agent-history", "agent-output", "transcript", "parent", "root", "help", "cost", "context", "copy", "stop-tree", "quit":
+		case "pending", "tasks", "next", "reconnect", "agents", "agent", "agent-history", "agent-output", "transcript", "parent", "root", "help", "cost", "context", "stop-tree", "quit":
 		default:
 			m.pushStatus("this command belongs to the main session; use /root first")
 			return m, nil
@@ -143,16 +143,6 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		m.pushLog("system", m.renderContext())
 		m.showContextDetail = true
 		return m, nil
-
-	case "copy":
-		if len(args) > 1 {
-			m.pushLog("error", "usage: /copy [message-id] (copies the latest response by default)")
-			return m, nil
-		}
-		if len(args) == 1 {
-			return m, m.copyLatestResponse(args[0])
-		}
-		return m, m.copyLatestResponse()
 
 	case "plugins":
 		return m, m.runQuery(protocol.QueryPlugins, "plugin report requested")
@@ -487,47 +477,6 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		}
 		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSaveSession,
 			SaveSession: &protocol.SaveSessionCommand{}}, "session save submitted")
-
-	case "sessions":
-		if m.ag == nil {
-			m.pushLog("error", "/sessions is unavailable through this session protocol")
-			return m, nil
-		}
-		sessions, issues, err := m.savedSessions()
-		if err != nil {
-			m.pushLog("error", err.Error())
-			return m, nil
-		}
-		if len(sessions) == 0 {
-			if note := sessionListIssuesNote(issues); note != "" {
-				m.pushLog("system", "no saved sessions could be read\n"+note)
-			} else {
-				m.pushLog("system", "no saved sessions")
-			}
-			return m, nil
-		}
-		var sb strings.Builder
-		sb.WriteString("Saved sessions (newest first):\n")
-		for i, s := range sessions {
-			if i >= 10 {
-				sb.WriteString("  …and more\n")
-				break
-			}
-			title := s.Title
-			if title == "" {
-				title = "(no user message)"
-			}
-			forkNote := ""
-			if s.ParentID != "" {
-				forkNote = fmt.Sprintf("  ← fork of %s @ %d", s.ParentID, s.BranchPoint)
-			}
-			fmt.Fprintf(&sb, "  %s  %s  %s\n    %s  (%d messages)%s\n",
-				s.ID, s.UpdatedAt.Format("2006-01-02 15:04"), s.Model, title, len(s.History), forkNote)
-		}
-		if note := sessionListIssuesNote(issues); note != "" {
-			sb.WriteString("\n" + note + "\n")
-		}
-		m.pushLog("system", sb.String())
 
 	case "resume":
 		// No argument → interactive picker over saved sessions.

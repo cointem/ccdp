@@ -198,8 +198,11 @@ func TestGenerationSettingsPersistResetAndFreeze(t *testing.T) {
 	}
 	req = ag.buildRequestFromConfig(restored, "openai-test", "test", nil, false, nil)
 	body, _ := json.Marshal(req)
-	if strings.Contains(string(body), "reasoning_effort") || strings.Contains(string(body), "verbosity") {
-		t.Fatalf("default fields must be omitted: %s", body)
+	if req.ReasoningEffort != config.DefaultReasoningEffort {
+		t.Fatalf("reset effort = %q, want built-in default %q", req.ReasoningEffort, config.DefaultReasoningEffort)
+	}
+	if strings.Contains(string(body), "verbosity") {
+		t.Fatalf("verbosity must stay omitted when unset: %s", body)
 	}
 	restored.ReasoningEffort = "none"
 	req = ag.buildRequestFromConfig(restored, "deepseek-test", "test", []messages.Message{{Role: messages.RoleAssistant, Content: "ok", ReasoningContent: "reason"}}, false, nil)

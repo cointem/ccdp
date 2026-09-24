@@ -176,7 +176,8 @@ func TestAnthropicBody(t *testing.T) {
 	for _, want := range []string{
 		`"system":"you are helpful"`,
 		`"max_tokens":4096`,
-		`"thinking":{"type":"enabled"}`,
+		`"thinking":{"type":"adaptive"}`,
+		`"output_config":{"effort":"high"}`,
 		`"type":"image"`,
 		`"media_type":"image/png"`,
 		`"type":"tool_use"`,
@@ -382,6 +383,53 @@ func TestAnthropicBodySystemFallback(t *testing.T) {
 	s := string(body)
 	if !strings.Contains(s, `"system":"LEGACY_SYS"`) {
 		t.Fatalf("fallback system string expected:\n%s", s)
+	}
+}
+
+// TestAnthropicBodyAdaptiveThinking covers the effort folding and the beta
+// headers: ccdp-only levels map into low|medium|high|max, "none" disables the
+// thinking block entirely, and thinking without effort stays adaptive-only.
+func TestAnthropicBodyAdaptiveThinking(t *testing.T) {
+	c, err := NewClient(Config{Model: "m", BaseURL: "https://example.com/v1", Wire: "anthropic", Timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, effort string
+		reqThinking  string
+		wantThinking string
+		wantOutput   string
+		wantBetas    string
+	}{
+		{name: "xhigh folds to high", effort: "xhigh", wantThinking: `"thinking":{"type":"adaptive"}`, wantOutput: `"output_config":{"effort":"high"}`, wantBetas: anthropicInterleavedThinkingBeta + ", " + anthropicEffortBeta},
+		{name: "ultra folds to max", effort: "ultra", wantThinking: `"thinking":{"type":"adaptive"}`, wantOutput: `"output_config":{"effort":"max"}`, wantBetas: anthropicInterleavedThinkingBeta + ", " + anthropicEffortBeta},
+		{name: "none disables thinking", effort: "none"},
+		{name: "unknown effort falls back", effort: "banana"},
+		{name: "thinking without effort", reqThinking: "enabled", wantThinking: `"thinking":{"type":"adaptive"}`, wantBetas: anthropicInterleavedThinkingBeta},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := CompletionRequest{Model: "claude", ReasoningEffort: tc.effort, Messages: []ChatMessage{{Role: "user", Content: "hi"}}}
+			if tc.reqThinking != "" {
+				req.Thinking = &ThinkingConfig{Type: tc.reqThinking}
+			}
+			body, err := c.anthropicBody(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := string(body)
+			if tc.wantThinking != "" && !strings.Contains(s, tc.wantThinking) {
+				t.Fatalf("body missing %s:\n%s", tc.wantThinking, s)
+			}
+			if tc.wantOutput != "" && !strings.Contains(s, tc.wantOutput) {
+				t.Fatalf("body missing %s:\n%s", tc.wantOutput, s)
+			}
+			if tc.wantThinking == "" && strings.Contains(s, `"thinking"`) {
+				t.Fatalf("thinking block must be absent:\n%s", s)
+			}
+			if got := anthropicBetaHeader(body); got != tc.wantBetas {
+				t.Fatalf("anthropic-beta = %q, want %q", got, tc.wantBetas)
+			}
+		})
 	}
 }
 

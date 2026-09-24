@@ -266,9 +266,6 @@ func (m *Model) persistentStatusContent() (string, footerLabels) {
 	if modelName == "" {
 		modelName = "model"
 	}
-	if effort == "" {
-		effort = "default"
-	}
 	if used < 0 {
 		used = 0
 	}
@@ -294,7 +291,7 @@ func (m *Model) persistentStatusContent() (string, footerLabels) {
 	modelName = compactModelName(sanitizeANSI(modelName), max(1, m.width))
 
 	parts := []string{modelName}
-	if effort != "default" {
+	if effort != "" && effort != "default" {
 		parts = append(parts, effortLabel(effort))
 	}
 	modeDisplay := permissions.Mode(mode).Label()

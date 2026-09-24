@@ -209,13 +209,13 @@ func TestInlineInterruptedStreamRemainsIdentified(t *testing.T) {
 	}
 }
 
-func TestCopyUsesRawHostClipboardText(t *testing.T) {
+func TestReaderCopyUsesRawHostClipboardText(t *testing.T) {
 	m := inlineTestModel()
 	copy := &captureClipboard{}
 	m.clipboard = copy
 	raw := "  answer\n\x1b[31mnot rendered\x1b[0m\n你好🙂"
-	m.confirmedItems = []historyCell{{kind: "assistant", text: raw, messageID: "answer-1"}}
-	cmd := m.copyLatestResponse()
+	m.reader = &readerState{rawText: raw}
+	cmd := m.copyReaderSource()
 	if cmd == nil {
 		t.Fatal("copy command was nil")
 	}
@@ -225,7 +225,7 @@ func TestCopyUsesRawHostClipboardText(t *testing.T) {
 	if copy.text != raw {
 		t.Fatalf("clipboard text=%q, want raw %q", copy.text, raw)
 	}
-	if noticeText(m) != "copied latest response" {
+	if noticeText(m) != "copied to clipboard" {
 		t.Fatalf("copy status=%q", noticeText(m))
 	}
 }
@@ -233,8 +233,8 @@ func TestCopyUsesRawHostClipboardText(t *testing.T) {
 func TestCopyReportsAdapterError(t *testing.T) {
 	m := inlineTestModel()
 	m.clipboard = &captureClipboard{err: errors.New("no pasteboard")}
-	m.confirmedItems = []historyCell{{kind: "assistant", text: "answer", messageID: "answer-1"}}
-	cmd := m.copyLatestResponse()
+	m.reader = &readerState{rawText: "answer"}
+	cmd := m.copyReaderSource()
 	if cmd == nil {
 		t.Fatal("copy command was nil")
 	}
@@ -255,8 +255,8 @@ func TestCopyTimesOutAndDoesNotCrossSessionToast(t *testing.T) {
 	m.sessionID = "session-a"
 	m.reportGeneration = 4
 	m.clipboard = contextBlockingClipboard{}
-	m.confirmedItems = []historyCell{{kind: "assistant", text: "answer", messageID: "answer-1"}}
-	cmd := m.copyLatestResponse()
+	m.reader = &readerState{rawText: "answer"}
+	cmd := m.copyReaderSource()
 	if cmd == nil {
 		t.Fatal("copy command was nil")
 	}
@@ -271,22 +271,15 @@ func TestCopyTimesOutAndDoesNotCrossSessionToast(t *testing.T) {
 	}
 }
 
-func TestCopyCommandIsTransient(t *testing.T) {
+func TestCopyCommandIsRemoved(t *testing.T) {
 	m := inlineTestModel()
 	m.confirmedItems = []historyCell{{kind: "assistant", text: "answer", messageID: "answer-1"}}
 	m.clipboard = &captureClipboard{}
-	if slashCommandHasTranscriptOutput("/copy") {
-		t.Fatal("/copy should not add a duplicate command line to the transcript")
+	if _, cmd := m.runCommand("/copy"); cmd != nil {
+		t.Fatal("/copy should no longer return a clipboard command")
 	}
-	_, cmd := m.runCommand("/copy")
-	if cmd == nil {
-		t.Fatal("/copy should return an async clipboard command")
-	}
-	model, _ := m.Update(cmd())
-	updated := modelValue(t, model)
-	m = &updated
-	if noticeText(m) != "copied latest response" {
-		t.Fatalf("copy status=%q", noticeText(m))
+	if _, ok := commandCatalog.Lookup("copy"); ok {
+		t.Fatal("/copy should be gone from the command catalog")
 	}
 }
 
@@ -310,15 +303,8 @@ func TestProtocolSnapshotKeepsRawMessageForCopy(t *testing.T) {
 	if len(m.confirmedItems) != 1 || m.confirmedItems[0].messageID != "assistant-1" {
 		t.Fatalf("snapshot history missing stable message: %#v", m.confirmedItems)
 	}
-	m.clipboard = &captureClipboard{}
-	cmd := m.copyLatestResponse("assistant-1")
-	if cmd == nil {
-		t.Fatal("copy command was nil")
-	}
-	model, _ := m.Update(cmd())
-	m = modelValue(t, model)
-	if m.clipboard.(*captureClipboard).text != "你好🙂" {
-		t.Fatal("copy did not preserve wide/emoji content")
+	if m.confirmedItems[0].text != "你好🙂" {
+		t.Fatal("snapshot did not preserve wide/emoji content")
 	}
 }
 

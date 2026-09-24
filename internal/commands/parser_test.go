@@ -17,7 +17,7 @@ func TestParseLineQuotesWithoutShellExpansion(t *testing.T) {
 }
 
 func TestParseLineRejectsIncompleteQuotes(t *testing.T) {
-	for _, input := range []string{`/copy "id`, `/copy trailing\`} {
+	for _, input := range []string{`/help "id`, `/help trailing\`} {
 		if _, err := ParseLine(input); err == nil {
 			t.Fatalf("ParseLine(%q) accepted malformed input", input)
 		}

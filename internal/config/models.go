@@ -7,17 +7,20 @@ import (
 	"os"
 	"sort"
 	"strings"
-
-	"ccdp/internal/protocol"
 )
 
 const DefaultMaxOutputTokens = 32000
+
+// DefaultReasoningEffort is the built-in reasoning depth applied when no
+// global reasoning_effort override is configured. Providers that do not
+// support a given level reject the request explicitly; silently running at an
+// unknown depth is worse.
+const DefaultReasoningEffort = "medium"
 
 // ModelConfig is the single configuration record for one provider's API model.
 type ModelConfig struct {
 	ContextWindow   int      `json:"context_window,omitempty"`
 	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
-	ReasoningEffort string   `json:"reasoning_effort,omitempty"`
 	Pricing         *Pricing `json:"pricing,omitempty"`
 }
 
@@ -44,6 +47,16 @@ func (p *ProviderConfig) UnmarshalJSON(data []byte) error {
 	*p = ProviderConfig(value)
 	for model := range p.ModelConfigs {
 		p.Models = append(p.Models, model)
+	}
+	if models, ok := raw["models"]; ok {
+		var perModel map[string]map[string]json.RawMessage
+		if json.Unmarshal(models, &perModel) == nil {
+			for model, fields := range perModel {
+				if _, ok := fields["reasoning_effort"]; ok {
+					return fmt.Errorf("provider.models.%s: per-model reasoning_effort is obsolete; reasoning depth is the single global reasoning_effort setting (default %q)", model, DefaultReasoningEffort)
+				}
+			}
+		}
 	}
 	sort.Strings(p.Models)
 	return nil
@@ -85,7 +98,7 @@ func (c *Config) ReasoningEffortFor(model string) string {
 	if c.ReasoningEffort != "" {
 		return c.ReasoningEffort
 	}
-	return c.ModelConfigFor(model).ReasoningEffort
+	return DefaultReasoningEffort
 }
 
 func (c *Config) PricingFor(model string) Pricing {
@@ -158,9 +171,6 @@ func (c *Config) validateModelConfigs() error {
 			}
 			if m.MaxOutputTokens < 0 || effectiveOutput >= c.ContextWindowFor(id+"/"+name) {
 				return fmt.Errorf("providers.%s.models.%s: max_output_tokens must be below context_window (default is %d); set a smaller per-model limit", id, name, DefaultMaxOutputTokens)
-			}
-			if err := protocol.ValidateGeneration(m.ReasoningEffort, ""); err != nil {
-				return fmt.Errorf("providers.%s.models.%s: %w", id, name, err)
 			}
 			if m.Pricing != nil && (m.Pricing.Input < 0 || m.Pricing.Output < 0) {
 				return fmt.Errorf("providers.%s.models.%s: negative pricing", id, name)

@@ -89,7 +89,7 @@ func wrapPersistentStatus(text string, width int) string {
 // frameChrome is the one measurement/rendering contract for all bottom and
 // header components. Both the viewport budget and View use these exact rows.
 type frameChrome struct {
-	header, status, tasks, surface, input, footer string
+	header, tasks, surface, input, footer string
 }
 
 // Base chrome never depends on which transient panel currently owns focus.
@@ -106,18 +106,24 @@ func (m *Model) composeChrome() frameChrome {
 	base.cmdSug = nil
 	base.fileMention = nil
 	base.tasksVisible = false
-	c := frameChrome{header: m.headerPresentation(), status: base.renderStatus(), surface: m.bottomSurface(), input: base.renderInput(), footer: base.renderFooter()}
-	// Keep a one-row gap between output/overlays and the composer. The row
-	// directly above the composer is the input's hint lane: the copy toast is
-	// right-aligned there and a command receipt ("effort → xhigh") takes its left
-	// edge. The row always exists, so neither hint shifts the transcript when it
-	// appears or expires.
+	c := frameChrome{header: m.headerPresentation(), surface: m.bottomSurface(), input: base.renderInput(), footer: base.renderFooter()}
+	// The one reserved row directly above the composer is the bottom-pane hint
+	// lane: the status lane (activity, pending operations, notices) takes its
+	// left edge, a command receipt ("effort → xhigh") fills in when the status
+	// is quiet, and the copy toast is right-aligned. The row always exists, so
+	// none of them shifts the transcript when it appears or expires.
 	if c.input != "" {
 		toast := ""
 		if m.copiedToast != "" {
 			toast = styleHints.Render(truncateDisplay(m.copiedToast, max(1, m.width)))
 		}
-		row := base.renderComposerFeedback(max(1, m.width-lipgloss.Width(toast)-1))
+		budget := max(1, m.width-lipgloss.Width(toast)-1)
+		row := base.renderStatus()
+		if row == "" {
+			row = base.renderComposerFeedback(budget)
+		} else if lipgloss.Width(row) > budget {
+			row = truncateDisplay(row, budget)
+		}
 		if row != "" || toast != "" {
 			pad := m.width - lipgloss.Width(row) - lipgloss.Width(toast)
 			if row != "" && toast != "" && pad < 1 {
@@ -136,7 +142,7 @@ func (m *Model) composeChrome() frameChrome {
 }
 func (c frameChrome) fixedHeight(width int) int {
 	total := 0
-	for _, text := range []string{c.header, c.status, c.tasks, c.input, c.footer} {
+	for _, text := range []string{c.header, c.tasks, c.input, c.footer} {
 		total += presentationHeight(text, width)
 	}
 	return total
@@ -144,7 +150,7 @@ func (c frameChrome) fixedHeight(width int) int {
 func (c frameChrome) segments(body string) []presentationSegment {
 	return []presentationSegment{
 		{text: c.header, mandatory: true}, {text: body},
-		{text: c.status, mandatory: true}, {text: c.tasks, mandatory: true},
+		{text: c.tasks, mandatory: true},
 		{text: c.surface, mandatory: true}, {text: c.input, mandatory: true}, {text: c.footer, mandatory: true},
 	}
 }

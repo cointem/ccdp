@@ -16,9 +16,18 @@ import (
 // and Responses clients. It is wire-only and minimal: text, extended thinking,
 // function calls and terminal usage. Auth uses the official x-api-key header.
 
-// anthropicThinking requests extended thinking when present.
+// anthropicThinking requests thinking on the Messages wire. The only shape we
+// send is adaptive: budget_tokens-style "enabled" thinking is rejected by
+// current models, and depth is carried by anthropicOutputConfig instead.
 type anthropicThinking struct {
 	Type string `json:"type"`
+}
+
+// anthropicOutputConfig carries the request-level output controls; effort is
+// the API-side reasoning depth (low|medium|high|max) paired with the
+// effort-2025-11-24 beta header.
+type anthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 // anthropicTool is an Anthropic function tool declaration.
@@ -37,20 +46,70 @@ type anthropicMessage struct {
 // anthropicBodyRequest is the Messages Create payload we send. `stream` is
 // always true; the adapter consumes the streaming Events API.
 type anthropicBodyRequest struct {
-	Model       string             `json:"model"`
-	MaxTokens   int                `json:"max_tokens"`
-	System      any                `json:"system,omitempty"`
-	Messages    []anthropicMessage `json:"messages"`
-	Tools       []anthropicTool    `json:"tools,omitempty"`
-	Thinking    *anthropicThinking `json:"thinking,omitempty"`
-	Temperature *float64           `json:"temperature,omitempty"`
-	TopP        *float64           `json:"top_p,omitempty"`
-	Stream      bool               `json:"stream"`
+	Model       string                 `json:"model"`
+	MaxTokens   int                    `json:"max_tokens"`
+	System      any                    `json:"system,omitempty"`
+	Messages    []anthropicMessage     `json:"messages"`
+	Tools       []anthropicTool        `json:"tools,omitempty"`
+	Thinking    *anthropicThinking     `json:"thinking,omitempty"`
+	OutputCfg   *anthropicOutputConfig `json:"output_config,omitempty"`
+	Temperature *float64               `json:"temperature,omitempty"`
+	TopP        *float64               `json:"top_p,omitempty"`
+	Stream      bool                   `json:"stream"`
 }
 
 // anthropicDefaultMaxTokens is the fallback when the caller did not supply a
 // max_tokens; Anthropic requires it and has no meaningful default.
 const anthropicDefaultMaxTokens = 4096
+
+// Beta headers required by the adaptive-thinking and effort controls. The
+// effort scale (low|medium|high|max) is validated by the API; "none" and an
+// unset effort send no thinking block, leaving depth to the model default.
+const (
+	anthropicInterleavedThinkingBeta = "interleaved-thinking-2025-05-14"
+	anthropicEffortBeta              = "effort-2025-11-24"
+)
+
+// anthropicEffort folds ccdp's wider effort scale into the four values the
+// Messages API accepts for output_config.effort; anything unknown falls back
+// to the provider default (no effort sent).
+func anthropicEffort(effort string) string {
+	switch effort {
+	case "", "none":
+		return ""
+	case "minimal", "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high", "xhigh":
+		return "high"
+	case "max", "ultra":
+		return "max"
+	default:
+		return ""
+	}
+}
+
+// anthropicBetaHeader returns the anthropic-beta value the marshaled body
+// requires: adaptive thinking needs the interleaved-thinking beta and
+// output_config.effort needs the effort beta. Empty when neither is present.
+func anthropicBetaHeader(body []byte) string {
+	var doc struct {
+		Thinking  *json.RawMessage `json:"thinking"`
+		OutputCfg *json.RawMessage `json:"output_config"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return ""
+	}
+	var betas []string
+	if doc.Thinking != nil {
+		betas = append(betas, anthropicInterleavedThinkingBeta)
+	}
+	if doc.OutputCfg != nil {
+		betas = append(betas, anthropicEffortBeta)
+	}
+	return strings.Join(betas, ", ")
+}
 
 // blocksForContent converts a ChatMessage content value (string or parts list)
 // into Anthropic content blocks (text and base64 images).
@@ -229,8 +288,11 @@ func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
 			})
 		}
 	}
-	if req.ReasoningEffort != "" || (req.Thinking != nil && req.Thinking.Type != "") {
-		br.Thinking = &anthropicThinking{Type: "enabled"}
+	if effort := anthropicEffort(req.ReasoningEffort); effort != "" {
+		br.Thinking = &anthropicThinking{Type: "adaptive"}
+		br.OutputCfg = &anthropicOutputConfig{Effort: effort}
+	} else if req.Thinking != nil && req.Thinking.Type == "enabled" {
+		br.Thinking = &anthropicThinking{Type: "adaptive"}
 	}
 	br.Temperature = req.Temperature
 	br.TopP = req.TopP

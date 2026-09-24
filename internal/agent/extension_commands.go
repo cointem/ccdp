@@ -77,10 +77,45 @@ func (a *Agent) applyExternalCommand(cmd protocol.Command) protocol.Receipt {
 			return strings.TrimSpace(res.Output), errors.New("external command timed out")
 		}
 		if res.ExitCode != 0 {
-			return strings.TrimSpace(res.Output), fmt.Errorf("%s exited with status %d", ext.Program, res.ExitCode)
+			output := strings.TrimSpace(res.Output)
+			return output, externalCommandFailure(ext.Program, res.ExitCode, output)
 		}
 		return strings.TrimSpace(res.Output), nil
 	})
+}
+
+// externalCommandFailure explains a non-zero exit with the command's own first
+// line of output. Without it a failure surfaces as an opaque "exited with
+// status N": for example `git diff` run outside a repository exits 129 and only
+// writes "Not a git repository" to the captured output, which the status code
+// alone never conveys.
+func externalCommandFailure(program string, exitCode int, output string) error {
+	if strings.Contains(output, "Not a git repository") {
+		return fmt.Errorf("%s failed: workspace is not a git repository", program)
+	}
+	if reason := firstOutputLine(output); reason != "" {
+		return fmt.Errorf("%s exited with status %d: %s", program, exitCode, reason)
+	}
+	return fmt.Errorf("%s exited with status %d", program, exitCode)
+}
+
+// firstOutputLine returns the first non-empty line of output, trimmed to a
+// length that stays readable in a single status row.
+func firstOutputLine(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return truncateRunes(line, 200)
+		}
+	}
+	return ""
+}
+
+func truncateRunes(s string, maxLen int) string {
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
+	}
+	return string(r[:maxLen]) + "…"
 }
 
 // applyApplyCommand reads a bounded plan/patch file in the runtime so the TUI

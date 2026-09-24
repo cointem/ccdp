@@ -12,7 +12,7 @@ func ValidateGeneration(effort, verbosity string) error {
 	switch effort {
 	case "", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
 	default:
-		return fmt.Errorf("invalid reasoning_effort %q (use none|minimal|low|medium|high|xhigh|max|ultra, or empty for provider default)", effort)
+		return fmt.Errorf("invalid reasoning_effort %q (use none|minimal|low|medium|high|xhigh|max|ultra, or empty for the built-in default medium)", effort)
 	}
 	switch verbosity {
 	case "", "low", "medium", "high":

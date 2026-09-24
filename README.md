@@ -9,7 +9,7 @@ ccdp 0.2.0 · Go 1.27+ · 无第三方 LLM SDK 依赖（纯 HTTP 流式实现）
 ## 功能特性
 
 - **Agent 循环** — Infer → ToolDispatch → ApprovalGate → Compact，支持并行工具执行（`max_parallel_tools`）、工具结果聚合预算、截断回复自动续写、`--max-turns` / `--max-budget` 双重熔断
-- **实时 TUI**（Bubble Tea）— 紧凑文字欢迎区、适配深浅终端的青蓝主题、动态工作指示与耗时、紧凑工具结果；默认 inline 转录、共享可滚动选择器、状态栏、多行输入和原文 `/copy`；普通聊天不捕获鼠标，历史滚动与拖选交给终端
+- **实时 TUI**（Bubble Tea）— 紧凑文字欢迎区、适配深浅终端的青蓝主题、动态工作指示与耗时、紧凑工具结果；默认 inline 转录、共享可滚动选择器、状态栏、多行输入；普通聊天不捕获鼠标，历史滚动与拖选交给终端
 - **需求澄清** — `AskUserQuestion` 支持 1–4 题、单选/多选和自由补充；plan 模式可用，答案不代替执行审批
 - **推理与输出控制** — `reasoning_effort` / `verbosity` 支持配置、环境变量、CLI 和 `/effort` / `/verbosity`；会话保存与恢复
 - **权限体系** — `manual` / `edits`（默认）/ `bypass` 审批策略与独立 plan 工作流；兼容 `/mode plan`，always_allow / always_deny 规则（glob）、会话级审批记忆、turn 级审批缓存
@@ -32,9 +32,9 @@ ccdp 0.2.0 · Go 1.27+ · 无第三方 LLM SDK 依赖（纯 HTTP 流式实现）
 }
 ```
 
-也可用 `CCDP_REASONING_EFFORT` / `CCDP_VERBOSITY`，或启动参数 `ccdp --effort high --verbosity low`。会话空闲时 `/effort high`、`/verbosity low` 修改当前设置；不带参数时，`/effort` 打开带过渡动画的横向强度选择器（←/→ 预览、Enter 确认、Esc 取消），`/verbosity` 使用上下选择菜单；预览不改变底部的生效值。`/effort default`、`/verbosity default` 清除覆盖。设置随会话保存；原有冻结请求不受后续修改影响。`verbosity` 控制模型输出，与诊断日志 `--verbose` 不同。
+也可用 `CCDP_REASONING_EFFORT` / `CCDP_VERBOSITY`，或启动参数 `ccdp --effort high --verbosity low`。会话空闲时 `/effort high`、`/verbosity low` 修改当前设置；不带参数时，`/effort` 打开带过渡动画的横向强度选择器（←/→ 预览、Enter 确认、Esc 取消），`/verbosity` 使用上下选择菜单；预览不改变底部的生效值。`/effort default` 恢复内置默认 `medium`，`/verbosity default` 清除覆盖。设置随会话保存；原有冻结请求不受后续修改影响。`verbosity` 控制模型输出，与诊断日志 `--verbose` 不同。
 
-`reasoning_effort` 接受 `none|minimal|low|medium|high|xhigh|max|ultra`，`verbosity` 接受 `low|medium|high`；未配置或空字符串时省略字段。实际支持的取值取决于所选模型和服务商，不支持时会保留 API 错误，不会静默重试并删除参数。Chat Completions 使用顶层 `reasoning_effort` / `verbosity`，格式见 [OpenAI 官方文档](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.2)。
+`reasoning_effort` 接受 `none|minimal|low|medium|high|xhigh|max|ultra`，`verbosity` 接受 `low|medium|high`；`reasoning_effort` 未配置时按内置默认 **`medium`** 发送，`verbosity` 未配置时省略字段。实际支持的取值取决于所选模型和服务商，不支持时会保留 API 错误，不会静默重试并删除参数。Chat Completions 使用顶层 `reasoning_effort` / `verbosity`，格式见 [OpenAI 官方文档](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.2)。Anthropic 线路使用新版 adaptive thinking：非 `none` 档位发送 `thinking: {type:"adaptive"}` 并在 `output_config.effort` 携带 `low|medium|high|max`（`minimal→low`、`xhigh→high`、`ultra→max`），`none` 关闭思考，旧的 `budget_tokens` 形态不再发送。
 
 DeepSeek 模型（名称以 `deepseek` 开头或使用官方端点）还会显式设置 `thinking.type`；`/effort none` 对应 `disabled`，其他显式档位对应 `enabled`。`reasoning_content` 随助手消息持久化，并在后续 DeepSeek 请求中回传，支持思考模式的连续工具调用；不会把该扩展字段发给其他模型。DeepSeek 的档位映射和限制见 [DeepSeek 官方文档](https://api-docs.deepseek.com/guides/thinking_mode/)。
 
@@ -110,7 +110,7 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
 
 模型名只在 `providers.<id>.models` 对象里声明一次，模型选项跟随该记录。`model` 和 `fallback_model` 使用完整的 `provider/model` 引用；同名模型可出现在不同供应商下，API 请求只发送模型部分。`api_key` 和 `api_key_env` 二选一，供应商间不继承密钥。`wire_api` 只能是 `chat` 或 `responses`，拼错会报错。
 
-`context_window` 省略时暂用内置 200000；自定义模型建议明确填写，数值必须与服务端实际支持的窗口一致。`max_output_tokens` 是每个模型的单次生成上限，思考与正文共用；省略或填 `0` 时默认 **32000**，必须小于该模型的上下文窗口。切换模型、fallback 和子 agent 都使用目标模型自己的值。旧的全局 `max_reply_tokens` / `CCDP_MAX_REPLY_TOKENS` 不再接受。模型的 `reasoning_effort` 是默认值，CLI、环境变量与会话 `/effort` 设置可覆盖它。
+`context_window` 省略时暂用内置 200000；自定义模型建议明确填写，数值必须与服务端实际支持的窗口一致。`max_output_tokens` 是每个模型的单次生成上限，思考与正文共用；省略或填 `0` 时默认 **32000**，必须小于该模型的上下文窗口。切换模型、fallback 和子 agent 都使用目标模型自己的值。旧的全局 `max_reply_tokens` / `CCDP_MAX_REPLY_TOKENS` 不再接受。推理强度是单一全局设置（`reasoning_effort`），未配置时内置默认 **`medium`**；不提供按模型默认值，旧的 `models.<model>.reasoning_effort` 不再接受。
 
 ```jsonc
 {
@@ -126,8 +126,7 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
           "max_output_tokens": 8192
         },
         "deepseek-reasoner": {
-          "context_window": 128000,
-          "reasoning_effort": "high"
+          "context_window": 128000
           // 可选 pricing: { "input_per_million": 实际单价, "output_per_million": 实际单价 }
         }
       }
@@ -222,11 +221,11 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
 /cost           token 用量与花费   /context         上下文占用可视化
 /rewind [n]     回退历史          /fork [n]         分支新会话
 /checkpoint     创建/恢复检查点    /diff /git        查看/执行 git
-/sessions       会话列表          /resume <id>      恢复会话
+/resume [id]    恢复会话（无参数进入选择器）
 /mcp /plugins   MCP 与插件状态     /skills           技能列表
 /permissions    权限规则管理       /add-dir <dir>    扩展沙箱目录
 /export [path]  导出 Markdown     /config set <k> <v>
-/copy [id]      复制最近/指定回复   /trust [revoke]   授权/撤销项目配置
+/trust [revoke] 授权/撤销项目配置
 /agents        进入子 Agent 视图   /root /parent    返回主/父会话
 /agent <id>    查看/定向控制子任务  /stop-tree       取消整棵运行树
 /agent-history 分页查看保存的转录  /agent-output <item-id> [offset]
@@ -253,7 +252,7 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
 | `↑` / `↓` | 单行输入浏览历史，多行输入移动光标；选择器逐项导航 |
 | `Home` / `End` | 移动输入光标；阅读器中跳到开头 / 结尾 |
 | `PgUp` / `PgDn`、`⌃U` / `⌃D` | 滚动当前对话、选择器或阅读器 |
-| 拖选后 `⌘C` | 终端原生复制；`/copy` 可直接复制回复原文 |
+| 拖选后 `⌘C` | 终端原生复制；阅读器中 `c` 可复制原文 |
 | `⌃P` / `⌃N` | 输入历史 |
 | `⌃R` | 增量反向搜索输入历史；`⌃R`/`↑` 翻下一处，`Enter` 回填到输入框，`Esc` 取消 |
 | `⌃G` | 用 `$EDITOR`（或 `$VISUAL`）编辑当前草稿，挂起/恢复终端 |

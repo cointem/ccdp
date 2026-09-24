@@ -21,7 +21,7 @@ import (
 // TestConversationResetErasesNativeHistory pins the /clear contract. The
 // runtime replaces the conversation projection and republishes a same-session
 // snapshot with no transcript; every row of the discarded conversation —
-// including UI-local reports such as /sessions output — must leave the screen,
+// including UI-local reports such as /status output — must leave the screen,
 // and the native scrollback that holds them must be erased, which no managed
 // frame repaint can reach.
 func TestConversationResetErasesNativeHistory(t *testing.T) {
@@ -29,7 +29,7 @@ func TestConversationResetErasesNativeHistory(t *testing.T) {
 	t.Cleanup(m.watchCancel)
 	view := protocolSnapshot("session", protocol.MessageView{ID: "m1", Role: "assistant", Content: "hello"})
 	m.applySnapshot(view)
-	m.pushLog("system", "/sessions\npubfyu7vgogno2octtqnkes2rr  2026-09-23 22:59")
+	m.pushLog("system", "/status\npubfyu7vgogno2octtqnkes2rr  2026-09-23 22:59")
 	if len(m.confirmedItems) == 0 || len(m.reports) == 0 {
 		t.Fatalf("precondition: transcript=%d reports=%d", len(m.confirmedItems), len(m.reports))
 	}
@@ -72,7 +72,7 @@ func TestWatchConversationResetErasesNativeHistory(t *testing.T) {
 	m := NewWithClient(client, "", false)
 	t.Cleanup(m.watchCancel)
 	m.applySnapshot(client.snapshot)
-	m.pushLog("system", "/sessions\npubfyu7vgogno2octtqnkes2rr  2026-09-23 22:59")
+	m.pushLog("system", "/status\npubfyu7vgogno2octtqnkes2rr  2026-09-23 22:59")
 	sub, err := client.Watch(context.Background(), protocol.Cursor{})
 	if err != nil {
 		t.Fatal(err)

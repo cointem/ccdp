@@ -140,6 +140,36 @@ func TestGitSafeRejectsOperators(t *testing.T) {
 	}
 }
 
+// TestQuotedArgvReadOnlyGitAutoAllowed guards the /diff regression: the
+// runtime formats typed external commands with per-token shell quoting
+// ('git' 'diff'), which must classify identically to the bare argv.
+func TestQuotedArgvReadOnlyGitAutoAllowed(t *testing.T) {
+	m := NewManager(ModeDefault, Policy{})
+	for _, cmd := range []string{
+		"'git' 'diff'",
+		"'git' 'status' '--short'",
+		"'git' 'diff' '--' 'a b.txt'",
+		"git 'diff'",
+		"env ls",
+	} {
+		if d, reason := m.Check("Bash", map[string]any{"command": cmd}); d != DecisionAllow {
+			t.Errorf("%q must be auto-allowed, got %v (%s)", cmd, d, reason)
+		}
+	}
+	for _, cmd := range []string{
+		"'git' 'push' 'origin'",
+		"'git' 'diff; rm -rf build'",
+		"'find' '.' '-delete'",
+		"env find . -delete",
+		"'git' 'diff",
+		"'git' 'diff' '",
+	} {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d == DecisionAllow {
+			t.Errorf("%q must not be auto-allowed, got %v", cmd, d)
+		}
+	}
+}
+
 func TestSessionAllowCannotBypassAlwaysDeny(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{AlwaysDeny: []string{"Bash:git push*"}})
 	key := SessionKey("Bash", map[string]any{"command": "git push origin"})

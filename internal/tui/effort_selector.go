@@ -10,9 +10,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Provider-default is a reset, not a level of reasoning intensity.
+// "default" is a reset to ccdp's built-in effort (medium), not a level.
 var effortOptions = []SelectorOption{
-	{ID: "default", Label: "default", Description: "由模型默认配置决定"},
+	{ID: "default", Label: "default", Description: "恢复内置默认 medium"},
 	{ID: "none", Label: "none", Description: "关闭显式推理"},
 	{ID: "minimal", Label: "minimal", Description: "最少推理"},
 	{ID: "low", Label: "low", Description: "较低推理强度"},

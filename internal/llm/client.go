@@ -285,6 +285,9 @@ func (c *Client) postStream(ctx context.Context, url string, body []byte) (resp 
 		if c.isAnthropic() {
 			httpReq.Header.Set("x-api-key", c.cfg.APIKey)
 			httpReq.Header.Set("anthropic-version", "2023-06-01")
+			if betas := anthropicBetaHeader(body); betas != "" {
+				httpReq.Header.Set("anthropic-beta", betas)
+			}
 		} else {
 			httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 		}

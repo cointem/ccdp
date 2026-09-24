@@ -519,7 +519,10 @@ func (m *Manager) checkBash(mode Mode, command string) (Decision, string) {
 
 // segmentReadOnly reports whether a single command segment (no control
 // operators) is safe to auto-allow: a read-only binary or a conservative git
-// subcommand, with no redirections or mutation primaries.
+// subcommand, with no redirections or mutation primaries. Words are matched
+// after shell quoting is resolved so an argv-canonical invocation such as
+// `'git' 'diff'` (the form the runtime builds for typed external commands)
+// classifies identically to `git diff`.
 func segmentReadOnly(segment string) bool {
 	segment = strings.TrimSpace(segment)
 	if segment == "" {
@@ -528,10 +531,30 @@ func segmentReadOnly(segment string) bool {
 	if hasDangerousOperator(segment) {
 		return false
 	}
-	if safeTokens[firstToken(segment)] {
+	words, ok := shellWords(segment)
+	if !ok || len(words) == 0 {
+		return false
+	}
+	// Leading `cd`/`env` prefixes do not change the safety of the wrapped
+	// command, so classification inspects the command behind them.
+	effective := stripCommandPrefix(words)
+	if len(effective) > 0 && effective[0] == "find" && hasFindMutation(effective[1:]) {
+		return false
+	}
+	if len(effective) > 0 && safeTokens[effective[0]] {
 		return true
 	}
-	return gitSafe(segment)
+	return gitSafe(words)
+}
+
+// stripCommandPrefix drops leading `cd`/`env` words used purely to launch the
+// effective command.
+func stripCommandPrefix(words []string) []string {
+	i := 0
+	for i < len(words) && (words[i] == "cd" || words[i] == "env") {
+		i++
+	}
+	return words[i:]
 }
 
 // commandAllowedByRules reports whether an always_allow rule set covers a Bash
@@ -685,47 +708,103 @@ func StringArg(args map[string]any, key, fallback string) string {
 	return fallback
 }
 
-func firstToken(s string) string {
-	s = strings.TrimSpace(s)
-	// Strip environment assignments and `cd` prefixes which don't change safety.
-	// `sudo` is deliberately NOT stripped: a sudo command must fall through to
-	// the ask gate, not inherit the safety of the wrapped command.
-	for {
-		if len(s) == 0 {
-			return ""
-		}
-		for _, prefix := range []string{"cd ", "env "} {
-			if strings.HasPrefix(s, prefix) {
-				s = strings.TrimSpace(strings.TrimPrefix(s, prefix))
+// shellWords splits a command segment into shell argument words, resolving
+// single quotes, double quotes and backslash escapes (adjacent quoted and
+// unquoted runs concatenate, as in the shell). Contents are treated as
+// literal: expansions such as `$HOME` or globs are not interpreted, which is
+// safe because callers only ever auto-allow exact literal words. It reports
+// ok=false on unbalanced quoting or a trailing backslash so callers fail
+// closed to the ask gate.
+func shellWords(s string) ([]string, bool) {
+	var (
+		words   []string
+		cur     strings.Builder
+		started bool
+	)
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		switch r := runes[i]; r {
+		case ' ', '\t':
+			if started {
+				words = append(words, cur.String())
+				cur.Reset()
+				started = false
 			}
+		case '\'':
+			started = true
+			i++
+			closed := false
+			for ; i < len(runes); i++ {
+				if runes[i] == '\'' {
+					closed = true
+					break
+				}
+				cur.WriteRune(runes[i])
+			}
+			if !closed {
+				return nil, false
+			}
+		case '"':
+			started = true
+			i++
+			closed := false
+			for ; i < len(runes); i++ {
+				switch runes[i] {
+				case '"':
+					closed = true
+					break
+				case '\\':
+					if i+1 >= len(runes) {
+						return nil, false
+					}
+					i++
+					cur.WriteRune(runes[i])
+				default:
+					cur.WriteRune(runes[i])
+				}
+			}
+			if !closed {
+				return nil, false
+			}
+		case '\\':
+			started = true
+			if i+1 >= len(runes) {
+				return nil, false
+			}
+			i++
+			cur.WriteRune(runes[i])
+		default:
+			started = true
+			cur.WriteRune(r)
 		}
-		if i := strings.IndexAny(s, " \t;|&"); i > 0 {
-			return s[:i]
-		}
-		return s
 	}
+	if started {
+		words = append(words, cur.String())
+	}
+	return words, true
 }
 
 // hasDangerousOperator flags shell operators (including embedded newlines and
-// command substitutions) that make a command unsafe to auto-allow.
+// command substitutions) that make a command unsafe to auto-allow. The check
+// is deliberately quote-blind: an operator inside a quoted argument still
+// fails closed to the ask gate.
 func hasDangerousOperator(s string) bool {
 	for _, op := range []string{">", ">>", "|", ";", "&&", "||", "$(", "`", "\n"} {
 		if strings.Contains(s, op) {
 			return true
 		}
 	}
-	// find is syntactically a read command, but these primaries execute a
-	// mutation or an arbitrary child command. They must not inherit the
-	// read-only first-token allowlist. Keep this token check conservative and
-	// exact so names such as "-delete-old" are not rejected accidentally.
-	if firstToken(s) == "find" {
-		for _, token := range strings.Fields(s) {
-			token = strings.Trim(token, "\"'")
-			switch token {
-			case "-delete", "-exec", "-execdir", "-ok", "-okdir",
-				"-fls", "-fprint", "-fprint0", "-fprintf":
-				return true
-			}
+	return false
+}
+
+// hasFindMutation reports whether a find invocation carries a primary that
+// mutates the filesystem or executes a child command.
+func hasFindMutation(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "-delete", "-exec", "-execdir", "-ok", "-okdir",
+			"-fls", "-fprint", "-fprint0", "-fprintf":
+			return true
 		}
 	}
 	return false
@@ -799,16 +878,15 @@ func splitCommandSegments(s string) ([]string, bool) {
 }
 
 // gitSafe allows a conservative, argv-aware subset of read-only git commands.
-// Matching is per-token so a mutating subcommand can never piggy-back on a safe
+// Matching is per-word so a mutating subcommand can never piggy-back on a safe
 // prefix (`git remote set-url`, `git branch -D`, `git tag v1` all fall through
 // to the ask gate) — the historic strings.HasPrefix check let them slip by.
-func gitSafe(command string) bool {
-	tokens := strings.Fields(command)
-	if len(tokens) < 2 || tokens[0] != "git" {
+func gitSafe(words []string) bool {
+	if len(words) < 2 || words[0] != "git" {
 		return false
 	}
-	sub := tokens[1]
-	args := tokens[2:]
+	sub := words[1]
+	args := words[2:]
 	switch sub {
 	case "status", "diff", "log", "show", "blame", "rev-parse", "describe", "shortlog", "ls-files", "grep":
 		return true

@@ -13,11 +13,11 @@ func TestComposerCodexLayout(t *testing.T) {
 		m.textarea.Reset()
 		m.layout()
 		empty := strings.Split(sanitizeANSI(m.renderInput()), "\n")
-		if len(empty) != 3 || strings.TrimSpace(empty[0]) != "" || strings.TrimSpace(empty[2]) != "" {
-			t.Fatalf("width %d: want one input row between two blank rows: %q", width, empty)
+		if len(empty) != 2 || strings.TrimSpace(empty[1]) != "" {
+			t.Fatalf("width %d: want one input row above a trailing blank row: %q", width, empty)
 		}
-		if !strings.HasPrefix(empty[1], "› Ask CCDP") {
-			t.Fatalf("unexpected prompt: %q", empty[1])
+		if !strings.HasPrefix(empty[0], "› Ask CCDP") {
+			t.Fatalf("unexpected prompt: %q", empty[0])
 		}
 		m.textarea.SetValue("first line\n中文第二行\nthird line")
 		m.syncInputHeight()

@@ -556,11 +556,11 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.selection {
-			// Drag copies surface through the toast above the composer; a
-			// status notice would add a layout row and shift the transcript.
+			// Drag copies take the right edge of the hint row; a status notice
+			// would overwrite the left-side lane content.
 			return m, m.showCopiedToast(msg.chars)
 		}
-		m.pushStatus("copied latest response")
+		m.pushStatus("copied to clipboard")
 		return m, nil
 
 	case copiedToastExpireMsg:

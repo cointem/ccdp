@@ -217,7 +217,7 @@ func (c Catalog) Help() string {
 		b.WriteByte('\n')
 	}
 	b.WriteString("\nCustom commands: markdown files in ~/.ccdp/commands/<name>.md or .ccdp/commands/<name>.md become /name; $ARGUMENTS is replaced by the args.\n")
-	b.WriteString("Keys\n  Enter        send/steer; /next queues      ⌥Enter       newline (⌃J also works)\n  ↑/↓          edit multiline input or browse input history\n  Home/End     move within input\n  ⌃C           interrupt agent; press twice when idle to quit\n  ⌘C           native terminal copy (or /copy for the latest response)\n  trackpad     native history; PgUp/PgDn or ⌃U/⌃D scroll the view\n  ⌃O           read transcript (review details in approval)\n  ⌃A           browse agents\n  Approval     ↑/↓ choose · Enter confirm · Esc later · /pending reopen\n  esc          dismiss or return; interrupt when running\n  /transcript  read full messages and tool output\n  Reader       / search · n next · o raw · c copy · esc return\n")
+	b.WriteString("Keys\n  Enter        send/steer; /next queues      ⌥Enter       newline (⌃J also works)\n  ↑/↓          edit multiline input or browse input history\n  Home/End     move within input\n  ⌃C           interrupt agent; press twice when idle to quit\n  ⌘C           native terminal copy\n  trackpad     native history; PgUp/PgDn or ⌃U/⌃D scroll the view\n  ⌃O           read transcript (review details in approval)\n  ⌃A           browse agents\n  Approval     ↑/↓ choose · Enter confirm · Esc later · /pending reopen\n  esc          dismiss or return; interrupt when running\n  /transcript  read full messages and tool output\n  Reader       / search · n next · o raw · c copy · esc return\n")
 	return b.String()
 }
 
@@ -251,7 +251,6 @@ func Default() Catalog {
 		{Name: "compact", Help: "compact context now", Feedback: FeedbackOperation, Busy: BusyReject, Mutation: true},
 		{Name: "cost", Help: "show token usage and estimated cost", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "context", Help: "visualize context window use and cumulative tokens", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
-		{Name: "copy", Help: "copy the latest response (or /copy <message-id>) to the host clipboard", Feedback: FeedbackNotice, Busy: BusyAllow},
 		{Name: "config", Help: "show runtime configuration or set a session setting", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, TransientSubcommands: []string{"set"}},
 		{Name: "doctor", Help: "run environment diagnostics", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "permissions", Help: "show or manage permission rules", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, TransientSubcommands: []string{"allow", "deny", "remove"}, Mutation: true},
@@ -265,7 +264,7 @@ func Default() Catalog {
 		{Name: "skills", Help: "list available skills", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "mode", Help: "choose or switch permission mode", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "model", Help: "choose or switch the active model", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
-		{Name: "effort", Help: "choose reasoning effort with left/right; default clears override", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
+		{Name: "effort", Help: "choose reasoning effort with left/right; default resets to built-in medium", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "verbosity", Help: "choose response verbosity: low|medium|high|default", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "plan", Help: "toggle plan mode (propose-then-approve)", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "sandbox", Help: "choose or switch sandbox mode", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
@@ -285,7 +284,6 @@ func Default() Catalog {
 		{Name: "apply", Help: "apply a git patch or send a plan to the agent", Feedback: FeedbackOperation, Busy: BusyReject, Mutation: true},
 		{Name: "git", Help: "run a git command in the workspace", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, Mutation: true},
 		{Name: "save", Help: "save the session to disk", Feedback: FeedbackOperation, Busy: BusyAllow, Mutation: true},
-		{Name: "sessions", Help: "list saved sessions", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "resume", Help: "resume a saved session", Feedback: FeedbackSelector, Busy: BusyReject, Mutation: true},
 		{Name: "status", Help: "show session details", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "commands", Help: "list custom slash commands", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},

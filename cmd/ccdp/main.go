@@ -32,7 +32,7 @@ const maxCLIPromptBytes = 4 << 20
 
 func main() {
 	var (
-		effortFlag    = flag.String("effort", "", "reasoning effort (empty = provider default)")
+		effortFlag    = flag.String("effort", "", "reasoning effort (empty = built-in default medium)")
 		verbosityFlag = flag.String("verbosity", "", "response verbosity: low|medium|high (empty = provider default)")
 		modelFlag     = flag.String("m", "", "model to use (overrides config)")
 		dirFlag       = flag.String("d", "", "working directory (default: current directory)")

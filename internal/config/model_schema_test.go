@@ -11,7 +11,7 @@ import (
 func TestModelObjectSchema(t *testing.T) {
 	t.Setenv("TEST_ROUTER_KEY", "test-secret")
 	path := filepath.Join(t.TempDir(), "config.json")
-	data := `{"model":"first/same","providers":{"first":{"base_url":"https://first.example/v1","api_key_env":"TEST_ROUTER_KEY","wire_api":"responses","models":{"same":{"context_window":1000000,"max_output_tokens":16000,"reasoning_effort":"high","pricing":{"input_per_million":2,"output_per_million":4}}}},"second":{"base_url":"https://second.example/v1","wire_api":"chat","models":{"same":{"context_window":128000},"org/model":{}}}}}`
+	data := `{"model":"first/same","reasoning_effort":"high","providers":{"first":{"base_url":"https://first.example/v1","api_key_env":"TEST_ROUTER_KEY","wire_api":"responses","models":{"same":{"context_window":1000000,"max_output_tokens":16000,"pricing":{"input_per_million":2,"output_per_million":4}}}},"second":{"base_url":"https://second.example/v1","wire_api":"chat","models":{"same":{"context_window":128000},"org/model":{}}}}}`
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +56,7 @@ func TestRejectOldModelConfiguration(t *testing.T) {
 		`{"max_reply_tokens":8192}`, `{"api_key":"old"}`, `{"base_url":"https://example.com"}`, `{"context_window":1000000}`, `{"pricing":{}}`,
 		`{"providers":{"p":{"models":["m"]}}}`,
 		`{"providers":{"p":{"models":{"m":{}},"context_windows":{"m":1000000}}}}`,
+		`{"providers":{"p":{"base_url":"https://example.com","wire_api":"chat","models":{"m":{"reasoning_effort":"low"}}}}}`,
 		`{"model":"p/m","providers":{"p":{"base_url":"https://example.com","wire_api":"respinses","models":{"m":{}}}}}`,
 	} {
 		path := filepath.Join(t.TempDir(), "config.json")
@@ -90,5 +91,16 @@ func TestPerModelOutputDefaultDoesNotInheritAnotherModelCap(t *testing.T) {
 		if got := cfg.MaxOutputTokensFor(model); got != want {
 			t.Fatalf("%s: got %d want %d", model, got, want)
 		}
+	}
+}
+
+func TestReasoningEffortBuiltInDefault(t *testing.T) {
+	cfg := Default()
+	if got := cfg.ReasoningEffortFor("p/a"); got != DefaultReasoningEffort {
+		t.Fatalf("unset effort = %q, want built-in default %q", got, DefaultReasoningEffort)
+	}
+	cfg.ReasoningEffort = "high"
+	if got := cfg.ReasoningEffortFor("p/a"); got != "high" {
+		t.Fatalf("global override lost: %q", got)
 	}
 }

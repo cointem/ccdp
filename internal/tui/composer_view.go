@@ -45,7 +45,7 @@ func (m *composerState) render(width int, placeholder string) string {
 		composer = styleStatus.Render(truncateDisplay("  "+m.pasteFold.summary(), max(1, width-4)))
 	}
 	return paintComposerBackground(lipgloss.NewStyle().Background(colorInputBackground).
-		Padding(1, 0).
+		Padding(0, 0, 1, 0).
 		Width(max(1, width)).
 		MaxWidth(width).
 		Render(m.imageInputSummary(width) + composer))
