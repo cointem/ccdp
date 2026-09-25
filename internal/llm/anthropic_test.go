@@ -402,7 +402,7 @@ func TestAnthropicBodyAdaptiveThinking(t *testing.T) {
 		wantBetas    string
 	}{
 		{name: "xhigh folds to high", effort: "xhigh", wantThinking: `"thinking":{"type":"adaptive"}`, wantOutput: `"output_config":{"effort":"high"}`, wantBetas: anthropicInterleavedThinkingBeta + ", " + anthropicEffortBeta},
-		{name: "ultra folds to max", effort: "ultra", wantThinking: `"thinking":{"type":"adaptive"}`, wantOutput: `"output_config":{"effort":"max"}`, wantBetas: anthropicInterleavedThinkingBeta + ", " + anthropicEffortBeta},
+		{name: "max passes through", effort: "max", wantThinking: `"thinking":{"type":"adaptive"}`, wantOutput: `"output_config":{"effort":"max"}`, wantBetas: anthropicInterleavedThinkingBeta + ", " + anthropicEffortBeta},
 		{name: "none disables thinking", effort: "none"},
 		{name: "unknown effort falls back", effort: "banana"},
 		{name: "thinking without effort", reqThinking: "enabled", wantThinking: `"thinking":{"type":"adaptive"}`, wantBetas: anthropicInterleavedThinkingBeta},

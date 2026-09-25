@@ -84,8 +84,8 @@ func TestEffortCancelResetAndStaleAnimation(t *testing.T) {
 	_, cmd := m.handlePickerKey(tea.KeyMsg{Type: tea.KeyEnter})
 	_ = cmd()
 	sent := m.client.(*recordingClient).submits[0]
-	if sent.Generation.ReasoningEffort == nil || *sent.Generation.ReasoningEffort != "" {
-		t.Fatal("default did not clear override")
+	if sent.Generation.ReasoningEffort == nil || *sent.Generation.ReasoningEffort != "none" {
+		t.Fatal("Home did not select none")
 	}
 }
 func TestEffortFramesFitAndOtherSelectorsStayVertical(t *testing.T) {

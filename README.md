@@ -32,9 +32,9 @@ ccdp 0.2.0 · Go 1.27+ · 无第三方 LLM SDK 依赖（纯 HTTP 流式实现）
 }
 ```
 
-也可用 `CCDP_REASONING_EFFORT` / `CCDP_VERBOSITY`，或启动参数 `ccdp --effort high --verbosity low`。会话空闲时 `/effort high`、`/verbosity low` 修改当前设置；不带参数时，`/effort` 打开带过渡动画的横向强度选择器（←/→ 预览、Enter 确认、Esc 取消），`/verbosity` 使用上下选择菜单；预览不改变底部的生效值。`/effort default` 恢复内置默认 `medium`，`/verbosity default` 清除覆盖。设置随会话保存；原有冻结请求不受后续修改影响。`verbosity` 控制模型输出，与诊断日志 `--verbose` 不同。
+也可用 `CCDP_REASONING_EFFORT` / `CCDP_VERBOSITY`，或启动参数 `ccdp --effort high --verbosity low`。会话空闲时 `/effort high`、`/verbosity low` 修改当前设置；不带参数时，`/effort` 打开带过渡动画的横向强度选择器（←/→ 预览、Enter 确认、Esc 取消），`/verbosity` 使用上下选择菜单；预览不改变底部的生效值。`/verbosity default` 清除覆盖，回到未配置状态。设置随会话保存；原有冻结请求不受后续修改影响。`verbosity` 控制模型输出，与诊断日志 `--verbose` 不同。
 
-`reasoning_effort` 接受 `none|minimal|low|medium|high|xhigh|max|ultra`，`verbosity` 接受 `low|medium|high`；`reasoning_effort` 未配置时按内置默认 **`medium`** 发送，`verbosity` 未配置时省略字段。实际支持的取值取决于所选模型和服务商，不支持时会保留 API 错误，不会静默重试并删除参数。Chat Completions 使用顶层 `reasoning_effort` / `verbosity`，格式见 [OpenAI 官方文档](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.2)。Anthropic 线路使用新版 adaptive thinking：非 `none` 档位发送 `thinking: {type:"adaptive"}` 并在 `output_config.effort` 携带 `low|medium|high|max`（`minimal→low`、`xhigh→high`、`ultra→max`），`none` 关闭思考，旧的 `budget_tokens` 形态不再发送。
+`reasoning_effort` 接受 `none|minimal|low|medium|high|xhigh|max`，`verbosity` 接受 `low|medium|high`；`reasoning_effort` 未配置时按内置默认 **`medium`** 发送，`verbosity` 未配置时省略字段。实际支持的取值取决于所选模型和服务商，不支持时会保留 API 错误，不会静默重试并删除参数。Chat Completions 使用顶层 `reasoning_effort` / `verbosity`，格式见 [OpenAI 官方文档](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.2)。Anthropic 线路使用新版 adaptive thinking：非 `none` 档位发送 `thinking: {type:"adaptive"}` 并在 `output_config.effort` 携带 `low|medium|high|max`（`minimal→low`、`xhigh→high`），`none` 关闭思考，旧的 `budget_tokens` 形态不再发送。
 
 DeepSeek 模型（名称以 `deepseek` 开头或使用官方端点）还会显式设置 `thinking.type`；`/effort none` 对应 `disabled`，其他显式档位对应 `enabled`。`reasoning_content` 随助手消息持久化，并在后续 DeepSeek 请求中回传，支持思考模式的连续工具调用；不会把该扩展字段发给其他模型。DeepSeek 的档位映射和限制见 [DeepSeek 官方文档](https://api-docs.deepseek.com/guides/thinking_mode/)。
 

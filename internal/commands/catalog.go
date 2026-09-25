@@ -264,7 +264,7 @@ func Default() Catalog {
 		{Name: "skills", Help: "list available skills", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "mode", Help: "choose or switch permission mode", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "model", Help: "choose or switch the active model", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
-		{Name: "effort", Help: "choose reasoning effort with left/right; default resets to built-in medium", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
+		{Name: "effort", Help: "choose reasoning effort with left/right; unset resolves to built-in medium", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "verbosity", Help: "choose response verbosity: low|medium|high|default", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "plan", Help: "toggle plan mode (propose-then-approve)", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "sandbox", Help: "choose or switch sandbox mode", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},

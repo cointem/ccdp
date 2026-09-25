@@ -101,7 +101,7 @@ func TestQuestionModalFitsTerminal(t *testing.T) {
 }
 
 func TestGenerationSlashCommands(t *testing.T) {
-	for _, line := range []string{"/effort high", "/verbosity low", "/effort default"} {
+	for _, line := range []string{"/effort high", "/verbosity low", "/effort none"} {
 		m := sugModel()
 		_, cmd := m.runCommand(line)
 		if cmd == nil {
@@ -112,8 +112,8 @@ func TestGenerationSlashCommands(t *testing.T) {
 		if command.Type != protocol.CommandSetGeneration {
 			t.Fatal(command.Type)
 		}
-		if line == "/effort default" && (command.Generation.ReasoningEffort == nil || *command.Generation.ReasoningEffort != "") {
-			t.Fatal("default did not clear override")
+		if line == "/effort none" && (command.Generation.ReasoningEffort == nil || *command.Generation.ReasoningEffort != "none") {
+			t.Fatal("none did not set override")
 		}
 	}
 }

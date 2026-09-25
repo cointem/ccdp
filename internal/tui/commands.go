@@ -196,11 +196,15 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			return m, m.startGenerationSelector(cmd)
 		}
 		if len(args) != 1 {
-			m.pushLog("error", "usage: /"+cmd+" <value|default>")
+			if cmd == "effort" {
+				m.pushLog("error", "usage: /effort <none|minimal|low|medium|high|xhigh|max>")
+			} else {
+				m.pushLog("error", "usage: /"+cmd+" <value|default>")
+			}
 			return m, nil
 		}
 		value := args[0]
-		if value == "default" {
+		if cmd == "verbosity" && value == "default" {
 			value = ""
 		}
 		g := &protocol.SetGeneration{}

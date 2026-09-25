@@ -5,14 +5,15 @@ import (
 	"strings"
 	"time"
 
+	"ccdp/internal/config"
 	"ccdp/internal/protocol"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-// "default" is a reset to ccdp's built-in effort (medium), not a level.
+// The scale contains only real levels: an unset effort resolves to the
+// built-in default medium, so there is no "default" stop.
 var effortOptions = []SelectorOption{
-	{ID: "default", Label: "default", Description: "恢复内置默认 medium"},
 	{ID: "none", Label: "none", Description: "关闭显式推理"},
 	{ID: "minimal", Label: "minimal", Description: "最少推理"},
 	{ID: "low", Label: "low", Description: "较低推理强度"},
@@ -20,7 +21,6 @@ var effortOptions = []SelectorOption{
 	{ID: "high", Label: "high", Description: "较高推理强度"},
 	{ID: "xhigh", Label: "xhigh", Description: "更高推理强度"},
 	{ID: "max", Label: "max", Description: "最大推理档位"},
-	{ID: "ultra", Label: "ultra", Description: "超高推理档位"},
 }
 
 func (m *Model) startGenerationSelector(name string) tea.Cmd {
@@ -30,8 +30,8 @@ func (m *Model) startGenerationSelector(name string) tea.Cmd {
 		current, kind, title = m.snapshot.Settings.Verbosity, selectorVerbosity, "Response verbosity"
 		options = []SelectorOption{{ID: "default", Label: "default", Description: "使用模型默认配置"}, {ID: "low", Label: "low", Description: "简短"}, {ID: "medium", Label: "medium", Description: "适中"}, {ID: "high", Label: "high", Description: "详细"}}
 	}
-	if current == "" {
-		current = "default"
+	if current == "" && kind == selectorEffort {
+		current = config.DefaultReasoningEffort
 	}
 	selected := 0
 	for i := range options {
@@ -141,7 +141,9 @@ func (m *Model) renderEffortSelector() string {
 	center := func(text string) string { return lipgloss.NewStyle().Width(width).Align(lipgloss.Center).Render(text) }
 	selected := p.Options[p.Index]
 	note := selected.Description
-	if selected.ID == m.snapshot.Settings.ReasoningEffort || selected.ID == "default" && m.snapshot.Settings.ReasoningEffort == "" {
+	if selected.ID == m.snapshot.Settings.ReasoningEffort ||
+		selected.ID == "default" && m.snapshot.Settings.Verbosity == "" ||
+		selected.ID == config.DefaultReasoningEffort && m.snapshot.Settings.ReasoningEffort == "" {
 		note += " · current"
 	}
 	warning := "更高强度可能增加 token 用量和响应时间"

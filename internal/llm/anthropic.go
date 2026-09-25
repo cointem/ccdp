@@ -63,19 +63,19 @@ type anthropicBodyRequest struct {
 const anthropicDefaultMaxTokens = 4096
 
 // Beta headers required by the adaptive-thinking and effort controls. The
-// effort scale (low|medium|high|max) is validated by the API; "none" and an
-// unset effort send no thinking block, leaving depth to the model default.
+// effort scale (low|medium|high|max) is validated by the API; "none" sends no
+// thinking block at all.
 const (
 	anthropicInterleavedThinkingBeta = "interleaved-thinking-2025-05-14"
 	anthropicEffortBeta              = "effort-2025-11-24"
 )
 
-// anthropicEffort folds ccdp's wider effort scale into the four values the
-// Messages API accepts for output_config.effort; anything unknown falls back
-// to the provider default (no effort sent).
+// anthropicEffort folds ccdp's effort scale into the four values the Messages
+// API accepts for output_config.effort (minimal→low, xhigh→high); anything
+// else, including "none", sends no thinking block at all.
 func anthropicEffort(effort string) string {
 	switch effort {
-	case "", "none":
+	case "none":
 		return ""
 	case "minimal", "low":
 		return "low"
@@ -83,7 +83,7 @@ func anthropicEffort(effort string) string {
 		return "medium"
 	case "high", "xhigh":
 		return "high"
-	case "max", "ultra":
+	case "max":
 		return "max"
 	default:
 		return ""
