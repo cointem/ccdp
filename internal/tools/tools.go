@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -74,9 +73,12 @@ type Context struct {
 	OutputLimit int
 	// ProcessInputLimit bounds one ProcessWrite call. Zero uses the default.
 	ProcessInputLimit int
-	// Sandbox confines path resolution to the workspace. When nil, paths are
-	// resolved against WorkingDir without containment.
+	// Sandbox applies the shared file policy: host reads are allowed except
+	// explicit denies, while writes require an authorized root.
 	Sandbox *sandbox.Sandbox
+	// HostNetworkAllowed authorizes this invocation's in-process network
+	// adapters. Seatbelt does not constrain the harness process itself.
+	HostNetworkAllowed bool
 	// Notify is called with transient progress updates (e.g. command output)
 	// that the UI can stream live for long-running tools.
 	Notify func(line string)
@@ -222,32 +224,26 @@ func (c *Context) processManager() (*ProcessManager, error) {
 	return nil, fmt.Errorf("tools: no session ProcessManager injected")
 }
 
-// ResolveRead resolves p for reading, honoring the sandbox when present.
+// ResolveRead resolves p for reading. A missing policy is a denied operation.
 func (c *Context) ResolveRead(p string) (string, error) {
 	if err := c.checkResources(); err != nil {
 		return "", err
 	}
-	if c.Sandbox != nil {
-		return c.Sandbox.ResolveRead(p)
+	if c.Sandbox == nil {
+		return "", fmt.Errorf("tools: sandbox policy is unavailable")
 	}
-	if filepath.IsAbs(p) {
-		return filepath.Clean(p), nil
-	}
-	return filepath.Join(c.WorkingDir, p), nil
+	return c.Sandbox.ResolveRead(p)
 }
 
-// ResolveWrite resolves p for writing, honoring the sandbox when present.
+// ResolveWrite resolves p for writing. A missing policy is a denied operation.
 func (c *Context) ResolveWrite(p string) (string, error) {
 	if err := c.checkResources(); err != nil {
 		return "", err
 	}
-	if c.Sandbox != nil {
-		return c.Sandbox.ResolveWrite(p)
+	if c.Sandbox == nil {
+		return "", fmt.Errorf("tools: sandbox policy is unavailable")
 	}
-	if filepath.IsAbs(p) {
-		return filepath.Clean(p), nil
-	}
-	return filepath.Join(c.WorkingDir, p), nil
+	return c.Sandbox.ResolveWrite(p)
 }
 
 // Tool is the interface implemented by every built-in tool.

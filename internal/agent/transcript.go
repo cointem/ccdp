@@ -311,6 +311,9 @@ func (t *transcriptState) applyTurnFinished(b []byte) {
 	if e.Error != "" {
 		t.put(protocol.TranscriptItem{ID: "error:" + e.TurnID, Kind: "error", Text: e.Error, TurnID: protocol.TurnID(e.TurnID), Status: e.Outcome})
 	}
+	if e.DurationMs > 0 {
+		t.put(protocol.TranscriptItem{ID: "turn-summary:" + e.TurnID, Kind: "turn_summary", TurnID: protocol.TurnID(e.TurnID), Status: e.Outcome, DurationMs: e.DurationMs})
+	}
 }
 
 func (t *transcriptState) event(ev protocol.EventView) {

@@ -9,11 +9,11 @@ ccdp 0.2.0 · Go 1.27+ · 无第三方 LLM SDK 依赖（纯 HTTP 流式实现）
 ## 功能特性
 
 - **Agent 循环** — Infer → ToolDispatch → ApprovalGate → Compact，支持并行工具执行（`max_parallel_tools`）、工具结果聚合预算、截断回复自动续写、`--max-turns` / `--max-budget` 双重熔断
-- **实时 TUI**（Bubble Tea）— 紧凑文字欢迎区、适配深浅终端的青蓝主题、动态工作指示与耗时、紧凑工具结果；默认 inline 转录、共享可滚动选择器、状态栏、多行输入；普通聊天不捕获鼠标，历史滚动与拖选交给终端
+- **实时 TUI**（Bubble Tea）— 紧凑文字欢迎区、适配深浅终端的青蓝主题、动态工作指示与每轮耗时、紧凑工具结果；完成后的耗时随回复保留在转录中；默认 inline 转录、共享可滚动选择器、状态栏、多行输入；普通聊天不捕获鼠标，历史滚动与拖选交给终端
 - **需求澄清** — `AskUserQuestion` 支持 1–4 题、单选/多选和自由补充；plan 模式可用，答案不代替执行审批
 - **推理与输出控制** — `reasoning_effort` / `verbosity` 支持配置、环境变量、CLI 和 `/effort` / `/verbosity`；会话保存与恢复
 - **权限体系** — `manual` / `edits`（默认）/ `bypass` 审批策略与独立 plan 工作流；兼容 `/mode plan`，always_allow / always_deny 规则（glob）、会话级审批记忆、turn 级审批缓存
-- **沙箱** — `confine`（路径围栏）/ `strict`（macOS sandbox-exec 内核隔离 + ulimit 资源限制 + 网络阻断）/ `none`；Bash 与 ProcessStart 同等受限
+- **沙箱** — macOS 上所有模型驱动的本地命令与外部程序固定进入 Seatbelt；后端不可用时拒绝执行。通过具体现授权目录和网络能力调整访问范围，`/sandbox` 显示运行诊断
 - **上下文管理** — 结构化自动压缩（6 段式摘要 + 最近读取文件重附 + trace 逃生通道）、token 原生用量锚定估算、`/fork` 会话分支（废弃方向自动摘要）、`/rewind` / `/remove`、checkpoint
 - **会话** — 事务 JSONL 存储、持久化 inbox、稳定输入 ID、冻结请求 manifest 与附件 blob、工具副作用事实与 unknown 恢复；旧 JSON 只读导入、`-r` 恢复、`-c` 选择器、`--replay` 只读导出 Markdown。恢复不自动重跑结果未知的副作用
 - **扩展** — MCP 客户端（stdio / SSE / Streamable HTTP，热刷新与断连清理）、自定义 shell 工具、Claude 风格 hooks、自定义斜杠命令、skills、Go 插件系统（依赖拓扑加载 / 级联卸载）
@@ -142,10 +142,10 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
   "keep_after_compact": 12,        // 压缩后保留最近消息数
   "max_tool_output_chars_per_turn": 200000,
 
-  "sandbox_mode": "confine",       // confine | strict | none
-  "sandbox_allow_network": false,  // strict 模式下放行网络
   "sandbox_limits": { "cpu_seconds": 600, "memory_mb": 2048 },
+  "network_access": false,          // true 授予本地沙箱进程外联能力
   "additional_directories": ["/data"],
+  "additional_read_only_directories": ["/reference"],
   "disallowed_directories": ["~/.ssh"],
   "max_parallel_tools": 4,         // 0 = 顺序执行
   "bash_timeout_seconds": 120,
@@ -171,7 +171,7 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
   // MCP 服务器：stdio（默认）或 sse
   "mcp_servers": {
     "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": { "GITHUB_TOKEN": "..." } },
-    "remote": { "transport": "sse", "base_url": "http://localhost:8080/sse" }
+    "remote": { "transport": "sse", "base_url": "http://localhost:8080/sse", "network_authorized": true }
   },
 
   // Hooks（Claude 风格）：简单形式或 matcher 结构形式
@@ -187,15 +187,21 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
 }
 ```
 
-项目级覆盖（`.ccdp/settings.json`，`/reload` 热加载）：`permission_mode`、`always_allow` / `always_deny`、`hooks`、`sandbox_mode`、`enable_web_tools`。
+项目级覆盖（`.ccdp/settings.json`，`/reload` 热加载）：`permission_mode`、`always_allow` / `always_deny`、`hooks`、`enable_web_tools`。项目设置不能扩大沙箱授权；其中 `network_access: false` 可收紧外联能力，`disallowed_directories` 只能增加拒绝目录。额外授权目录和外联能力由用户配置或本会话的明确 capability approval 授予。
 
-## 沙箱模式
+## macOS Seatbelt 沙箱
 
-| 模式 | 行为 |
-|------|------|
-| `confine`（默认） | 路径围栏：写操作限制在 workspace 内（symlink 解析后判定），读不受限 |
-| `strict` | confine + 读限制 + macOS sandbox-exec 内核隔离 + ulimit 资源限制 + 网络客户端阻断（`sandbox_allow_network: true` 可放行）；Bash 与 ProcessStart 同等受限 |
-| `none` | 无沙箱（仅权限门禁生效） |
+沙箱的最终目标边界与验收条件见 [macOS 沙箱设计](docs/macos-sandbox.md)。
+
+所有模型驱动的本地命令、后台进程、hooks、stdio MCP 和搜索子进程始终由 macOS Seatbelt 执行。Seatbelt 或策略加载失败时，执行入口会报错并停止；CCDP 不自动移除限制重试。非 macOS 平台不提供本地执行回退。没有 confine/strict/none 沙箱档位，也没有旧档位字段或兼容映射。
+
+workspace 默认可读写，工作区外的主机文件默认可读、不可写。`additional_directories` 授予额外读写访问；`additional_read_only_directories` 可在可写范围内划出禁止写入的目录，位于可写范围外时不改变默认读取行为；`disallowed_directories` 始终拒绝读写并优先于允许目录。Git config、hooks 和 worktree 指针受保护，普通提交仍可运行。`network_access` 明确控制本地子进程的 TCP/UDP 外联；它不自动开放本机服务连接或监听，后者按具体协议和端口授权。Seatbelt 的 `localhost:<port>` 规则限制端口，但不能保证只匹配字面上的 `127.0.0.1` 或单一 loopback 接口。审批通过命令不会扩大这些授权。Web 工具与远程 MCP 使用主进程网络，另受网络 capability 检查；远程 MCP server 连接还需在服务器配置中由用户明确设置 `network_authorized: true`，这项连接授权不代替每次工具操作的权限审批或网络 capability。内置文件工具仍由主进程的路径策略检查。`/sandbox` 显示 Seatbelt、workspace、授权目录、网络和运行时状态；它显示可能残留旧策略后代的 sticky 风险标志，不提供准确 PID 清单。
+
+在 TUI 中，`/sandbox` 只读查看诊断，`/sandbox revoke all` 请求撤销本会话临时 capability 并收束托管的进程、MCP 和当前工作；`/add-dir <dir>` 授予额外读写目录，`/add-dir --read-only <dir>` 授予只读目录，`/disallowed-dir <dir>` 添加拒绝目录。用 `/config set network-access allow|deny` 更新持久子进程网络授权。`once` 与 `session` capability 只保存在运行时，不会从恢复会话的记录中重新授权。
+
+本地子进程可能通过 `setsid` 留下脱离进程组的后代，因此其生命周期 witness 在本会话内保持 sticky。该事实本身不阻止正常派发或新增授权；用户请求收紧或撤销且系统无法确认旧策略后代已经退出时，会进入 `revocationPending`，继续阻断派发和设置，不能通过再授权绕过。重试不会清除此状态；需独立清理可能残留的进程并新建会话。普通关闭会清理受管理资源并报告不确定性，不代表可热撤销所有运行进程的策略。
+
+截至 2026-09-26，本机真实 Seatbelt 集成下的 `go test ./...`、agent/tools/mcp/netguard 全包 race、`go vet ./...` 及最终 revision/ABA 修复后的授权/reload/approval 定向 race 均通过。检查覆盖 loopback 默认拒绝、外联授权不解锁 loopback、按端口区分的 TCP connect/listen、Unix socket 拒绝、公网 TCP dial，以及生产默认路径发现的 Go、Node、Python toolchain。它们是本机验收结果，不是通用安全证明。sticky witness 仍无法证明经 `setsid` 脱离进程组的后代已退出；撤销/收紧无法确认时会持续阻断派发和设置，必须独立清理可能残留的进程并新建会话。
 
 ## 权限模式
 
@@ -217,13 +223,13 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
 
 ```
 /model [name]   选择/切换模型      /mode [mode]      选择权限模式
-/sandbox [m]    选择/切换沙箱      /compact          立即压缩上下文
+/sandbox [revoke all] Seatbelt 诊断/撤销临时授权   /compact 立即压缩上下文
 /cost           token 用量与花费   /context         上下文占用可视化
 /rewind [n]     回退历史          /fork [n]         分支新会话
 /checkpoint     创建/恢复检查点    /diff /git        查看/执行 git
 /resume [id]    恢复会话（无参数进入选择器）
 /mcp /plugins   MCP 与插件状态     /skills           技能列表
-/permissions    权限规则管理       /add-dir <dir>    扩展沙箱目录
+/permissions    权限规则管理       /add-dir <dir>    授予读写目录
 /export [path]  导出 Markdown     /config set <k> <v>
 /trust [revoke] 授权/撤销项目配置
 /agents        进入子 Agent 视图   /root /parent    返回主/父会话
@@ -234,7 +240,7 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
 /reconnect     重新连接会话更新    /tasks           切换任务清单
 ```
 
-`/model`、`/mode`、`/sandbox` 不带参数会打开选择器；`Esc` 取消，不修改设置。长列表可继续向下导航，命令结果保留在转录中，不占用可被下一条命令覆盖的状态行。设置类命令（`/model`、`/mode`、`/permissions`、`/sandbox`、`/plan`、`/effort`、`/verbosity` 与 `Shift+Tab`）无论空闲还是忙碌都立即生效：每次 provider 请求已在 step 边界冻结自身配置与绑定、每次授权也在锁内原子读取模式，故中途切换不会扰动进行中的请求或已做出的判定，只影响下一次调用，对齐 codex/claude-code。
+`/model`、`/mode` 不带参数会打开选择器；`/sandbox` 只读显示 Seatbelt 与授权诊断，`/sandbox revoke all` 请求撤销本会话临时授权。长列表可继续向下导航，命令结果保留在转录中，不占用可被下一条命令覆盖的状态行。设置类命令（`/model`、`/mode`、`/permissions`、`/plan`、`/effort`、`/verbosity` 与 `Shift+Tab`）无论空闲还是忙碌都立即生效：每次 provider 请求已在 step 边界冻结自身配置与绑定、每次授权也在锁内原子读取模式，故中途切换不会扰动进行中的请求或已做出的判定，只影响下一次调用，对齐 codex/claude-code。
 
 输入下方常驻 `deepseek-chat · high · 12.3k/200k`：当前生效模型、推理强度、当前上下文用量/容量。零用量也显示，未知容量显示 `—`；达到 80% 时保留警示颜色。这里的用量是当前上下文估算，不是会话累计消耗。窄屏先省略次要信息，必要时紧凑换行；模型、强度和用量不会因 `/statusline` 自定义而消失。
 
@@ -295,7 +301,7 @@ internal/
   llm/             OpenAI 兼容流式客户端
   mcp/             JSON-RPC over stdio/SSE 的 MCP 客户端
   permissions/     权限规则与审批判定
-  sandbox/         沙箱（路径围栏 / sandbox-exec / ulimit）
+  sandbox/         macOS Seatbelt profile 与路径策略
   hooks/           shell hooks 执行器
   plugin/          插件 Host、ModelRegistry、GoHooks
   config/          配置加载与合并
@@ -307,7 +313,7 @@ internal/
 
 - API key 仅从环境变量 / config 运行时读取，不入库；`.gitignore` 已覆盖 `.ccdp/`、构建产物、`.env`
 - 默认模式下所有写操作与非只读命令需人工审批；`always_deny` 优先级最高
-- 进程、Git、hooks、stdio MCP 与命令 worker 复用受控执行边界；strict 使用 macOS `sandbox-exec`，缺失时报错而非降级。confine 仅提供受控文件路径围栏，不是任意 shell 的内核隔离
+- 进程、Git、hooks、stdio MCP 与命令 worker 复用受控执行边界；模型驱动的本地执行始终使用 macOS Seatbelt，后端缺失或策略加载失败时停止。无隔离操作需由用户在外部终端执行
 - 项目配置、信任记录与会话控制文件受写保护；只读 Git 查询禁用 external diff、textconv、pager 和 fsmonitor 等可执行助手
 - headless 模式（`-p`）审批自动拒绝，适合 CI 只读场景
 

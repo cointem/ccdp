@@ -45,7 +45,6 @@ func newWorkflowTestSetupAt(t *testing.T, workspace string, permission permissio
 	cfg.APIKey = "workflow-test-key"
 	cfg.PermissionMode = string(permission)
 	cfg.AlwaysDeny = append([]string(nil), deny...)
-	cfg.SandboxMode = "none"
 	cfg.EnableGuardian = config.BoolPtr(false)
 	cfg.EnableMemory = config.BoolPtr(false)
 	cfg.MCPServers = nil
@@ -185,9 +184,12 @@ add) printf 'added\n' ;;
 commit) printf 'committed\n' ;;
 push) printf 'pushed\n' ;;
 diff) printf 'diff\n' ;;
-esac`,
+		esac`,
 		`printf 'gh %s\n' "$*" >> "$CCDP_WORKFLOW_LOG"
-printf 'pr-created\n'`)
+	printf 'pr-created\n'`)
+	// The workflow includes `git push` and `gh pr create`; its sandbox fixture
+	// must carry the explicit outbound capability those steps require.
+	setup.ag.sandbox.SetAllowNetwork(true)
 	cmd := workflowCommand(setup.ag, "workflow-success", protocol.WorkflowCommitPushPR, "ship it")
 	submitWorkflow(t, setup.ag, cmd)
 	completed := waitWorkflowCompleted(t, setup.ag, cmd.ID)

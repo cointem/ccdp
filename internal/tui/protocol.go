@@ -672,7 +672,8 @@ func approvalRequestFromView(view *protocol.ApprovalView) *approvalPrompt {
 			command = string(view.Args)
 		}
 	}
-	return &approvalPrompt{ID: view.ID, Tool: view.Tool, Command: command, Reason: view.Reason}
+	return &approvalPrompt{ID: view.ID, Tool: view.Tool, Command: command, Reason: view.Reason,
+		Capabilities: append([]protocol.CapabilityRequest(nil), view.Capabilities...)}
 }
 
 // Small indirections keep protocol projection testable without binding the
@@ -953,10 +954,11 @@ func (m Model) sandboxPolicy() protocol.SandboxPolicy {
 	if m.hasSnapshot {
 		p := m.snapshot.Settings.Sandbox
 		p.AdditionalDirectories = append([]string(nil), p.AdditionalDirectories...)
+		p.AdditionalReadOnlyDirectories = append([]string(nil), p.AdditionalReadOnlyDirectories...)
 		p.DisallowedDirectories = append([]string(nil), p.DisallowedDirectories...)
 		return p
 	}
-	return protocol.SandboxPolicy{Mode: string(m.mode)}
+	return protocol.SandboxPolicy{}
 }
 
 func (m Model) permissionPolicy() protocol.PermissionPolicy {
@@ -1082,11 +1084,6 @@ func (m *Model) executeSelectorAction(action selectorAction, optionID string) te
 		}
 		return m.submitCommand(protocol.Command{Type: protocol.CommandSetExecutionMode,
 			ExecutionMode: &protocol.SetExecutionMode{Mode: mode}}, "plan mode → "+optionID)
-	case selectorSandbox:
-		policy := m.sandboxPolicy()
-		policy.Mode = optionID
-		return m.submitCommand(protocol.Command{Type: protocol.CommandSetSandboxPolicy,
-			SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, "sandbox mode → "+optionID)
 	case selectorRewind:
 		keep, ok := parseRewindOption(optionID)
 		if !ok {

@@ -20,5 +20,6 @@
 *.swp
 .trae/
 
-# Intermediate implementation docs
-docs/
+# Keep the final sandbox contract; ignore intermediate design notes.
+/docs/*
+!/docs/macos-sandbox.md

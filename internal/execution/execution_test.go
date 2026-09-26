@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -19,12 +20,12 @@ func TestRunNotifyDrainsUnterminatedLargeLine(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	start := time.Now()
-	res, err := Run(Request{
+	res, err := Run(testRequest(t, Request{
 		Context:     ctx,
 		Command:     "head -c 2097152 /dev/zero",
 		OutputLimit: 64 * 1024,
 		Progress:    make(chan string),
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +39,7 @@ func TestRunNotifyDrainsUnterminatedLargeLine(t *testing.T) {
 
 func TestRunSlowNotifyDoesNotBlockProcessDrain(t *testing.T) {
 	start := time.Now()
-	res, err := Run(Request{
+	res, err := Run(testRequest(t, Request{
 		Context:     context.Background(),
 		Command:     "for i in $(seq 1 100); do echo line; done",
 		OutputLimit: 1024,
@@ -46,7 +47,7 @@ func TestRunSlowNotifyDoesNotBlockProcessDrain(t *testing.T) {
 			time.Sleep(500 * time.Millisecond)
 			return nil
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func TestRunSlowNotifyDoesNotBlockProcessDrain(t *testing.T) {
 func TestRunCancellationKillsProcessGroup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	res, err := Run(Request{Context: ctx, Command: "sleep 10"})
+	res, err := Run(testRequest(t, Request{Context: ctx, Command: "sleep 10"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +76,7 @@ func TestRunSuccessfulExitNearDeadlineIsNotClassifiedAsTimeout(t *testing.T) {
 	// cancellable progress observer deliberately takes longer to clean up. The
 	// wrapper context may expire during that cleanup, but that is not a process
 	// timeout and must not turn an exit-0 result into TimedOut.
-	res, err := Run(Request{
+	res, err := Run(testRequest(t, Request{
 		Context: context.Background(),
 		Command: "printf 'done\\n'; sleep 0.1",
 		Timeout: 300 * time.Millisecond,
@@ -83,7 +84,7 @@ func TestRunSuccessfulExitNearDeadlineIsNotClassifiedAsTimeout(t *testing.T) {
 			time.Sleep(600 * time.Millisecond)
 			return nil
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,11 +92,11 @@ func TestRunSuccessfulExitNearDeadlineIsNotClassifiedAsTimeout(t *testing.T) {
 		t.Fatalf("successful command was misclassified after observer cleanup: %+v", res)
 	}
 
-	timedOut, err := Run(Request{
+	timedOut, err := Run(testRequest(t, Request{
 		Context: context.Background(),
 		Command: "sleep 1",
 		Timeout: 50 * time.Millisecond,
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +125,18 @@ func TestSanitizedEnvironmentRemovesCommonProviderCredentials(t *testing.T) {
 	}
 }
 
+func TestLocalExecutionFailsClosedWithoutSandbox(t *testing.T) {
+	if _, err := Run(Request{Context: context.Background(), Command: "true"}); err == nil {
+		t.Fatal("Run started without a sandbox policy")
+	}
+	if _, err := RunArgv(context.Background(), []string{"true"}, Request{Context: context.Background()}); err == nil {
+		t.Fatal("RunArgv started without a sandbox policy")
+	}
+	if _, err := StartArgv(StartRequest{Context: context.Background(), Argv: []string{"true"}}); err == nil {
+		t.Fatal("StartArgv started without a sandbox policy")
+	}
+}
+
 func TestSanitizedEnvironmentGitHubOptInIsNarrow(t *testing.T) {
 	entries := []string{
 		"PATH=/bin",
@@ -144,6 +157,116 @@ func TestSanitizedEnvironmentGitHubOptInIsNarrow(t *testing.T) {
 	}
 }
 
+func TestExplicitEnvironmentCannotReintroduceHostProxyOrAgentSocket(t *testing.T) {
+	policy := sandbox.New(t.TempDir())
+	policy.SetScratchDir(t.TempDir())
+	env, cleanup, err := prepareProcessEnvironment([]string{
+		"PATH=/usr/bin:/bin",
+		"HTTP_PROXY=http://127.0.0.1:8080",
+		"CUSTOM_PROXY=socks5://127.0.0.1:1080",
+		"SSH_AUTH_SOCK=/tmp/agent.sock",
+		"DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/bus",
+		"SERVER_TOKEN=explicit-mcp-token",
+	}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	joined := strings.Join(env, "\n")
+	for _, denied := range []string{"HTTP_PROXY=", "CUSTOM_PROXY=", "SSH_AUTH_SOCK=", "DBUS_SESSION_BUS_ADDRESS="} {
+		if strings.Contains(joined, denied) {
+			t.Fatalf("explicit child environment retained host delegation variable %q: %v", denied, env)
+		}
+	}
+	if !strings.Contains(joined, "SERVER_TOKEN=explicit-mcp-token") {
+		t.Fatalf("purpose-specific explicit credential was removed: %v", env)
+	}
+}
+
+func TestProcessEnvironmentReusesSessionScratchForCaches(t *testing.T) {
+	scratch := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(scratch); err == nil {
+		scratch = resolved
+	}
+	policy := sandbox.New(t.TempDir())
+	policy.SetScratchDir(scratch)
+
+	first, cleanupFirst, err := prepareProcessEnvironment([]string{"PATH=/usr/bin:/bin"}, policy.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupFirst()
+	second, cleanupSecond, err := prepareProcessEnvironment([]string{"PATH=/usr/bin:/bin"}, policy.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupSecond()
+	for _, key := range []string{"HOME", "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "GOCACHE", "npm_config_cache", "PIP_CACHE_DIR"} {
+		firstValue, secondValue := environmentValue(first, key), environmentValue(second, key)
+		if firstValue == "" || firstValue != secondValue {
+			t.Fatalf("%s was not stable across session calls: first=%q second=%q", key, firstValue, secondValue)
+		}
+		if !withinPath(scratch, firstValue) {
+			t.Fatalf("%s escaped the session scratch root: %q", key, firstValue)
+		}
+	}
+}
+
+func TestPreferNativeGitAvoidsXcrunShim(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Command Line Tools adaptation")
+	}
+	if executableFile(nativeGitPath) == "" {
+		t.Skip("Command Line Tools git is not installed")
+	}
+	env := []string{"PATH=/usr/bin:/bin"}
+	argv, _ := preferNativeGit([]string{"git", "--version"}, "", env, t.TempDir())
+	if argv[0] != nativeGitPath {
+		t.Fatalf("argv git resolved to the xcrun shim: %v", argv)
+	}
+	_, shellEnv := preferNativeGit(nil, "git status", env, t.TempDir())
+	if got := environmentValue(shellEnv, "PATH"); !strings.HasPrefix(got, filepath.Dir(nativeGitPath)+string(os.PathListSeparator)) {
+		t.Fatalf("shell git PATH does not select the native tool: %q", got)
+	}
+}
+
+func TestPreferNativeCLTPythonAvoidsXcrunShim(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Command Line Tools adaptation")
+	}
+	nativePath := nativeCLTPythonPath()
+	if nativePath == "" {
+		t.Skip("Command Line Tools Python framework is not installed")
+	}
+	dir := t.TempDir()
+	env := []string{"PATH=/usr/bin:/bin"}
+	argv, _ := preferNativeCLTPython([]string{"/usr/bin/python3", "--version"}, "", env, dir, nativePath)
+	if argv[0] != nativePath {
+		t.Fatalf("argv python resolved to the xcrun shim: %v", argv)
+	}
+	_, shellEnv := preferNativeCLTPython(nil, "python3 --version", env, dir, nativePath)
+	if got := environmentValue(shellEnv, "PATH"); !strings.HasPrefix(got, filepath.Dir(nativePath)+string(os.PathListSeparator)) {
+		t.Fatalf("shell PATH does not select the native Python runtime: %q", got)
+	}
+
+	policy := sandbox.New(dir)
+	addExecutionReadRoots(policy, argv, "", dir, env)
+	wantRoot := pythonFrameworkVersionRoot(nativePath)
+	if wantRoot == "" || executableReadRoot(nativePath, policy.Workspace) != wantRoot {
+		t.Fatalf("Python executable read root = %q, want exact version root %q", executableReadRoot(nativePath, policy.Workspace), wantRoot)
+	}
+	found := false
+	for _, root := range policy.ExecutionReadRoots {
+		if root == wantRoot {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("execution policy did not discover Python runtime root %q: %v", wantRoot, policy.ExecutionReadRoots)
+	}
+}
+
 func TestRunArgvAllowsGitReadTreeWithTemporaryIndex(t *testing.T) {
 	dir := t.TempDir()
 	if err := exec.Command("git", "init", "--quiet", dir).Run(); err != nil {
@@ -156,9 +279,13 @@ func TestRunArgvAllowsGitReadTreeWithTemporaryIndex(t *testing.T) {
 		Context: context.Background(),
 		Dir:     dir,
 		Env:     env,
+		Sandbox: sandbox.New(dir),
 	})
 	if err != nil {
 		t.Fatalf("git read-tree was incorrectly treated as interactive: %v (result=%+v)", err, result)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("git read-tree failed: result=%+v", result)
 	}
 	if _, err := os.Stat(index); err != nil {
 		t.Fatalf("read-tree did not create the temporary index: %v", err)
@@ -166,7 +293,9 @@ func TestRunArgvAllowsGitReadTreeWithTemporaryIndex(t *testing.T) {
 }
 
 func TestSandboxLimitsApplyToAllExecutionEntrances(t *testing.T) {
-	t.Setenv("SHELL", "/bin/zsh")
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Seatbelt integration test")
+	}
 	runEntrances := func(label string, s *sandbox.Sandbox) error {
 		check := func(name string, result Result, err error) error {
 			if err != nil {
@@ -181,11 +310,11 @@ func TestSandboxLimitsApplyToAllExecutionEntrances(t *testing.T) {
 			return nil
 		}
 		workspace := s.Workspace
-		runResult, runErr := Run(Request{Context: context.Background(), Command: "ulimit -n", Dir: workspace, Shell: "/bin/zsh", Sandbox: s})
+		runResult, runErr := Run(Request{Context: context.Background(), Command: "ulimit -n", Dir: workspace, Sandbox: s})
 		if err := check("Run", runResult, runErr); err != nil {
 			return err
 		}
-		argvResult, argvErr := RunArgv(context.Background(), []string{"sh", "-c", "ulimit -n"}, Request{Context: context.Background(), Dir: workspace, Shell: "/bin/zsh", Sandbox: s})
+		argvResult, argvErr := RunArgv(context.Background(), []string{"sh", "-c", "ulimit -n"}, Request{Context: context.Background(), Dir: workspace, Sandbox: s})
 		if err := check("RunArgv", argvResult, argvErr); err != nil {
 			return err
 		}
@@ -194,6 +323,7 @@ func TestSandboxLimitsApplyToAllExecutionEntrances(t *testing.T) {
 		if err != nil {
 			return fmt.Errorf("%s/StartArgv: %w", label, err)
 		}
+		defer CleanupStartedProcess(cmd)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
@@ -209,27 +339,10 @@ func TestSandboxLimitsApplyToAllExecutionEntrances(t *testing.T) {
 		return nil
 	}
 
-	s := sandbox.New(t.TempDir(), sandbox.ModeConfine)
+	s := sandbox.New(t.TempDir())
 	s.Limits = &sandbox.Limits{MaxFiles: 64}
-	if err := runEntrances("confine", s); err != nil {
+	if err := runEntrances("Seatbelt", s); err != nil {
 		t.Fatal(err)
-	}
-
-	// Strict mode uses the real Darwin backend when available. Nested CI/Codex
-	// sandboxes may intentionally deny sandbox-exec, so retain the confine
-	// assertions above and record that environmental skip explicitly.
-	strict := sandbox.New(t.TempDir(), sandbox.ModeStrict)
-	strict.Limits = &sandbox.Limits{MaxFiles: 64}
-	if err := strict.StrictBackendError(); err == nil {
-		if err := runEntrances("strict", strict); err != nil {
-			if strings.Contains(err.Error(), "sandbox_apply: Operation not permitted") {
-				t.Logf("strict limit entrance unavailable in this host sandbox: %v", err)
-			} else {
-				t.Fatal(err)
-			}
-		}
-	} else {
-		t.Logf("strict limit entrance skipped: %v", err)
 	}
 }
 
@@ -237,12 +350,12 @@ func TestRunProgressChannelCannotBlockOrOutliveRun(t *testing.T) {
 	// There is intentionally no progress consumer. A non-blocking channel send
 	// must still drain the child and leave no observer goroutine behind.
 	progress := make(chan string)
-	res, err := Run(Request{
+	res, err := Run(testRequest(t, Request{
 		Context:     context.Background(),
 		Command:     "head -c 2097152 /dev/zero",
 		OutputLimit: 1024,
 		Progress:    progress,
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,10 +367,9 @@ func TestRunProgressChannelCannotBlockOrOutliveRun(t *testing.T) {
 func TestRunCancellableNotifyIsJoinedBeforeReturn(t *testing.T) {
 	var once sync.Once
 	observerStopped := make(chan struct{})
-	res, err := Run(Request{
+	res, err := Run(testRequest(t, Request{
 		Context: context.Background(),
 		Command: "printf 'progress\\n'; sleep 0.2",
-		Shell:   "/bin/sh",
 		NotifyContext: func(ctx context.Context, _ string) error {
 			// Model a permanently waiting observer that is nevertheless controlled
 			// by the invocation context. Run must cancel and join it, rather than
@@ -266,7 +378,7 @@ func TestRunCancellableNotifyIsJoinedBeforeReturn(t *testing.T) {
 			once.Do(func() { close(observerStopped) })
 			return ctx.Err()
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,17 +401,16 @@ func TestRunCancellationWithNotifyContinuesDraining(t *testing.T) {
 	var result Result
 	var runErr error
 	go func() {
-		result, runErr = Run(Request{
+		result, runErr = Run(testRequest(t, Request{
 			Context:     ctx,
 			Command:     "yes x",
-			Shell:       "/bin/sh",
 			OutputLimit: 1024,
 			NotifyContext: func(observerCtx context.Context, _ string) error {
 				once.Do(func() { close(started) })
 				<-observerCtx.Done()
 				return observerCtx.Err()
 			},
-		})
+		}))
 		close(runDone)
 	}()
 	select {
@@ -325,7 +436,7 @@ func TestRunCleansDescendantsAfterPipeWait(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "child.pid")
 	command := fmt.Sprintf("sleep 30 & echo $! > %s; printf done", shellQuote(pidFile))
-	res, err := Run(Request{Context: context.Background(), Command: command, Shell: "/bin/sh"})
+	res, err := Run(testRequest(t, Request{Context: context.Background(), Command: command, Dir: dir}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,4 +463,15 @@ func TestRunCleansDescendantsAfterPipeWait(t *testing.T) {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+}
+
+func testRequest(t *testing.T, req Request) Request {
+	t.Helper()
+	if req.Dir == "" {
+		req.Dir = t.TempDir()
+	}
+	if req.Sandbox == nil {
+		req.Sandbox = sandbox.New(req.Dir)
+	}
+	return req
 }

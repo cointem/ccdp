@@ -89,8 +89,8 @@ func (m *Model) renderStatus() string {
 			}
 			return " " + fitLines(styleToolErr.Render("■ Turn stopped")+styleHints.Render(" · ready for your next message"), width)
 		}
-		// Completion is represented by the final tool/assistant rows and the
-		// persistent footer. A permanent “All set” row only pushes useful
+		// Completion is represented by the final answer and per-turn duration
+		// in the transcript. A permanent “All set” row only pushes useful
 		// transcript and input content down on short terminals.
 		return ""
 	}

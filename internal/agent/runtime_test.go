@@ -17,7 +17,6 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
-	"ccdp/internal/sandbox"
 	"ccdp/internal/session"
 )
 
@@ -665,7 +664,7 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 		t.Fatal(err)
 	}
 	settingsPath := filepath.Join(settingsDir, "settings.json")
-	first := `{"permission_mode":"bypassPermissions","always_allow":["Bash:make build"],"hooks":{"PreToolUse":["echo ok"]},"sandbox_mode":"none","enable_web_tools":false}`
+	first := `{"permission_mode":"bypassPermissions","always_allow":["Bash:make build"],"hooks":{"PreToolUse":["echo ok"]},"enable_web_tools":false}`
 	if err := os.WriteFile(settingsPath, []byte(first), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -691,8 +690,8 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	if len(ag.HooksList()[hooks.EventPreToolUse]) != 1 {
 		t.Fatal("project hook was not loaded")
 	}
-	if ag.PermissionMode() != permissions.ModeAcceptEdits || ag.SandboxMode() != sandbox.ModeConfine {
-		t.Fatalf("project attempted to loosen modes: permission=%s sandbox=%s", ag.PermissionMode(), ag.SandboxMode())
+	if ag.PermissionMode() != permissions.ModeAcceptEdits {
+		t.Fatalf("project attempted to loosen permission policy: %s", ag.PermissionMode())
 	}
 	if _, ok := ag.registry.Get("WebFetch"); ok {
 		t.Fatal("web tools remained registered after disabling them")
@@ -709,8 +708,8 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	if len(ag.HooksList()[hooks.EventPreToolUse]) != 0 {
 		t.Fatal("removed project hook remained active")
 	}
-	if ag.PermissionMode() != permissions.ModeAcceptEdits || ag.SandboxMode() != sandbox.ModeConfine {
-		t.Fatalf("removed project modes remained active: permission=%s sandbox=%s", ag.PermissionMode(), ag.SandboxMode())
+	if ag.PermissionMode() != permissions.ModeAcceptEdits {
+		t.Fatalf("removed project permission settings remained active: %s", ag.PermissionMode())
 	}
 	if _, ok := ag.registry.Get("WebFetch"); !ok {
 		t.Fatal("web tools were not restored after removing the override")

@@ -391,10 +391,14 @@ func TestTaskChildHooksApplyToSingleAndBatch(t *testing.T) {
 	}}
 	a, _ := newChildRuntimeTestAgent(t, p)
 	hookFile := filepath.Join(t.TempDir(), "task-hooks.log")
+	// The hook log intentionally lives outside the child workspace. Grant that
+	// one temporary directory to the parent session sandbox used by lifecycle
+	// hooks instead of relying on a nil/unrestricted policy.
+	a.AddDirectory(filepath.Dir(hookFile))
 	a.hooks = hooks.NewManager(hooks.Config{
 		hooks.EventSubagentStart: {{Command: `printf 'start\n' >> "$CCDP_TEST_HOOK_FILE"`}},
 		hooks.EventSubagentStop:  {{Command: `printf 'stop\n' >> "$CCDP_TEST_HOOK_FILE"`}},
-	}, hooks.Options{SessionID: a.SessionID(), Workspace: a.cfg.Workspace, Env: []string{"CCDP_TEST_HOOK_FILE=" + hookFile}})
+	}, hooks.Options{SessionID: a.SessionID(), Workspace: a.cfg.Workspace, Env: []string{"CCDP_TEST_HOOK_FILE=" + hookFile}, Sandbox: a.sandbox})
 	if _, err := a.runSubagent("single-hook", ""); err != nil {
 		t.Fatal(err)
 	}

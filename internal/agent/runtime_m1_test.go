@@ -14,7 +14,6 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
-	"ccdp/internal/sandbox"
 )
 
 func TestM1StepFreezesModelClientAndConfigAcrossStream(t *testing.T) {
@@ -234,7 +233,7 @@ func TestM1SnapshotProjectsContextUsageAndStablePlanVersion(t *testing.T) {
 	}
 }
 
-func TestM1ModeAndSandboxOnlyPreserveExistingRules(t *testing.T) {
+func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.Default()
 	cfg.Workspace = dir
@@ -243,8 +242,7 @@ func TestM1ModeAndSandboxOnlyPreserveExistingRules(t *testing.T) {
 	cfg.PermissionMode = string(permissions.ModeDefault)
 	cfg.AlwaysAllow = []string{"Read:*"}
 	cfg.AlwaysDeny = []string{"Bash:rm *"}
-	cfg.SandboxMode = string(sandbox.ModeStrict)
-	cfg.SandboxAllowNetwork = true
+	cfg.NetworkAccess = true
 	cfg.AdditionalDirectories = []string{dir + "/extra"}
 	cfg.DisallowedDirectories = []string{dir + "/blocked"}
 	ag, err := New(&cfg, make(chan Event, 32))
@@ -266,13 +264,14 @@ func TestM1ModeAndSandboxOnlyPreserveExistingRules(t *testing.T) {
 	ag.mu.Unlock()
 
 	sandboxCmd := protocol.Command{ID: "sandbox-only-legacy", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandSetSandboxPolicy,
-		SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{Mode: string(sandbox.ModeConfine)}}}
+		SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{NetworkAccess: true,
+			AdditionalDirectories: []string{dir + "/extra"}, DisallowedDirectories: []string{dir + "/blocked"}}}}
 	if receipt := ag.applyCommand(sandboxCmd); receipt.Rejected() {
 		t.Fatalf("sandbox-only command rejected: %+v", receipt)
 	}
 	ag.mu.Lock()
-	if !ag.cfg.SandboxAllowNetwork || len(ag.cfg.AdditionalDirectories) != 1 || len(ag.cfg.DisallowedDirectories) != 1 {
-		t.Fatalf("sandbox-only changed policy: network=%v additional=%v disallowed=%v", ag.cfg.SandboxAllowNetwork, ag.cfg.AdditionalDirectories, ag.cfg.DisallowedDirectories)
+	if !ag.cfg.NetworkAccess || len(ag.cfg.AdditionalDirectories) != 1 || len(ag.cfg.DisallowedDirectories) != 1 {
+		t.Fatalf("sandbox policy changed unexpectedly: network=%v additional=%v disallowed=%v", ag.cfg.NetworkAccess, ag.cfg.AdditionalDirectories, ag.cfg.DisallowedDirectories)
 	}
 	ag.mu.Unlock()
 
@@ -290,14 +289,15 @@ func TestM1ModeAndSandboxOnlyPreserveExistingRules(t *testing.T) {
 	}
 	ag.mu.Unlock()
 	canonicalSandbox := protocol.Command{ID: "sandbox-only", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandSetSandboxPolicy,
-		SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{Mode: string(sandbox.ModeStrict)}}}
+		SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{NetworkAccess: true,
+			AdditionalDirectories: []string{dir + "/extra"}, DisallowedDirectories: []string{dir + "/blocked"}}}}
 	if receipt := ag.applyCommand(canonicalSandbox); receipt.Rejected() {
 		t.Fatalf("canonical sandbox-only command rejected: %+v", receipt)
 	}
 	ag.mu.Lock()
-	if !ag.cfg.SandboxAllowNetwork || len(ag.cfg.AdditionalDirectories) != 1 || len(ag.cfg.DisallowedDirectories) != 1 {
+	if !ag.cfg.NetworkAccess || len(ag.cfg.AdditionalDirectories) != 1 || len(ag.cfg.DisallowedDirectories) != 1 {
 		ag.mu.Unlock()
-		t.Fatalf("canonical sandbox-only changed policy: network=%v additional=%v disallowed=%v", ag.cfg.SandboxAllowNetwork, ag.cfg.AdditionalDirectories, ag.cfg.DisallowedDirectories)
+		t.Fatalf("canonical sandbox policy changed unexpectedly: network=%v additional=%v disallowed=%v", ag.cfg.NetworkAccess, ag.cfg.AdditionalDirectories, ag.cfg.DisallowedDirectories)
 	}
 	ag.mu.Unlock()
 }
@@ -315,7 +315,7 @@ func TestM1SafetyChangesApplyImmediatelyWhileBusy(t *testing.T) {
 	commands := []protocol.Command{
 		{ID: "busy-execution", SessionID: session, Type: protocol.CommandSetExecutionMode, ExecutionMode: &protocol.SetExecutionMode{Mode: protocol.ExecutionModePlan}},
 		{ID: "busy-permission", SessionID: session, Type: protocol.CommandSetPermissionPolicy, PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeBypass)}}},
-		{ID: "busy-sandbox", SessionID: session, Type: protocol.CommandSetSandboxPolicy, SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{Mode: string(sandbox.ModeNone)}}},
+		{ID: "busy-sandbox", SessionID: session, Type: protocol.CommandSetSandboxPolicy, SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{NetworkAccess: true}}},
 	}
 	for _, command := range commands {
 		receipt := ag.applyCommand(command)
@@ -332,8 +332,8 @@ func TestM1SafetyChangesApplyImmediatelyWhileBusy(t *testing.T) {
 	if ag.cfg.PermissionMode != string(permissions.ModeBypass) {
 		t.Fatalf("permission mode did not apply immediately: %s", ag.cfg.PermissionMode)
 	}
-	if ag.cfg.SandboxMode != string(sandbox.ModeNone) {
-		t.Fatalf("sandbox mode did not apply immediately: %s", ag.cfg.SandboxMode)
+	if !ag.cfg.NetworkAccess {
+		t.Fatal("network capability did not apply immediately")
 	}
 }
 

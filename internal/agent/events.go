@@ -63,6 +63,7 @@ type ApprovalRequest struct {
 	Tool    string
 	Command string
 	Reason  string
+	Capabilities []protocol.CapabilityRequest
 	// journalID is the occurrence-scoped durable identity. ID remains the
 	// compatibility/UI call ID so older control clients can answer a prompt;
 	// durable ApprovalResolved facts use journalID instead.

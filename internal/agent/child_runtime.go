@@ -17,6 +17,8 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/plugin"
+	"ccdp/internal/protocol"
+	"ccdp/internal/sandbox"
 	"ccdp/internal/session"
 	"ccdp/internal/tools"
 )
@@ -37,6 +39,8 @@ type Options struct {
 	AllowedTools          map[string]bool
 	Purpose               string
 	ParentSessionID       string
+	CapabilityCeiling     []protocol.CapabilityRequest
+	ExecutionGuard        *sandbox.ExecutionGuard
 	toolBindingDigest     string
 	memoryResume          []session.Record
 	memoryBlobs           *memoryRequestArtifacts
@@ -67,11 +71,12 @@ var guardianReadOnlyTools = map[string]bool{
 // constructor. It is intentionally not a package-level registry: lifecycle
 // state must be released with the Agent and must not outlive a session.
 type childRuntimeState struct {
-	purpose        string
-	nonInteractive bool
-	allowed        map[string]bool
-	parentSession  string
-	perms          *permissions.Manager
+	purpose           string
+	nonInteractive    bool
+	allowed           map[string]bool
+	parentSession     string
+	perms             *permissions.Manager
+	capabilityCeiling map[string]bool
 }
 
 // childStepSnapshot is populated by the provider/runtime owner at the
@@ -362,6 +367,20 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 		return config.Config{}, Options{}, fmt.Errorf("agent: unknown child purpose %q", purpose)
 	}
 	cfg, binding, sourceModels, parentID, registryNames, perms, parentCtx := a.childSourceSnapshot()
+	a.mu.Lock()
+	capabilityCeiling := make([]protocol.CapabilityRequest, 0, len(a.capabilityGrants))
+	var executionGuard *sandbox.ExecutionGuard
+	if a.sandbox != nil {
+		executionGuard = a.sandbox.ExecutionGuard()
+	}
+	for _, grant := range a.capabilityGrants {
+		capabilityCeiling = append(capabilityCeiling, grant)
+	}
+	revokingCapabilities := a.capabilityRevoking
+	a.mu.Unlock()
+	if revokingCapabilities {
+		return config.Config{}, Options{}, errors.New("agent: parent sandbox capabilities are being revoked")
+	}
 	if parentCtx == nil {
 		parentCtx = context.Background()
 	}
@@ -401,6 +420,8 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 		AllowedTools:          allowed,
 		Purpose:               purpose,
 		ParentSessionID:       parentID,
+		CapabilityCeiling:     capabilityCeiling,
+		ExecutionGuard:        executionGuard,
 	}, nil
 }
 

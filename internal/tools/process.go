@@ -3,6 +3,7 @@ package tools
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -48,25 +49,12 @@ type ProcessManager struct {
 	next      uint32
 	procs     map[int]*managedProcess
 	closed    bool
+	revoking  bool
 	closeErr  error
 	closeDone chan struct{}
 }
 
 var processScopeSequence atomic.Uint32
-
-func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-			return err
-		}
-		return os.ErrProcessDone
-	}
-	cmd.WaitDelay = 3 * time.Second
-}
 
 // NewProcessManager creates an empty owner-scoped process manager.
 func NewProcessManager(owner string) *ProcessManager {
@@ -97,22 +85,25 @@ func (m *ProcessManager) CheckOpen() error {
 	if m.closed {
 		return fmt.Errorf("process manager for %q is closed", m.owner)
 	}
+	if m.revoking {
+		return fmt.Errorf("process manager for %q is stopping processes for sandbox revocation", m.owner)
+	}
 	return nil
 }
 
 // Start launches a long-running process. The command must already have passed
 // sandbox/execution policy checks; ProcessStartTool calls sandbox.PrepareCommand
 // immediately before this method.
-func (m *ProcessManager) Start(command, dir string) (int, error) {
-	id, _, err := m.startContext(context.Background(), command, dir)
+func (m *ProcessManager) Start(command, dir string, policy *sandbox.Sandbox) (int, error) {
+	id, _, err := m.startContext(context.Background(), command, dir, policy)
 	return id, err
 }
 
-func (m *ProcessManager) start(command, dir string) (int, *managedProcess, error) {
-	return m.startContext(context.Background(), command, dir)
+func (m *ProcessManager) start(command, dir string, policy *sandbox.Sandbox) (int, *managedProcess, error) {
+	return m.startContext(context.Background(), command, dir, policy)
 }
 
-func (m *ProcessManager) startContext(ctx context.Context, command, dir string) (int, *managedProcess, error) {
+func (m *ProcessManager) startContext(ctx context.Context, command, dir string, policy *sandbox.Sandbox) (int, *managedProcess, error) {
 	if m == nil {
 		return 0, nil, fmt.Errorf("ProcessStart: nil process manager")
 	}
@@ -125,14 +116,11 @@ func (m *ProcessManager) startContext(ctx context.Context, command, dir string) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
+	cmd, err := execution.StartShell(ctx, command, dir,
+		execution.SanitizedEnvironmentFor(execution.EnvironmentCommand, os.Environ()), policy)
+	if err != nil {
+		return 0, nil, fmt.Errorf("ProcessStart: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, shell, "-c", command)
-	cmd.Dir = dir
-	cmd.Env = execution.SanitizedEnvironmentFor(execution.EnvironmentCommand, os.Environ())
-	setProcessGroup(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -148,6 +136,7 @@ func (m *ProcessManager) startContext(ctx context.Context, command, dir string) 
 		_ = stdin.Close()
 		return 0, nil, fmt.Errorf("ProcessStart: %w", err)
 	}
+	policy.MarkExternalExecution()
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		return 0, nil, fmt.Errorf("ProcessStart: %w", err)
@@ -172,6 +161,7 @@ func (m *ProcessManager) startContext(ctx context.Context, command, dir string) 
 	}()
 	go func() {
 		waitErr := cmd.Wait()
+		execution.CleanupStartedProcess(cmd)
 		wg.Wait()
 		mp.mu.Lock()
 		mp.err = waitErr
@@ -181,10 +171,14 @@ func (m *ProcessManager) startContext(ctx context.Context, command, dir string) 
 	}()
 
 	m.mu.Lock()
-	if m.closed {
+	if m.closed || m.revoking {
+		closed := m.closed
 		m.mu.Unlock()
 		_, _, _ = mp.stop()
-		return 0, nil, fmt.Errorf("process manager for %q is closed", m.owner)
+		if closed {
+			return 0, nil, fmt.Errorf("process manager for %q is closed", m.owner)
+		}
+		return 0, nil, fmt.Errorf("process manager for %q is stopping processes for sandbox revocation", m.owner)
 	}
 	m.next++
 	local := m.next
@@ -192,6 +186,78 @@ func (m *ProcessManager) startContext(ctx context.Context, command, dir string) 
 	m.procs[id] = mp
 	m.mu.Unlock()
 	return id, mp, nil
+}
+
+// StopAll stops and joins every process currently owned by this manager while
+// keeping the manager open for calls authorized after revocation completes.
+// Starts remain blocked until ResumeAfterRevocation is called by the owner.
+func (m *ProcessManager) StopAll() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return fmt.Errorf("process manager for %q is closed", m.owner)
+	}
+	m.revoking = true
+	type owned struct {
+		id int
+		mp *managedProcess
+	}
+	procs := make([]owned, 0, len(m.procs))
+	for id, mp := range m.procs {
+		procs = append(procs, owned{id: id, mp: mp})
+	}
+	m.procs = map[int]*managedProcess{}
+	m.mu.Unlock()
+
+	var stopErr error
+	failed := make(map[int]*managedProcess)
+	for _, proc := range procs {
+		_, exited, err := proc.mp.stop()
+		if err != nil {
+			stopErr = errors.Join(stopErr, err)
+		}
+		if !exited && err == nil {
+			stopErr = errors.Join(stopErr, fmt.Errorf("background process did not exit after sandbox revocation"))
+		}
+		if !exited || err != nil {
+			failed[proc.id] = proc.mp
+		}
+	}
+	if len(failed) > 0 {
+		m.mu.Lock()
+		for id, mp := range failed {
+			m.procs[id] = mp
+		}
+		m.mu.Unlock()
+	}
+	return stopErr
+}
+
+// Count returns the number of session-owned background processes not yet
+// confirmed exited.
+func (m *ProcessManager) Count() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.procs)
+}
+
+// ResumeAfterRevocation allows new starts after the owner has confirmed that
+// every process holding the older sandbox policy has exited.
+func (m *ProcessManager) ResumeAfterRevocation() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if !m.closed {
+		m.revoking = false
+	}
+	m.mu.Unlock()
 }
 
 // pipe drains one output stream into a bounded buffer.
@@ -404,7 +470,10 @@ func (t *ProcessStartTool) Description() string {
 in the background and return its process id. The process keeps running between
 tool calls: feed it input with ProcessWrite, read its output with ProcessOutput,
 and terminate it with ProcessStop. Prefer this over Bash for anything that
-blocks or waits for stdin.`
+blocks or waits for stdin. If it needs resources outside the workspace, include
+only the specific requested_capabilities needed; approval is separate from
+permission to start the process. Any approved access remains active until this
+background process exits.`
 }
 
 func (t *ProcessStartTool) Parameters() map[string]any {
@@ -419,6 +488,7 @@ func (t *ProcessStartTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "A short note describing the process.",
 			},
+			"requested_capabilities": capabilityRequestSchema(),
 		},
 		"required": []string{"command"},
 	}
@@ -442,10 +512,6 @@ func (t *ProcessStartTool) Run(ctx *Context) (string, error) {
 	if err := sandbox.CheckInteractive(command); err != nil {
 		return "", err
 	}
-	prepared, err := prepareCommand(ctx, command)
-	if err != nil {
-		return "", err
-	}
 	m, err := ctx.processManager()
 	if err != nil {
 		return "", err
@@ -459,7 +525,7 @@ func (t *ProcessStartTool) Run(ctx *Context) (string, error) {
 	if ctx.Resources != nil {
 		ownerCtx = ctx.Resources.OwnerContext()
 	}
-	id, mp, err := m.startContext(ownerCtx, prepared, ctx.WorkingDir)
+	id, mp, err := m.startContext(ownerCtx, command, ctx.WorkingDir, ctx.Sandbox)
 	if err != nil {
 		return "", err
 	}
@@ -675,14 +741,4 @@ func boundedProcessResult(ctx *Context, value string) string {
 	}
 	marker := "\n…[tool output truncated]"
 	return value[:limit-len(marker)] + marker
-}
-
-func prepareCommand(ctx *Context, command string) (string, error) {
-	if ctx == nil {
-		return "", fmt.Errorf("execution: nil context")
-	}
-	if ctx.Sandbox == nil {
-		return command, nil
-	}
-	return sandbox.PrepareCommand(ctx.Sandbox, command)
 }

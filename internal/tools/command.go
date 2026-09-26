@@ -36,7 +36,7 @@ func NewCommandTool(name, description, command string, schema map[string]any) *C
 func (t *CommandTool) Name() string        { return t.name }
 func (t *CommandTool) Description() string { return t.description }
 
-func (t *CommandTool) Parameters() map[string]any { return t.schema }
+func (t *CommandTool) Parameters() map[string]any { return WithCapabilityRequest(t.schema) }
 
 func (t *CommandTool) Run(ctx *Context) (string, error) {
 	if err := ctx.checkResources(); err != nil {

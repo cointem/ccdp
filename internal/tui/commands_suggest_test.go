@@ -9,9 +9,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"ccdp/internal/commands"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
-	"ccdp/internal/sandbox"
 )
 
 // sugModel builds a bare Model with just enough state for the suggestion logic.
@@ -22,7 +22,7 @@ func sugModel() *Model {
 	snapshot := protocol.SessionView{SessionID: "test-session",
 		Settings: protocol.SettingsSnapshot{Model: protocol.ModelBinding{Model: "test-model"},
 			Permission:    protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)},
-			Sandbox:       protocol.SandboxPolicy{Mode: string(sandbox.ModeConfine)},
+			Sandbox:       protocol.SandboxPolicy{},
 			ContextWindow: 100000},
 		Catalog: protocol.CatalogSnapshot{Providers: []protocol.ProviderSnapshot{{ID: "test", Models: []string{"test-model", "test-model-2"}}}}}
 	client := &recordingClient{snapshot: snapshot}
@@ -330,7 +330,7 @@ func TestDurableSlashCommandAppearsInTranscript(t *testing.T) {
 	}
 }
 
-func TestStatusCommandsReplaceTransientLineWithoutTranscript(t *testing.T) {
+func TestModelPermissionAndSandboxCommands(t *testing.T) {
 	m := sugModel()
 	m.viewport = viewport.New(80, 10)
 	client := m.client.(*recordingClient)
@@ -381,19 +381,35 @@ func TestStatusCommandsReplaceTransientLineWithoutTranscript(t *testing.T) {
 		t.Fatalf("unexpected mode command: %#v", got)
 	}
 
-	m.textarea.SetValue("/sandbox")
-	_, _ = m.submit()
-	if m.picker == nil || !m.picker.inline || len(m.picker.Options) != len(sandbox.ValidModes) {
-		t.Fatalf("/sandbox should open an inline picker: %#v", m.picker)
+	m.workspace = "/tmp/project"
+	m.snapshot.Settings.Sandbox = protocol.SandboxPolicy{
+		NetworkAccess:                 true,
+		AdditionalDirectories:         []string{"/tmp/project/shared"},
+		AdditionalReadOnlyDirectories: []string{"/tmp/reference"},
+		DisallowedDirectories:         []string{"/tmp/private"},
+		Revision:                      7,
 	}
-	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
-	_, cmd = m.handlePickerKey(tea.KeyMsg{Type: tea.KeyEnter})
+	next, cmd := m.runCommand("/sandbox")
+	updated := modelValue(t, next)
+	m = &updated
+	if m.picker != nil {
+		t.Fatalf("/sandbox must be a read-only diagnostic, got picker %#v", m.picker)
+	}
+	if len(m.reports) == 0 {
+		t.Fatal("/sandbox did not render the confirmed policy")
+	}
+	policyReport := m.reports[len(m.reports)-1].text
+	for _, want := range []string{"/tmp/project", "/tmp/project/shared", "/tmp/reference", "/tmp/private", "Network access: authorized", "revision 7"} {
+		if !strings.Contains(policyReport, want) {
+			t.Errorf("/sandbox diagnostic missing %q: %s", want, policyReport)
+		}
+	}
+	if cmd == nil {
+		t.Fatal("/sandbox should request runtime Seatbelt diagnostics")
+	}
 	applyTeaCmd(m, cmd)
-	if noticeText(m) != "sandbox mode → strict" {
-		t.Fatalf("sandbox selection was not applied: %q", noticeText(m))
-	}
-	if got := client.submits[len(client.submits)-1]; got.Type != protocol.CommandSetSandboxPolicy || got.SandboxPolicy.Policy.Mode != string(sandbox.ModeStrict) {
-		t.Fatalf("unexpected sandbox command: %#v", got)
+	if got := client.submits[len(client.submits)-1]; got.Type != protocol.CommandQuery || got.Query == nil || got.Query.Kind != protocol.QueryDoctor {
+		t.Fatalf("/sandbox must query read-only runtime diagnostics, got %#v", got)
 	}
 
 	m.textarea.SetValue("/help")
@@ -401,7 +417,14 @@ func TestStatusCommandsReplaceTransientLineWithoutTranscript(t *testing.T) {
 	if noticeText(m) != "" {
 		t.Fatalf("durable command should clear stale transient status, got %q", noticeText(m))
 	}
-	if len(m.items) != 2 || m.items[0].text != "/help" {
+	foundHelp := false
+	for _, item := range m.items {
+		if item.text == "/help" {
+			foundHelp = true
+			break
+		}
+	}
+	if !foundHelp {
 		t.Fatalf("/help should produce durable transcript output: %#v", m.items)
 	}
 }
@@ -413,6 +436,7 @@ func TestSlashCommandOutputLifetime(t *testing.T) {
 	}{
 		{"/model", false},
 		{"/mode default", false},
+		{"/sandbox", true},
 		{"/config", true},
 		{"/config set model test", false},
 		{"/permissions", true},
@@ -426,6 +450,22 @@ func TestSlashCommandOutputLifetime(t *testing.T) {
 		if got := slashCommandHasTranscriptOutput(tt.command); got != tt.durable {
 			t.Errorf("slashCommandHasTranscriptOutput(%q) = %v, want %v", tt.command, got, tt.durable)
 		}
+	}
+}
+
+func TestSandboxCatalogIsPersistentDiagnosticWithRevokeUsage(t *testing.T) {
+	entry, ok := commandCatalog.Lookup("sandbox")
+	if !ok {
+		t.Fatal("sandbox command is missing from the TUI catalog")
+	}
+	if entry.Feedback != commands.FeedbackReport || !entry.Transcript || !entry.Mutation {
+		t.Fatalf("sandbox should report persistent diagnostics and support a mutating revoke action, got %#v", entry)
+	}
+	if !strings.Contains(entry.Help, "[revoke all]") || !strings.Contains(entry.Help, "revoke all session access") {
+		t.Fatalf("sandbox help should document /sandbox [revoke all], got %q", entry.Help)
+	}
+	if !commandCatalog.ShouldTranscript("sandbox", nil) || !slashCommandHasTranscriptOutput("/sandbox") {
+		t.Fatal("sandbox diagnostic should keep its output in the transcript")
 	}
 }
 

@@ -38,9 +38,9 @@ func TestTypedEventsRoundTrip(t *testing.T) {
 		AssistantCommitted{TurnID: "turn", Message: testMessage("m2", "answer"), ToolCalls: []ToolCall{{CallID: "call", ToolID: "read", Arguments: args}}},
 		ToolStarted{TurnID: "turn", Call: ToolCall{CallID: "call", ToolID: "read", Arguments: args}, Fingerprint: "fingerprint"},
 		ToolFinished{TurnID: "turn", CallID: "call", Status: "success", Result: ToolResult{CallID: "call", Status: "success", Text: "ok"}},
-		ApprovalRequested{Request: ApprovalRequest{ApprovalID: "approval", SessionID: "typed", ArgumentDigest: "digest", Workspace: "."}},
+		ApprovalRequested{Request: ApprovalRequest{ApprovalID: "approval", SessionID: "typed", ArgumentDigest: "digest", BusinessArgumentDigest: "business-digest", Workspace: "."}},
 		ApprovalResolved{Resolution: ApprovalResolution{ApprovalID: "approval", Decision: "allow"}},
-		TurnFinished{TurnID: "turn", Outcome: "success"},
+		TurnFinished{TurnID: "turn", Outcome: "success", DurationMs: 155_000},
 	}
 	if _, err := st.Commit(0, Batch{Events: events}); err != nil {
 		t.Fatal(err)
@@ -65,6 +65,9 @@ func TestTypedEventsRoundTrip(t *testing.T) {
 	}
 	if _, ok := records[6].Event.(*ToolFinished); !ok {
 		t.Fatalf("tool result event type = %T", records[6].Event)
+	}
+	if got, ok := records[len(records)-1].Event.(*TurnFinished); !ok || got.DurationMs != 155_000 {
+		t.Fatalf("turn duration did not survive JSONL replay: %#v", records[len(records)-1].Event)
 	}
 }
 

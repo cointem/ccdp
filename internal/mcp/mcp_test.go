@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"ccdp/internal/sandbox"
 	"ccdp/internal/tools"
 )
 
@@ -80,6 +82,7 @@ func newTestServer(t *testing.T, name string) *Client {
 		Env:     map[string]string{fakeServerEnv: "1"},
 	}
 	c := NewClient(name, cfg)
+	c.SetSandbox(sandbox.New(t.TempDir()))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.Start(ctx); err != nil {
@@ -249,6 +252,7 @@ func TestManagerRegisterTools(t *testing.T) {
 	}
 
 	m := NewManager()
+	m.SetSandbox(sandbox.New(t.TempDir()))
 	m.Start(context.Background(), map[string]ServerConfig{
 		"fake": {
 			Command: os.Args[0],
@@ -286,6 +290,7 @@ func TestManagerRegisterTools(t *testing.T) {
 
 func TestManagerStartCheckedRollsBackAllCandidates(t *testing.T) {
 	m := NewManager()
+	m.SetSandbox(sandbox.New(t.TempDir()))
 	err := m.StartChecked(context.Background(), map[string]ServerConfig{
 		"broken":          {Command: "/definitely/not/a/real/mcp-server"},
 		"missing-command": {},
@@ -306,6 +311,7 @@ func TestManagerRefreshKeepsOldStepBindingAlive(t *testing.T) {
 	}
 	server := ServerConfig{Command: os.Args[0], Args: []string{"-test.run=TestManagerRefreshKeepsOldStepBindingAlive"}, Env: map[string]string{fakeServerEnv: "1"}}
 	m := NewManager()
+	m.SetSandbox(sandbox.New(t.TempDir()))
 	if err := m.StartChecked(context.Background(), map[string]ServerConfig{"fake": server}); err != nil {
 		t.Fatal(err)
 	}
@@ -340,6 +346,7 @@ func TestManagerPrepareAbortDoesNotPublishCandidate(t *testing.T) {
 	}
 	server := ServerConfig{Command: os.Args[0], Args: []string{"-test.run=TestManagerPrepareAbortDoesNotPublishCandidate"}, Env: map[string]string{fakeServerEnv: "1"}}
 	m := NewManager()
+	m.SetSandbox(sandbox.New(t.TempDir()))
 	if err := m.StartChecked(context.Background(), map[string]ServerConfig{"fake": server}); err != nil {
 		t.Fatal(err)
 	}
@@ -395,9 +402,13 @@ func TestManagerStartsSSEWithoutCommand(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// The in-process SSE transport connects only to this loopback test server.
+	sb := sandbox.New(t.TempDir())
+	sb.SetAllowNetwork(true)
 	m := NewManager()
+	m.SetSandbox(sb)
 	m.Start(context.Background(), map[string]ServerConfig{
-		"remote": {Transport: "sse", BaseURL: srv.URL},
+		"remote": {Transport: "sse", BaseURL: srv.URL, NetworkAuthorized: true},
 	})
 	defer m.Close()
 	if names := m.Names(); len(names) != 1 || names[0] != "remote" {
@@ -405,6 +416,36 @@ func TestManagerStartsSSEWithoutCommand(t *testing.T) {
 	}
 	if got := m.ToolNames()["remote"]; len(got) != 1 || got[0] != "sse_echo" {
 		t.Fatalf("SSE tools = %v", got)
+	}
+}
+
+func TestUnapprovedRemoteMCPDoesNotConnect(t *testing.T) {
+	client := NewClient("remote", ServerConfig{Transport: "sse", BaseURL: "http://127.0.0.1:1/sse"})
+	err := client.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "explicit network_authorized consent") {
+		t.Fatalf("unapproved remote MCP start = %v", err)
+	}
+}
+
+func TestRemoteMCPToolRequiresPerCallHostNetwork(t *testing.T) {
+	client := NewClient("remote", ServerConfig{Transport: "sse", BaseURL: "https://example.test/sse", NetworkAuthorized: true})
+	tool := &mcpTool{client: client, def: ToolDef{Name: "read"}}
+	if _, err := tool.Run(&tools.Context{Context: context.Background(), Args: map[string]any{}}); err == nil || !strings.Contains(err.Error(), "per-call outbound network authorization") {
+		t.Fatalf("remote MCP call without per-call authorization = %v", err)
+	}
+}
+
+func TestSSERedirectMustStayOnConfiguredOrigin(t *testing.T) {
+	base, _ := url.Parse("https://mcp.example.test:8443/sse")
+	for _, raw := range []string{"https://mcp.example.test:8443/next", "https://other.example.test:8443/next", "https://mcp.example.test/next"} {
+		target, _ := url.Parse(raw)
+		err := sameSSEOriginRedirect(&http.Request{URL: target}, []*http.Request{{URL: base}})
+		if sameHTTPOrigin(base, target) && err != nil {
+			t.Errorf("same-origin redirect %s rejected: %v", raw, err)
+		}
+		if !sameHTTPOrigin(base, target) && err == nil {
+			t.Errorf("cross-origin redirect %s allowed", raw)
+		}
 	}
 }
 

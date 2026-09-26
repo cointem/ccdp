@@ -400,10 +400,6 @@ func (m *Manager) runOne(ctx context.Context, command string, timeout time.Durat
 		Context: ctx, Command: command, Dir: opts.Workspace, Timeout: timeout,
 		Input: bytes.NewReader(payload), Env: env, Sandbox: opts.Sandbox,
 		OutputLimit: opts.OutputLimit,
-		// Hook commands are a portable configuration contract, not an
-		// interactive terminal session. Keep their POSIX shell semantics stable
-		// across users whose login shell may be fish, nushell, or something else.
-		Shell: "/bin/sh",
 	})
 	if err != nil {
 		return Output{}, false, fmt.Errorf("hook %q: %w", command, err)

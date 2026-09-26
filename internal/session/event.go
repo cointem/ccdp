@@ -224,31 +224,44 @@ func (r ToolResult) validate() error {
 }
 
 type Settings struct {
-	ReasoningEffort           string   `json:"reasoning_effort,omitempty"`
-	Verbosity                 string   `json:"verbosity,omitempty"`
-	GenerationOptionsSet      bool     `json:"generation_options_set,omitempty"`
-	Model                     string   `json:"model,omitempty"`
-	Provider                  string   `json:"provider,omitempty"`
-	Endpoint                  string   `json:"endpoint,omitempty"`
-	Temperature               *float64 `json:"temperature,omitempty"`
-	MaxOutputTokens           *int     `json:"max_output_tokens,omitempty"`
-	ExecutionMode             string   `json:"execution_mode,omitempty"`
-	PermissionPolicy          string   `json:"permission_policy,omitempty"`
-	AlwaysAllow               []string `json:"always_allow,omitempty"`
-	AlwaysDeny                []string `json:"always_deny,omitempty"`
-	SandboxPolicy             string   `json:"sandbox_policy,omitempty"`
-	AllowNetwork              bool     `json:"allow_network,omitempty"`
-	AllowNetworkSet           bool     `json:"allow_network_set,omitempty"`
-	AdditionalDirectories     []string `json:"additional_directories,omitempty"`
-	DisallowedDirectories     []string `json:"disallowed_directories,omitempty"`
-	ContextWindow             int      `json:"context_window,omitempty"`
-	EffectiveContextWindow    int      `json:"effective_context_window,omitempty"`
-	CompactThreshold          float64  `json:"compact_threshold,omitempty"`
-	MaxResultSizeChars        int      `json:"max_result_size_chars,omitempty"`
-	MaxTurns                  int      `json:"max_turns,omitempty"`
-	MaxBudgetUSD              float64  `json:"max_budget_usd,omitempty"`
-	MaxToolOutputCharsPerTurn int      `json:"max_tool_output_chars_per_turn,omitempty"`
-	Workspace                 string   `json:"workspace,omitempty"`
+	ReasoningEffort               string   `json:"reasoning_effort,omitempty"`
+	Verbosity                     string   `json:"verbosity,omitempty"`
+	GenerationOptionsSet          bool     `json:"generation_options_set,omitempty"`
+	Model                         string   `json:"model,omitempty"`
+	Provider                      string   `json:"provider,omitempty"`
+	Endpoint                      string   `json:"endpoint,omitempty"`
+	Temperature                   *float64 `json:"temperature,omitempty"`
+	MaxOutputTokens               *int     `json:"max_output_tokens,omitempty"`
+	ExecutionMode                 string   `json:"execution_mode,omitempty"`
+	PermissionPolicy              string   `json:"permission_policy,omitempty"`
+	AlwaysAllow                   []string `json:"always_allow,omitempty"`
+	AlwaysDeny                    []string `json:"always_deny,omitempty"`
+	NetworkAccess                 bool     `json:"network_access,omitempty"`
+	AdditionalDirectories         []string `json:"additional_directories,omitempty"`
+	AdditionalReadOnlyDirectories []string `json:"additional_read_only_directories,omitempty"`
+	DisallowedDirectories         []string `json:"disallowed_directories,omitempty"`
+	ContextWindow                 int      `json:"context_window,omitempty"`
+	EffectiveContextWindow        int      `json:"effective_context_window,omitempty"`
+	CompactThreshold              float64  `json:"compact_threshold,omitempty"`
+	MaxResultSizeChars            int      `json:"max_result_size_chars,omitempty"`
+	MaxTurns                      int      `json:"max_turns,omitempty"`
+	MaxBudgetUSD                  float64  `json:"max_budget_usd,omitempty"`
+	MaxToolOutputCharsPerTurn     int      `json:"max_tool_output_chars_per_turn,omitempty"`
+	Workspace                     string   `json:"workspace,omitempty"`
+}
+
+func (s *Settings) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, removed := range []string{"sandbox_policy", "allow_network", "allow_network_set"} {
+		if _, exists := fields[removed]; exists {
+			return fmt.Errorf("session: setting %q is no longer supported", removed)
+		}
+	}
+	type wire Settings
+	return json.Unmarshal(data, (*wire)(s))
 }
 
 func (s Settings) validate() error {
@@ -275,9 +288,6 @@ func (s Settings) validate() error {
 	}
 	if s.PermissionPolicy != "" && s.PermissionPolicy != "default" && s.PermissionPolicy != "acceptEdits" && s.PermissionPolicy != "bypassPermissions" {
 		return fmt.Errorf("unknown permission_policy %q", s.PermissionPolicy)
-	}
-	if s.SandboxPolicy != "" && s.SandboxPolicy != "confine" && s.SandboxPolicy != "strict" && s.SandboxPolicy != "none" {
-		return fmt.Errorf("unknown sandbox_policy %q", s.SandboxPolicy)
 	}
 	return nil
 }
@@ -491,16 +501,18 @@ func (t Task) validate() error {
 }
 
 type ApprovalRequest struct {
-	ApprovalID     string `json:"approval_id"`
-	SessionID      string `json:"session_id"`
-	TurnID         string `json:"turn_id,omitempty"`
-	CallID         string `json:"call_id,omitempty"`
-	PlanID         string `json:"plan_id,omitempty"`
-	PlanVersion    uint64 `json:"plan_version,omitempty"`
-	ArgumentDigest string `json:"argument_digest"`
-	Workspace      string `json:"workspace"`
-	ToolVersion    string `json:"tool_version,omitempty"`
-	PolicyRevision uint64 `json:"policy_revision"`
+	ApprovalID             string                       `json:"approval_id"`
+	SessionID              string                       `json:"session_id"`
+	TurnID                 string                       `json:"turn_id,omitempty"`
+	CallID                 string                       `json:"call_id,omitempty"`
+	PlanID                 string                       `json:"plan_id,omitempty"`
+	PlanVersion            uint64                       `json:"plan_version,omitempty"`
+	ArgumentDigest         string                       `json:"argument_digest"`
+	BusinessArgumentDigest string                       `json:"business_argument_digest"`
+	Workspace              string                       `json:"workspace"`
+	ToolVersion            string                       `json:"tool_version,omitempty"`
+	PolicyRevision         uint64                       `json:"policy_revision"`
+	Capabilities           []protocol.CapabilityRequest `json:"capabilities,omitempty"`
 }
 
 func (a ApprovalRequest) validate() error {
@@ -513,14 +525,19 @@ func (a ApprovalRequest) validate() error {
 	if a.ArgumentDigest == "" {
 		return errors.New("approval argument_digest is required")
 	}
+	if a.BusinessArgumentDigest == "" {
+		return errors.New("approval business_argument_digest is required")
+	}
 	return nil
 }
 
 type ApprovalResolution struct {
-	ApprovalID string `json:"approval_id"`
-	Decision   string `json:"decision"`
-	Reason     string `json:"reason,omitempty"`
-	ResolvedBy string `json:"resolved_by,omitempty"`
+	ApprovalID      string                       `json:"approval_id"`
+	Decision        string                       `json:"decision"`
+	Reason          string                       `json:"reason,omitempty"`
+	ResolvedBy      string                       `json:"resolved_by,omitempty"`
+	CapabilityScope protocol.CapabilityScope     `json:"capability_scope,omitempty"`
+	Capabilities    []protocol.CapabilityRequest `json:"capabilities,omitempty"`
 }
 
 func (a ApprovalResolution) validate() error {
@@ -624,9 +641,10 @@ type TurnStarted struct {
 }
 
 type TurnFinished struct {
-	TurnID  string `json:"turn_id"`
-	Outcome string `json:"outcome"`
-	Error   string `json:"error,omitempty"`
+	TurnID     string `json:"turn_id"`
+	Outcome    string `json:"outcome"`
+	Error      string `json:"error,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
 }
 
 type RequestPrepared struct {
@@ -942,6 +960,9 @@ func (e TurnStarted) validate() error {
 func (e TurnFinished) validate() error {
 	if err := requireID("turn_id", e.TurnID); err != nil {
 		return err
+	}
+	if e.DurationMs < 0 {
+		return errors.New("duration_ms must not be negative")
 	}
 	return validateOutcome(e.Outcome)
 }

@@ -5,13 +5,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ccdp/internal/sandbox"
 )
 
 func TestTodoPersistsAcrossStores(t *testing.T) {
 	dir := t.TempDir()
 	resources := NewResources("todo-test", dir)
 	t.Cleanup(func() { _ = resources.Close() })
-	ctx := resources.Context(nil, dir, nil)
+	ctx := resources.Context(nil, dir, sandbox.New(dir))
 	ctx.Args = map[string]any{
 		"todos": []any{
 			map[string]any{"content": "step one", "status": "in_progress", "priority": "high"},

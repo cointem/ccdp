@@ -364,6 +364,9 @@ func renderItemWidth(it *historyCell, width int) string {
 	case "status":
 		return styleStatus.Render("· " + text)
 
+	case "turn_summary":
+		return styleStatus.Render("· " + text)
+
 	case "system":
 		return styleSystem.Render(text)
 

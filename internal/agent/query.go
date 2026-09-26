@@ -11,7 +11,6 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
-	"ccdp/internal/sandbox"
 	"ccdp/internal/skills"
 )
 
@@ -22,7 +21,9 @@ import (
 type queryRuntimeSnapshot struct {
 	view          protocol.SessionView
 	cfg           config.Config
-	sandboxMode   sandbox.Mode
+	sandboxReady  bool
+	sandboxDetail string
+	sandboxRev    uint64
 	sandboxLimits bool
 	plugins       []string
 	pending       []string
@@ -109,11 +110,21 @@ func (a *Agent) captureQuerySnapshot(ctx context.Context) *queryRuntimeSnapshot 
 	}
 	view := a.snapshotLocked()
 	cfg := cloneConfig(a.cfg)
-	var mode sandbox.Mode
+	var sandboxReady bool
+	var sandboxDetail string
+	var sandboxRevision uint64
 	var limits bool
 	if a.sandbox != nil {
-		mode = a.sandbox.CurrentMode()
+		sandboxRevision = a.sandbox.Revision
 		limits = a.sandbox.Limits != nil
+		if err := a.sandbox.BackendError(); err != nil {
+			sandboxDetail = err.Error()
+		} else {
+			sandboxReady = true
+			sandboxDetail = "macOS Seatbelt is available"
+		}
+	} else {
+		sandboxDetail = "sandbox policy is unavailable"
 	}
 	var plugins, pending []string
 	if a.host != nil {
@@ -136,7 +147,8 @@ func (a *Agent) captureQuerySnapshot(ctx context.Context) *queryRuntimeSnapshot 
 	if a.perms != nil {
 		permissionSnapshot = a.perms.Snapshot()
 	}
-	return &queryRuntimeSnapshot{view: view, cfg: cfg, sandboxMode: mode,
+	return &queryRuntimeSnapshot{view: view, cfg: cfg, sandboxReady: sandboxReady,
+		sandboxDetail: sandboxDetail, sandboxRev: sandboxRevision,
 		sandboxLimits: limits, plugins: append([]string(nil), plugins...),
 		pending: append([]string(nil), pending...), mcpNames: append([]string(nil), mcpNames...),
 		mcpTools: mcpTools, skills: loadedSkills, permissions: permissionSnapshot}
@@ -151,21 +163,23 @@ func formatQueryConfig(s *queryRuntimeSnapshot) string {
 	if mode == "" {
 		mode = permissions.Mode(cfg.PermissionMode)
 	}
-	sandboxMode := "unavailable"
-	if s.sandboxMode != "" {
-		sandboxMode = string(s.sandboxMode)
-	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "model:         %s\n", cfg.Model)
 	fmt.Fprintf(&b, "reasoning_effort: %s\nverbosity: %s\n", cfg.ReasoningEffortFor(cfg.Model), cfg.Verbosity)
 	fmt.Fprintf(&b, "base_url:      %s\n", redactURL(cfg.ResolveProvider(cfg.Model).BaseURL))
 	fmt.Fprintf(&b, "api_key:       %s\n", maskKey(cfg.ResolveProvider(cfg.Model).APIKey))
 	fmt.Fprintf(&b, "permission:    %s\n", mode)
-	fmt.Fprintf(&b, "sandbox:       %s", sandboxMode)
+	fmt.Fprintf(&b, "Seatbelt:      %s", s.sandboxDetail)
 	if s.sandboxLimits {
 		b.WriteString(" (limits: on)")
 	}
 	b.WriteString("\n")
+	fmt.Fprintf(&b, "sandbox revision: %d\n", s.sandboxRev)
+	fmt.Fprintf(&b, "network access: %v\n", cfg.NetworkAccess)
+	fmt.Fprintf(&b, "workspace:     %s\n", cfg.Workspace)
+	fmt.Fprintf(&b, "read/write roots: %s\n", strings.Join(append([]string{cfg.Workspace}, cfg.AdditionalDirectories...), ", "))
+	fmt.Fprintf(&b, "read-only roots: %s\n", strings.Join(cfg.AdditionalReadOnlyDirectories, ", "))
+	fmt.Fprintf(&b, "denied roots: %s\n", strings.Join(cfg.DisallowedDirectories, ", "))
 	fmt.Fprintf(&b, "plan mode:     %v\n", s.view.Settings.ExecutionMode == protocol.ExecutionModePlan)
 	fmt.Fprintf(&b, "workspace:     %s\n", cfg.Workspace)
 	fmt.Fprintf(&b, "context_window:%d\n", cfg.ContextWindowFor(cfg.Model))
@@ -231,7 +245,7 @@ func formatQueryDoctor(s *queryRuntimeSnapshot) string {
 		path = config.ConfigPath()
 	}
 	ok("config file present", fileExists(path), path)
-	ok("sandbox active", s.sandboxMode != "", string(s.sandboxMode))
+	ok("Seatbelt backend", s.sandboxReady, s.sandboxDetail)
 	ok("tools loaded", len(s.view.Catalog.Tools) > 0, fmt.Sprintf("%d tools", len(s.view.Catalog.Tools)))
 	if len(s.mcpNames) > 0 {
 		ok("mcp servers", true, fmt.Sprintf("%d connected", len(s.mcpNames)))

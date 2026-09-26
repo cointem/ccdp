@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,6 +33,8 @@ const DefaultOutputLimit = 512 * 1024
 // inherited stdout/stderr open.
 const PipeWaitDelay = 3 * time.Second
 
+var startScratchCleanup sync.Map // map[*exec.Cmd]func()
+
 // EnvironmentPurpose identifies the owner of a local process environment.
 // Every purpose starts from a credential-filtered host environment; callers
 // that need an explicit secret must pass that complete environment in
@@ -49,6 +52,7 @@ const (
 type Request struct {
 	Context context.Context
 	Command string
+	Argv    []string
 	Dir     string
 	Timeout time.Duration
 	Input   io.Reader
@@ -70,8 +74,6 @@ type Request struct {
 	NotifyContext func(context.Context, string) error
 	// OutputLimit bounds retained output. Zero uses DefaultOutputLimit.
 	OutputLimit int
-	// Shell is optional; an empty value resolves $SHELL then /bin/sh.
-	Shell string
 }
 
 // Result is the bounded result of a process invocation.
@@ -96,8 +98,7 @@ type StartRequest struct {
 }
 
 // StartArgv starts one admitted process without interpreting argument values
-// as shell syntax. Strict macOS sandboxes use the checked profile wrapper;
-// ordinary modes retain direct exec argv semantics.
+// as shell syntax. The process and its descendants inherit Seatbelt.
 func StartArgv(req StartRequest) (*exec.Cmd, error) {
 	if len(req.Argv) == 0 || strings.TrimSpace(req.Argv[0]) == "" {
 		return nil, fmt.Errorf("execution: empty argv")
@@ -106,43 +107,79 @@ func StartArgv(req StartRequest) (*exec.Cmd, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	parts := make([]string, len(req.Argv))
-	for i, arg := range req.Argv {
-		parts[i] = shellQuote(arg)
+	if req.Sandbox == nil {
+		return nil, fmt.Errorf("execution: sandbox policy is unavailable")
 	}
-	command := strings.Join(parts, " ")
-	if err := sandbox.CheckInteractive(command); err != nil {
+	if err := sandbox.CheckInteractive(strings.Join(req.Argv, " ")); err != nil {
 		return nil, err
 	}
-	var cmd *exec.Cmd
-	if req.Sandbox != nil && req.Sandbox.CurrentMode() == sandbox.ModeStrict {
-		prepared, err := sandbox.PrepareCommandContext(ctx, req.Sandbox, command)
-		if err != nil {
-			return nil, err
-		}
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/sh"
-		}
-		cmd = exec.CommandContext(ctx, shell, "-c", prepared)
-	} else if req.Sandbox != nil && req.Sandbox.Prefix() != "" {
-		// A non-strict sandbox still carries configured per-command limits. Use
-		// the shell only for this explicit prefix; argv values remain quoted.
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/sh"
-		}
-		cmd = exec.CommandContext(ctx, shell, "-c", req.Sandbox.Prefix()+" "+command)
-	} else {
-		cmd = exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
+	policy := req.Sandbox.Snapshot()
+	procEnv, cleanupScratch, err := prepareProcessEnvironment(req.Env, policy)
+	if err != nil {
+		return nil, err
 	}
+	argv := append([]string(nil), req.Argv...)
+	argv, procEnv = preferNativeGit(argv, "", procEnv, req.Dir)
+	argv, procEnv = preferNativeCLTPython(argv, "", procEnv, req.Dir, nativeCLTPythonPath())
+	addExecutionReadRoots(policy, argv, "", req.Dir, procEnv)
+	profile, err := policy.Profile()
+	if err != nil {
+		cleanupScratch()
+		return nil, err
+	}
+	if err := verifyProfileContext(ctx, profile); err != nil {
+		cleanupScratch()
+		return nil, err
+	}
+	argv = applyArgvLimits(policy, argv)
+	cmd := exec.CommandContext(ctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, argv...)...)
 	cmd.Dir = req.Dir
-	if req.Env != nil {
-		cmd.Env = append([]string(nil), req.Env...)
-	} else {
-		cmd.Env = SanitizedEnvironment(os.Environ())
-	}
+	cmd.Env = procEnv
 	setProcessGroup(cmd)
+	if cleanupScratch != nil {
+		startScratchCleanup.Store(cmd, cleanupScratch)
+	}
+	return cmd, nil
+}
+
+// StartShell creates a fixed /bin/sh invocation inside Seatbelt for a
+// long-running shell command. The owner remains responsible for process pipes
+// and lifetime.
+func StartShell(ctx context.Context, command, dir string, env []string, policy *sandbox.Sandbox) (*exec.Cmd, error) {
+	if strings.TrimSpace(command) == "" {
+		return nil, fmt.Errorf("execution: empty command")
+	}
+	if policy == nil {
+		return nil, fmt.Errorf("execution: sandbox policy is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	policy = policy.Snapshot()
+	procEnv, cleanupScratch, err := prepareProcessEnvironment(env, policy)
+	if err != nil {
+		return nil, err
+	}
+	_, procEnv = preferNativeGit(nil, command, procEnv, dir)
+	_, procEnv = preferNativeCLTPython(nil, command, procEnv, dir, nativeCLTPythonPath())
+	addExecutionReadRoots(policy, nil, command, dir, procEnv)
+	prepared, err := sandbox.PrepareCommandContext(ctx, policy, command)
+	if err != nil {
+		cleanupScratch()
+		return nil, err
+	}
+	profile, err := policy.Profile()
+	if err != nil {
+		cleanupScratch()
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, sandbox.BackendPath, "-p", profile, "--", "/bin/sh", "-c", prepared)
+	cmd.Dir = dir
+	cmd.Env = procEnv
+	setProcessGroup(cmd)
+	if cleanupScratch != nil {
+		startScratchCleanup.Store(cmd, cleanupScratch)
+	}
 	return cmd, nil
 }
 
@@ -202,6 +239,13 @@ func secretEnvironmentKey(key string) bool {
 	if upper == "" {
 		return false
 	}
+	switch upper {
+	case "SSH_AUTH_SOCK", "GPG_AGENT_INFO", "DBUS_SESSION_BUS_ADDRESS", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY":
+		return true
+	}
+	if strings.HasSuffix(upper, "_PROXY") {
+		return true
+	}
 	for _, fragment := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASS", "CREDENTIAL"} {
 		if strings.Contains(upper, fragment) {
 			return true
@@ -219,8 +263,11 @@ func secretEnvironmentKey(key string) bool {
 // real Darwin profile; an unavailable backend is returned as an error instead
 // of silently weakening the policy.
 func Run(req Request) (Result, error) {
-	if strings.TrimSpace(req.Command) == "" {
+	if len(req.Argv) == 0 && strings.TrimSpace(req.Command) == "" {
 		return Result{}, fmt.Errorf("execution: empty command")
+	}
+	if len(req.Argv) > 0 && req.Command != "" {
+		return Result{}, fmt.Errorf("execution: choose Command or Argv")
 	}
 	if req.Progress != nil && req.NotifyContext != nil {
 		return Result{}, fmt.Errorf("execution: choose one progress sink (Progress or NotifyContext)")
@@ -235,31 +282,55 @@ func Run(req Request) (Result, error) {
 	}
 	cctx, cancel := context.WithTimeout(base, timeout)
 	defer cancel()
-	if err := sandbox.CheckInteractive(req.Command); err != nil {
-		return Result{}, err
+	if req.Sandbox == nil {
+		return Result{}, fmt.Errorf("execution: sandbox policy is unavailable")
 	}
-	command, err := sandbox.PrepareCommandContext(cctx, req.Sandbox, req.Command)
+	policy := req.Sandbox.Snapshot()
+	procEnv, cleanupScratch, err := prepareProcessEnvironment(req.Env, policy)
 	if err != nil {
 		return Result{}, err
 	}
-	shell := req.Shell
-	if shell == "" {
-		shell = os.Getenv("SHELL")
-	}
-	if shell == "" {
-		shell = "/bin/sh"
-	}
-	cmd := exec.CommandContext(cctx, shell, "-c", command)
-	cmd.Dir = req.Dir
-	if req.Env != nil {
-		cmd.Env = append([]string(nil), req.Env...)
+	argv, procEnv := preferNativeGit(req.Argv, req.Command, procEnv, req.Dir)
+	argv, procEnv = preferNativeCLTPython(argv, req.Command, procEnv, req.Dir, nativeCLTPythonPath())
+	defer cleanupScratch()
+	addExecutionReadRoots(policy, argv, req.Command, req.Dir, procEnv)
+	var cmd *exec.Cmd
+	if len(req.Argv) > 0 {
+		if argv[0] == "" {
+			return Result{}, fmt.Errorf("execution: empty argv")
+		}
+		if err := sandbox.CheckInteractive(strings.Join(argv, " ")); err != nil {
+			return Result{}, err
+		}
+		profile, err := policy.Profile()
+		if err != nil {
+			return Result{}, err
+		}
+		if err := verifyProfileContext(cctx, profile); err != nil {
+			return Result{}, err
+		}
+		limitedArgv := applyArgvLimits(policy, argv)
+		cmd = exec.CommandContext(cctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, limitedArgv...)...)
 	} else {
-		cmd.Env = SanitizedEnvironment(os.Environ())
+		command, err := sandbox.PrepareCommandContext(cctx, policy, req.Command)
+		if err != nil {
+			return Result{}, err
+		}
+		profile, err := policy.Profile()
+		if err != nil {
+			return Result{}, err
+		}
+		cmd = exec.CommandContext(cctx, sandbox.BackendPath, "-p", profile, "--", "/bin/sh", "-c", command)
 	}
+	cmd.Dir = req.Dir
+	cmd.Env = procEnv
 	if req.Input != nil {
 		cmd.Stdin = req.Input
 	}
 	setProcessGroup(cmd)
+	if err := cctx.Err(); err == nil {
+		policy.MarkExternalExecution()
+	}
 
 	limit := req.OutputLimit
 	if limit <= 0 {
@@ -415,22 +486,515 @@ func Run(req Request) (Result, error) {
 	return res, fmt.Errorf("execution: %w", runErr)
 }
 
+func prepareProcessEnvironment(env []string, policy *sandbox.Sandbox) ([]string, func(), error) {
+	if policy == nil {
+		return nil, nil, fmt.Errorf("execution: sandbox policy is unavailable")
+	}
+	entries := append([]string(nil), env...)
+	if env == nil {
+		entries = SanitizedEnvironment(os.Environ())
+	} else {
+		entries = filterHostDelegationEnvironment(entries)
+	}
+	var scratch string
+	for _, root := range policy.Snapshot().ScratchDirs {
+		if info, err := os.Stat(root); err == nil && info.IsDir() {
+			scratch = root
+			break
+		}
+	}
+	var cleanup func()
+	if scratch == "" {
+		var err error
+		scratch, err = os.MkdirTemp("", "ccdp-sandbox-")
+		if err != nil {
+			return nil, nil, fmt.Errorf("execution: create invocation scratch directory: %w", err)
+		}
+		policy.AddExecutionScratchDir(scratch)
+		cleanup = func() { _ = os.RemoveAll(scratch) }
+	}
+	cache := filepath.Join(scratch, "cache")
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil, nil, fmt.Errorf("execution: initialize invocation cache: %w", err)
+	}
+	entries = setEnvironment(entries, "HOME", scratch)
+	entries = setEnvironment(entries, "TMPDIR", scratch)
+	entries = setEnvironment(entries, "TMP", scratch)
+	entries = setEnvironment(entries, "TEMP", scratch)
+	entries = setEnvironment(entries, "XDG_CACHE_HOME", cache)
+	entries = setEnvironment(entries, "GOCACHE", filepath.Join(cache, "go-build"))
+	entries = setEnvironment(entries, "npm_config_cache", filepath.Join(cache, "npm"))
+	entries = setEnvironment(entries, "PIP_CACHE_DIR", filepath.Join(cache, "pip"))
+	if cleanup == nil {
+		cleanup = func() {}
+	}
+	return entries, cleanup, nil
+}
+
+// filterHostDelegationEnvironment removes proxy and agent sockets even when a
+// caller supplies an explicit environment. Explicit credentials remain
+// available for purpose-specific adapters such as MCP/gh, but cannot smuggle
+// host network or authentication services into a sandboxed child.
+func filterHostDelegationEnvironment(entries []string) []string {
+	filtered := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		upper := strings.ToUpper(strings.TrimSpace(key))
+		if upper == "SSH_AUTH_SOCK" || upper == "GPG_AGENT_INFO" || upper == "DBUS_SESSION_BUS_ADDRESS" || upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY" || strings.HasSuffix(upper, "_PROXY") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+const nativeGitPath = "/Library/Developer/CommandLineTools/usr/bin/git"
+
+// preferNativeGit avoids Apple's /usr/bin/git xcrun launcher when it is the
+// selected executable. xcrun creates a database under the host's
+// DARWIN_USER_TEMP_DIR (which ignores TMPDIR), so allowing that host directory
+// would expose unrelated user temporary data. The actual selected CLT binary
+// is already covered by the narrow developer-toolchain read root.
+func preferNativeGit(argv []string, command string, env []string, dir string) ([]string, []string) {
+	if executableFile(nativeGitPath) == "" {
+		return argv, env
+	}
+	path := environmentValue(env, "PATH")
+	if path == "" {
+		path = os.Getenv("PATH")
+	}
+	if len(argv) > 0 {
+		resolved := resolveExecutable(argv[0], path, dir)
+		if resolved == "/usr/bin/git" {
+			argv = append([]string(nil), argv...)
+			argv[0] = nativeGitPath
+		}
+		return argv, env
+	}
+	for _, name := range shellCommandNames(command) {
+		if filepath.Base(name) == "git" && resolveExecutable(name, path, dir) == "/usr/bin/git" {
+			return argv, prependPath(env, filepath.Dir(nativeGitPath), path)
+		}
+	}
+	return argv, env
+}
+
+const nativeCLTPythonShimPath = "/Library/Developer/CommandLineTools/usr/bin/python3"
+
+// preferNativeCLTPython bypasses Apple's /usr/bin/python3 launcher when it
+// resolves to the Command Line Tools shim. That launcher asks xcrun to locate
+// the runtime and writes an xcrun database under DARWIN_USER_TEMP_DIR, outside
+// the per-invocation TMPDIR. The direct framework interpreter avoids that host
+// temporary state; addExecutionReadRoots then authorizes only its versioned
+// Python.framework runtime root.
+func preferNativeCLTPython(argv []string, command string, env []string, dir, nativePath string) ([]string, []string) {
+	if nativePath == "" {
+		return argv, env
+	}
+	nativePath = executableFile(nativePath)
+	if nativePath == "" || pythonFrameworkVersionRoot(nativePath) == "" {
+		return argv, env
+	}
+	path := environmentValue(env, "PATH")
+	if path == "" {
+		path = os.Getenv("PATH")
+	}
+	if len(argv) > 0 {
+		resolved := resolveExecutable(argv[0], path, dir)
+		if isSystemPython3Shim(resolved) && nativePythonSupportsName(filepath.Base(argv[0]), nativePath) {
+			argv = append([]string(nil), argv...)
+			argv[0] = nativePath
+		}
+		return argv, env
+	}
+	for _, name := range shellCommandNames(command) {
+		resolved := resolveExecutable(name, path, dir)
+		if isSystemPython3Shim(resolved) && nativePythonSupportsName(filepath.Base(name), nativePath) {
+			return argv, prependPath(env, filepath.Dir(nativePath), path)
+		}
+	}
+	return argv, env
+}
+
+func nativeCLTPythonPath() string {
+	path := executableFile(nativeCLTPythonShimPath)
+	if path == "" || pythonFrameworkVersionRoot(path) == "" {
+		return ""
+	}
+	return path
+}
+
+func isSystemPython3Shim(path string) bool {
+	if filepath.Dir(filepath.Clean(path)) != "/usr/bin" {
+		return false
+	}
+	name := filepath.Base(path)
+	if name == "python3" {
+		return true
+	}
+	if !strings.HasPrefix(name, "python3.") {
+		return false
+	}
+	for _, digit := range strings.TrimPrefix(name, "python3.") {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return len(name) > len("python3.")
+}
+
+func nativePythonSupportsName(name, nativePath string) bool {
+	return name == "python3" || filepath.Base(name) == filepath.Base(nativePath)
+}
+
+func environmentValue(env []string, key string) string {
+	prefix := key + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+func prependPath(env []string, first, existing string) []string {
+	var entries []string
+	for _, entry := range filepath.SplitList(existing) {
+		if entry != first && entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	entries = append([]string{first}, entries...)
+	return setEnvironment(env, "PATH", strings.Join(entries, string(os.PathListSeparator)))
+}
+
+func setEnvironment(entries []string, key, value string) []string {
+	filtered := entries[:0]
+	prefix := key + "="
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry, prefix) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return append(filtered, prefix+value)
+}
+
+// CleanupStartedProcess releases an invocation scratch directory after a
+// long-lived command has exited. Callers that start a command must call this
+// after Wait, even when Wait reports an error.
+func CleanupStartedProcess(cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
+	if value, ok := startScratchCleanup.LoadAndDelete(cmd); ok {
+		value.(func())()
+	}
+}
+
+func applyArgvLimits(policy *sandbox.Sandbox, argv []string) []string {
+	if policy == nil {
+		return append([]string(nil), argv...)
+	}
+	prefix := strings.TrimSpace(policy.Prefix())
+	if prefix == "" {
+		return append([]string(nil), argv...)
+	}
+	prefix = strings.TrimSuffix(prefix, "&&")
+	command := strings.TrimSpace(prefix) + ` && exec "$@"`
+	wrapped := []string{"/bin/sh", "-c", command, "ccdp-argv"}
+	return append(wrapped, argv...)
+}
+
+func addExecutionReadRoots(policy *sandbox.Sandbox, argv []string, command, dir string, env []string) {
+	if policy == nil {
+		return
+	}
+	searchPath := os.Getenv("PATH")
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			searchPath = strings.TrimPrefix(entry, "PATH=")
+			break
+		}
+	}
+	var names []string
+	if len(argv) > 0 {
+		names = append(names, argv[0])
+	} else {
+		names = shellCommandNames(command)
+	}
+	for _, name := range names {
+		path := resolveExecutable(name, searchPath, dir)
+		if path == "" {
+			continue
+		}
+		if root := executableReadRoot(path, policy.Workspace); root != "" {
+			policy.AddExecutionReadRoot(root)
+		}
+	}
+}
+
+func resolveExecutable(name, searchPath, dir string) string {
+	if name == "" {
+		return ""
+	}
+	if strings.ContainsRune(name, filepath.Separator) {
+		if !filepath.IsAbs(name) {
+			if dir == "" {
+				dir, _ = os.Getwd()
+			}
+			name = filepath.Join(dir, name)
+		}
+		return executableFile(name)
+	}
+	for _, entry := range filepath.SplitList(searchPath) {
+		if entry == "" {
+			entry = "."
+		}
+		candidate := filepath.Join(entry, name)
+		if resolved := executableFile(candidate); resolved != "" {
+			return resolved
+		}
+	}
+	return ""
+}
+
+func executableFile(path string) string {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Mode()&0111 == 0 {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	return filepath.Clean(path)
+}
+
+func executableReadRoot(executable, workspace string) string {
+	executable = filepath.Clean(executable)
+	if workspace != "" && withinPath(workspace, executable) {
+		return ""
+	}
+	for _, root := range []string{"/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/lib", "/System"} {
+		if withinPath(root, executable) {
+			return ""
+		}
+	}
+	for _, root := range []string{"/usr/local/go", "/Library/Developer/CommandLineTools/usr"} {
+		if withinPath(root, executable) {
+			return root
+		}
+	}
+	if root := pythonFrameworkVersionRoot(executable); root != "" {
+		return root
+	}
+	parts := strings.Split(filepath.ToSlash(executable), "/")
+	for i := 0; i+2 < len(parts); i++ {
+		if parts[i] == "Cellar" && parts[i+1] != "" && parts[i+2] != "" {
+			return filepath.FromSlash(strings.Join(parts[:i+3], "/"))
+		}
+	}
+	for i := 0; i+3 < len(parts); i++ {
+		if parts[i] == ".nvm" && parts[i+1] == "versions" && parts[i+2] == "node" {
+			return filepath.FromSlash(strings.Join(parts[:i+4], "/"))
+		}
+		if parts[i] == ".pyenv" && parts[i+1] == "versions" {
+			return filepath.FromSlash(strings.Join(parts[:i+3], "/"))
+		}
+		if parts[i] == ".rustup" && parts[i+1] == "toolchains" {
+			return filepath.FromSlash(strings.Join(parts[:i+3], "/"))
+		}
+	}
+	for _, root := range []string{
+		"/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain",
+		"/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs",
+	} {
+		if withinPath(root, executable) {
+			return root
+		}
+	}
+	// For an unfamiliar user-installed executable, grant only that binary's
+	// read/execute path. Its containing directory may hold unrelated user data.
+	return executable
+}
+
+func pythonFrameworkVersionRoot(executable string) string {
+	parts := strings.Split(filepath.ToSlash(filepath.Clean(executable)), "/")
+	for i := 0; i+3 < len(parts); i++ {
+		if parts[i] == "Python3.framework" && parts[i+1] == "Versions" && parts[i+2] != "" {
+			return filepath.FromSlash(strings.Join(parts[:i+3], "/"))
+		}
+	}
+	return ""
+}
+
+func withinPath(root, child string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(child))
+	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
+}
+
+func shellCommandNames(command string) []string {
+	var segments []string
+	var b strings.Builder
+	quote := rune(0)
+	escaped := false
+	flush := func() {
+		if segment := strings.TrimSpace(b.String()); segment != "" {
+			segments = append(segments, segment)
+		}
+		b.Reset()
+	}
+	for _, r := range command {
+		if escaped {
+			b.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			b.WriteRune(r)
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			b.WriteRune(r)
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			b.WriteRune(r)
+			continue
+		}
+		if r == ';' || r == '&' || r == '|' || r == '\n' || r == '(' || r == ')' {
+			flush()
+			continue
+		}
+		b.WriteRune(r)
+	}
+	flush()
+
+	var names []string
+	for _, segment := range segments {
+		words := shellWords(segment)
+		for i := 0; i < len(words); i++ {
+			word := words[i]
+			if word == "" || strings.Contains(word, "=") && !strings.Contains(word, "/") && !strings.HasPrefix(word, "=") {
+				continue
+			}
+			if shellKeywordOrBuiltin(word) {
+				if word == "command" || word == "exec" || word == "builtin" {
+					continue
+				}
+				if word == "then" || word == "else" || word == "do" || word == "!" {
+					continue
+				}
+				break
+			}
+			names = append(names, word)
+			if word == "env" || word == "nice" || word == "nohup" || word == "time" || word == "timeout" {
+				continue
+			}
+			break
+		}
+	}
+	return names
+}
+
+func shellKeywordOrBuiltin(word string) bool {
+	switch word {
+	case "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "in", "function", "!",
+		"cd", "echo", "printf", "export", "readonly", "local", "set", "unset", "shift", "read", "test", "[", ":", "true", "false", "ulimit", "umask", "wait", "jobs", "break", "continue", "return", "exit", "source", ".":
+		return true
+	default:
+		return false
+	}
+}
+
+func shellWords(segment string) []string {
+	var words []string
+	var b strings.Builder
+	quote := rune(0)
+	escaped := false
+	active := false
+	flush := func() {
+		if active {
+			words = append(words, b.String())
+			b.Reset()
+			active = false
+		}
+	}
+	for _, r := range segment {
+		if escaped {
+			b.WriteRune(r)
+			active = true
+			escaped = false
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			escaped = true
+			active = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				b.WriteRune(r)
+			}
+			active = true
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			active = true
+			continue
+		}
+		if r == ' ' || r == '\t' || r == '\r' {
+			flush()
+			continue
+		}
+		b.WriteRune(r)
+		active = true
+	}
+	flush()
+	return words
+}
+
 // RunArgv executes argv without interpreting caller-provided values as shell
-// syntax. It still enters the same sandbox runner; in strict mode argv is
-// safely shell-quoted only to place it inside the Darwin profile's /bin/sh.
+// syntax. The fixed Seatbelt binary directly launches argv.
 func RunArgv(ctx context.Context, argv []string, req Request) (Result, error) {
 	if len(argv) == 0 || argv[0] == "" {
 		return Result{}, fmt.Errorf("execution: empty argv")
 	}
-	parts := make([]string, len(argv))
-	for i, arg := range argv {
-		parts[i] = shellQuote(arg)
-	}
-	req.Command = strings.Join(parts, " ")
+	req.Argv = append([]string(nil), argv...)
+	req.Command = ""
 	if req.Context == nil {
 		req.Context = ctx
 	}
 	return Run(req)
+}
+
+func verifyProfileContext(ctx context.Context, profile string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	probe := exec.CommandContext(probeCtx, sandbox.BackendPath, "-p", profile, "--", "/bin/sh", "-c", "true")
+	if output, err := probe.CombinedOutput(); err != nil {
+		return fmt.Errorf("execution: Seatbelt rejected the profile: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func setProcessGroup(cmd *exec.Cmd) {

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"syscall"
 
-	"ccdp/internal/sandbox"
 )
 
 // ---------- Read ----------
@@ -93,20 +92,18 @@ func (t *ReadTool) Run(ctx *Context) (string, error) {
 
 	readPath := path
 	noFollow := false
-	if ctx.Sandbox != nil && ctx.Sandbox.CurrentMode() == sandbox.ModeStrict {
-		// ResolveRead checks containment using the resolved form but deliberately
-		// returns the caller-visible alias. Canonicalize once more at the open
-		// boundary so O_NOFOLLOW can reject a final-link swap while preserving
-		// legitimate links whose target is inside the workspace.
-		readPath, err = filepath.EvalSymlinks(path)
-		if err != nil {
-			return "", fmt.Errorf("Read: strict path resolution: %w", err)
-		}
-		if readPath, err = ctx.Sandbox.ResolveRead(readPath); err != nil {
-			return "", fmt.Errorf("Read: strict path resolution: %w", err)
-		}
-		noFollow = true
+	// ResolveRead checks containment using the resolved form but deliberately
+	// returns the caller-visible alias. Canonicalize once more at the open
+	// boundary so O_NOFOLLOW can reject a final-link swap while preserving
+	// legitimate links whose target is inside an authorized root.
+	readPath, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("Read: path resolution: %w", err)
 	}
+	if readPath, err = ctx.Sandbox.ResolveRead(readPath); err != nil {
+		return "", fmt.Errorf("Read: path resolution: %w", err)
+	}
+	noFollow = true
 	data, snapshot, err := readRangeSnapshot(readPath, offset, limit, noFollow)
 	if err != nil {
 		return "", fmt.Errorf("Read: %w", err)

@@ -72,8 +72,8 @@ var configFieldNames = []string{
 	"keep_after_compact", "bash_timeout_seconds", "max_turns",
 	"max_budget_usd", "fallback_model",
 	"max_tool_output_chars_per_turn", "enable_guardian", "enable_memory",
-	"sandbox_mode", "max_parallel_tools", "sandbox_limits",
-	"sandbox_allow_network", "additional_directories", "disallowed_directories",
+	"max_parallel_tools", "sandbox_limits", "network_access",
+	"additional_directories", "additional_read_only_directories", "disallowed_directories",
 	"hooks", "enable_web_tools", "tools", "mcp_servers", "pricing", "session_dir",
 	"verbose", "debug", "session_id", "no_session_persistence",
 }
@@ -287,14 +287,14 @@ func (c *Config) ApplyCLIOverride(field string, value any) error {
 		if err == nil {
 			c.EnableMemory = cloneBool(&v)
 		}
-	case "sandbox_mode":
-		err = setString(&c.SandboxMode)
 	case "max_parallel_tools":
 		err = setInt(&c.MaxParallelTools)
-	case "sandbox_allow_network":
-		err = setBool(&c.SandboxAllowNetwork)
+	case "network_access":
+		err = setBool(&c.NetworkAccess)
 	case "additional_directories":
 		err = setStrings(&c.AdditionalDirectories)
+	case "additional_read_only_directories":
+		err = setStrings(&c.AdditionalReadOnlyDirectories)
 	case "disallowed_directories":
 		err = setStrings(&c.DisallowedDirectories)
 	case "enable_web_tools":
@@ -387,16 +387,16 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			dst.EnableGuardian = cloneBool(src.EnableGuardian)
 		case "enable_memory":
 			dst.EnableMemory = cloneBool(src.EnableMemory)
-		case "sandbox_mode":
-			dst.SandboxMode = src.SandboxMode
 		case "max_parallel_tools":
 			dst.MaxParallelTools = src.MaxParallelTools
 		case "sandbox_limits":
 			dst.SandboxLimits = cloneLimits(src.SandboxLimits)
-		case "sandbox_allow_network":
-			dst.SandboxAllowNetwork = src.SandboxAllowNetwork
+		case "network_access":
+			dst.NetworkAccess = src.NetworkAccess
 		case "additional_directories":
 			dst.AdditionalDirectories = append([]string(nil), src.AdditionalDirectories...)
+		case "additional_read_only_directories":
+			dst.AdditionalReadOnlyDirectories = append([]string(nil), src.AdditionalReadOnlyDirectories...)
 		case "disallowed_directories":
 			dst.DisallowedDirectories = append([]string(nil), src.DisallowedDirectories...)
 		case "hooks":
@@ -651,7 +651,7 @@ func ProjectExecutableFingerprint(root string, cfg Config) (string, error) {
 		AlwaysAllow           []string                    `json:"always_allow"`
 		EnableWebTools        *bool                       `json:"enable_web_tools"`
 		AdditionalDirectories []string                    `json:"additional_directories"`
-		SandboxAllowNetwork   bool                        `json:"sandbox_allow_network"`
+		NetworkAccess         bool                        `json:"network_access"`
 	}{
 		Root:                  normalized,
 		Hooks:                 cloneHookSpecs(cfg.Hooks),
@@ -660,7 +660,7 @@ func ProjectExecutableFingerprint(root string, cfg Config) (string, error) {
 		AlwaysAllow:           append([]string(nil), cfg.AlwaysAllow...),
 		EnableWebTools:        cloneBool(cfg.EnableWebTools),
 		AdditionalDirectories: append([]string(nil), cfg.AdditionalDirectories...),
-		SandboxAllowNetwork:   cfg.SandboxAllowNetwork,
+		NetworkAccess:         cfg.NetworkAccess,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

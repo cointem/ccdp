@@ -12,7 +12,6 @@ import (
 	"ccdp/internal/commands"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
-	"ccdp/internal/sandbox"
 )
 
 // statuslineTokens are the valid /statusline items.
@@ -261,38 +260,20 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			ExecutionMode: &protocol.SetExecutionMode{Mode: mode}}, map[bool]string{true: "plan mode on", false: "plan mode off"}[on])
 
 	case "sandbox":
-		if len(args) == 0 {
-			modes := append([]sandbox.Mode(nil), sandbox.ValidModes...)
-			descriptions := map[sandbox.Mode]string{
-				sandbox.ModeConfine: "confine writes to the workspace",
-				sandbox.ModeStrict:  "confine all file access to the workspace",
-				sandbox.ModeNone:    "disable containment",
-			}
-			current := sandbox.Mode(m.sandboxPolicy().Mode)
-			lines := make([]string, len(modes))
-			selected := 0
-			for i, mode := range modes {
-				lines[i] = fmt.Sprintf("%s — %s", string(mode), descriptions[mode])
-				if mode == current {
-					selected = i
-				}
-			}
-			options := make([]SelectorOption, len(modes))
-			for i, mode := range modes {
-				options[i] = SelectorOption{ID: string(mode), Label: string(mode), Description: descriptions[mode],
-					Current: mode == current}
-			}
-			return m, m.startSelectorAt("Select sandbox mode", options, selected, true, selectorAction{Kind: selectorSandbox})
+		if len(args) == 2 && args[0] == "revoke" && args[1] == "all" {
+			return m, m.submitCommand(protocol.Command{Type: protocol.CommandRevokeCapabilities,
+				RevokeCapabilities: &protocol.RevokeCapabilities{All: true}}, "revoking session sandbox capabilities…")
 		}
-		mode, err := sandbox.ParseMode(args[0])
-		if err != nil {
-			m.pushLog("error", err.Error())
+		if len(args) != 0 {
+			m.pushLog("error", "usage: /sandbox [revoke all]")
 			return m, nil
 		}
-		policy := m.sandboxPolicy()
-		policy.Mode = string(mode)
-		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetSandboxPolicy,
-			SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, "sandbox mode → "+string(mode))
+		runtime := protocol.SandboxRuntimeView{}
+		if m.hasSnapshot {
+			runtime = m.snapshot.SandboxRuntime
+		}
+		m.pushLog("system", formatSandboxPolicy(m.workspace, m.sandboxPolicy(), runtime))
+		return m, m.runQuery(protocol.QueryDoctor, "Seatbelt diagnostics requested")
 
 	case "remove":
 		n := 1
@@ -377,23 +358,47 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			Workflow: &protocol.WorkflowCommand{Kind: protocol.WorkflowReview}}, "review workflow submitted")
 
 	case "add-dir":
-		if len(args) == 0 {
-			m.pushLog("error", "usage: /add-dir <directory>")
+		readOnly := false
+		directory := ""
+		switch {
+		case len(args) == 1:
+			directory = args[0]
+		case len(args) == 2 && args[0] == "--read-only":
+			readOnly = true
+			directory = args[1]
+		default:
+			m.pushLog("error", "usage: /add-dir [--read-only] <directory>")
+			return m, nil
+		}
+		if strings.TrimSpace(directory) == "" {
+			m.pushLog("error", "usage: /add-dir [--read-only] <directory>")
 			return m, nil
 		}
 		policy := m.sandboxPolicy()
-		if !containsString(policy.AdditionalDirectories, args[0]) {
-			policy.AdditionalDirectories = append(policy.AdditionalDirectories, args[0])
+		if readOnly {
+			policy.AdditionalDirectories = removeString(policy.AdditionalDirectories, directory)
+			if !containsString(policy.AdditionalReadOnlyDirectories, directory) {
+				policy.AdditionalReadOnlyDirectories = append(policy.AdditionalReadOnlyDirectories, directory)
+			}
+		} else {
+			policy.AdditionalReadOnlyDirectories = removeString(policy.AdditionalReadOnlyDirectories, directory)
+			if !containsString(policy.AdditionalDirectories, directory) {
+				policy.AdditionalDirectories = append(policy.AdditionalDirectories, directory)
+			}
 		}
 		if m.client == nil {
 			m.pushLog("error", "/add-dir requires a session protocol")
 			return m, nil
 		}
+		label := "additional writable directory change submitted"
+		if readOnly {
+			label = "additional read-only directory change submitted"
+		}
 		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetSandboxPolicy,
-			SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, "additional directory change submitted")
+			SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, label)
 
 	case "disallowed-dir":
-		if len(args) == 0 {
+		if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 			m.pushLog("error", "usage: /disallowed-dir <directory>")
 			return m, nil
 		}
@@ -494,7 +499,7 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			return m, m.runQuery(protocol.QueryConfig, "configuration report requested")
 		}
 		// /config set <key> <value> — runtime settable keys reuse the existing
-		// commands (model, mode, sandbox); anything else is read-only.
+		// commands (model and permission/execution settings); anything else is read-only.
 		if args[0] == "set" && len(args) >= 3 {
 			key, val := args[1], strings.Join(args[2:], " ")
 			switch key {
@@ -513,22 +518,27 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 				policy.Mode = string(mode)
 				return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
 					PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode change submitted")
-			case "sandbox":
-				mode, err := sandbox.ParseMode(val)
-				if err != nil {
-					m.pushLog("error", err.Error())
+			case "network-access":
+				var allowed bool
+				switch strings.ToLower(val) {
+				case "allow", "on", "true":
+					allowed = true
+				case "deny", "off", "false":
+					allowed = false
+				default:
+					m.pushLog("error", "usage: /config set network-access <allow|deny>")
 					return m, nil
 				}
 				policy := m.sandboxPolicy()
-				policy.Mode = string(mode)
+				policy.NetworkAccess = allowed
 				return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetSandboxPolicy,
-					SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, "sandbox mode change submitted")
+					SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy}}, "network access authorization change submitted")
 			default:
-				m.pushLog("error", "/config set supports: model, mode, sandbox (others are read-only)")
+				m.pushLog("error", "/config set supports: model, mode, network-access (others are read-only)")
 			}
 			return m, nil
 		}
-		m.pushLog("error", "usage: /config  |  /config set <model|mode|sandbox> <value>")
+		m.pushLog("error", "usage: /config  |  /config set <model|mode|network-access> <value>")
 
 	case "doctor":
 		return m, m.runQuery(protocol.QueryDoctor, "diagnostics report requested")
@@ -874,4 +884,33 @@ func (m *Model) pushLog(kind, text string) {
 	m.render()
 	m.followOutput = true
 	m.viewport.GotoBottom()
+}
+
+func formatSandboxPolicy(workspace string, policy protocol.SandboxPolicy, runtime protocol.SandboxRuntimeView) string {
+	if workspace == "" {
+		workspace = "(unavailable)"
+	}
+	list := func(values []string) string {
+		if len(values) == 0 {
+			return "(none)"
+		}
+		return "\n  - " + strings.Join(values, "\n  - ")
+	}
+	network := "not authorized"
+	if policy.NetworkAccess {
+		network = "authorized"
+	}
+	grants := make([]string, 0, len(runtime.SessionGrants))
+	for _, grant := range runtime.SessionGrants {
+		grants = append(grants, formatApprovalCapability(grant))
+	}
+	status := "stable"
+	if runtime.RevocationPending {
+		status = "revocation pending; tool dispatch remains blocked"
+	} else if runtime.ExternalExecutionPossible {
+		status = "local process descendants may retain an older Seatbelt policy; revoke/tighten may fail closed"
+	}
+	return fmt.Sprintf("Confirmed sandbox policy (revision %d)\nWorkspace: %s\nAdditional writable roots:%s\nAdditional read-only roots:%s\nDenied roots:%s\nNetwork access: %s\nSession-only grants:%s\nRuntime status: %s",
+		policy.Revision, workspace, list(policy.AdditionalDirectories),
+		list(policy.AdditionalReadOnlyDirectories), list(policy.DisallowedDirectories), network, list(grants), status)
 }

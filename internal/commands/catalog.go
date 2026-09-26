@@ -267,7 +267,7 @@ func Default() Catalog {
 		{Name: "effort", Help: "choose reasoning effort with left/right; unset resolves to built-in medium", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "verbosity", Help: "choose response verbosity: low|medium|high|default", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
 		{Name: "plan", Help: "toggle plan mode (propose-then-approve)", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
-		{Name: "sandbox", Help: "choose or switch sandbox mode", Feedback: FeedbackSelector, Busy: BusyAllow, Mutation: true},
+		{Name: "sandbox", Help: "[revoke all] show Seatbelt and authorized-root diagnostics or revoke all session access", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, Mutation: true},
 		{Name: "remove", Help: "remove the last n messages", Feedback: FeedbackOperation, Busy: BusyReject, Mutation: true},
 		{Name: "rewind", Help: "keep the first n messages or pick interactively", Feedback: FeedbackSelector, Busy: BusyReject, Mutation: true},
 		{Name: "fork", Help: "branch a new session from message n", Feedback: FeedbackOperation, Busy: BusyReject, Mutation: true},

@@ -11,7 +11,7 @@ func TestCommandToolRunsWithArgsOnStdin(t *testing.T) {
 	tool := NewCommandTool(
 		"echo-name",
 		"echo the name",
-		`cat /dev/stdin | python3 -c "import json,sys; print('hello ' + json.load(sys.stdin).get('name',''))"`,
+		`payload=$(cat); case "$payload" in *'"name":"world"'*) printf 'hello world\n';; *) exit 1;; esac`,
 		nil,
 	)
 	ctx := scopedTestContext(t, dir)

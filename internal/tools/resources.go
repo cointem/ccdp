@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 
 	"ccdp/internal/sandbox"
@@ -17,6 +18,7 @@ type Resources struct {
 	sessionDir  string
 	ownerCtx    context.Context
 	ownerCancel context.CancelFunc
+	scratchDir  string
 
 	// Exactly one owner-owned instance of each mutable session resource.
 	Processes *ProcessManager
@@ -49,11 +51,23 @@ func NewResourcesWithContext(owner, sessionDir string, ownerCtx context.Context)
 		ownerCtx = context.Background()
 	}
 	ownerCtx, ownerCancel := context.WithCancel(ownerCtx)
-	r := &Resources{owner: owner, sessionDir: sessionDir, ownerCtx: ownerCtx, ownerCancel: ownerCancel}
+	scratch, _ := os.MkdirTemp("", "ccdp-session-")
+	r := &Resources{owner: owner, sessionDir: sessionDir, ownerCtx: ownerCtx, ownerCancel: ownerCancel, scratchDir: scratch}
 	r.Processes = NewProcessManager(owner)
 	r.Todos = NewTodoStore(owner, sessionDir)
 	r.Files = NewFileState(owner)
 	return r
+}
+
+// ScratchDir returns the private, session-scoped execution scratch root. It is
+// removed after the owner stops processes and closes its resources.
+func (r *Resources) ScratchDir() string {
+	if r == nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.scratchDir
 }
 
 // Owner returns the immutable scope identifier carried by this container.
@@ -139,6 +153,11 @@ func (r *Resources) Close() error {
 		}
 		if r.Files != nil {
 			r.Files.Close()
+		}
+		if r.scratchDir != "" {
+			if err := os.RemoveAll(r.scratchDir); err != nil && closeErr == nil {
+				closeErr = fmt.Errorf("remove session execution scratch: %w", err)
+			}
 		}
 		r.mu.Lock()
 		r.closeErr = closeErr

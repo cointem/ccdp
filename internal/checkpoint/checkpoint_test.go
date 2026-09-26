@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,7 +9,22 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"ccdp/internal/sandbox"
 )
+
+func scopedStore(t *testing.T, sessionRoot, sessionID, workspace string) *Store {
+	t.Helper()
+	sb := sandbox.New(workspace)
+	if sessionRoot != "" {
+		// Checkpoint records live outside the repository workspace in these
+		// fixtures, so grant only the temporary session root for their writes.
+		sb.AddDir(sessionRoot)
+	}
+	store := NewStore(sessionRoot, sessionID)
+	store.SetExecutionBoundary(context.Background(), sb)
+	return store
+}
 
 // gitIn runs git in dir with isolated identity.
 func gitIn(t *testing.T, dir string, args ...string) string {
@@ -46,7 +62,7 @@ func TestCheckpointCreateRestore(t *testing.T) {
 	// Make a change so there is something to snapshot.
 	writeFile(t, filepath.Join(ws, "a.txt"), "working copy")
 
-	store := NewStore(t.TempDir(), "sess-1")
+	store := scopedStore(t, t.TempDir(), "sess-1", ws)
 	id, err := store.Create(ws, "initial state")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -91,7 +107,7 @@ func TestCheckpointCapturesUntrackedWithoutChangingWorktree(t *testing.T) {
 	beforeHead := gitIn(t, ws, "rev-parse", "HEAD")
 	beforeRef := gitIn(t, ws, "symbolic-ref", "--short", "HEAD")
 
-	store := NewStore(t.TempDir(), "sess-untracked")
+	store := scopedStore(t, t.TempDir(), "sess-untracked", ws)
 	id, err := store.Create(ws, "agent output")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -136,7 +152,7 @@ func TestCheckpointCleanTree(t *testing.T) {
 	gitIn(t, ws, "add", "-A")
 	gitIn(t, ws, "commit", "-qm", "base")
 
-	store := NewStore(t.TempDir(), "sess-1")
+	store := scopedStore(t, t.TempDir(), "sess-1", ws)
 	id, err := store.Create(ws, "nothing changed")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -147,8 +163,9 @@ func TestCheckpointCleanTree(t *testing.T) {
 }
 
 func TestCheckpointNotGitRepo(t *testing.T) {
-	store := NewStore(t.TempDir(), "sess-1")
-	if _, err := store.Create(t.TempDir(), "nope"); err == nil {
+	ws := t.TempDir()
+	store := scopedStore(t, t.TempDir(), "sess-1", ws)
+	if _, err := store.Create(ws, "nope"); err == nil {
 		t.Error("expected error outside a git repo")
 	}
 }
@@ -163,6 +180,7 @@ func TestMemoryStoreDoesNotCreateSessionFiles(t *testing.T) {
 
 	sessionRoot := t.TempDir()
 	store := NewMemoryStore("memory-session")
+	store.SetExecutionBoundary(context.Background(), sandbox.New(ws))
 	if _, err := store.Create(ws, "memory only"); err != nil {
 		t.Fatal(err)
 	}

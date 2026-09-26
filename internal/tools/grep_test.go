@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"ccdp/internal/sandbox"
 )
 
 // grepFixture lays out a tree that exercises every filter the search backends
@@ -41,6 +43,7 @@ func grepCtx(dir string) *Context {
 	return &Context{
 		Context:    context.Background(),
 		WorkingDir: dir,
+		Sandbox:    sandbox.New(dir),
 		Args:       map[string]any{},
 	}
 }
@@ -254,10 +257,10 @@ func TestGrepToolRun(t *testing.T) {
 		t.Errorf("expected a group separator between non-contiguous context blocks:\n%s", out)
 	}
 
-	if _, err := tool.Run(&Context{Context: context.Background(), WorkingDir: dir, Args: map[string]any{"pattern": "needle", "output_mode": "bogus"}}); err == nil {
+	if _, err := tool.Run(&Context{Context: context.Background(), WorkingDir: dir, Sandbox: sandbox.New(dir), Args: map[string]any{"pattern": "needle", "output_mode": "bogus"}}); err == nil {
 		t.Error("expected an error for an unknown output_mode")
 	}
-	if _, err := tool.Run(&Context{Context: context.Background(), WorkingDir: dir, Args: map[string]any{"pattern": "(["}}); err == nil {
+	if _, err := tool.Run(&Context{Context: context.Background(), WorkingDir: dir, Sandbox: sandbox.New(dir), Args: map[string]any{"pattern": "(["}}); err == nil {
 		t.Error("expected an error for a malformed regex")
 	}
 }

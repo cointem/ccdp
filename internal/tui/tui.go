@@ -155,7 +155,6 @@ const (
 	selectorModel       selectorActionKind = "model"
 	selectorMode        selectorActionKind = "mode"
 	selectorPlan        selectorActionKind = "plan"
-	selectorSandbox     selectorActionKind = "sandbox"
 	selectorRewind      selectorActionKind = "rewind"
 	selectorResume      selectorActionKind = "resume"
 	selectorAgent       selectorActionKind = "agent"

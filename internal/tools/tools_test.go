@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ccdp/internal/sandbox"
 )
 
 // newTestRepo creates a temp git repo with one committed file.
@@ -45,6 +47,7 @@ func gitCtx(dir string) *Context {
 		WorkingDir: dir,
 		SessionDir: resources.SessionDir(),
 		Resources:  resources,
+		Sandbox:    sandbox.New(dir),
 		Args:       map[string]any{},
 	}
 }
@@ -53,7 +56,7 @@ func scopedTestContext(t *testing.T, dir string) *Context {
 	t.Helper()
 	resources := NewResources("test:"+t.Name(), filepath.Join(dir, ".ccdp-session"))
 	t.Cleanup(func() { _ = resources.Close() })
-	return resources.Context(context.Background(), dir, nil)
+	return resources.Context(context.Background(), dir, sandbox.New(dir))
 }
 
 func TestGitStatusTool(t *testing.T) {
@@ -111,6 +114,9 @@ func TestGitDiffRejectsOptionRevision(t *testing.T) {
 	dir := newTestRepo(t)
 	target := filepath.Join(t.TempDir(), "must-not-exist.diff")
 	ctx := gitCtx(dir)
+	// Include the sentinel path so sandbox path denial cannot make this
+	// argument-validation assertion pass if Git is incorrectly invoked.
+	ctx.Sandbox.AddDir(filepath.Dir(target))
 	ctx.Args = map[string]any{"base": "--output=" + target}
 	if _, err := NewGitDiffTool().Run(ctx); err == nil {
 		t.Fatal("expected option-shaped diff revision to be rejected")

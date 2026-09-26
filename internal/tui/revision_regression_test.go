@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func TestModePickerKeepsRevisionAfterCommandCompletion(t *testing.T) {
 				}
 			}
 			drain()
-			for _, line := range []string{"/mode", "/mode", "/mode plan", "/mode default", "/plan on", "/plan off", "/sandbox none", "/sandbox confine", "/clear", "/save", "/mode"} {
+			for _, line := range []string{"/mode", "/mode", "/mode plan", "/mode default", "/plan on", "/plan off", "/sandbox", "/clear", "/save", "/mode"} {
 				next, cmd := m.runCommand(line)
 				m = modelValue(t, next)
 				if line == "/mode" {
@@ -71,6 +72,25 @@ func TestModePickerKeepsRevisionAfterCommandCompletion(t *testing.T) {
 				}
 				if cmd == nil {
 					t.Fatalf("%s returned no command", line)
+				}
+				if line == "/sandbox" {
+					msg, ok := cmd().(queryReportMsg)
+					if !ok || msg.err != nil {
+						t.Fatalf("/sandbox query result = %#v; want successful read-only report", msg)
+					}
+					if !strings.Contains(msg.report.Text, "Seatbelt backend") {
+						t.Fatalf("/sandbox report omitted Seatbelt status: %q", msg.report.Text)
+					}
+					m.applyQueryReport(msg)
+					drain()
+					current, err := ag.Snapshot(context.Background())
+					if err != nil {
+						t.Fatal(err)
+					}
+					if m.snapshot.Revision != current.Revision {
+						t.Fatalf("after read-only /sandbox, UI revision = %+v; runtime = %+v", m.snapshot.Revision, current.Revision)
+					}
+					continue
 				}
 				msg, ok := cmd().(commandReceiptMsg)
 				if !ok || msg.receipt.Rejected() {

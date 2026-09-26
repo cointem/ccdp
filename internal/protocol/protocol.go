@@ -89,6 +89,7 @@ const (
 	CommandSetExecutionMode    CommandType = "set_execution_mode"
 	CommandSetPermissionPolicy CommandType = "set_permission_policy"
 	CommandSetSandboxPolicy    CommandType = "set_sandbox_policy"
+	CommandRevokeCapabilities  CommandType = "revoke_capabilities"
 	CommandApproveTool         CommandType = "approve_tool"
 	CommandApprovePlan         CommandType = "approve_plan"
 	CommandInterrupt           CommandType = "interrupt"
@@ -136,11 +137,50 @@ type PermissionPolicy struct {
 }
 
 type SandboxPolicy struct {
-	Mode                  string   `json:"mode"`
-	AllowNetwork          bool     `json:"allow_network"`
-	AdditionalDirectories []string `json:"additional_directories,omitempty"`
-	DisallowedDirectories []string `json:"disallowed_directories,omitempty"`
-	Revision              uint64   `json:"revision"`
+	NetworkAccess                 bool     `json:"network_access"`
+	AdditionalDirectories         []string `json:"additional_directories,omitempty"`
+	AdditionalReadOnlyDirectories []string `json:"additional_read_only_directories,omitempty"`
+	DisallowedDirectories         []string `json:"disallowed_directories,omitempty"`
+	Revision                      uint64   `json:"revision"`
+}
+
+type RevokeCapabilities struct {
+	All          bool                `json:"all,omitempty"`
+	Capabilities []CapabilityRequest `json:"capabilities,omitempty"`
+}
+
+// CapabilityRequest is a concrete resource request attached to one tool
+// invocation. Directory grants distinguish read from write; outbound network
+// and localhost services are separate capabilities.
+type CapabilityRequest struct {
+	Kind      string `json:"kind"`
+	Path      string `json:"path,omitempty"`
+	Access    string `json:"access,omitempty"`
+	Direction string `json:"direction,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
+	Address   string `json:"address,omitempty"`
+	Port      uint16 `json:"port,omitempty"`
+}
+
+type CapabilityScope string
+
+const (
+	CapabilityScopeOnce    CapabilityScope = "once"
+	CapabilityScopeSession CapabilityScope = "session"
+)
+
+func (p *SandboxPolicy) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, removed := range []string{"mode", "allow_network"} {
+		if _, exists := fields[removed]; exists {
+			return fmt.Errorf("protocol: sandbox policy field %q is no longer supported", removed)
+		}
+	}
+	type wire SandboxPolicy
+	return json.Unmarshal(data, (*wire)(p))
 }
 
 type SubmitInput struct {
@@ -174,9 +214,10 @@ type SetSandboxPolicy struct {
 }
 
 type ApproveTool struct {
-	ApprovalID string `json:"approval_id"`
-	Approve    bool   `json:"approve"`
-	Remember   bool   `json:"remember,omitempty"`
+	ApprovalID      string          `json:"approval_id"`
+	Approve         bool            `json:"approve"`
+	Remember        bool            `json:"remember,omitempty"`
+	CapabilityScope CapabilityScope `json:"capability_scope,omitempty"`
 }
 
 type ApprovePlan struct {
@@ -209,28 +250,29 @@ type Command struct {
 	ExpectedRevision uint64          `json:"expected_revision,omitempty"`
 	ExpectedRunID    RunID           `json:"expected_run_id,omitempty"`
 
-	Input            *SubmitInput         `json:"input,omitempty"`
-	Model            *SetModel            `json:"model,omitempty"`
-	ExecutionMode    *SetExecutionMode    `json:"execution_mode,omitempty"`
-	PermissionPolicy *SetPermissionPolicy `json:"permission_policy,omitempty"`
-	SandboxPolicy    *SetSandboxPolicy    `json:"sandbox_policy,omitempty"`
-	Approval         *ApproveTool         `json:"approval,omitempty"`
-	Plan             *ApprovePlan         `json:"plan,omitempty"`
-	Remove           *RemoveMessages      `json:"remove,omitempty"`
-	Rewind           *RewindConversation  `json:"rewind,omitempty"`
-	Fork             *Fork                `json:"fork,omitempty"`
-	External         *ExternalCommand     `json:"external,omitempty"`
-	Apply            *ApplyCommand        `json:"apply,omitempty"`
-	Checkpoint       *CheckpointCommand   `json:"checkpoint,omitempty"`
-	Export           *ExportCommand       `json:"export,omitempty"`
-	Init             *InitCommand         `json:"init,omitempty"`
-	Workflow         *WorkflowCommand     `json:"workflow,omitempty"`
-	Query            *QueryCommand        `json:"query,omitempty"`
-	Workspace        *WorkspaceCommand    `json:"workspace,omitempty"`
-	Reload           *ReloadCommand       `json:"reload,omitempty"`
-	TrustProject     *TrustProjectCommand `json:"trust_project,omitempty"`
-	ClearMemory      *ClearMemoryCommand  `json:"clear_memory,omitempty"`
-	SaveSession      *SaveSessionCommand  `json:"save_session,omitempty"`
+	Input              *SubmitInput         `json:"input,omitempty"`
+	Model              *SetModel            `json:"model,omitempty"`
+	ExecutionMode      *SetExecutionMode    `json:"execution_mode,omitempty"`
+	PermissionPolicy   *SetPermissionPolicy `json:"permission_policy,omitempty"`
+	SandboxPolicy      *SetSandboxPolicy    `json:"sandbox_policy,omitempty"`
+	RevokeCapabilities *RevokeCapabilities  `json:"revoke_capabilities,omitempty"`
+	Approval           *ApproveTool         `json:"approval,omitempty"`
+	Plan               *ApprovePlan         `json:"plan,omitempty"`
+	Remove             *RemoveMessages      `json:"remove,omitempty"`
+	Rewind             *RewindConversation  `json:"rewind,omitempty"`
+	Fork               *Fork                `json:"fork,omitempty"`
+	External           *ExternalCommand     `json:"external,omitempty"`
+	Apply              *ApplyCommand        `json:"apply,omitempty"`
+	Checkpoint         *CheckpointCommand   `json:"checkpoint,omitempty"`
+	Export             *ExportCommand       `json:"export,omitempty"`
+	Init               *InitCommand         `json:"init,omitempty"`
+	Workflow           *WorkflowCommand     `json:"workflow,omitempty"`
+	Query              *QueryCommand        `json:"query,omitempty"`
+	Workspace          *WorkspaceCommand    `json:"workspace,omitempty"`
+	Reload             *ReloadCommand       `json:"reload,omitempty"`
+	TrustProject       *TrustProjectCommand `json:"trust_project,omitempty"`
+	ClearMemory        *ClearMemoryCommand  `json:"clear_memory,omitempty"`
+	SaveSession        *SaveSessionCommand  `json:"save_session,omitempty"`
 }
 
 // Normalize validates the discriminant/payload relationship and returns a
@@ -266,6 +308,9 @@ func (c Command) Normalize() (Command, error) {
 		payloads++
 	}
 	if c.SandboxPolicy != nil {
+		payloads++
+	}
+	if c.RevokeCapabilities != nil {
 		payloads++
 	}
 	if c.Approval != nil {
@@ -414,8 +459,22 @@ func (c Command) Normalize() (Command, error) {
 		}
 		policy := c.SandboxPolicy.Policy
 		policy.AdditionalDirectories = cloneStrings(policy.AdditionalDirectories)
+		policy.AdditionalReadOnlyDirectories = cloneStrings(policy.AdditionalReadOnlyDirectories)
 		policy.DisallowedDirectories = cloneStrings(policy.DisallowedDirectories)
 		c.SandboxPolicy = &SetSandboxPolicy{Policy: policy}
+	case CommandRevokeCapabilities:
+		if err := requirePayload(c.RevokeCapabilities != nil); err != nil {
+			return Command{}, err
+		}
+		revoke := *c.RevokeCapabilities
+		revoke.Capabilities = append([]CapabilityRequest(nil), revoke.Capabilities...)
+		if revoke.All == (len(revoke.Capabilities) > 0) {
+			return Command{}, errors.New("protocol: revoke capabilities requires either all=true or a non-empty capability list")
+		}
+		if len(revoke.Capabilities) > 8 {
+			return Command{}, errors.New("protocol: revoke capability list exceeds 8 entries")
+		}
+		c.RevokeCapabilities = &revoke
 	case CommandApproveTool:
 		if err := requirePayload(c.Approval != nil); err != nil {
 			return Command{}, err
@@ -424,6 +483,9 @@ func (c Command) Normalize() (Command, error) {
 		c.Approval = &approval
 		if c.Approval.ApprovalID == "" {
 			return Command{}, errors.New("protocol: approval_id is required")
+		}
+		if c.Approval.CapabilityScope != "" && c.Approval.CapabilityScope != CapabilityScopeOnce && c.Approval.CapabilityScope != CapabilityScopeSession {
+			return Command{}, fmt.Errorf("protocol: unknown capability scope %q", c.Approval.CapabilityScope)
 		}
 	case CommandApprovePlan:
 		if err := requirePayload(c.Plan != nil); err != nil {
@@ -766,12 +828,13 @@ type InputView struct {
 }
 
 type ApprovalView struct {
-	ID        string          `json:"id"`
-	Tool      string          `json:"tool"`
-	Reason    string          `json:"reason,omitempty"`
-	Args      json.RawMessage `json:"args,omitempty"`
-	CallID    CallID          `json:"call_id,omitempty"`
-	PolicyRev uint64          `json:"policy_revision,omitempty"`
+	ID           string              `json:"id"`
+	Tool         string              `json:"tool"`
+	Reason       string              `json:"reason,omitempty"`
+	Args         json.RawMessage     `json:"args,omitempty"`
+	Capabilities []CapabilityRequest `json:"capabilities,omitempty"`
+	CallID       CallID              `json:"call_id,omitempty"`
+	PolicyRev    uint64              `json:"policy_revision,omitempty"`
 }
 
 type PlanView struct {
@@ -844,6 +907,15 @@ type TaskView struct {
 	Status string `json:"status"`
 }
 
+// SandboxRuntimeView is the live, session-only authorization projection. These
+// grants are deliberately separate from Settings so replay can never turn a
+// former approval into a current authorization.
+type SandboxRuntimeView struct {
+	SessionGrants             []CapabilityRequest `json:"session_grants,omitempty"`
+	RevocationPending         bool                `json:"revocation_pending,omitempty"`
+	ExternalExecutionPossible bool                `json:"external_execution_possible,omitempty"`
+}
+
 // SessionView is a read-only projection. Agent returns copies of all slices
 // and nested values so a client cannot mutate or race runtime state.
 type SessionView struct {
@@ -858,6 +930,7 @@ type SessionView struct {
 	Busy              bool             `json:"busy"`
 	Closing           bool             `json:"closing"`
 	Settings          SettingsSnapshot `json:"settings"`
+	SandboxRuntime    SandboxRuntimeView `json:"sandbox_runtime"`
 	Catalog           CatalogSnapshot  `json:"catalog"`
 	Usage             UsageSnapshot    `json:"usage"`
 	ContextUsedTokens int              `json:"context_used_tokens"`

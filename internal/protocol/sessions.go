@@ -70,6 +70,7 @@ type TranscriptItem struct {
 	Tool       string          `json:"tool,omitempty"`
 	Args       json.RawMessage `json:"args,omitempty"`
 	Status     string          `json:"status,omitempty"`
+	DurationMs int64           `json:"duration_ms,omitempty"`
 	Truncated  bool            `json:"truncated,omitempty"`
 }
 

@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,16 +29,14 @@ func TestProcessStopTerminatesProcessGroup(t *testing.T) {
 	}
 }
 
-func TestProcessLifecyclePython(t *testing.T) {
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 not available")
-	}
+func TestProcessLifecycleStdinEcho(t *testing.T) {
 	ctx := scopedTestContext(t, t.TempDir())
 
-	// Start an unbuffered python REPL-like loop.
+	// Keep cat reading stdin so ProcessWrite/Output exercise the long-lived pipe
+	// lifecycle without relying on an optional runtime.
 	start := NewProcessStartTool()
 	out, err := start.Run(ctxWithArgs(ctx, map[string]any{
-		"command": "python3 -u -c 'import sys\nfor line in sys.stdin:\n    sys.stdout.write(\"got: \" + line)\n    sys.stdout.flush()'",
+		"command": "cat",
 	}))
 	if err != nil {
 		t.Fatalf("ProcessStart: %v", err)
@@ -61,7 +58,7 @@ func TestProcessLifecyclePython(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessOutput: %v", err)
 	}
-	if !strings.Contains(out, "got: hello") {
+	if !strings.Contains(out, "hello") {
 		t.Errorf("process output missing echo: %s", out)
 	}
 
@@ -83,7 +80,8 @@ func TestProcessStartSurvivesStepCancellationUntilOwnerClose(t *testing.T) {
 	t.Cleanup(func() { _ = resources.Close() })
 
 	stepCtx, cancelStep := context.WithCancel(context.Background())
-	startCtx := resources.Context(stepCtx, dir, nil)
+	sb := sandbox.New(dir)
+	startCtx := resources.Context(stepCtx, dir, sb)
 	startCtx.Args = map[string]any{"command": "sleep 30"}
 	started, err := NewProcessStartTool().Run(startCtx)
 	if err != nil {
@@ -92,7 +90,7 @@ func TestProcessStartSurvivesStepCancellationUntilOwnerClose(t *testing.T) {
 	pid := extractPID(t, started)
 	cancelStep()
 
-	readCtx := resources.Context(context.Background(), dir, nil)
+	readCtx := resources.Context(context.Background(), dir, sb)
 	readCtx.Args = map[string]any{"pid": pid, "wait_ms": 0}
 	out, err := NewProcessOutputTool().Run(readCtx)
 	if err != nil {
@@ -147,7 +145,7 @@ func TestProcessOutputWaitHonorsContextCancellation(t *testing.T) {
 
 func TestProcessStartAppliesSandboxLimits(t *testing.T) {
 	ctx := scopedTestContext(t, t.TempDir())
-	ctx.Sandbox = sandbox.New(ctx.WorkingDir, sandbox.ModeConfine)
+	ctx.Sandbox = sandbox.New(ctx.WorkingDir)
 	ctx.Sandbox.Limits = &sandbox.Limits{MaxFiles: 64}
 	started, err := NewProcessStartTool().Run(ctxWithArgs(ctx, map[string]any{
 		"command": "printf 'open-files=%s\\n' \"$(ulimit -n)\"",

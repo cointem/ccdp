@@ -143,6 +143,7 @@ func TestGitHubStatusSurfacesGHFailure(t *testing.T) {
 	ag := newGithubAgent(t, dir)
 	defer ag.Close()
 	ag.perms.SetAllowAll(true)
+	ag.sandbox.SetAllowNetwork(true)
 
 	out := ag.GitHubStatus()
 	if !strings.Contains(out, "gh: unavailable") || !strings.Contains(out, "forbidden") {

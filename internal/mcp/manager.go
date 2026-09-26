@@ -597,6 +597,32 @@ func (m *Manager) ToolNames() map[string][]string {
 	return out
 }
 
+// RequiresHostNetwork reports whether the qualified tool is backed by a
+// remote HTTP MCP server. Local stdio MCP remains governed by its Seatbelt
+// process policy and does not consume the host-network capability.
+func (m *Manager) RequiresHostNetwork(toolName string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	clients := make([]*Client, 0, len(m.clients))
+	for _, client := range m.clients {
+		clients = append(clients, client)
+	}
+	m.mu.Unlock()
+	for _, client := range clients {
+		if !client.RequiresHostNetwork() {
+			continue
+		}
+		for _, def := range client.Tools() {
+			if protocol.MCPToolName(client.Name(), def.Name) == toolName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // RegisterTools wraps every advertised tool as a tools.Tool and registers it
 // into the registry under the "mcp" scope. Each tool is published under its
 // qualified name (`mcp__<server>__<tool>`), so a server can never shadow a
@@ -701,11 +727,14 @@ func (t *mcpTool) Description() string {
 
 func (t *mcpTool) Parameters() map[string]any {
 	if t.def.InputSchema == nil {
-		return map[string]any{"type": "object", "properties": map[string]any{}}
+		return tools.WithCapabilityRequest(map[string]any{"type": "object", "properties": map[string]any{}})
 	}
-	return t.def.InputSchema
+	return tools.WithCapabilityRequest(t.def.InputSchema)
 }
 
 func (t *mcpTool) Run(ctx *tools.Context) (string, error) {
+	if t.client.RequiresHostNetwork() && !ctx.HostNetworkAllowed {
+		return "", fmt.Errorf("remote MCP tool %s requires per-call outbound network authorization", t.Name())
+	}
 	return t.client.Call(ctx, t.def.Name, ctx.Args)
 }

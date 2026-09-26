@@ -1139,10 +1139,9 @@ func (a *Agent) sessionSettingsLocked() session.Settings {
 	settings.PermissionPolicy = a.cfg.PermissionMode
 	settings.AlwaysAllow = append([]string(nil), a.cfg.AlwaysAllow...)
 	settings.AlwaysDeny = append([]string(nil), a.cfg.AlwaysDeny...)
-	settings.SandboxPolicy = a.cfg.SandboxMode
-	settings.AllowNetwork = a.cfg.SandboxAllowNetwork
-	settings.AllowNetworkSet = true
+	settings.NetworkAccess = a.cfg.NetworkAccess
 	settings.AdditionalDirectories = append([]string(nil), a.cfg.AdditionalDirectories...)
+	settings.AdditionalReadOnlyDirectories = append([]string(nil), a.cfg.AdditionalReadOnlyDirectories...)
 	settings.DisallowedDirectories = append([]string(nil), a.cfg.DisallowedDirectories...)
 	settings.ContextWindow = a.cfg.ContextWindow
 	settings.EffectiveContextWindow = a.cfg.ContextWindowFor(a.cfg.Model)
@@ -2042,6 +2041,7 @@ func snapshotSettings(settings session.Settings) *session.Settings {
 	copy.AlwaysAllow = append([]string(nil), settings.AlwaysAllow...)
 	copy.AlwaysDeny = append([]string(nil), settings.AlwaysDeny...)
 	copy.AdditionalDirectories = append([]string(nil), settings.AdditionalDirectories...)
+	copy.AdditionalReadOnlyDirectories = append([]string(nil), settings.AdditionalReadOnlyDirectories...)
 	copy.DisallowedDirectories = append([]string(nil), settings.DisallowedDirectories...)
 	return &copy
 }

@@ -45,6 +45,9 @@ func (t *GlobTool) Run(ctx *Context) (string, error) {
 	if err := ctx.checkResources(); err != nil {
 		return "", err
 	}
+	if ctx.Sandbox == nil {
+		return "", fmt.Errorf("Glob: sandbox policy is unavailable")
+	}
 	pattern := StringArg(ctx.Args, "pattern", "")
 	if pattern == "" {
 		return "", fmt.Errorf("Glob: missing pattern")
@@ -57,21 +60,31 @@ func (t *GlobTool) Run(ctx *Context) (string, error) {
 			return "", err
 		}
 	}
-
+	// Even the default working directory must be admitted by the same policy as
+	// an explicit path. In particular, it may have become disallowed after the
+	// tool context was created.
+	base, err := ctx.ResolveRead(base)
+	if err != nil {
+		return "", fmt.Errorf("Glob: %w", err)
+	}
 	fullPattern := pattern
 	if !filepath.IsAbs(fullPattern) {
-		fullPattern = filepath.Join(base, pattern)
+		fullPattern = filepath.Join(base, fullPattern)
 	}
-
-	matches, err := filepath.Glob(fullPattern)
+	fullPattern = filepath.Clean(fullPattern)
+	anchor, parts, err := globPatternAnchor(fullPattern)
 	if err != nil {
 		return "", fmt.Errorf("Glob: bad pattern: %w", err)
 	}
-
-	// Glob does not recurse into ** on its own; do a best-effort walk for
-	// patterns containing "**".
-	if strings.Contains(pattern, "**") {
-		matches = globWalk(base, pattern)
+	// Match only below the literal prefix before the first wildcard. Requiring
+	// that prefix to be readable prevents filepath.Glob from probing arbitrary
+	// parent directories while expanding an absolute or ../ pattern.
+	if _, err := ctx.ResolveRead(anchor); err != nil {
+		return "", fmt.Errorf("Glob: %w", err)
+	}
+	matches, err := scopedGlob(ctx, anchor, parts)
+	if err != nil {
+		return "", fmt.Errorf("Glob: %w", err)
 	}
 
 	sort.Strings(matches)
@@ -88,27 +101,159 @@ func (t *GlobTool) Run(ctx *Context) (string, error) {
 	return boundedToolString(ctx, sb.String()), nil
 }
 
-// globWalk implements a simple ** glob walk over the base directory.
-func globWalk(base, pattern string) []string {
-	var out []string
-	// Strip a leading ** or **/ prefix, then walk.
-	rest := strings.TrimPrefix(pattern, "**")
-	rest = strings.TrimPrefix(rest, "/")
-	_ = filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
+// globPatternAnchor returns the literal directory prefix before the first
+// wildcard and the remaining path components. Searching starts at the anchor
+// so wildcard expansion never enumerates an unauthorized ancestor.
+func globPatternAnchor(pattern string) (string, []string, error) {
+	pattern, err := filepath.Abs(pattern)
+	if err != nil {
+		return "", nil, err
+	}
+	pattern = filepath.Clean(pattern)
+	volume := filepath.VolumeName(pattern)
+	root := volume
+	if filepath.IsAbs(pattern) {
+		root += string(filepath.Separator)
+	}
+	rest := strings.TrimPrefix(pattern, root)
+	parts := make([]string, 0)
+	if rest != "" {
+		for _, part := range strings.Split(rest, string(filepath.Separator)) {
+			if part != "" {
+				parts = append(parts, part)
+			}
+		}
+	}
+	firstWildcard := len(parts)
+	for i, part := range parts {
+		if _, err := filepath.Match(part, ""); err != nil {
+			return "", nil, err
+		}
+		if firstWildcard == len(parts) && strings.ContainsAny(part, "*?[") {
+			firstWildcard = i
+		}
+	}
+	if root == "" {
+		root = string(filepath.Separator)
+	}
+	anchor := root
+	for _, part := range parts[:firstWildcard] {
+		anchor = filepath.Join(anchor, part)
+	}
+	if firstWildcard == len(parts) {
+		// A literal path needs no parent enumeration. Resolve the candidate
+		// directly so "." and an authorized absolute file do not require read
+		// access to an otherwise out-of-scope parent directory.
+		return filepath.Clean(pattern), nil, nil
+	}
+	return filepath.Clean(anchor), parts[firstWildcard:], nil
+}
+
+// scopedGlob expands path components one directory at a time. Every directory
+// is resolved through the same application policy before it is enumerated, and
+// denied matches are discarded before they can be returned or traversed.
+// A complete ** component matches zero or more descendant path components.
+func scopedGlob(ctx *Context, anchor string, parts []string) ([]string, error) {
+	if len(parts) == 0 {
+		if _, err := ctx.ResolveRead(anchor); err != nil {
+			return nil, err
+		}
+		if _, err := os.Lstat(anchor); err == nil {
+			return []string{anchor}, nil
+		}
+		return nil, nil
+	}
+	info, err := os.Stat(anchor)
+	if err != nil || !info.IsDir() {
+		return nil, nil
+	}
+	seen := make(map[string]bool)
+	var matches []string
+	var expand func(string, int, bool) error
+	expand = func(current string, index int, initial bool) error {
+		if _, err := ctx.ResolveRead(current); err != nil {
+			return nil
+		}
+		if index == len(parts) {
+			if initial {
+				return nil
+			}
+			if _, err := os.Lstat(current); err == nil && !seen[current] {
+				seen[current] = true
+				matches = append(matches, current)
+			}
+			return nil
+		}
+
+		part := parts[index]
+		if part == "**" {
+			// First match zero levels of this recursive wildcard.
+			if err := expand(current, index+1, initial); err != nil {
+				return err
+			}
+			entries, err := os.ReadDir(current)
+			if err != nil {
+				return nil
+			}
+			for _, entry := range entries {
+				child := filepath.Join(current, entry.Name())
+				if _, err := ctx.ResolveRead(child); err != nil {
+					continue
+				}
+				if index == len(parts)-1 {
+					if _, err := os.Lstat(child); err == nil && !seen[child] {
+						seen[child] = true
+						matches = append(matches, child)
+					}
+				}
+				// WalkDir's historical behavior did not follow symlinked
+				// directories; keep that rule for the recursive wildcard too.
+				if entry.IsDir() {
+					if err := expand(child, index, false); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+
+		entries, err := os.ReadDir(current)
 		if err != nil {
 			return nil
 		}
-		rel, rerr := filepath.Rel(base, path)
-		if rerr != nil {
-			return nil
-		}
-		ok, _ := filepath.Match(rest, rel)
-		if ok && rel != "." {
-			out = append(out, path)
+		for _, entry := range entries {
+			matched, err := filepath.Match(part, entry.Name())
+			if err != nil {
+				return err
+			}
+			if !matched {
+				continue
+			}
+			child := filepath.Join(current, entry.Name())
+			if _, err := ctx.ResolveRead(child); err != nil {
+				continue
+			}
+			if index == len(parts)-1 {
+				if _, err := os.Lstat(child); err == nil && !seen[child] {
+					seen[child] = true
+					matches = append(matches, child)
+				}
+				continue
+			}
+			childInfo, err := os.Stat(child)
+			if err != nil || !childInfo.IsDir() {
+				continue
+			}
+			if err := expand(child, index+1, false); err != nil {
+				return err
+			}
 		}
 		return nil
-	})
-	return out
+	}
+	if err := expand(anchor, 0, true); err != nil {
+		return nil, err
+	}
+	return matches, nil
 }
 
 // ---------- Grep ----------
@@ -185,11 +330,11 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 	}
 	base := ctx.WorkingDir
 	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
-		resolved, err := ctx.ResolveRead(rawPath)
-		if err != nil {
-			return "", err
-		}
-		base = resolved
+		base = rawPath
+	}
+	base, err := ctx.ResolveRead(base)
+	if err != nil {
+		return "", fmt.Errorf("Grep: %w", err)
 	}
 	info, err := os.Stat(base)
 	if err != nil {
@@ -288,16 +433,23 @@ func (t *LSTool) Run(ctx *Context) (string, error) {
 	}
 	dir := ctx.WorkingDir
 	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
-		var err error
-		dir, err = ctx.ResolveRead(rawPath)
-		if err != nil {
-			return "", err
-		}
+		dir = rawPath
+	}
+	dir, err := ctx.ResolveRead(dir)
+	if err != nil {
+		return "", fmt.Errorf("LS: %w", err)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return "", fmt.Errorf("LS: %w", err)
 	}
+	visible := entries[:0]
+	for _, entry := range entries {
+		if _, err := ctx.ResolveRead(filepath.Join(dir, entry.Name())); err == nil {
+			visible = append(visible, entry)
+		}
+	}
+	entries = visible
 	sort.Slice(entries, func(i, j int) bool {
 		ei, ej := entries[i], entries[j]
 		if ei.IsDir() != ej.IsDir() {

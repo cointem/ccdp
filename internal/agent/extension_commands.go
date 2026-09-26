@@ -16,7 +16,6 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
-	"ccdp/internal/sandbox"
 	"ccdp/internal/session"
 	"ccdp/internal/workspace"
 )
@@ -406,8 +405,8 @@ func (a *Agent) runWorkflowStep(ctx context.Context, id protocol.CommandID, labe
 	workspace := a.cfg.Workspace
 	sb := a.sandbox
 	a.mu.Unlock()
-	if network && sb != nil && sb.CurrentMode() == sandbox.ModeStrict && !sb.NetworkAllowed() {
-		return "", fmt.Errorf("%s: network command denied by strict sandbox", label)
+	if network && (sb == nil || !sb.NetworkAllowed()) {
+		return "", fmt.Errorf("%s: network command denied: no network capability is authorized", label)
 	}
 	actualArgv := argv
 	readOnly := externalCommandReadOnly(argv)
@@ -448,8 +447,13 @@ func (a *Agent) scheduleCommandOperation(cmd protocol.Command, name string, oper
 // alongside a model turn; mutating operations reserve the session busy state.
 func (a *Agent) scheduleCommandOperationWithBusy(cmd protocol.Command, name string, operation commandOperation, requireIdle bool) protocol.Receipt {
 	a.mu.Lock()
-	if (requireIdle && (a.busy || a.settling)) || a.closing || a.closed {
+	revoking := a.capabilityRevoking
+	if (requireIdle && (a.busy || a.settling)) || a.closing || a.closed ||
+		revoking && name != "query:doctor" && name != "query:status" {
 		a.mu.Unlock()
+		if revoking {
+			return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox capability revocation is in progress")
+		}
 		if requireIdle {
 			return a.rejectedReceipt(cmd, protocol.ErrorBusy, "command requires an idle session")
 		}
@@ -463,6 +467,10 @@ func (a *Agent) scheduleCommandOperationWithBusy(cmd protocol.Command, name stri
 		a.turnCtx = ctx
 	}
 	a.operationWG.Add(1)
+	trackForSandboxQuiescence := !sandboxQuiescenceOwner(name) && name != "query:doctor" && name != "query:status"
+	if trackForSandboxQuiescence {
+		a.sandboxOperationWG.Add(1)
+	}
 	a.mu.Unlock()
 	if err := a.persistCommandScheduled(cmd, name, a.revision().LogSeq); err != nil {
 		if requireIdle {
@@ -477,21 +485,27 @@ func (a *Agent) scheduleCommandOperationWithBusy(cmd protocol.Command, name stri
 		}
 		cancel()
 		a.operationWG.Done()
+		if trackForSandboxQuiescence {
+			a.sandboxOperationWG.Done()
+		}
 		return a.rejectedReceipt(cmd, protocol.ErrorInternal, err.Error())
 	}
 	if requireIdle {
 		a.publishState()
 	}
 	receipt := a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
-	go a.completeScheduledOperation(ctx, cancel, cmd, name, operation, requireIdle)
+	go a.completeScheduledOperation(ctx, cancel, cmd, name, operation, requireIdle, trackForSandboxQuiescence)
 	return receipt
 }
 
 // completeScheduledOperation runs a long-lived command operation, releases its
 // busy reservation, and persists the terminal CommandCompleted admission ahead
 // of the final receipt so a restart cannot observe a success without it.
-func (a *Agent) completeScheduledOperation(ctx context.Context, cancel context.CancelFunc, cmd protocol.Command, name string, operation func(context.Context) (string, error), requireIdle bool) {
+func (a *Agent) completeScheduledOperation(ctx context.Context, cancel context.CancelFunc, cmd protocol.Command, name string, operation func(context.Context) (string, error), requireIdle, trackForSandboxQuiescence bool) {
 	defer a.operationWG.Done()
+	if trackForSandboxQuiescence {
+		defer a.sandboxOperationWG.Done()
+	}
 	output, err := operation(ctx)
 	status := "success"
 	if err != nil {
@@ -605,6 +619,9 @@ func (a *Agent) commandPathLocked(path string, write bool) (string, error) {
 	}
 	var resolved string
 	var err error
+	if a.sandbox == nil {
+		return "", errors.New("sandbox policy is unavailable")
+	}
 	if write {
 		resolved, err = a.sandbox.ResolveWrite(path)
 	} else {

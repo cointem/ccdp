@@ -24,6 +24,7 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	var approve, remember bool
+	var capabilityScope protocol.CapabilityScope
 	handled := true
 	switch msg.String() {
 	case "ctrl+c":
@@ -59,6 +60,15 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.approvalCursor = m.selectedApprovalChoice()
 		if m.approval.Tool == "Plan" {
 			approve = m.approvalCursor == 0
+		} else if len(m.approval.Capabilities) > 0 {
+			switch m.approvalCursor {
+			case 1:
+				approve, capabilityScope = true, protocol.CapabilityScopeSession
+			case 2:
+				approve = false
+			default:
+				approve, capabilityScope = true, protocol.CapabilityScopeOnce
+			}
 		} else {
 			switch m.approvalCursor {
 			case 1:
@@ -98,7 +108,7 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.submitCommand(cmd, "plan decision submitted")
 		}
 		cmd := protocol.Command{Type: protocol.CommandApproveTool,
-			Approval: &protocol.ApproveTool{ApprovalID: approval.ID, Approve: approve, Remember: remember}}
+			Approval: &protocol.ApproveTool{ApprovalID: approval.ID, Approve: approve, Remember: remember, CapabilityScope: capabilityScope}}
 		m.approvalPending = true
 		m.pendingApprovalCommand = cmd.ID
 		if cmd.ID == "" {

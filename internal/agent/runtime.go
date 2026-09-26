@@ -21,7 +21,6 @@ import (
 	"ccdp/internal/permissions"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
-	"ccdp/internal/sandbox"
 	"ccdp/internal/session"
 	"ccdp/internal/tools"
 	"ccdp/internal/workspace"
@@ -106,7 +105,11 @@ func (a *Agent) closeAsync() {
 	compactCancel := a.compactCancel
 	rootCancel := a.rootCancel
 	runStarted := a.runStartedFlag
+	sandboxPolicy := a.sandbox
 	a.mu.Unlock()
+	if sandboxPolicy != nil && sandboxPolicy.ExternalExecutionPossible() {
+		a.emitStatus("session shutdown will clean up managed leaders and process groups, but detached Seatbelt descendants cannot be proven exited")
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -463,6 +466,8 @@ func (a *Agent) applyCommand(cmd protocol.Command) protocol.Receipt {
 		return a.applyPermissionPolicy(normalized)
 	case protocol.CommandSetSandboxPolicy:
 		return a.applySandboxPolicy(normalized)
+	case protocol.CommandRevokeCapabilities:
+		return a.applyRevokeCapabilities(normalized)
 	case protocol.CommandApproveTool:
 		return a.applyApproveTool(normalized)
 	case protocol.CommandApprovePlan:
@@ -614,9 +619,13 @@ func (a *Agent) rewindMessagesCommand(n int, turnID string) error {
 func (a *Agent) scheduleCompact(cmd protocol.Command) protocol.Receipt {
 	ctx, cancel := context.WithCancel(a.rootCtx)
 	a.mu.Lock()
-	if a.closing || a.closed {
+	revoking := a.capabilityRevoking
+	if a.closing || a.closed || revoking {
 		a.mu.Unlock()
 		cancel()
+		if revoking {
+			return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox capability revocation is in progress")
+		}
 		return a.rejectedReceipt(cmd, protocol.ErrorClosed, "session is closed")
 	}
 	a.busy = true
@@ -628,11 +637,13 @@ func (a *Agent) scheduleCompact(cmd protocol.Command) protocol.Receipt {
 	a.stop = false
 	a.compactCancel = cancel
 	a.operationWG.Add(1)
+	a.sandboxOperationWG.Add(1)
 	a.mu.Unlock()
 	a.publishState()
 	receipt := a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
 	go func() {
 		defer a.operationWG.Done()
+		defer a.sandboxOperationWG.Done()
 		defer cancel()
 		a.compactContext(ctx)
 		canceled := ctx.Err() != nil
@@ -712,15 +723,21 @@ func (a *Agent) scheduleCompact(cmd protocol.Command) protocol.Receipt {
 
 func (a *Agent) scheduleFork(cmd protocol.Command) protocol.Receipt {
 	a.mu.Lock()
-	if a.closing || a.closed {
+	revoking := a.capabilityRevoking
+	if a.closing || a.closed || revoking {
 		a.mu.Unlock()
+		if revoking {
+			return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox capability revocation is in progress")
+		}
 		return a.rejectedReceipt(cmd, protocol.ErrorClosed, "session is closed")
 	}
 	a.operationWG.Add(1)
+	a.sandboxOperationWG.Add(1)
 	a.mu.Unlock()
 	receipt := a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
 	go func() {
 		defer a.operationWG.Done()
+		defer a.sandboxOperationWG.Done()
 		id, err := a.Fork(cmd.Fork.Count)
 		if err != nil {
 			// Fork is an independent operation and may finish after a new turn
@@ -972,6 +989,16 @@ func (a *Agent) beginStep() stepRuntime {
 func (a *Agent) beginStepChecked() (stepRuntime, error) {
 	a.settingsCommitMu.Lock()
 	defer a.settingsCommitMu.Unlock()
+	a.mu.Lock()
+	revoking := a.capabilityRevoking
+	closing := a.closing || a.closed
+	a.mu.Unlock()
+	if revoking {
+		return stepRuntime{}, errors.New("sandbox capability revocation is in progress")
+	}
+	if closing {
+		return stepRuntime{}, errors.New("session is closing")
+	}
 	step, lease := a.captureStepRuntime()
 	if err := a.loadStepExternalContext(&step, lease); err != nil {
 		return stepRuntime{}, err
@@ -1306,24 +1333,10 @@ func (a *Agent) applyPermissionPolicy(cmd protocol.Command) protocol.Receipt {
 func (a *Agent) applySandboxPolicy(cmd protocol.Command) protocol.Receipt {
 	p := cmd.SandboxPolicy.Policy
 	return a.applySettingsCommand(cmd, func(target *session.Settings) error {
-		mode, err := sandbox.ParseMode(p.Mode)
-		if err != nil {
-			return err
-		}
-		target.SandboxPolicy = string(mode)
-		// Nil directory lists denote a mode-only patch. Preserve the existing
-		// network and directory policy for that form; a non-nil list is an explicit
-		// replacement (including an intentionally empty list).
-		if p.AdditionalDirectories != nil || p.DisallowedDirectories != nil {
-			target.AllowNetwork = p.AllowNetwork
-			target.AllowNetworkSet = true
-			if p.AdditionalDirectories != nil {
-				target.AdditionalDirectories = cloneStringSlice(p.AdditionalDirectories)
-			}
-			if p.DisallowedDirectories != nil {
-				target.DisallowedDirectories = cloneStringSlice(p.DisallowedDirectories)
-			}
-		}
+		target.NetworkAccess = p.NetworkAccess
+		target.AdditionalDirectories = cloneStringSlice(p.AdditionalDirectories)
+		target.AdditionalReadOnlyDirectories = cloneStringSlice(p.AdditionalReadOnlyDirectories)
+		target.DisallowedDirectories = cloneStringSlice(p.DisallowedDirectories)
 		return nil
 	})
 }
@@ -1340,6 +1353,15 @@ func (a *Agent) applyApproveTool(cmd protocol.Command) protocol.Receipt {
 		a.mu.Unlock()
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "approval response was already delivered")
 	}
+	capabilities := append([]protocol.CapabilityRequest(nil), pending.Capabilities...)
+	if len(capabilities) > 0 && cmd.Approval.Approve && cmd.Approval.CapabilityScope != protocol.CapabilityScopeOnce && cmd.Approval.CapabilityScope != protocol.CapabilityScopeSession {
+		a.mu.Unlock()
+		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "capability approval requires once or session scope")
+	}
+	if len(capabilities) == 0 && cmd.Approval.CapabilityScope != "" {
+		a.mu.Unlock()
+		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "approval has no capability request")
+	}
 	a.approvalResolving = true
 	decision := "deny"
 	if cmd.Approval.Approve {
@@ -1352,10 +1374,12 @@ func (a *Agent) applyApproveTool(cmd protocol.Command) protocol.Receipt {
 	reason := pending.Reason
 	a.mu.Unlock()
 	if err := a.persistApprovalResolved(session.ApprovalResolution{
-		ApprovalID: approvalID,
-		Decision:   decision,
-		Reason:     reason,
-		ResolvedBy: "user",
+		ApprovalID:      approvalID,
+		Decision:        decision,
+		Reason:          reason,
+		ResolvedBy:      "user",
+		CapabilityScope: cmd.Approval.CapabilityScope,
+		Capabilities:    capabilities,
 	}); err != nil {
 		// Wake the waiting tool without asking it to write a second resolution.
 		// The persistence gate remains failed, so the tool cannot cross its
@@ -1367,7 +1391,7 @@ func (a *Agent) applyApproveTool(cmd protocol.Command) protocol.Receipt {
 		return a.rejectedReceipt(cmd, protocol.ErrorInternal, err.Error())
 	}
 	select {
-	case resp <- approvalAnswer{approve: cmd.Approval.Approve, remember: cmd.Approval.Remember, persisted: true}:
+	case resp <- approvalAnswer{approve: cmd.Approval.Approve, remember: cmd.Approval.Remember, capabilityScope: cmd.Approval.CapabilityScope, persisted: true}:
 		a.publishState()
 		return a.receipt(cmd, protocol.ReceiptApplied, "", nil)
 	default:
@@ -1434,6 +1458,16 @@ func (a *Agent) snapshotLocked() protocol.SessionView {
 			InputTokens: a.usage.InputTokens, OutputTokens: a.usage.OutputTokens,
 			CachedTokens: a.usage.CachedTokens, Cache: a.usage.Cache, Cost: a.usage.Cost, TurnCount: a.usage.TurnCount,
 		}}
+	view.SandboxRuntime.RevocationPending = a.capabilityRevoking
+	if a.sandbox != nil {
+		view.SandboxRuntime.ExternalExecutionPossible = a.sandbox.ExternalExecutionPossible()
+	}
+	for _, capability := range a.capabilityGrants {
+		view.SandboxRuntime.SessionGrants = append(view.SandboxRuntime.SessionGrants, capability)
+	}
+	sort.Slice(view.SandboxRuntime.SessionGrants, func(i, j int) bool {
+		return capabilityKey(view.SandboxRuntime.SessionGrants[i]) < capabilityKey(view.SandboxRuntime.SessionGrants[j])
+	})
 	view.History = make([]protocol.MessageView, 0, len(a.history))
 	for _, m := range a.history {
 		mv := protocol.MessageView{ID: m.ID, Role: string(m.Role), Content: m.Content, ReasoningContent: m.ReasoningContent}
@@ -1446,7 +1480,7 @@ func (a *Agent) snapshotLocked() protocol.SessionView {
 	view.PendingInputs = append([]protocol.InputView(nil), a.pendingInputs...)
 	if a.pendingApproval != nil {
 		view.Approval = &protocol.ApprovalView{ID: a.pendingApproval.ID, Tool: a.pendingApproval.Tool,
-			Reason: a.pendingApproval.Reason, Args: approvalArgsView(a.pendingApproval)}
+			Reason: a.pendingApproval.Reason, Args: approvalArgsView(a.pendingApproval), Capabilities: append([]protocol.CapabilityRequest(nil), a.pendingApproval.Capabilities...)}
 	}
 	view.Question = protocol.CloneQuestionRequest(a.pendingQuestion)
 	if a.pendingPlan != nil {
@@ -1543,10 +1577,13 @@ func approvalArgsView(req *ApprovalRequest) json.RawMessage {
 func (a *Agent) settingsSnapshotLocked() protocol.SettingsSnapshot {
 	b := a.activeBinding
 	return protocol.SettingsSnapshot{Revision: a.settingsRev,
-		Model:           protocol.ModelBinding{Model: b.model, Provider: b.provider, Endpoint: b.endpoint, BindingVersion: b.version},
-		ExecutionMode:   map[bool]protocol.ExecutionMode{true: protocol.ExecutionModePlan, false: protocol.ExecutionModeExecute}[a.planMode],
-		Permission:      protocol.PermissionPolicy{Mode: string(a.perms.CurrentMode()), AlwaysAllow: append([]string(nil), a.cfg.AlwaysAllow...), AlwaysDeny: append([]string(nil), a.cfg.AlwaysDeny...), Revision: a.settingsRev},
-		Sandbox:         protocol.SandboxPolicy{Mode: a.cfg.SandboxMode, AllowNetwork: a.cfg.SandboxAllowNetwork, AdditionalDirectories: append([]string(nil), a.cfg.AdditionalDirectories...), DisallowedDirectories: append([]string(nil), a.cfg.DisallowedDirectories...), Revision: a.settingsRev},
+		Model:         protocol.ModelBinding{Model: b.model, Provider: b.provider, Endpoint: b.endpoint, BindingVersion: b.version},
+		ExecutionMode: map[bool]protocol.ExecutionMode{true: protocol.ExecutionModePlan, false: protocol.ExecutionModeExecute}[a.planMode],
+		Permission:    protocol.PermissionPolicy{Mode: string(a.perms.CurrentMode()), AlwaysAllow: append([]string(nil), a.cfg.AlwaysAllow...), AlwaysDeny: append([]string(nil), a.cfg.AlwaysDeny...), Revision: a.settingsRev},
+		Sandbox: protocol.SandboxPolicy{NetworkAccess: a.cfg.NetworkAccess,
+			AdditionalDirectories:         append([]string(nil), a.cfg.AdditionalDirectories...),
+			AdditionalReadOnlyDirectories: append([]string(nil), a.cfg.AdditionalReadOnlyDirectories...),
+			DisallowedDirectories:         append([]string(nil), a.cfg.DisallowedDirectories...), Revision: a.settingsRev},
 		ReasoningEffort: a.cfg.ReasoningEffortFor(a.cfg.Model), Verbosity: a.cfg.Verbosity,
 		ContextWindow: a.cfg.ContextWindowFor(a.cfg.Model), CompactThreshold: a.cfg.CompactThreshold, MaxOutputTokens: a.cfg.MaxOutputTokensFor(a.cfg.Model), MaxTurns: a.cfg.MaxTurns, MaxBudgetUSD: a.cfg.MaxBudgetUSD}
 }
@@ -1806,7 +1843,7 @@ func (a *Agent) eventView(ev Event) protocol.EventView {
 	}
 	if ev.Approval != nil {
 		view.Approval = &protocol.ApprovalView{ID: ev.Approval.ID, Tool: ev.Approval.Tool,
-			Reason: ev.Approval.Reason, Args: approvalArgsView(ev.Approval)}
+			Reason: ev.Approval.Reason, Args: approvalArgsView(ev.Approval), Capabilities: append([]protocol.CapabilityRequest(nil), ev.Approval.Capabilities...)}
 		view.CallID = protocol.CallID(ev.Approval.ID)
 	}
 	if ev.Plan != nil {

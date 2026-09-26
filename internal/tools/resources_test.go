@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ccdp/internal/sandbox"
 )
 
 func TestResourcesSessionIsolationAndClose(t *testing.T) {
@@ -24,12 +26,14 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 		_ = b.Close()
 	})
 
-	aCtx := a.Context(nil, aDir, nil)
+	// Both contexts belong to the same synthetic project workspace. The
+	// separate Resources values, not path denial, are the subject of this test.
+	aCtx := a.Context(nil, aDir, sandbox.New(root))
 	aCtx.Args = map[string]any{"todos": []any{map[string]any{"content": "only A", "status": "in_progress"}}}
 	if _, err := NewTodoWriteTool().Run(aCtx); err != nil {
 		t.Fatalf("A TodoWrite: %v", err)
 	}
-	bCtx := b.Context(nil, bDir, nil)
+	bCtx := b.Context(nil, bDir, sandbox.New(root))
 	if got := b.Todos.Section(); got != "" {
 		t.Fatalf("B observed A's todo state: %q", got)
 	}
@@ -99,5 +103,29 @@ func TestResourcesCloseIdempotent(t *testing.T) {
 	}
 	if err := r.CheckOpen(); err == nil {
 		t.Fatal("closed resources still open")
+	}
+}
+
+func TestResourcesOwnSessionExecutionScratch(t *testing.T) {
+	r := NewResources("scratch-test", t.TempDir())
+	scratch := r.ScratchDir()
+	if scratch == "" {
+		t.Fatal("session scratch directory was not created")
+	}
+	if info, err := os.Stat(scratch); err != nil || !info.IsDir() {
+		t.Fatalf("session scratch root is unavailable: info=%v err=%v", info, err)
+	}
+	cache := filepath.Join(scratch, "cache", "go-build", "kept")
+	if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache, []byte("reusable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close resources: %v", err)
+	}
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("session scratch still exists after close: %v", err)
 	}
 }

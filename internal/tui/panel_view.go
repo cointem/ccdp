@@ -3,6 +3,8 @@ package tui
 import (
 	"fmt"
 	"strings"
+
+	"ccdp/internal/protocol"
 )
 
 func (m *Model) renderInlineSurface() string {
@@ -164,6 +166,8 @@ func (m *Model) renderApprovalInline() string {
 	}
 	if tool == "Plan" {
 		rows = append(rows, renderApprovalChoices([]string{"Approve plan", "Decline plan"}, m.selectedApprovalChoice())...)
+	} else if len(m.approval.Capabilities) > 0 {
+		rows = append(rows, renderApprovalChoices([]string{"Allow this call", "Allow for session", "Deny"}, m.selectedApprovalChoice())...)
 	} else {
 		rows = append(rows, renderApprovalChoices([]string{"Allow once", "Always allow", "Deny"}, m.selectedApprovalChoice())...)
 	}
@@ -344,5 +348,21 @@ func (m *Model) approvalDetailLines() []string {
 	for _, line := range reason {
 		lines = append(lines, styleStatus.Render(line))
 	}
+	for _, capability := range m.approval.Capabilities {
+		lines = append(lines, styleStatus.Render("Sandbox: "+formatApprovalCapability(capability)))
+	}
 	return lines
+}
+
+func formatApprovalCapability(cap protocol.CapabilityRequest) string {
+	switch cap.Kind {
+	case "directory":
+		return fmt.Sprintf("%s directory %s", cap.Access, cap.Path)
+	case "network":
+		return "outbound TCP/UDP to non-local network destinations (Unix sockets remain blocked)"
+	case "local_service":
+		return fmt.Sprintf("%s %s localhost service on port %d (Seatbelt may match other host-local addresses on that port)", cap.Direction, cap.Protocol, cap.Port)
+	default:
+		return "unknown capability request"
+	}
 }

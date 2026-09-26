@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"ccdp/internal/execution"
+	"ccdp/internal/netguard"
 	"ccdp/internal/sandbox"
 )
 
@@ -41,6 +42,10 @@ type ServerConfig struct {
 	Env       map[string]string `json:"env"`
 	Transport string            `json:"transport"` // "" | "stdio" (default) | "sse"
 	BaseURL   string            `json:"base_url"`  // required when transport = sse
+	// NetworkAuthorized is explicit per-server consent for the host process to
+	// keep this remote connection open. Each model-requested remote tool call
+	// still passes the agent's per-call sandbox network capability gate.
+	NetworkAuthorized bool `json:"network_authorized,omitempty"`
 }
 
 // ToolDef is the schema of one tool advertised by an MCP server (tools/list).
@@ -205,6 +210,12 @@ func (c *Client) SetSandbox(sb *sandbox.Sandbox) {
 // Name returns the server name.
 func (c *Client) Name() string { return c.name }
 
+// RequiresHostNetwork distinguishes a host-process HTTP connection from a
+// stdio server whose command is confined by Seatbelt.
+func (c *Client) RequiresHostNetwork() bool {
+	return c != nil && strings.EqualFold(c.cfg.Transport, "sse")
+}
+
 // Tools returns the tools advertised by the server (empty until Start).
 func (c *Client) Tools() []ToolDef {
 	c.mu.Lock()
@@ -224,6 +235,9 @@ func (c *Client) Start(ctx context.Context) error {
 		return err
 	}
 	if strings.EqualFold(c.cfg.Transport, "sse") {
+		if !c.cfg.NetworkAuthorized {
+			return fmt.Errorf("mcp %s: remote server requires explicit network_authorized consent", c.name)
+		}
 		return c.startSSE(ctx)
 	}
 	c.mu.Lock()
@@ -256,6 +270,9 @@ func (c *Client) Start(ctx context.Context) error {
 	stderr := &boundedBuffer{limit: maxMCPStderr}
 	cmd.Stderr = stderr
 
+	if sb != nil {
+		sb.MarkExternalExecution()
+	}
 	if err := cmd.Start(); err != nil {
 		procCancel()
 		return fmt.Errorf("mcp %s: start %s: %w", c.name, c.cfg.Command, err)
@@ -509,7 +526,14 @@ func (c *Client) startSSE(ctx context.Context) error {
 		return fmt.Errorf("mcp %s: transport sse requires base_url", c.name)
 	}
 	c.sseTransport = true
-	c.sseClient = &http.Client{}
+	transport, err := netguard.OriginTransport(c.cfg.BaseURL)
+	if err != nil {
+		return fmt.Errorf("mcp %s: %w", c.name, err)
+	}
+	c.mu.Lock()
+	c.sseClient = &http.Client{Transport: transport, CheckRedirect: sameSSEOriginRedirect}
+	sseClient := c.sseClient
+	c.mu.Unlock()
 	c.mu.Lock()
 	c.sseCtx, c.sseCancel = context.WithCancel(ctx)
 	c.mu.Unlock()
@@ -532,7 +556,7 @@ func (c *Client) startSSE(ctx context.Context) error {
 	}
 	req.Header.Set("Accept", "text/event-stream")
 
-	resp, err := c.sseClient.Do(req)
+	resp, err := sseClient.Do(req)
 	if err != nil {
 		c.sseCancel()
 		c.fireClosed()
@@ -581,6 +605,32 @@ func (c *Client) startSSE(ctx context.Context) error {
 	}
 
 	return c.handshake(ctx)
+}
+
+func sameSSEOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("mcp sse: stopped after 10 redirects")
+	}
+	if len(via) == 0 || req.URL == nil || !sameHTTPOrigin(via[0].URL, req.URL) {
+		return fmt.Errorf("mcp sse: redirect crosses the configured origin")
+	}
+	return nil
+}
+
+func sameHTTPOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil || !strings.EqualFold(a.Scheme, b.Scheme) || !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if strings.EqualFold(u.Scheme, "https") {
+			return "443"
+		}
+		return "80"
+	}
+	return port(a) == port(b)
 }
 
 // resolveSSEEndpoint resolves the endpoint advertised by an SSE server
@@ -764,10 +814,14 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	cancel := c.sseCancel
 	procCancel := c.procCancel
+	sseClient := c.sseClient
 	c.procCancel = nil
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel() // abort the SSE stream; its read loop closes the body
+	}
+	if sseClient != nil {
+		sseClient.CloseIdleConnections()
 	}
 	var err error
 	intentionalStop := false
@@ -785,6 +839,7 @@ func (c *Client) Close() error {
 			}
 		}
 		err = c.cmd.Wait()
+		execution.CleanupStartedProcess(c.cmd)
 		c.waited = true
 	}
 	if procCancel != nil {

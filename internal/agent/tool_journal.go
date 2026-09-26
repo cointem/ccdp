@@ -14,10 +14,12 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
+	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 	"ccdp/internal/tools"
 )
@@ -514,12 +516,13 @@ func (a *Agent) persistTurnStarted(turnID, stepID, inputID string) error {
 	return nil
 }
 
-func (a *Agent) persistTurnFinished(turnID, outcome, finishErr string) error {
+func (a *Agent) persistTurnFinished(turnID, outcome, finishErr string, duration time.Duration) error {
 	p := a.persistenceHandle()
 	if p == nil {
 		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
 	}
-	event := session.TurnFinished{TurnID: turnID, Outcome: outcome, Error: boundedToolFactText(finishErr, toolFactPreviewBytes)}
+	durationMs := max(int64(1), duration.Milliseconds())
+	event := session.TurnFinished{TurnID: turnID, Outcome: outcome, Error: boundedToolFactText(finishErr, toolFactPreviewBytes), DurationMs: durationMs}
 	a.persistMu.Lock()
 	defer a.persistMu.Unlock()
 	if err := a.persistenceFailure(); err != nil {
@@ -563,9 +566,17 @@ func (a *Agent) persistApprovalResolved(resolution session.ApprovalResolution) e
 	return nil
 }
 
-func toolApprovalRequest(a *Agent, tc messages.ToolCall, reason string) session.ApprovalRequest {
+func toolApprovalRequest(a *Agent, tc messages.ToolCall, reason string, capabilities []protocol.CapabilityRequest) session.ApprovalRequest {
 	args, _ := json.Marshal(tc.Arguments)
 	sum := sha256.Sum256(args)
+	businessArgs := make(map[string]any, len(tc.Arguments))
+	for key, value := range tc.Arguments {
+		if key != "requested_capabilities" {
+			businessArgs[key] = value
+		}
+	}
+	businessJSON, _ := json.Marshal(businessArgs)
+	businessSum := sha256.Sum256(businessJSON)
 	a.mu.Lock()
 	sessionID, turnID, workspace, policyRevision, stepID := a.sessionID, fmt.Sprintf("turn-%d", a.turnSeq), a.cfg.Workspace, a.settingsRev, a.stepSeq
 	a.mu.Unlock()
@@ -577,7 +588,8 @@ func toolApprovalRequest(a *Agent, tc messages.ToolCall, reason string) session.
 			CallID    string
 		}{sessionID, turnID, stepID, tc.ID}),
 		SessionID: sessionID, TurnID: turnID, CallID: tc.ID,
-		ArgumentDigest: hex.EncodeToString(sum[:]), Workspace: workspace,
+		ArgumentDigest: hex.EncodeToString(sum[:]), BusinessArgumentDigest: hex.EncodeToString(businessSum[:]), Workspace: workspace,
 		ToolVersion: tc.Name, PolicyRevision: policyRevision,
+		Capabilities: append([]protocol.CapabilityRequest(nil), capabilities...),
 	}
 }

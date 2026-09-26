@@ -10,7 +10,6 @@ import (
 
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
-	"ccdp/internal/sandbox"
 )
 
 // TestTurnDoneIsAnIdleBoundary uses the typed terminal update itself as the
@@ -64,11 +63,14 @@ terminal:
 	if view.Busy || view.LastTurn == nil || view.LastTurn.TurnID != done.TurnID || view.LastTurn.Status != protocol.TurnSucceeded {
 		t.Fatalf("snapshot at TurnDone boundary = %+v, event=%+v", view, done)
 	}
+	if len(view.Transcript) == 0 || view.Transcript[len(view.Transcript)-1].Kind != "turn_summary" || view.Transcript[len(view.Transcript)-1].DurationMs <= 0 {
+		t.Fatalf("completed turn omitted its durable elapsed time: %+v", view.Transcript)
+	}
 
 	// Exercise both an ordinary safety command and the asynchronous fork path
 	// at the exact terminal boundary. Neither may report the old turn as busy.
 	sandboxCmd := protocol.Command{ID: "lifecycle-sandbox", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandSetSandboxPolicy,
-		SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{Mode: string(sandbox.ModeNone)}}}
+		SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{NetworkAccess: true}}}
 	if receipt, err := ag.Submit(context.Background(), sandboxCmd); err != nil || receipt.Rejected() {
 		t.Fatalf("sandbox immediately after TurnDone = %+v", receipt)
 	}

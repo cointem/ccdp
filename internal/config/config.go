@@ -241,19 +241,18 @@ type Config struct {
 	EnableMemory *bool `json:"enable_memory"`
 
 	// Sandbox & execution policy
-	SandboxMode      string `json:"sandbox_mode"`       // confine | strict | none
-	MaxParallelTools int    `json:"max_parallel_tools"` // tools executed concurrently per turn (0 = sequential)
+	MaxParallelTools int `json:"max_parallel_tools"` // tools executed concurrently per turn (0 = sequential)
 
-	// SandboxLimits apply per-command resource bounds (ulimit) to Bash calls.
-	// SandboxAllowNetwork permits network clients in strict mode.
-	SandboxLimits       *sandbox.Limits `json:"sandbox_limits"`
-	SandboxAllowNetwork bool            `json:"sandbox_allow_network"`
+	// SandboxLimits apply per-process resource bounds (ulimit).
+	SandboxLimits *sandbox.Limits `json:"sandbox_limits"`
+	NetworkAccess bool            `json:"network_access"`
 
 	// AdditionalDirectories are extra dirs the sandbox treats like the
 	// workspace (Claude Code's additionalDirectories). DisallowedDirectories
 	// are always blocked, even inside the workspace.
-	AdditionalDirectories []string `json:"additional_directories"`
-	DisallowedDirectories []string `json:"disallowed_directories"`
+	AdditionalDirectories         []string `json:"additional_directories"`
+	AdditionalReadOnlyDirectories []string `json:"additional_read_only_directories"`
+	DisallowedDirectories         []string `json:"disallowed_directories"`
 
 	// Hooks (Claude Code style), keyed by event name. Accepts the simple
 	// ["cmd"] form and the structured [{matcher, hooks:[{command, timeout}]}]
@@ -480,7 +479,6 @@ func defaultConfig() Config {
 		MaxResultSizeChars: 32000,
 		KeepAfterCompact:   8,
 		BashTimeoutSeconds: 120,
-		SandboxMode:        "confine",
 		MaxParallelTools:   4,
 		Hooks:              hooks.Config{},
 		EnableWebTools:     BoolPtr(true),
@@ -525,7 +523,19 @@ func applyEnvChecked(cfg *Config) error {
 	apply("CCDP_MODEL", func(v string) error { cfg.Model = v; return nil })
 	apply("CCDP_PERMISSION_MODE", func(v string) error { cfg.PermissionMode = v; return nil })
 	apply("CCDP_WORKSPACE", func(v string) error { cfg.Workspace = v; return nil })
-	apply("CCDP_SANDBOX_MODE", func(v string) error { cfg.SandboxMode = v; return nil })
+	if _, exists := os.LookupEnv("CCDP_SANDBOX_MODE"); exists {
+		return fmt.Errorf("config: CCDP_SANDBOX_MODE is no longer supported; local execution always uses macOS Seatbelt")
+	}
+	if _, exists := os.LookupEnv("CCDP_SANDBOX_ALLOW_NETWORK"); exists {
+		return fmt.Errorf("config: CCDP_SANDBOX_ALLOW_NETWORK is no longer supported; use network_access")
+	}
+	apply("CCDP_NETWORK_ACCESS", func(v string) error {
+		b, err := parseEnvBool("CCDP_NETWORK_ACCESS", v)
+		if err == nil {
+			cfg.NetworkAccess = b
+		}
+		return err
+	})
 	apply("CCDP_MAX_TURNS", func(v string) error {
 		n, err := parseEnvInt("CCDP_MAX_TURNS", v)
 		if err == nil {
@@ -633,6 +643,9 @@ func LoadFrom(path string) (Config, error) {
 		if err := rejectLegacyModelFields(raw); err != nil {
 			return cfg, err
 		}
+		if err := rejectRemovedSandboxFields(raw); err != nil {
+			return cfg, err
+		}
 		applyConfigFields(&cfg, &fileCfg, raw, SourceUserFile, path, true)
 	} else if !os.IsNotExist(err) {
 		return cfg, fmt.Errorf("config: read %s: %w", path, err)
@@ -662,9 +675,6 @@ func (c *Config) Validate() error {
 		return err
 	} else {
 		c.PermissionMode = string(mode)
-	}
-	if _, err := sandbox.ParseMode(c.SandboxMode); err != nil {
-		return err
 	}
 	for id, p := range c.Providers {
 		for model, window := range p.ContextWindows {
@@ -800,23 +810,36 @@ func (c *Config) CostFor(model string, inputTokens, outputTokens int) float64 {
 	return float64(inputTokens)/1e6*p.Input + float64(outputTokens)/1e6*p.Output
 }
 
-// Sandbox builds a sandbox for the configured workspace and mode.
+// Sandbox builds the fixed macOS Seatbelt policy for the configured workspace.
 func (c *Config) Sandbox() *sandbox.Sandbox {
-	mode, err := sandbox.ParseMode(c.SandboxMode)
-	if err != nil {
-		mode = sandbox.ModeConfine
-	}
-	s := sandbox.New(c.Workspace, mode)
+	s := sandbox.New(c.Workspace)
 	if c.SandboxLimits != nil {
 		lim := *c.SandboxLimits
 		s.Limits = &lim
 	}
-	s.AllowNetwork = c.SandboxAllowNetwork
+	s.AllowNetwork = c.NetworkAccess
 	for _, d := range c.AdditionalDirectories {
 		s.AddDir(d)
 	}
+	for _, d := range c.AdditionalReadOnlyDirectories {
+		s.AddReadOnlyDir(d)
+	}
 	for _, d := range c.DisallowedDirectories {
 		s.AddDisallowedDir(d)
+	}
+	// Git's config, hooks, and linked-worktree pointer files are control state.
+	// Discover them from the effective repository metadata while keeping the
+	// index, objects, refs, and worktree files available to normal Git commands.
+	gitRoots := append([]string{s.Workspace}, s.AdditionalDirs...)
+	for _, root := range gitRoots {
+		for _, path := range sandbox.GitControlPaths(root) {
+			if s.InWorkspace(path) {
+				s.AddProtectedDir(path)
+			}
+		}
+		for _, path := range sandbox.GitControlEntryPaths(root) {
+			s.AddProtectedEntry(path)
+		}
 	}
 	// Session logs, blobs, and control metadata are owner resources rather
 	// than ordinary workspace files. They remain available to the persistence
@@ -827,8 +850,7 @@ func (c *Config) Sandbox() *sandbox.Sandbox {
 		s.AddProtectedDir(c.SessionDir)
 	}
 	// Configuration, project instructions, and trust metadata are application
-	// control state. They are never ordinary model-writable files, including
-	// when the user selected the unrestricted compatibility sandbox mode.
+	// control state and never ordinary model-writable files.
 	s.AddProtectedDir(ProjectSettingsDir(c.Workspace))
 	if source := c.SourcePath(); source != "" {
 		s.AddProtectedDir(source)
@@ -896,6 +918,9 @@ func loadProjectSettings(ws string, store *TrustStore) (Config, error) {
 		if err := rejectLegacyModelFields(raw); err != nil {
 			return proj, err
 		}
+		if err := rejectRemovedSandboxFields(raw); err != nil {
+			return proj, err
+		}
 		source := SourceProject
 		if name == "settings.local.json" {
 			source = SourceProjectLocal
@@ -956,10 +981,6 @@ func applyProjectSettings(dst, src *Config) {
 		dst.PermissionMode = src.PermissionMode
 		dst.markSource("permission_mode", src.SourceOf("permission_mode"), srcReport.Fields["permission_mode"].Path, srcReport.ProjectTrusted)
 	}
-	if src.IsExplicit("sandbox_mode") && projectOverrideAllowed(dst, "sandbox_mode") && sandboxTightens(dst.SandboxMode, src.SandboxMode) {
-		dst.SandboxMode = src.SandboxMode
-		dst.markSource("sandbox_mode", src.SourceOf("sandbox_mode"), srcReport.Fields["sandbox_mode"].Path, srcReport.ProjectTrusted)
-	}
 	if src.IsExplicit("enable_web_tools") && projectOverrideAllowed(dst, "enable_web_tools") && src.EnableWebTools != nil {
 		// Disabling network-facing web tools is always safe. Enabling them from
 		// an untrusted checkout is not an implicit trust grant.
@@ -967,6 +988,18 @@ func applyProjectSettings(dst, src *Config) {
 			dst.EnableWebTools = BoolPtr(*src.EnableWebTools)
 			dst.markSource("enable_web_tools", src.SourceOf("enable_web_tools"), srcReport.Fields["enable_web_tools"].Path, srcReport.ProjectTrusted)
 		}
+	}
+	// Project settings may tighten the network boundary but cannot enable
+	// network access. This keeps /reload and workspace selection capable of
+	// applying an explicit project restriction without treating the project as
+	// an authority that can widen the user's sandbox.
+	if src.IsExplicit("network_access") && !src.NetworkAccess && projectOverrideAllowed(dst, "network_access") {
+		dst.NetworkAccess = false
+		dst.markSource("network_access", src.SourceOf("network_access"), srcReport.Fields["network_access"].Path, false)
+	}
+	if src.IsExplicit("disallowed_directories") && projectOverrideAllowed(dst, "disallowed_directories") {
+		dst.DisallowedDirectories = appendUniqueStrings(dst.DisallowedDirectories, src.DisallowedDirectories...)
+		dst.markSource("disallowed_directories", src.SourceOf("disallowed_directories"), srcReport.Fields["disallowed_directories"].Path, false)
 	}
 	trusted := srcReport.ProjectTrusted
 	if trusted {
@@ -1039,20 +1072,13 @@ func projectModeTightens(base, project string) bool {
 	return false
 }
 
-func sandboxTightens(base, project string) bool {
-	rank := func(v string) int {
-		switch v {
-		case "strict":
-			return 3
-		case "confine":
-			return 2
-		case "none":
-			return 1
-		default:
-			return 0
+func rejectRemovedSandboxFields(raw map[string]json.RawMessage) error {
+	for _, field := range []string{"sandbox_mode", "sandbox_allow_network"} {
+		if _, ok := raw[field]; ok {
+			return fmt.Errorf("config: %q is no longer supported; sandboxing uses fixed macOS Seatbelt policy", field)
 		}
 	}
-	return project != "" && rank(project) > rank(base)
+	return nil
 }
 
 // BoolPtr returns a pointer to b (helper for tri-state config booleans: a nil

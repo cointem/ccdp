@@ -11,6 +11,10 @@ import (
 	"ccdp/internal/sandbox"
 )
 
+func testOptions(dir string) Options {
+	return Options{Workspace: dir, Mode: "default", Sandbox: sandbox.New(dir)}
+}
+
 func TestPreToolUseDecision(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{
@@ -21,7 +25,9 @@ echo '{"decision":"deny","reason":"policy"}'
 `},
 		},
 	}
-	m := NewManager(cfg, Options{SessionID: "s1", Workspace: dir, Mode: "default"})
+	opts := testOptions(dir)
+	opts.SessionID = "s1"
+	m := NewManager(cfg, opts)
 	out := m.PreToolUse(context.Background(), "Bash", map[string]any{"command": "rm x"})
 	if out.Decision != DecisionDeny || out.Reason != "policy" {
 		t.Errorf("PreToolUse = %+v, want deny/policy", out)
@@ -32,7 +38,7 @@ func TestPreToolUseAllow(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{
 		EventPreToolUse: []HookSpec{{Command: `echo '{"decision":"allow"}'`}},
-	}, Options{Workspace: dir, Mode: "default"})
+	}, testOptions(dir))
 	out := m.PreToolUse(context.Background(), "Write", map[string]any{})
 	if out.Decision != DecisionAllow {
 		t.Errorf("PreToolUse = %+v, want allow", out)
@@ -43,7 +49,7 @@ func TestPostToolUseAppendsOutput(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{
 		EventPostToolUse: []HookSpec{{Command: `printf '%s' '{"hookSpecificOutput":"[checked]"}'`}},
-	}, Options{Workspace: dir, Mode: "default"})
+	}, testOptions(dir))
 	out := m.PostToolUse(context.Background(), "Bash", map[string]any{}, "out")
 	if out.HookSpecificOutput == "" {
 		t.Errorf("expected hookSpecificOutput, got %+v", out)
@@ -56,7 +62,7 @@ func TestUserPromptSubmitBlock(t *testing.T) {
 		EventUserPromptSubmit: []HookSpec{
 			{Command: `input=$(cat); case "$input" in *ban*) echo '{"decision":"block","reason":"forbidden topic"}';; esac`},
 		},
-	}, Options{Workspace: dir, Mode: "default"})
+	}, testOptions(dir))
 	out := m.UserPromptSubmit(context.Background(), "please ban this")
 	if out.Decision != DecisionBlock {
 		t.Errorf("UserPromptSubmit = %+v, want block", out)
@@ -74,7 +80,7 @@ func TestHooksDoNotInheritLoginShell(t *testing.T) {
 		EventUserPromptSubmit: []HookSpec{
 			{Command: `input=$(cat); case "$input" in *portable*) printf '{"decision":"block"}';; esac`},
 		},
-	}, Options{Workspace: dir, Mode: "default"})
+	}, testOptions(dir))
 
 	out := m.UserPromptSubmit(context.Background(), "portable hook")
 	if out.Decision != DecisionBlock {
@@ -84,7 +90,7 @@ func TestHooksDoNotInheritLoginShell(t *testing.T) {
 
 func TestNoHooks(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(nil, Options{Workspace: dir, Mode: "default"})
+	m := NewManager(nil, testOptions(dir))
 	if m.Has(EventPreToolUse) {
 		t.Error("Has should be false with no config")
 	}
@@ -106,7 +112,7 @@ func TestHookTimeoutNonBlocking(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{
 		EventPreToolUse: []HookSpec{{Command: `sleep 5`}},
-	}, Options{Workspace: dir, Mode: "default", Timeout: 200 * time.Millisecond})
+	}, Options{Workspace: dir, Mode: "default", Timeout: 200 * time.Millisecond, Sandbox: sandbox.New(dir)})
 	start := time.Now()
 	out := m.PreToolUse(context.Background(), "Bash", nil)
 	if time.Since(start) > 2*time.Second {
@@ -126,7 +132,7 @@ func TestExitCode2Blocks(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{
 		EventPreToolUse: []HookSpec{{Command: `echo "no way" >&2; exit 2`}},
-	}, Options{Workspace: dir, Mode: "default"})
+	}, testOptions(dir))
 	out := m.PreToolUse(context.Background(), "Bash", map[string]any{"command": "x"})
 	if out.Decision != DecisionBlock || out.Reason != "no way" {
 		t.Errorf("exit 2 should block with stderr reason, got %+v", out)
@@ -137,7 +143,7 @@ func TestExitOneNonBlocking(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{
 		EventPreToolUse: []HookSpec{{Command: `echo "boom" >&2; exit 1`}},
-	}, Options{Workspace: dir, Mode: "default"})
+	}, testOptions(dir))
 	out := m.PreToolUse(context.Background(), "Bash", map[string]any{"command": "x"})
 	if out.Decision != DecisionNone {
 		t.Errorf("exit 1 is a non-blocking error, got %+v", out)
@@ -151,7 +157,7 @@ func TestStrictObserverHookFailureRemainsBestEffort(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{
 		EventPostToolUse: []HookSpec{{Command: `false`}},
-	}, Options{Workspace: dir, Mode: "default", Sandbox: sandbox.New(dir, sandbox.ModeStrict), FailClosed: true})
+	}, Options{Workspace: dir, Mode: "default", Sandbox: sandbox.New(dir), FailClosed: true})
 	out := m.PostToolUse(context.Background(), "Read", nil, "ok")
 	if out.Decision != DecisionNone {
 		t.Fatalf("observer failure must not veto a completed tool: %+v", out)
@@ -165,7 +171,7 @@ func TestStrictDecisionHookFailureFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{
 		EventPreToolUse: []HookSpec{{Command: `false`}},
-	}, Options{Workspace: dir, Mode: "default", Sandbox: sandbox.New(dir, sandbox.ModeStrict), FailClosed: true})
+	}, Options{Workspace: dir, Mode: "default", Sandbox: sandbox.New(dir), FailClosed: true})
 	out := m.PreToolUse(context.Background(), "Read", nil)
 	if out.Decision != DecisionDeny {
 		t.Fatalf("decision hook failure must fail closed: %+v", out)
@@ -187,9 +193,12 @@ if printf '%%s' "$input" | grep -Fq '"session_id":"s1","cwd":"%s","permission_mo
 else
   printf '{"decision":"deny","reason":"mixed hook options snapshot"}'
 fi`, w1, w2)
-	m := NewManager(Config{EventPreToolUse: []HookSpec{{Command: command}}}, Options{
-		SessionID: "s1", Workspace: w1, Mode: "default",
-	})
+	sb := sandbox.New(w1)
+	sb.AddReadOnlyDir(w2)
+	opts := testOptions(w1)
+	opts.SessionID = "s1"
+	opts.Sandbox = sb
+	m := NewManager(Config{EventPreToolUse: []HookSpec{{Command: command}}}, opts)
 	stop := make(chan struct{})
 	var setter sync.WaitGroup
 	setter.Add(1)
@@ -225,7 +234,7 @@ func TestMatcherFiltersByToolName(t *testing.T) {
 			{Matcher: `^Git`, Command: `echo '{"decision":"deny","reason":"git-hook"}'`},
 			{Command: `echo '{"decision":"deny","reason":"all-hook"}'`},
 		},
-	}, Options{Workspace: dir, Mode: "default"})
+	}, testOptions(dir))
 	_ = ran
 
 	// Bash: only the Bash matcher and the catch-all run; first veto wins.
@@ -260,7 +269,7 @@ func TestAdditionalContextAggregated(t *testing.T) {
 			{Command: `echo '{"additionalContext":"ctx-1"}'`},
 			{Command: `echo '{"additionalContext":"ctx-2"}'`},
 		},
-	}, Options{Workspace: dir, Mode: "default"})
+	}, testOptions(dir))
 	out := m.UserPromptSubmit(context.Background(), "hi")
 	if out.AdditionalContext != "ctx-1ctx-2" {
 		t.Errorf("additionalContext should aggregate, got %q", out.AdditionalContext)
@@ -295,7 +304,7 @@ func TestProjectDirEnv(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(Config{
 		EventPreToolUse: []HookSpec{{Command: `printf '%s' "{\"additionalContext\":\"$CCDP_PROJECT_DIR\"}"`}},
-	}, Options{Workspace: dir, Mode: "default"})
+	}, testOptions(dir))
 	out := m.PreToolUse(context.Background(), "Bash", nil)
 	if out.AdditionalContext != dir {
 		t.Errorf("CCDP_PROJECT_DIR = %q, want %q", out.AdditionalContext, dir)

@@ -366,7 +366,7 @@ func toolArgumentSummary(name string, args map[string]any, raw string) string {
 	return truncateDisplay(string(encoded), 64)
 }
 
-// isReadOnlyTool reports whether a tool only inspects the workspace. A
+// isReadOnlyTool reports whether a tool only inspects files or state. A
 // successful call produces no output the user needs inline, so it collapses to
 // a single summary line.
 func isReadOnlyTool(name string) bool {

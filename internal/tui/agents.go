@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -578,7 +579,21 @@ func projectTranscriptCell(item protocol.TranscriptItem) historyCell {
 	if item.Kind == "tool" {
 		args = protocolToolArgs(&protocol.ToolView{Name: item.Tool, Args: item.Args})
 	}
-	return historyCell{kind: item.Kind, text: item.Text, messageID: item.ID, turnID: item.TurnID,
+	text := item.Text
+	if item.Kind == "turn_summary" {
+		label := "结束"
+		switch item.Status {
+		case "success":
+			label = "完成"
+		case "error":
+			label = "失败"
+		case "cancelled", "interrupted":
+			label = "已停止"
+		}
+		const maxDurationMs = int64((1<<63 - 1) / int64(time.Millisecond))
+		text = label + " · 用时 " + formatElapsed(time.Duration(min(item.DurationMs, maxDurationMs))*time.Millisecond)
+	}
+	return historyCell{kind: item.Kind, text: text, messageID: item.ID, turnID: item.TurnID,
 		toolID: string(item.CallID), status: item.Status, toolName: item.Tool, toolArgs: args,
 		toolArgsRaw: string(item.Args), toolTruncated: item.Truncated}
 }

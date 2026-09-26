@@ -347,6 +347,9 @@ func (t *historyLedger) plan(items []historyCell, width int, turnDone bool, rend
 }
 
 func transcriptGap(previous, current string) bool {
+	if current == "turn_summary" {
+		return false
+	}
 	return previous != "" && previous != current && previous != "user" && current != "user"
 }
 

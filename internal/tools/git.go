@@ -26,18 +26,8 @@ func runGit(ctx *Context, args ...string) (string, int, error) {
 		}
 		argv = hardened
 	}
-	rawParts := argv
-	raw := strings.Join(rawParts, " ")
-	// Check the human-readable command before quoting argv. This preserves the
-	// strict network/destructive-command classification for git while the
-	// actual execution still passes each argument safely through the shell.
-	if ctx.Sandbox != nil {
-		if err := ctx.Sandbox.CommandPolicy(raw); err != nil {
-			return "", -1, err
-		}
-	}
-	parts := make([]string, 0, len(rawParts))
-	for _, arg := range rawParts {
+	parts := make([]string, 0, len(argv))
+	for _, arg := range argv {
 		parts = append(parts, execution.QuoteArg(arg))
 	}
 	env := execution.SanitizedEnvironmentFor(execution.EnvironmentGit, os.Environ())

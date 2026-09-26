@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"ccdp/internal/execution"
-	"ccdp/internal/sandbox"
 )
 
 // Grep runs through ripgrep when it is available and falls back to an
@@ -76,6 +75,9 @@ func (r *grepRequest) fetchLines() int {
 }
 
 func searchGrep(ctx *Context, r *grepRequest) (string, error) {
+	if ctx == nil || ctx.Sandbox == nil {
+		return "", fmt.Errorf("Grep: sandbox policy is unavailable")
+	}
 	if ripgrepUsableFor(ctx) {
 		lines, truncated, err := ripgrepSearch(ctx, r)
 		if err == nil {
@@ -94,14 +96,9 @@ func searchGrep(ctx *Context, r *grepRequest) (string, error) {
 	return formatGrepResult(lines, r, truncated), nil
 }
 
-// ripgrepUsableFor reports whether the ripgrep backend can serve this request.
-// Strict sandboxes confine reads to the workspace roots, which normally excludes
-// the ripgrep binary itself, so strict mode always uses the in-process engine.
+// ripgrepUsableFor reports whether the sandboxed ripgrep backend can serve this request.
 func ripgrepUsableFor(ctx *Context) bool {
-	if ripgrepBinary() == "" {
-		return false
-	}
-	return ctx.Sandbox == nil || ctx.Sandbox.CurrentMode() != sandbox.ModeStrict
+	return ctx != nil && ctx.Sandbox != nil && ripgrepBinary() != ""
 }
 
 var (
@@ -371,6 +368,12 @@ func inProcessSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
 		if err != nil {
 			return nil
 		}
+		if _, err := ctx.ResolveRead(path); err != nil {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
 		rel, rerr := filepath.Rel(r.base, path)
 		if rerr != nil || rel == "." {
 			return nil
@@ -516,17 +519,15 @@ func readGrepFile(ctx *Context, path string) ([]byte, bool) {
 	if err != nil || info.IsDir() || info.Size() > int64(ctx.readLimit()) {
 		return nil, false
 	}
-	readPath := path
-	if ctx.Sandbox != nil {
-		readPath, err = ctx.Sandbox.ResolveRead(path)
-		if err != nil {
-			return nil, false
-		}
+	if ctx == nil || ctx.Sandbox == nil {
+		return nil, false
+	}
+	readPath, err := ctx.Sandbox.ResolveRead(path)
+	if err != nil {
+		return nil, false
 	}
 	flags := os.O_RDONLY
-	if ctx.Sandbox != nil && ctx.Sandbox.CurrentMode() == sandbox.ModeStrict {
-		flags |= syscall.O_NOFOLLOW
-	}
+	flags |= syscall.O_NOFOLLOW
 	f, err := os.OpenFile(readPath, flags, 0)
 	if err != nil {
 		return nil, false

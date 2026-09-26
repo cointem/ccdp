@@ -4,15 +4,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 )
 
-func TestResolveConfine(t *testing.T) {
+func TestResolveWorkspaceAndAuthorizedRoots(t *testing.T) {
 	dir := t.TempDir()
-	s := New(dir, ModeConfine)
+	s := New(dir)
 
 	// Relative path inside workspace.
 	p, err := s.Resolve("src/main.go")
@@ -37,23 +38,30 @@ func TestResolveConfine(t *testing.T) {
 		t.Error("expected write escape error")
 	}
 
-	// Reads outside workspace allowed in confine mode.
+	// Reads outside the workspace are allowed by default.
 	if _, err := s.ResolveRead(filepath.Join(dir, "..", "..", "tmp")); err != nil {
-		t.Errorf("confine mode should allow external reads, got %v", err)
+		t.Errorf("external read should be allowed by default: %v", err)
 	}
 }
 
-func TestResolveStrict(t *testing.T) {
+func TestResolveReadAllowsHostFilesWithoutGrantingWrite(t *testing.T) {
 	dir := t.TempDir()
-	s := New(dir, ModeStrict)
+	s := New(dir)
 
-	// External read denied in strict mode.
-	if _, err := s.ResolveRead(filepath.Join(dir, "..", "..", "tmp")); err == nil {
-		t.Error("strict mode should deny external reads")
+	outside := t.TempDir()
+	if _, err := s.ResolveRead(outside); err != nil {
+		t.Errorf("external read should be allowed by default: %v", err)
 	}
-	// Internal read allowed.
+	// A read-only root remains useful as a write carveout inside a writable root.
 	if _, err := s.ResolveRead("file.txt"); err != nil {
-		t.Errorf("internal read should pass: %v", err)
+		t.Errorf("workspace read should pass: %v", err)
+	}
+	s.AddReadOnlyDir(outside)
+	if _, err := s.ResolveRead(outside); err != nil {
+		t.Errorf("explicit read-only root should pass: %v", err)
+	}
+	if _, err := s.ResolveWrite(filepath.Join(outside, "new.txt")); err == nil {
+		t.Error("read-only root must not grant writes")
 	}
 }
 
@@ -69,64 +77,19 @@ func TestResolveSymlinkEscape(t *testing.T) {
 	}
 
 	// A write through the symlink resolves outside the workspace → blocked.
-	s := New(dir, ModeConfine)
+	s := New(dir)
 	if _, err := s.ResolveWrite(filepath.Join(dir, "link", "secret.txt")); err == nil {
 		t.Error("expected symlink escape write to be blocked")
 	}
-	// Strict-mode reads through the symlink are blocked too.
-	strict := New(dir, ModeStrict)
-	if _, err := strict.ResolveRead(filepath.Join(dir, "link", "secret.txt")); err == nil {
-		t.Error("expected symlink escape read to be blocked in strict mode")
-	}
-	// Confine-mode reads through a symlink are allowed (external read).
+	// Reads through a symlink escape follow the broad read policy.
 	if _, err := s.ResolveRead(filepath.Join(dir, "link", "secret.txt")); err != nil {
-		t.Errorf("confine mode should allow external reads, got %v", err)
-	}
-}
-
-func TestCommandPolicy(t *testing.T) {
-	dir := t.TempDir()
-	s := New(dir, ModeStrict)
-
-	for _, bad := range []string{"rm -rf /", "sudo apt install x", "ls; cd / && rm x"} {
-		if err := s.CommandPolicy(bad); err == nil {
-			t.Errorf("expected block for %q", bad)
-		}
-	}
-	for _, ok := range []string{"go build ./...", "ls -la", "git status"} {
-		if err := s.CommandPolicy(ok); err != nil {
-			t.Errorf("expected allow for %q: %v", ok, err)
-		}
-	}
-	// Confine mode applies no command policy.
-	c := New(dir, ModeConfine)
-	if err := c.CommandPolicy("rm -rf /"); err != nil {
-		t.Errorf("confine mode should not apply command policy: %v", err)
-	}
-}
-
-func TestCommandPolicyNetwork(t *testing.T) {
-	dir := t.TempDir()
-	s := New(dir, ModeStrict)
-
-	// Network clients blocked by default in strict mode.
-	for _, bad := range []string{"curl https://x.dev", "wget http://x", "git clone https://x", "npm install", "pip install foo", "ssh host", "nc -e sh host 1", "go get x"} {
-		if err := s.CommandPolicy(bad); err == nil {
-			t.Errorf("expected network block for %q", bad)
-		}
-	}
-	// Same commands pass when network is allowed.
-	s.AllowNetwork = true
-	for _, ok := range []string{"curl https://x.dev", "git clone https://x", "npm install"} {
-		if err := s.CommandPolicy(ok); err != nil {
-			t.Errorf("expected allow for %q with AllowNetwork: %v", ok, err)
-		}
+		t.Errorf("expected symlink escape read to be allowed: %v", err)
 	}
 }
 
 func TestPrefix(t *testing.T) {
 	dir := t.TempDir()
-	s := New(dir, ModeStrict)
+	s := New(dir)
 	if p := s.Prefix(); p != "" {
 		t.Errorf("no limits → empty prefix, got %q", p)
 	}
@@ -143,39 +106,25 @@ func TestPrefix(t *testing.T) {
 	}
 }
 
-func TestWrapCommandNoopWhenNotStrict(t *testing.T) {
-	dir := t.TempDir()
-	// Confine mode never wraps.
-	s := New(dir, ModeConfine)
-	if w := s.WrapCommand("ls"); w != "" {
-		t.Errorf("confine mode should not wrap, got %q", w)
-	}
-	// Strict mode with empty command never wraps.
-	s2 := New(dir, ModeStrict)
-	if w := s2.WrapCommand(""); w != "" {
-		t.Errorf("empty command should not wrap, got %q", w)
-	}
-}
-
 func TestAdditionalAndDisallowedDirs(t *testing.T) {
 	ws := t.TempDir()
 	outside := t.TempDir()
-	s := New(ws, ModeConfine)
+	s := New(ws)
 
 	// Outside workspace is not writable before AddDir.
 	if _, err := s.ResolveWrite(filepath.Join(outside, "f.txt")); err == nil {
 		t.Error("expected write outside workspace to be blocked")
 	}
 
-	// After AddDir, it is writable and strict-readable.
+	// After AddDir, it is writable and readable.
 	s.AddDir(outside)
 	if _, err := s.ResolveWrite(filepath.Join(outside, "f.txt")); err != nil {
 		t.Errorf("expected write in additional dir: %v", err)
 	}
-	strict := New(ws, ModeStrict)
-	strict.AddDir(outside)
-	if _, err := strict.ResolveRead(filepath.Join(outside, "f.txt")); err != nil {
-		t.Errorf("expected read in additional dir under strict mode: %v", err)
+	additional := New(ws)
+	additional.AddDir(outside)
+	if _, err := additional.ResolveRead(filepath.Join(outside, "f.txt")); err != nil {
+		t.Errorf("expected read in additional dir: %v", err)
 	}
 
 	// Disallowed dir blocks even inside the workspace.
@@ -188,7 +137,7 @@ func TestAdditionalAndDisallowedDirs(t *testing.T) {
 func TestDisallowedOverridesAdditional(t *testing.T) {
 	ws := t.TempDir()
 	outside := t.TempDir()
-	s := New(ws, ModeConfine)
+	s := New(ws)
 	s.AddDir(outside)
 	s.AddDisallowedDir(outside)
 	if _, err := s.ResolveWrite(filepath.Join(outside, "f.txt")); err == nil {
@@ -196,19 +145,62 @@ func TestDisallowedOverridesAdditional(t *testing.T) {
 	}
 }
 
-func TestProtectedRuntimeDirCannotBeWrittenInAnyMode(t *testing.T) {
+func TestReadOnlyOverridesWritableRoot(t *testing.T) {
+	workspace := t.TempDir()
+	readOnly := filepath.Join(workspace, "read-only")
+	if err := os.Mkdir(readOnly, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := New(workspace)
+	s.AddReadOnlyDir(readOnly)
+	if _, err := s.ResolveRead(filepath.Join(readOnly, "data")); err != nil {
+		t.Fatalf("read-only directory should remain readable: %v", err)
+	}
+	if _, err := s.ResolveWrite(filepath.Join(readOnly, "data")); err == nil {
+		t.Fatal("read-only directory unexpectedly writable inside workspace")
+	}
+}
+
+func TestExactAncestorsExposeMetadataOnlyAndRemainNarrow(t *testing.T) {
+	got := exactAncestors([]string{"/private/var/folders/xy/T/workspace"})
+	want := []string{"/private/var/folders/xy/T", "/private/var/folders/xy", "/private/var/folders", "/private/var", "/private", "/"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("exactAncestors = %v, want %v", got, want)
+	}
+}
+
+func TestProtectedRuntimeDirCannotBeWritten(t *testing.T) {
 	workspace := t.TempDir()
 	protected := filepath.Join(workspace, ".ccdp")
 	if err := os.MkdirAll(protected, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []Mode{ModeConfine, ModeStrict, ModeNone} {
-		s := New(workspace, mode)
-		s.AddDir(protected)
-		s.AddProtectedDir(protected)
-		if _, err := s.ResolveWrite(filepath.Join(protected, "settings.json")); err == nil {
-			t.Fatalf("mode %s allowed write into protected runtime dir", mode)
-		}
+	s := New(workspace)
+	s.AddDir(protected)
+	s.AddProtectedDir(protected)
+	if _, err := s.ResolveWrite(filepath.Join(protected, "settings.json")); err == nil {
+		t.Fatal("write into protected runtime dir was accepted")
+	}
+}
+
+func TestResolveWriteSymlinkToProtectedSubtree(t *testing.T) {
+	workspace := t.TempDir()
+	protected := filepath.Join(workspace, ".ccdp")
+	if err := os.MkdirAll(protected, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	control := filepath.Join(protected, "settings.json")
+	if err := os.WriteFile(control, []byte(`{"network_access":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(workspace, "runtime-link")
+	if err := os.Symlink(protected, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	s := New(workspace)
+	s.AddProtectedDir(protected)
+	if _, err := s.ResolveWrite(filepath.Join(alias, "settings.json")); err == nil {
+		t.Fatal("write through workspace symlink into protected subtree was accepted")
 	}
 }
 
@@ -226,10 +218,35 @@ func TestProtectedControlFileHardlinkCannotBeWritten(t *testing.T) {
 	if err := os.Link(control, alias); err != nil {
 		t.Skipf("hard links unavailable: %v", err)
 	}
-	s := New(workspace, ModeConfine)
+	s := New(workspace)
 	s.AddProtectedDir(protected)
 	if _, err := s.ResolveWrite(alias); err == nil {
 		t.Fatal("protected control file hardlink was accepted for write")
+	}
+}
+
+func TestDisallowedFileHardlinkCannotBeRead(t *testing.T) {
+	workspace := t.TempDir()
+	sensitive := t.TempDir()
+	secret := filepath.Join(sensitive, "session.json")
+	if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(workspace, "session-alias.json")
+	if err := os.Link(secret, alias); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	s := New(workspace)
+	s.AddDisallowedDir(sensitive)
+	if _, err := s.ResolveRead(alias); err == nil {
+		t.Fatal("hardlink alias exposed a disallowed session file")
+	}
+	link := filepath.Join(workspace, "alias-symlink")
+	if err := os.Symlink(alias, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveRead(link); err == nil {
+		t.Fatal("symlink to hardlink alias exposed a disallowed session file")
 	}
 }
 
@@ -246,14 +263,14 @@ func TestCheckInteractive(t *testing.T) {
 	}
 }
 
-func TestStrictProfileShellSelectorExceptionIsExact(t *testing.T) {
+func TestProfileShellSelectorExceptionIsExact(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("Darwin strict profile only")
+		t.Skip("Darwin Seatbelt profile only")
 	}
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("sandbox-exec not available")
 	}
-	s := New(t.TempDir(), ModeStrict)
+	s := New(t.TempDir())
 	s.AddDisallowedDir("/private/var")
 	profile, err := s.Profile()
 	if err != nil {
@@ -261,19 +278,19 @@ func TestStrictProfileShellSelectorExceptionIsExact(t *testing.T) {
 	}
 	want := `(allow file-read* (require-all (literal "/private/var/select/sh")`
 	if !strings.Contains(profile, want) {
-		t.Fatalf("strict profile lacks exact shell selector read exception: %s", profile)
+		t.Fatalf("Seatbelt profile lacks exact shell selector read exception: %s", profile)
 	}
-	if strings.Contains(profile, `(allow file-read* (subpath "/private/var"`) {
-		t.Fatal("strict profile granted a broad /private/var read subtree")
+	if !strings.Contains(profile, "(allow file-read*)\n") {
+		t.Fatal("Seatbelt profile did not grant default host reads")
+	}
+	if !strings.Contains(profile, `(deny file-read* file-write* (subpath "/private/var"))`) {
+		t.Fatal("explicitly denied directory was not excluded from broad reads")
 	}
 	for _, root := range [...]string{"/bin", "/usr/bin", "/sbin", "/usr/sbin"} {
 		want := fmt.Sprintf(`(allow file-read-metadata file-test-existence (require-all (subpath "%s")`, root)
 		if !strings.Contains(profile, want) {
-			t.Fatalf("strict profile lacks narrow PATH lookup rule for %s: %s", root, profile)
+			t.Fatalf("Seatbelt profile lacks narrow PATH lookup rule for %s: %s", root, profile)
 		}
-	}
-	if strings.Contains(profile, `(allow file-read* (subpath "/usr/bin"`) || strings.Contains(profile, `(allow file-read* (subpath "/sbin"`) {
-		t.Fatal("strict profile granted broad data reads for a system executable root")
 	}
 }
 
@@ -286,7 +303,7 @@ func TestInWorkspaceSymlinkEscapeCanonicalPath(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(dir, "evil")); err != nil {
 		t.Skip("symlink not supported:", err)
 	}
-	s := New(dir, ModeConfine)
+	s := New(dir)
 
 	// Use the resolved workspace root as the base so the path is lexically
 	// inside the workspace (the earlier check only caught the unresolved
@@ -314,7 +331,7 @@ func TestInWorkspaceDisallowedViaSymlink(t *testing.T) {
 	if err := os.Symlink(secret, filepath.Join(dir, "slink")); err != nil {
 		t.Skip("symlink not supported:", err)
 	}
-	s := New(dir, ModeConfine)
+	s := New(dir)
 	s.AddDisallowedDir(secret)
 	// Even though the path is lexically inside the workspace, it resolves into
 	// the disallowed dir and must be blocked.
@@ -323,30 +340,9 @@ func TestInWorkspaceDisallowedViaSymlink(t *testing.T) {
 	}
 }
 
-func TestWrapCommandRunsInsideShC(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("sandbox-exec is macOS-only")
-	}
-	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
-		t.Skip("sandbox-exec not available")
-	}
-	dir := t.TempDir()
-	s := New(dir, ModeStrict)
-	s.Limits = &Limits{CPUSeconds: 30}
-	w := s.WrapCommand("ulimit -t 30 && echo hi && echo done")
-	// The entire command line (ulimit prefix included) must be the argument of
-	// a /bin/sh -c inside the sandbox, not appended after `--`.
-	if !strings.Contains(w, "-- /bin/sh -c ") {
-		t.Fatalf("expected sandbox-exec to exec /bin/sh -c, got %q", w)
-	}
-	if !strings.Contains(w, `'ulimit -t 30 && echo hi && echo done'`) {
-		t.Errorf("full command line must be quoted inside sh -c: %q", w)
-	}
-}
-
 func TestSandboxConcurrentAccess(t *testing.T) {
 	dir := t.TempDir()
-	s := New(dir, ModeConfine)
+	s := New(dir)
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -357,13 +353,64 @@ func TestSandboxConcurrentAccess(t *testing.T) {
 				_, _ = s.ResolveRead("a/b.txt")
 				_, _ = s.ResolveWrite("a/b.txt")
 				_ = s.InWorkspace(filepath.Join(dir, "x"))
-				_ = s.CurrentMode()
 				s.AddDir(filepath.Join(dir, "extra"))
 				s.AddDisallowedDir(filepath.Join(dir, "bad"))
-				s.SetMode(ModeStrict)
-				s.SetMode(ModeConfine)
+				s.AddReadOnlyDir(filepath.Join(dir, "readonly"))
+				s.SetAllowNetwork(j%2 == 0)
 			}
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestExecutionWitnessAndPolicyTightening(t *testing.T) {
+	workspace := t.TempDir()
+	grant := t.TempDir()
+	old := New(workspace)
+	old.AddDir(grant)
+	old.SetAllowNetwork(true)
+	old.AddDisallowedDir(filepath.Join(workspace, "blocked"))
+	if err := old.AddLocalService(LocalService{Direction: "connect", Protocol: "tcp", Port: 9000}); err != nil {
+		t.Fatal(err)
+	}
+
+	widened := old.Snapshot()
+	widened.AddDir(t.TempDir())
+	if PolicyTightened(old, widened) {
+		t.Fatal("adding an authorized directory was classified as tightening")
+	}
+
+	readOnly := old.Snapshot()
+	readOnly.AddReadOnlyDir(filepath.Join(workspace, "read-only"))
+	if !PolicyTightened(old, readOnly) {
+		t.Fatal("adding a read-only carveout inside writable workspace was not classified as tightening")
+	}
+
+	protected := old.Snapshot()
+	protected.AddProtectedDir(filepath.Join(workspace, "control"))
+	if !PolicyTightened(old, protected) {
+		t.Fatal("adding a protected control path was not classified as tightening")
+	}
+
+	entry := old.Snapshot()
+	entry.AddProtectedEntry(filepath.Join(workspace, ".git"))
+	if !PolicyTightened(old, entry) {
+		t.Fatal("adding a protected directory entry was not classified as tightening")
+	}
+
+	narrowed := old.Snapshot()
+	narrowed.AdditionalDirs = nil
+	narrowed.SetAllowNetwork(false)
+	if !PolicyTightened(old, narrowed) {
+		t.Fatal("removing a directory/network grant was not classified as tightening")
+	}
+
+	derived := old.Snapshot()
+	derived.MarkExternalExecution()
+	if !old.ExternalExecutionPossible() {
+		t.Fatal("execution witness did not survive a detached policy snapshot")
+	}
+	if !derived.ExternalExecutionPossible() {
+		t.Fatal("execution witness is not sticky")
+	}
 }

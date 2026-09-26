@@ -48,6 +48,15 @@ func (a *Agent) ReloadSettings() error {
 
 type settingsCandidate struct {
 	cfg config.Config
+	// sourceSandboxRevision binds preparation to the live policy generation it
+	// observed. A candidate must not overwrite a policy published while its
+	// project/provider inputs were being resolved outside settingsCommitMu.
+	sourceSandboxRevision uint64
+	// sourceSettingsRevision is the monotonic publication epoch. Sandbox.Revision
+	// is also used by standalone snapshots and can legitimately be reset to a
+	// lower settings revision after initialization, so it cannot prevent ABA on
+	// its own.
+	sourceSettingsRevision uint64
 	// binding is resolved against the candidate config and a cloned provider
 	// registry. Keeping it with cfg prevents a reload that changes context or
 	// output limits from leaving the active binding's capability wrapper on the
@@ -68,6 +77,12 @@ func (a *Agent) prepareSettingsCandidate(workspace string) (*settingsCandidate, 
 	store := a.trustStore
 	active := a.activeBinding
 	models := a.models
+	oldSandbox := a.sandbox
+	sourceSettingsRevision := a.settingsRev
+	sourceSandboxRevision := uint64(0)
+	if oldSandbox != nil {
+		sourceSandboxRevision = oldSandbox.Snapshot().Revision
+	}
 	a.mu.Unlock()
 	if store == nil {
 		store = config.DefaultTrustStore()
@@ -95,13 +110,11 @@ func (a *Agent) prepareSettingsCandidate(workspace string) (*settingsCandidate, 
 	if err != nil {
 		return nil, err
 	}
-	if _, err := sandbox.ParseMode(effective.SandboxMode); err != nil {
-		return nil, err
-	}
 	if _, err := filepath.Abs(workspace); err != nil {
 		return nil, err
 	}
 	sb := buildSandbox(&effective, workspace)
+	sb.ShareExecutionGuard(oldSandbox)
 	customPerms := make(map[string]string)
 	for _, spec := range effective.Tools {
 		name := strings.TrimSpace(spec.Name)
@@ -127,6 +140,7 @@ func (a *Agent) prepareSettingsCandidate(workspace string) (*settingsCandidate, 
 		binding = active
 	}
 	return &settingsCandidate{cfg: effective, binding: binding, mode: mode, sandbox: sb,
+		sourceSandboxRevision: sourceSandboxRevision, sourceSettingsRevision: sourceSettingsRevision,
 		hooks: cloneHookConfig(effective.Hooks), webTools: effective.WebToolsEnabled(),
 		tools: cloneToolSpecs(effective.Tools), customPerms: customPerms,
 		mcpServers: cloneMCPConfig(effective.MCPServers)}, nil
@@ -265,7 +279,24 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	a.settingsCommitMu.Lock()
 	defer a.settingsCommitMu.Unlock()
 	a.mu.Lock()
+	if a.capabilityRevoking {
+		a.mu.Unlock()
+		return fmt.Errorf("sandbox capability revocation is in progress")
+	}
 	oldCfg := a.cfg.Clone()
+	oldSandbox := a.sandbox
+	sandboxPolicyChanged := oldCfg.NetworkAccess != candidate.cfg.NetworkAccess ||
+		!equalStringSlice(oldCfg.AdditionalDirectories, candidate.cfg.AdditionalDirectories) ||
+		!equalStringSlice(oldCfg.AdditionalReadOnlyDirectories, candidate.cfg.AdditionalReadOnlyDirectories) ||
+		!equalStringSlice(oldCfg.DisallowedDirectories, candidate.cfg.DisallowedDirectories)
+	currentSandboxRevision := uint64(0)
+	if oldSandbox != nil {
+		currentSandboxRevision = oldSandbox.Snapshot().Revision
+	}
+	if currentSandboxRevision != candidate.sourceSandboxRevision || a.settingsRev != candidate.sourceSettingsRevision {
+		a.mu.Unlock()
+		return fmt.Errorf("settings changed while candidate was being prepared")
+	}
 	oldMCP := cloneMCPConfig(oldCfg.MCPServers)
 	binding := candidate.binding
 	if binding.client == nil {
@@ -302,6 +333,36 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	}
 	a.mu.Unlock()
 
+	policyTightened := oldSandbox != nil && sandbox.PolicyTightened(oldSandbox, candidate.sandbox)
+	quiesced := false
+	durable := false
+	policyPublished := false
+	if policyTightened {
+		// Tightening always invalidates and joins old work. The sticky witness
+		// controls whether success can be confirmed, not whether this protocol
+		// runs at all.
+		if err := a.quiesceForSandboxSettingsChange(ctx, false); err != nil {
+			return fmt.Errorf("sandbox settings change cannot be confirmed because old-policy descendants may remain: %w", err)
+		}
+		quiesced = true
+	}
+	defer func() {
+		if !quiesced || durable || policyPublished {
+			return
+		}
+		a.mu.Lock()
+		uncertain := a.sandbox != nil && a.sandbox.ExternalExecutionPossible()
+		resources := a.resources
+		if !uncertain {
+			a.capabilityRevoking = false
+			a.capabilityRevision++
+		}
+		a.mu.Unlock()
+		if !uncertain && resources != nil && resources.Processes != nil {
+			resources.Processes.ResumeAfterRevocation()
+		}
+	}()
+
 	// Start and handshake candidate MCP resources without publishing them. The
 	// durable settings fact below is the admission point; Abort closes every
 	// started candidate if that write fails and leaves the old generation live.
@@ -326,6 +387,7 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	if err := a.persistSettingsWorkflowFact(settings, nextRevision, &workflow); err != nil {
 		return err
 	}
+	durable = true
 	if mcpCandidate != nil {
 		if err := mcpCandidate.Commit(); err != nil {
 			// refreshMu makes this impossible while the Agent owns the candidate,
@@ -378,7 +440,18 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	a.workflow = protocol.WorkflowState(workflow.Phase)
 	a.cfg.PermissionMode = string(permissionMode)
 	a.settingsRev = nextRevision
+	if policyTightened {
+		clear(a.capabilityGrants)
+		a.capabilityRevision++
+		a.capabilityRevoking = false
+	} else if sandboxPolicyChanged {
+		a.capabilityRevision++
+	}
+	resources := a.resources
 	a.mu.Unlock()
+	if policyTightened && resources != nil && resources.Processes != nil {
+		resources.Processes.ResumeAfterRevocation()
+	}
 	a.perms.SetMode(permissionMode)
 	a.perms.SetPolicy(candidate.cfg.PermissionPolicy())
 	a.hooks.Update(cloneHookConfig(candidate.hooks))
@@ -388,6 +461,7 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	// through CreateContext/RestoreContext below.
 	a.checkpoints.SetExecutionBoundary(a.rootCtx, candidate.sandbox)
 	a.syncHookContext()
+	policyPublished = true
 	return nil
 }
 
@@ -413,10 +487,9 @@ func (a *Agent) settingsForCandidateLocked(candidate *settingsCandidate, permiss
 	settings.PermissionPolicy = string(permissionMode)
 	settings.AlwaysAllow = append([]string(nil), candidate.cfg.AlwaysAllow...)
 	settings.AlwaysDeny = append([]string(nil), candidate.cfg.AlwaysDeny...)
-	settings.SandboxPolicy = candidate.cfg.SandboxMode
-	settings.AllowNetwork = candidate.cfg.SandboxAllowNetwork
-	settings.AllowNetworkSet = true
+	settings.NetworkAccess = candidate.cfg.NetworkAccess
 	settings.AdditionalDirectories = append([]string(nil), candidate.cfg.AdditionalDirectories...)
+	settings.AdditionalReadOnlyDirectories = append([]string(nil), candidate.cfg.AdditionalReadOnlyDirectories...)
 	settings.DisallowedDirectories = append([]string(nil), candidate.cfg.DisallowedDirectories...)
 	settings.ContextWindow = candidate.cfg.ContextWindow
 	settings.EffectiveContextWindow = candidate.cfg.ContextWindowFor(candidate.cfg.Model)
@@ -531,21 +604,31 @@ func (a *Agent) setWorkspaceContext(ctx context.Context, abs string) error {
 // config.Config.Sandbox but for an arbitrary workspace, without touching the
 // config package).
 func buildSandbox(cfg *config.Config, dir string) *sandbox.Sandbox {
-	mode, err := sandbox.ParseMode(cfg.SandboxMode)
-	if err != nil {
-		mode = sandbox.ModeConfine
-	}
-	s := sandbox.New(dir, mode)
+	s := sandbox.New(dir)
 	if cfg.SandboxLimits != nil {
 		lim := *cfg.SandboxLimits
 		s.Limits = &lim
 	}
-	s.AllowNetwork = cfg.SandboxAllowNetwork
+	s.AllowNetwork = cfg.NetworkAccess
 	for _, d := range cfg.AdditionalDirectories {
 		s.AddDir(d)
 	}
+	for _, d := range cfg.AdditionalReadOnlyDirectories {
+		s.AddReadOnlyDir(d)
+	}
 	for _, d := range cfg.DisallowedDirectories {
 		s.AddDisallowedDir(d)
+	}
+	gitRoots := append([]string{s.Workspace}, s.AdditionalDirs...)
+	for _, root := range gitRoots {
+		for _, path := range sandbox.GitControlPaths(root) {
+			if s.InWorkspace(path) {
+				s.AddProtectedDir(path)
+			}
+		}
+		for _, path := range sandbox.GitControlEntryPaths(root) {
+			s.AddProtectedEntry(path)
+		}
 	}
 	if cfg.SessionDir != "" {
 		s.AddDisallowedDir(cfg.SessionDir)

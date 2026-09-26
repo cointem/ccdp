@@ -214,21 +214,26 @@ type runtimeData struct {
 	runOnce        sync.Once
 	turnWG         sync.WaitGroup
 	operationWG    sync.WaitGroup
-	compactCancel  context.CancelFunc
-	compactFailure *compactFailureState
-	closeOnce      sync.Once
-	closeDone      chan struct{}
-	closeErr       error
-	commands       chan runtimeCommand
-	eventQueue     chan Event
-	eventDone      chan struct{}
-	eventWG        sync.WaitGroup
-	closing        bool
-	closed         bool
-	settling       bool // terminal event published before a queued turn starts
-	phase          protocol.RuntimePhase
-	workflow       protocol.WorkflowState
-	lastTurn       *protocol.TurnOutcome
+	// sandboxOperationWG tracks scheduled work that must finish before a
+	// tightened policy is published. Settings-mutating owner operations are
+	// excluded because their context may be the operation performing the
+	// publication; admission freezes all later additions once revocation starts.
+	sandboxOperationWG sync.WaitGroup
+	compactCancel      context.CancelFunc
+	compactFailure     *compactFailureState
+	closeOnce          sync.Once
+	closeDone          chan struct{}
+	closeErr           error
+	commands           chan runtimeCommand
+	eventQueue         chan Event
+	eventDone          chan struct{}
+	eventWG            sync.WaitGroup
+	closing            bool
+	closed             bool
+	settling           bool // terminal event published before a queued turn starts
+	phase              protocol.RuntimePhase
+	workflow           protocol.WorkflowState
+	lastTurn           *protocol.TurnOutcome
 }
 
 type Agent struct {
@@ -255,6 +260,7 @@ type Agent struct {
 
 	// approvalState groups per-turn approval bookkeeping. Guarded by mu.
 	approvalState
+	capabilityState
 
 	// Plan mode (Claude Code's /plan): while on, the model only proposes a plan;
 	// mutating tools are blocked until the user approves it.
@@ -324,6 +330,14 @@ type Agent struct {
 	watchState
 }
 
+type capabilityState struct {
+	// Session grants exist only in memory. Recovery initializes this map empty,
+	// so prior approval events cannot restore a capability.
+	capabilityGrants   map[string]protocol.CapabilityRequest
+	capabilityRevision uint64
+	capabilityRevoking bool
+}
+
 type modelBinding struct {
 	model      string
 	provider   string // resolved provider/adapter name
@@ -356,8 +370,9 @@ type runtimeWatcher struct {
 }
 
 type approvalAnswer struct {
-	approve  bool
-	remember bool
+	approve         bool
+	remember        bool
+	capabilityScope protocol.CapabilityScope
 	// persisted is set by applyApproveTool, which commits the resolution before
 	// waking the waiting tool. Direct package tests/legacy callers leave it
 	// false, so requestApproval persists their answer itself.
@@ -420,12 +435,10 @@ func agentOptionsRequireIsolation(opts Options) bool {
 	return opts.Purpose != "" || opts.AllowedTools != nil || opts.NonInteractive || opts.ParentSessionID != ""
 }
 
-// applySessionSettingsToConfig restores the credential-free settings snapshot
-// before providers, permissions, and the sandbox are constructed.  The
-// session log is authoritative for mutable session policy; credentials and
-// opaque provider configuration deliberately remain sourced from the current
-// process configuration. A provider record owns its endpoint and credential
-// together, so neither is ever restored or re-paired from the log here.
+// applySessionSettingsToConfig restores credential-free settings under the
+// current process configuration's authorization ceiling. Prior session
+// settings may tighten today's baseline, but cannot restore network or
+// directory access that the current configuration no longer authorizes.
 func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings) {
 	if cfg == nil {
 		return
@@ -447,12 +460,7 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 	if settings.ExecutionMode == string(permissions.ExecutionModePlan) {
 		cfg.PermissionMode = string(permissions.ModePlan)
 	}
-	if settings.SandboxPolicy != "" {
-		cfg.SandboxMode = settings.SandboxPolicy
-	}
-	if settings.AllowNetworkSet || settings.AllowNetwork {
-		cfg.SandboxAllowNetwork = settings.AllowNetwork
-	}
+	cfg.NetworkAccess = cfg.NetworkAccess && settings.NetworkAccess
 	if settings.AlwaysAllow != nil {
 		cfg.AlwaysAllow = append([]string(nil), settings.AlwaysAllow...)
 	}
@@ -460,10 +468,13 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 		cfg.AlwaysDeny = append([]string(nil), settings.AlwaysDeny...)
 	}
 	if settings.AdditionalDirectories != nil {
-		cfg.AdditionalDirectories = append([]string(nil), settings.AdditionalDirectories...)
+		cfg.AdditionalDirectories = intersectSandboxDirectories(cfg.AdditionalDirectories, settings.AdditionalDirectories)
+	}
+	if settings.AdditionalReadOnlyDirectories != nil {
+		cfg.AdditionalReadOnlyDirectories = intersectSandboxDirectories(cfg.AdditionalReadOnlyDirectories, settings.AdditionalReadOnlyDirectories)
 	}
 	if settings.DisallowedDirectories != nil {
-		cfg.DisallowedDirectories = append([]string(nil), settings.DisallowedDirectories...)
+		cfg.DisallowedDirectories = appendUniqueSandboxDirectories(cfg.DisallowedDirectories, settings.DisallowedDirectories)
 	}
 	if settings.ContextWindow > 0 {
 		cfg.ContextWindow = settings.ContextWindow
@@ -487,6 +498,57 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 	if settings.MaxToolOutputCharsPerTurn > 0 {
 		cfg.MaxToolOutputCharsPerTurn = settings.MaxToolOutputCharsPerTurn
 	}
+}
+
+func intersectSandboxDirectories(current, saved []string) []string {
+	allowed := make(map[string]string, len(current))
+	for _, path := range current {
+		if canonical := canonicalSandboxDirectory(path); canonical != "" {
+			allowed[canonical] = path
+		}
+	}
+	seen := make(map[string]bool, len(saved))
+	result := make([]string, 0, len(saved))
+	for _, path := range saved {
+		canonical := canonicalSandboxDirectory(path)
+		if currentPath, ok := allowed[canonical]; ok && !seen[canonical] {
+			result = append(result, currentPath)
+			seen[canonical] = true
+		}
+	}
+	return result
+}
+
+func appendUniqueSandboxDirectories(left, right []string) []string {
+	result := append([]string(nil), left...)
+	seen := make(map[string]bool, len(left)+len(right))
+	for _, path := range left {
+		if canonical := canonicalSandboxDirectory(path); canonical != "" {
+			seen[canonical] = true
+		}
+	}
+	for _, path := range right {
+		canonical := canonicalSandboxDirectory(path)
+		if canonical != "" && !seen[canonical] {
+			result = append(result, path)
+			seen[canonical] = true
+		}
+	}
+	return result
+}
+
+func canonicalSandboxDirectory(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+	return filepath.Clean(abs)
 }
 
 // newAgentWithOptions is the shared construction path for the main session,
@@ -575,7 +637,8 @@ func newAgentWithOptions(cfg *config.Config, evCh chan Event, initial *SessionSn
 			deferTools:  map[string]bool{},
 			discovered:  map[string]bool{},
 		},
-		approvalState: approvalState{approvalCache: map[string]bool{}},
+		approvalState:   approvalState{approvalCache: map[string]bool{}},
+		capabilityState: capabilityState{capabilityGrants: map[string]protocol.CapabilityRequest{}},
 		modelState: modelState{
 			primaryBinding:  host.primaryBinding,
 			fallbackBinding: host.fallbackBinding,
@@ -816,7 +879,7 @@ func (a *Agent) finalizeConstruction(initial *SessionSnapshot, opts Options, iso
 		return err
 	}
 	a.initExecutionMode(initial)
-	if err := a.startSessionServices(rootCancel, isolated); err != nil {
+	if err := a.startSessionServices(rootCancel, isolated, opts.CapabilityCeiling, opts.ExecutionGuard); err != nil {
 		return err
 	}
 	a.finalizeToolsAndSkills(isolated)
@@ -838,12 +901,17 @@ func (a *Agent) applySessionLineage(opts Options, isolated bool) {
 	}
 	a.childSlots = newChildSlots(a.cfg.MaxParallelTools)
 	if isolated {
+		ceiling := make(map[string]bool, len(opts.CapabilityCeiling))
+		for _, capability := range opts.CapabilityCeiling {
+			ceiling[capabilityKey(capability)] = true
+		}
 		a.childState = &childRuntimeState{
-			purpose:        opts.Purpose,
-			nonInteractive: opts.NonInteractive,
-			allowed:        cloneChildAllowed(opts.AllowedTools),
-			parentSession:  opts.ParentSessionID,
-			perms:          a.perms,
+			purpose:           opts.Purpose,
+			nonInteractive:    opts.NonInteractive,
+			allowed:           cloneChildAllowed(opts.AllowedTools),
+			parentSession:     opts.ParentSessionID,
+			perms:             a.perms,
+			capabilityCeiling: ceiling,
 		}
 	}
 }
@@ -973,12 +1041,26 @@ func (a *Agent) initExecutionMode(initial *SessionSnapshot) {
 // stack. MCP startup and SessionStart run only after every configured server
 // has completed its handshake, so a failed candidate never produces a visible
 // hook side effect.
-func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated bool) error {
+func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated bool, inheritedCapabilities []protocol.CapabilityRequest, inheritedExecutionGuard *sandbox.ExecutionGuard) error {
 	if a.events != nil {
 		a.eventWG.Add(1)
 		go a.eventLoop()
 	}
 	a.sandbox = a.cfg.Sandbox()
+	a.sandbox.SetExecutionGuard(inheritedExecutionGuard)
+	if a.resources != nil {
+		// Execution caches and temporary files live for this session only. The
+		// directory is created by the harness and removed when Resources.Close
+		// shuts down the session; subprocess invocations never receive host /tmp.
+		if scratch := a.resources.ScratchDir(); scratch != "" {
+			a.sandbox.AddScratchDir(scratch)
+		}
+	}
+	for _, capability := range inheritedCapabilities {
+		if err := applyCapability(a.sandbox, capability); err != nil {
+			return fmt.Errorf("inherit parent sandbox capability: %w", err)
+		}
+	}
 	a.checkpoints.SetExecutionBoundary(a.rootCtx, a.sandbox)
 	a.hooks = hooks.NewManager(a.cfg.Hooks, hooks.Options{SessionID: a.sessionID, Workspace: a.cfg.Workspace, Mode: a.cfg.PermissionMode, Sandbox: a.sandbox, FailClosed: true})
 	a.mcp.SetSandbox(a.sandbox)
@@ -1099,13 +1181,21 @@ func (a *Agent) CheckpointList() []checkpoint.Record { return a.checkpoints.List
 
 // AddDirectory grants the sandbox access to an extra directory at runtime.
 func (a *Agent) AddDirectory(dir string) {
-	a.sandbox.AddDir(dir)
+	a.mu.Lock()
+	if a.sandbox != nil {
+		a.sandbox.AddDir(dir)
+	}
+	a.mu.Unlock()
 	a.emitStatus("additional directory: %s", dir)
 }
 
 // AddDisallowedDirectory blocks a directory at runtime.
 func (a *Agent) AddDisallowedDirectory(dir string) {
-	a.sandbox.AddDisallowedDir(dir)
+	a.mu.Lock()
+	if a.sandbox != nil {
+		a.sandbox.AddDisallowedDir(dir)
+	}
+	a.mu.Unlock()
 	a.emitStatus("disallowed directory: %s", dir)
 }
 
@@ -1255,11 +1345,6 @@ func (a *Agent) syncHookContext() {
 	sessionID, ws := a.sessionID, a.cfg.Workspace
 	a.mu.Unlock()
 	a.hooks.SetContext(sessionID, ws, string(a.perms.CurrentMode()))
-}
-
-// SandboxMode returns the active sandbox mode.
-func (a *Agent) SandboxMode() sandbox.Mode {
-	return a.currentSandbox().CurrentMode()
 }
 
 // Usage returns a snapshot of the session's token/cost accounting.
@@ -1444,6 +1529,7 @@ func (a *Agent) Run() {
 // runTurn processes one user message through the full agent loop:
 // Infer → ToolDispatch → ApprovalGate → Compact.
 func (a *Agent) runTurn(input turnInput) {
+	startedAt := time.Now()
 	defer a.turnWG.Done()
 	// turnFinished may hand off to a queued follow-up and add another turn to
 	// the same WaitGroup. Keep this turn counted until that hand-off has either
@@ -1491,7 +1577,7 @@ func (a *Agent) runTurn(input turnInput) {
 				outcome = "cancelled"
 			}
 		}
-		if err := a.persistTurnFinished(turnID, outcome, finishErr); err != nil {
+		if err := a.persistTurnFinished(turnID, outcome, finishErr, time.Since(startedAt)); err != nil {
 			a.failTurnPersistence(err)
 		}
 	}()
@@ -2259,8 +2345,43 @@ func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournal
 	if denied {
 		return out, true
 	}
+	policy, requestedCapabilities, policyVersion, capErr := a.toolCapabilityPolicy(tc)
+	if capErr != nil {
+		a.emit(toolEvent(tc, "denied", capErr.Error()))
+		return "permission denied: " + capErr.Error(), true
+	}
+	approveCapabilities := func(reason string) bool {
+		if len(requestedCapabilities) == 0 {
+			return true
+		}
+		updated, updatedVersion, approved, _ := a.approveToolWithCapabilities(tc, reason, policy, policyVersion, requestedCapabilities)
+		if !approved {
+			return false
+		}
+		policy = updated
+		policyVersion = updatedVersion
+		requestedCapabilities = nil
+		return true
+	}
+	runApproved := func() (string, bool) {
+		if !a.capabilityApprovalCurrent(policyVersion) {
+			a.mu.Lock()
+			revocationPending := a.capabilityRevoking
+			a.mu.Unlock()
+			if revocationPending {
+				return "permission denied: sandbox capability revocation is pending; inspect /sandbox; this call was not run", true
+			}
+			return "permission denied: sandbox policy changed; retry the tool under the current policy", true
+		}
+		return a.runToolWithJournalPolicy(tc, tool, journal, execution, policy)
+	}
+	var approved, remember bool
 	if runNow {
-		return a.runToolWithJournal(tc, tool, journal, execution)
+		if !approveCapabilities("This tool needs additional sandbox access") {
+			a.emit(toolEvent(tc, "denied", "additional sandbox access was not approved"))
+			return "permission denied: additional sandbox access was not approved", true
+		}
+		return runApproved()
 	}
 
 	// In-process Go hooks run first; their verdict can veto the call.
@@ -2273,7 +2394,7 @@ func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournal
 			a.emit(toolEvent(tc, "denied", reason))
 			return fmt.Sprintf("blocked by hook: %s", reason), true
 		case plugin.DecisionAsk:
-			approved, remember := a.requestApproval(tc, "Go hook requests approval")
+			policy, policyVersion, approved, remember = a.approveToolWithCapabilities(tc, "Go hook requests approval", policy, policyVersion, requestedCapabilities)
 			if !approved {
 				a.emit(toolEvent(tc, "denied", reason))
 				return fmt.Sprintf("permission denied: %s", reason), true
@@ -2281,8 +2402,12 @@ func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournal
 			if remember {
 				a.perms.RememberAllow(permissions.SessionKey(tc.Name, tc.Arguments))
 			}
+			requestedCapabilities = nil
 		case plugin.DecisionAllow:
-			return a.runToolWithJournal(tc, tool, journal, execution)
+			if !approveCapabilities("This tool needs additional sandbox access") {
+				return "permission denied: additional sandbox access was not approved", true
+			}
+			return runApproved()
 		}
 	}
 
@@ -2299,7 +2424,7 @@ func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournal
 			a.emit(toolEvent(tc, "denied", reason))
 			return fmt.Sprintf("blocked by hook: %s", reason), true
 		case hooks.DecisionAsk:
-			approved, remember := a.requestApproval(tc, "PreToolUse hook requests approval")
+			policy, policyVersion, approved, remember = a.approveToolWithCapabilities(tc, "PreToolUse hook requests approval", policy, policyVersion, requestedCapabilities)
 			if !approved {
 				reason := "denied by user after hook request"
 				if ho.Reason != "" {
@@ -2311,9 +2436,13 @@ func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournal
 			if remember {
 				a.perms.RememberAllow(permissions.SessionKey(tc.Name, tc.Arguments))
 			}
+			requestedCapabilities = nil
 		case hooks.DecisionAllow:
 			// Hook already approved; skip the permission gate.
-			return a.runToolWithJournal(tc, tool, journal, execution)
+			if !approveCapabilities("This tool needs additional sandbox access") {
+				return "permission denied: additional sandbox access was not approved", true
+			}
+			return runApproved()
 		}
 	}
 
@@ -2323,7 +2452,7 @@ func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournal
 		a.emit(toolEvent(tc, "denied", ""))
 		return fmt.Sprintf("permission denied: %s", reason), true
 	case permissions.DecisionAsk:
-		approved, remember := a.requestApproval(tc, reason)
+		policy, policyVersion, approved, remember = a.approveToolWithCapabilities(tc, reason, policy, policyVersion, requestedCapabilities)
 		if remember {
 			key := permissions.SessionKey(tc.Name, tc.Arguments)
 			if approved {
@@ -2332,13 +2461,19 @@ func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournal
 				a.perms.RememberDeny(key)
 			}
 		}
+		requestedCapabilities = nil
 		if !approved {
 			a.emit(toolEvent(tc, "denied", ""))
 			return fmt.Sprintf("permission denied by user: %s", reason), true
 		}
+	case permissions.DecisionAllow:
+		if !approveCapabilities("This tool needs additional sandbox access") {
+			a.emit(toolEvent(tc, "denied", "additional sandbox access was not approved"))
+			return "permission denied: additional sandbox access was not approved", true
+		}
 	}
 
-	return a.runToolWithJournal(tc, tool, journal, execution)
+	return runApproved()
 }
 
 // hardAdmitTool resolves the frozen tool implementation and applies the
@@ -2383,17 +2518,6 @@ func (a *Agent) hardAdmitTool(tc messages.ToolCall, journal toolJournalContext, 
 		return nil, fmt.Sprintf("permission denied: %s", reason), false, true
 	}
 
-	// Sandbox × approval linkage: in strict sandbox mode, network tools are
-	// blocked unless network access was explicitly allowed (Codex's
-	// sandbox_mode ↔ approval matrix).
-	if sb := a.currentSandbox(); sb != nil && sb.CurrentMode() == sandbox.ModeStrict && !sb.AllowNetwork {
-		switch tc.Name {
-		case "WebFetch", "WebSearch":
-			a.emit(toolEvent(tc, "denied", "network blocked by strict sandbox"))
-			return nil, fmt.Sprintf("permission denied: %s needs network access, which strict sandbox mode blocks (set sandbox_allow_network: true to permit)", tc.Name), false, true
-		}
-	}
-
 	// Custom tools may carry a config-level permission override that bypasses
 	// the normal approval gate ("allow" runs it, "deny" refuses it).
 	if perm, isCustom := a.customPerms[tc.Name]; isCustom {
@@ -2415,10 +2539,20 @@ func (a *Agent) runTool(tc messages.ToolCall, tool tools.Tool) (string, bool) {
 }
 
 func (a *Agent) runToolWithJournal(tc messages.ToolCall, tool tools.Tool, journal toolJournalContext, execution *toolJournalExecution) (string, bool) {
+	return a.runToolWithJournalPolicy(tc, tool, journal, execution, nil)
+}
+
+func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, journal toolJournalContext, execution *toolJournalExecution, invocationPolicy *sandbox.Sandbox) (string, bool) {
 	a.mu.Lock()
 	cfg := cloneConfig(a.cfg)
 	turnCtx := a.turnCtx
-	sb := a.sandbox
+	sb := invocationPolicy
+	if sb == nil {
+		sb = a.sandbox
+	}
+	if sb != nil {
+		sb = sb.Snapshot()
+	}
 	resources := a.resources
 	skills := a.skills
 	a.mu.Unlock()
@@ -2531,6 +2665,7 @@ func (a *Agent) runToolWithJournal(tc messages.ToolCall, tool tools.Tool, journa
 // streaming output sink. The registry/MCP leases are already frozen at the step
 // boundary, so this context cannot observe a mid-stream plugin update.
 func (a *Agent) buildToolContext(tc messages.ToolCall, turnCtx context.Context, cfg config.Config, sb *sandbox.Sandbox, resources *tools.Resources, skills *skills.Store) *tools.Context {
+	sb = sb.Snapshot()
 	var tctx *tools.Context
 	if resources != nil {
 		tctx = resources.Context(turnCtx, cfg.Workspace, sb)
@@ -2539,7 +2674,14 @@ func (a *Agent) buildToolContext(tc messages.ToolCall, turnCtx context.Context, 
 		// New sessions always own a Resources container.
 		tctx = &tools.Context{Context: turnCtx, WorkingDir: cfg.Workspace, SessionDir: cfg.SessionDir, Sandbox: sb}
 	}
-	tctx.Args = tc.Arguments
+	tctx.Args = make(map[string]any, len(tc.Arguments))
+	for name, value := range tc.Arguments {
+		if name == "requested_capabilities" {
+			continue
+		}
+		tctx.Args[name] = value
+	}
+	tctx.HostNetworkAllowed = sb != nil && sb.NetworkAllowed()
 	tctx.Timeout = cfg.BashTimeout()
 	if a.childState == nil {
 		tctx.Sessions = a.Sessions()
@@ -2581,12 +2723,17 @@ func (a *Agent) buildToolContext(tc messages.ToolCall, turnCtx context.Context, 
 // the first answer instead of re-prompting. The cache lives only for the
 // current turn; lasting grants go through the remember flag / permission rules.
 func (a *Agent) requestApproval(tc messages.ToolCall, reason string) (bool, bool) {
+	answer := a.requestApprovalDetailed(tc, reason, nil)
+	return answer.approve, answer.remember
+}
+
+func (a *Agent) requestApprovalDetailed(tc messages.ToolCall, reason string, capabilities []protocol.CapabilityRequest) approvalAnswer {
 	// Non-interactive child/guardian sessions have no consumer for an approval
 	// event. Deny synchronously instead of publishing a request that would hang
 	// the child forever. ChildToolGate normally catches this before reaching
 	// here; this guard also covers hook and direct package-level callers.
 	if a != nil && a.childState != nil && a.childState.nonInteractive {
-		return false, false
+		return approvalAnswer{}
 	}
 	a.approvalMu.Lock()
 	defer a.approvalMu.Unlock()
@@ -2596,25 +2743,30 @@ func (a *Agent) requestApproval(tc messages.ToolCall, reason string) (bool, bool
 	// always stored its answer by the time a second worker gets here.
 	key := permissions.SessionKey(tc.Name, tc.Arguments)
 	a.mu.Lock()
-	if dec, ok := a.approvalCache[key]; ok {
+	if dec, ok := a.approvalCache[key]; ok && len(capabilities) == 0 {
 		a.mu.Unlock()
 		if dec {
 			a.emitStatus("auto-approved %s (same call was already approved this turn)", tc.Name)
 		}
-		return dec, false
+		return approvalAnswer{approve: dec}
 	}
 	a.mu.Unlock()
 
-	req := &ApprovalRequest{
-		ID:      tc.ID,
-		Tool:    tc.Name,
-		Command: prettyArgs(tc.Arguments),
-		Reason:  reason,
+	displayReason := reason
+	if len(capabilities) > 0 {
+		displayReason = strings.TrimSpace(displayReason + "\n" + formatCapabilityRequests(capabilities))
 	}
-	typedRequest := toolApprovalRequest(a, tc, reason)
+	req := &ApprovalRequest{
+		ID:           tc.ID,
+		Tool:         tc.Name,
+		Command:      prettyArgs(tc.Arguments),
+		Reason:       displayReason,
+		Capabilities: append([]protocol.CapabilityRequest(nil), capabilities...),
+	}
+	typedRequest := toolApprovalRequest(a, tc, reason, capabilities)
 	req.journalID = typedRequest.ApprovalID
 	if err := a.persistApprovalRequested(typedRequest); err != nil {
-		return false, false
+		return approvalAnswer{}
 	}
 	a.mu.Lock()
 	a.pendingApproval = req
@@ -2653,23 +2805,27 @@ func (a *Agent) requestApproval(tc messages.ToolCall, reason string) (bool, bool
 				// will deliver its answer through this channel; this branch can
 				// only be reached for a stale direct sender, so do not write a
 				// second ApprovalResolved fact.
-				return ans.approve, ans.remember
+				return ans
 			}
 			a.approvalResolving = true
 			a.mu.Unlock()
-			if err := a.persistApprovalResolved(session.ApprovalResolution{ApprovalID: typedRequest.ApprovalID, Decision: decision, Reason: reason, ResolvedBy: "user"}); err != nil {
-				return false, false
+			resolution := session.ApprovalResolution{ApprovalID: typedRequest.ApprovalID, Decision: decision, Reason: reason, ResolvedBy: "user",
+				CapabilityScope: ans.capabilityScope, Capabilities: append([]protocol.CapabilityRequest(nil), capabilities...)}
+			if err := a.persistApprovalResolved(resolution); err != nil {
+				return approvalAnswer{}
 			}
 		}
-		a.mu.Lock()
-		a.approvalCache[key] = ans.approve
-		a.mu.Unlock()
-		return ans.approve, ans.remember
+		if len(capabilities) == 0 {
+			a.mu.Lock()
+			a.approvalCache[key] = ans.approve
+			a.mu.Unlock()
+		}
+		return ans
 	case <-approvalCtx.Done():
 		a.mu.Lock()
 		if a.approvalResp != resp {
 			a.mu.Unlock()
-			return false, false
+			return approvalAnswer{}
 		}
 		if a.approvalResolving {
 			a.mu.Unlock()
@@ -2677,15 +2833,15 @@ func (a *Agent) requestApproval(tc messages.ToolCall, reason string) (bool, bool
 			// buffered answer yet. Wait for that answer rather than writing a
 			// competing cancel fact under the same ApprovalID.
 			ans := <-resp
-			return ans.approve, ans.remember
+			return ans
 		}
 		a.approvalResolving = true
 		a.mu.Unlock()
 		if err := a.persistApprovalResolved(session.ApprovalResolution{ApprovalID: typedRequest.ApprovalID, Decision: "cancel", Reason: "interrupted", ResolvedBy: "runtime"}); err != nil {
-			return false, false
+			return approvalAnswer{}
 		}
 		a.emitStatus("approval skipped (interrupted)")
-		return false, false
+		return approvalAnswer{}
 	}
 }
 

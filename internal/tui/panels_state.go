@@ -47,4 +47,5 @@ type selectorPanel struct {
 // approvalPrompt is the UI projection of a protocol decision, never a runtime handle.
 type approvalPrompt struct {
 	ID, Tool, Command, Reason string
+	Capabilities              []protocol.CapabilityRequest
 }

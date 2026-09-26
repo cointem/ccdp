@@ -10,7 +10,6 @@ import (
 
 	"ccdp/internal/execution"
 	"ccdp/internal/permissions"
-	"ccdp/internal/sandbox"
 )
 
 // GitHub integration commands (Claude Code's /github, /pr-comments and
@@ -62,8 +61,8 @@ func (a *Agent) localCommandContext(ctx context.Context, argv []string, network 
 			return "", fmt.Errorf("command requires the typed runtime approval gate: %s", reason)
 		}
 	}
-	if network && sb != nil && sb.CurrentMode() == sandbox.ModeStrict && !sb.NetworkAllowed() {
-		return "", fmt.Errorf("network command denied by strict sandbox")
+	if network && (sb == nil || !sb.NetworkAllowed()) {
+		return "", fmt.Errorf("network command denied: no network capability is authorized")
 	}
 	actualArgv := argv
 	readOnly := externalCommandReadOnly(argv)

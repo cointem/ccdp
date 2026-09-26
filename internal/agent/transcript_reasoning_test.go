@@ -88,3 +88,22 @@ func TestCommittedReasoningRestoresAndReconcilesLiveSegment(t *testing.T) {
 		}
 	}
 }
+
+func TestTurnDurationFollowsFinalAnswerOnReplay(t *testing.T) {
+	facts := []session.Event{
+		session.AssistantCommitted{TurnID: "turn-7", StepID: "step-1", Message: session.Message{
+			MessageID: "answer-7", Role: "assistant", Content: []session.ContentBlock{{Kind: session.ContentText, Text: "done"}},
+		}},
+		session.TurnFinished{TurnID: "turn-7", Outcome: "success", DurationMs: 155_000},
+	}
+	for _, events := range [][]session.Event{facts, {&session.AssistantCommitted{TurnID: "turn-7", StepID: "step-1", Message: session.Message{
+		MessageID: "answer-7", Role: "assistant", Content: []session.ContentBlock{{Kind: session.ContentText, Text: "done"}},
+	}}, &session.TurnFinished{TurnID: "turn-7", Outcome: "success", DurationMs: 155_000}}} {
+		tr := &transcriptState{}
+		tr.facts(events)
+		items, _ := tr.snapshot()
+		if len(items) != 2 || items[0].ID != "answer-7" || items[1].ID != "turn-summary:turn-7" || items[1].DurationMs != 155_000 {
+			t.Fatalf("turn duration did not follow final answer: %+v", items)
+		}
+	}
+}

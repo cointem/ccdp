@@ -56,7 +56,9 @@ func (b *BashTool) Description() string {
 	return `Run a bash command. Use this tool to execute shell commands, scripts,
 tests, build steps and inspect the environment. Returns stdout and stderr,
 followed by the exit code. Long-running commands are interrupted after the
-configured timeout (default 120s).`
+configured timeout (default 120s). If the command needs resources outside the
+workspace, list only the specific requested_capabilities it needs. Requests
+are approved separately from permission to run the command.`
 }
 
 func (b *BashTool) Parameters() map[string]any {
@@ -71,6 +73,7 @@ func (b *BashTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "A short note describing what the command does and why. Useful for the log.",
 			},
+			"requested_capabilities": capabilityRequestSchema(),
 		},
 		"required": []string{"command"},
 	}

@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"ccdp/internal/netguard"
 )
 
 const maxHTTPBytes = 2 * 1024 * 1024 // 2 MiB cap on any fetched body
@@ -33,7 +35,7 @@ approval in default permission mode.`
 }
 
 func (t *WebFetchTool) Parameters() map[string]any {
-	return map[string]any{
+	return WithCapabilityRequest(map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"url": map[string]any{
@@ -46,12 +48,15 @@ func (t *WebFetchTool) Parameters() map[string]any {
 			},
 		},
 		"required": []string{"url"},
-	}
+	})
 }
 
 func (t *WebFetchTool) Run(ctx *Context) (string, error) {
 	if err := ctx.checkResources(); err != nil {
 		return "", err
+	}
+	if !ctx.HostNetworkAllowed {
+		return "", errors.New("WebFetch: outbound network access is not authorized for this call")
 	}
 	raw := StringArg(ctx.Args, "url", "")
 	u, err := url.Parse(raw)
@@ -107,7 +112,7 @@ endpoint; results may be limited. Network access requires approval.`
 }
 
 func (t *WebSearchTool) Parameters() map[string]any {
-	return map[string]any{
+	return WithCapabilityRequest(map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"query": map[string]any{
@@ -120,12 +125,15 @@ func (t *WebSearchTool) Parameters() map[string]any {
 			},
 		},
 		"required": []string{"query"},
-	}
+	})
 }
 
 func (t *WebSearchTool) Run(ctx *Context) (string, error) {
 	if err := ctx.checkResources(); err != nil {
 		return "", err
+	}
+	if !ctx.HostNetworkAllowed {
+		return "", errors.New("WebSearch: outbound network access is not authorized for this call")
 	}
 	q := StringArg(ctx.Args, "query", "")
 	if strings.TrimSpace(q) == "" {
@@ -284,7 +292,9 @@ func httpGet(ctx context.Context, u string) ([]byte, error) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; ccdp/0.1)")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 
-	client := &http.Client{CheckRedirect: checkExternalRedirect}
+	transport := netguard.PublicTransport()
+	client := &http.Client{Transport: transport, CheckRedirect: checkExternalRedirect}
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

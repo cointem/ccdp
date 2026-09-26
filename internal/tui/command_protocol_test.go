@@ -61,6 +61,31 @@ func TestWorkspaceCommandsUseTypedRuntimePayloads(t *testing.T) {
 				t.Fatalf("doctor command = %#v", command)
 			}
 		}},
+		{line: "/sandbox", check: func(t *testing.T, command protocol.Command) {
+			if command.Type != protocol.CommandQuery || command.Query == nil || command.Query.Kind != protocol.QueryDoctor {
+				t.Fatalf("sandbox diagnostic command = %#v", command)
+			}
+		}},
+		{line: "/add-dir /tmp/shared", check: func(t *testing.T, command protocol.Command) {
+			if command.Type != protocol.CommandSetSandboxPolicy || command.SandboxPolicy == nil || len(command.SandboxPolicy.Policy.AdditionalDirectories) != 1 || command.SandboxPolicy.Policy.AdditionalDirectories[0] != "/tmp/shared" {
+				t.Fatalf("writable root command = %#v", command)
+			}
+		}},
+		{line: "/add-dir --read-only /tmp/reference", check: func(t *testing.T, command protocol.Command) {
+			if command.Type != protocol.CommandSetSandboxPolicy || command.SandboxPolicy == nil || len(command.SandboxPolicy.Policy.AdditionalReadOnlyDirectories) != 1 || command.SandboxPolicy.Policy.AdditionalReadOnlyDirectories[0] != "/tmp/reference" {
+				t.Fatalf("read-only root command = %#v", command)
+			}
+		}},
+		{line: "/disallowed-dir /tmp/private", check: func(t *testing.T, command protocol.Command) {
+			if command.Type != protocol.CommandSetSandboxPolicy || command.SandboxPolicy == nil || len(command.SandboxPolicy.Policy.DisallowedDirectories) != 1 || command.SandboxPolicy.Policy.DisallowedDirectories[0] != "/tmp/private" {
+				t.Fatalf("denied root command = %#v", command)
+			}
+		}},
+		{line: "/config set network-access allow", check: func(t *testing.T, command protocol.Command) {
+			if command.Type != protocol.CommandSetSandboxPolicy || command.SandboxPolicy == nil || !command.SandboxPolicy.Policy.NetworkAccess {
+				t.Fatalf("network authorization command = %#v", command)
+			}
+		}},
 		{line: "/memory", check: func(t *testing.T, command protocol.Command) {
 			if command.Type != protocol.CommandQuery || command.Query == nil || command.Query.Kind != protocol.QueryMemory {
 				t.Fatalf("memory command = %#v", command)

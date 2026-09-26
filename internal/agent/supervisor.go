@@ -38,6 +38,7 @@ type SessionSupervisor struct {
 	interactive bool
 	active      int
 	wg          sync.WaitGroup
+	childWG     sync.WaitGroup
 }
 
 type managedRun struct {
@@ -232,6 +233,7 @@ func (s *SessionSupervisor) launch(parent *Agent, ctx context.Context, task tool
 	s.runs[row.Run.ID] = r
 	s.active++
 	s.wg.Add(1)
+	s.childWG.Add(1)
 	s.mu.Unlock()
 	go s.execute(r, runCtx, task.Description, nil)
 	return r, nil
@@ -251,6 +253,7 @@ func (s *SessionSupervisor) persist(r *managedRun, transition string) error {
 
 func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text string, initial *SessionSnapshot) {
 	defer s.wg.Done()
+	defer s.childWG.Done()
 	defer func() { s.mu.Lock(); s.active--; s.mu.Unlock() }()
 	defer close(r.done)
 	defer r.cancel()
@@ -312,7 +315,7 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 		final.History = nil
 		r.final = final
 		if !child.cfg.NoSessionPersistence {
-			r.final = protocol.SessionView{SessionID: final.SessionID, Revision: final.Revision, Settings: final.Settings, Usage: final.Usage, ContextUsedTokens: final.ContextUsedTokens, LastTurn: final.LastTurn}
+			r.final = protocol.SessionView{SessionID: final.SessionID, Revision: final.Revision, Settings: final.Settings, SandboxRuntime: final.SandboxRuntime, Usage: final.Usage, ContextUsedTokens: final.ContextUsedTokens, LastTurn: final.LastTurn}
 		}
 		r.agent = nil
 		r.mu.Unlock()
@@ -581,6 +584,70 @@ func (s *SessionSupervisor) close() {
 	s.wg.Wait()
 }
 
+// revokeCapabilities cancels every descendant run owned by this supervisor
+// and joins its child Agents before a parent capability revocation commits.
+// A child may outlive the parent tool step (notify mode) while retaining the
+// frozen capability ceiling from that step, so waiting only for the parent
+// turn is not sufficient.
+func (s *SessionSupervisor) revokeCapabilities(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	// Freeze new child runs before cancelling the current tree. If an earlier
+	// revocation timed out, keep this gate in place and allow a retry to join
+	// the same remaining runs.
+	s.stopping = true
+	runs := make([]*managedRun, 0, len(s.runs))
+	seen := make(map[*managedRun]bool, len(s.runs))
+	for _, run := range s.runs {
+		if run == nil || seen[run] {
+			continue
+		}
+		seen[run] = true
+		runs = append(runs, run)
+	}
+	for _, run := range runs {
+		run.mu.Lock()
+		if run.cancel != nil {
+			run.cancel()
+		}
+		run.mu.Unlock()
+	}
+	s.mu.Unlock()
+
+	var revokeErr error
+	for _, run := range runs {
+		run.mu.Lock()
+		child := run.agent
+		run.mu.Unlock()
+		if child != nil {
+			if err := child.CloseContext(ctx); err != nil {
+				revokeErr = errors.Join(revokeErr, fmt.Errorf("close child session %s: %w", run.fact.Child.SessionID, err))
+			}
+		}
+	}
+	if err := waitGroupContext(ctx, &s.childWG); err != nil {
+		revokeErr = errors.Join(revokeErr, fmt.Errorf("wait for child runs: %w", err))
+	}
+	if revokeErr != nil {
+		return revokeErr
+	}
+	s.mu.Lock()
+	if !s.closed {
+		s.stopping = false
+	}
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *SessionSupervisor) lookup(id protocol.SessionID) (*managedRun, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -648,7 +715,7 @@ func (s *SessionSupervisor) childRowLocked(r *managedRun) protocol.ChildSession 
 		row.Capabilities.Interrupt = true
 		r.agent.mu.Lock()
 		if pending := r.agent.pendingApproval; pending != nil {
-			row.Approval = &protocol.ApprovalView{ID: pending.ID, Tool: pending.Tool, Reason: pending.Reason, Args: approvalArgsView(pending)}
+			row.Approval = &protocol.ApprovalView{ID: pending.ID, Tool: pending.Tool, Reason: pending.Reason, Args: approvalArgsView(pending), Capabilities: append([]protocol.CapabilityRequest(nil), pending.Capabilities...)}
 		}
 		r.agent.mu.Unlock()
 		if row.Approval != nil {
@@ -858,6 +925,7 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 	s.runs[row.Run.ID] = next
 	s.active++
 	s.wg.Add(1)
+	s.childWG.Add(1)
 	s.mu.Unlock()
 	go s.execute(next, runCtx, c.Text, initial)
 	return row.Run, nil

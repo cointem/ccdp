@@ -403,7 +403,7 @@ func TestFormalSettingsFailureDoesNotPublish(t *testing.T) {
 			case protocol.CommandSetPermissionPolicy:
 				command.PermissionPolicy = &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: "default", AlwaysDeny: []string{"FormalAuditEffect"}}}
 			case protocol.CommandSetSandboxPolicy:
-				command.SandboxPolicy = &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{Mode: "strict"}}
+				command.SandboxPolicy = &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{NetworkAccess: true}}
 			}
 			receipt, submitErr := a.Submit(context.Background(), command)
 			if submitErr != nil {
