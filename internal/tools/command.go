@@ -1,12 +1,11 @@
 package tools
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
-
-	"ccdp/internal/execution"
+	"time"
 )
 
 // CommandTool is a user-defined external tool (Codex's config tools). When
@@ -49,24 +48,49 @@ func (t *CommandTool) Run(ctx *Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%s: marshal args: %w", t.name, err)
 	}
-	res, err := execution.Run(execution.Request{
-		Context:       ctx.Context,
-		Command:       t.command,
-		Dir:           ctx.WorkingDir,
-		Timeout:       ctx.Timeout,
-		Input:         bytes.NewReader(argsJSON),
-		Sandbox:       ctx.Sandbox,
-		NotifyContext: ctx.notifyContext(),
-		OutputLimit:   ctx.outputLimit(),
-	})
+	m, err := ctx.processManager()
 	if err != nil {
-		return "", fmt.Errorf("%s: %w", t.name, err)
+		return "", err
 	}
-	out := strings.TrimRight(res.Output, "\n")
-	if res.TimedOut {
-		out += fmt.Sprintf("\n[%s timed out]", t.name)
-	} else if res.ExitCode != 0 {
-		out += fmt.Sprintf("\n[%s failed: exit code %d]", t.name, res.ExitCode)
+	call := ctx.Context
+	if call == nil {
+		call = context.Background()
 	}
-	return boundedToolString(ctx, out), nil
+	timeout := ctx.Timeout
+	if timeout <= 0 {
+		timeout = 2 * time.Minute
+	}
+	runCtx, cancel := context.WithCancel(call)
+	defer cancel()
+	id, mp, err := m.startManaged(runCtx, t.command, ctx.WorkingDir, ctx.Sandbox, false, true, timeout)
+	if err != nil {
+		return "", err
+	}
+	if err = mp.write(string(argsJSON)); err != nil {
+		_, _, _ = mp.stop()
+		return "", err
+	}
+	_ = mp.cmd.CloseInput()
+	select {
+	case <-mp.done:
+	case <-runCtx.Done():
+		_, _, _ = mp.stop()
+	}
+	out, err := mp.view(ctx, id, 0, min(51200, max(4, (ctx.outputLimit()-2048)/6)), 0)
+	if err != nil {
+		return "", err
+	}
+	if runCtx.Err() != nil {
+		return out + "\n[command timed out or cancelled]", runCtx.Err()
+	}
+	if mp.cmd.Reason() == "timed_out" {
+		return out + "\n[command timed out]", context.DeadlineExceeded
+	}
+	mp.mu.Lock()
+	exitErr := mp.err
+	mp.mu.Unlock()
+	if exitErr != nil {
+		return out + "\n[command failed]", exitErr
+	}
+	return out, nil
 }

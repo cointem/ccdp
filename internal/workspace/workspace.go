@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unicode/utf8"
 )
 
@@ -306,7 +307,11 @@ func (i *Info) Rel(abs string) string {
 }
 
 // cache guards a per-workspace Info so repeated prompts don't rescan.
-var cache sync.Map // root → *Info
+var cache sync.Map // root → cachedInfo
+type cachedInfo struct {
+	info *Info
+	at   time.Time
+}
 
 // CachedScan returns a cached Info for root, rescanning if force is true.
 func CachedScan(root string, force bool) (*Info, error) {
@@ -316,14 +321,17 @@ func CachedScan(root string, force bool) (*Info, error) {
 	}
 	if !force {
 		if v, ok := cache.Load(abs); ok {
-			return v.(*Info), nil
+			entry := v.(cachedInfo)
+			if time.Since(entry.at) < 2*time.Second {
+				return entry.info, nil
+			}
 		}
 	}
-	info, err := Scan(abs, 300)
+	info, err := Scan(abs, int(^uint(0)>>1))
 	if err != nil {
 		return nil, err
 	}
-	cache.Store(abs, info)
+	cache.Store(abs, cachedInfo{info, time.Now()})
 	return info, nil
 }
 

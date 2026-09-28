@@ -76,7 +76,7 @@ func (m *Model) headerPresentation() string {
 		status := "running"
 		for _, row := range m.routing.rows {
 			if string(row.SessionID) == m.sessionID {
-				if t := strings.TrimSpace(row.Title); t != "" {
+				if t := childDisplayName(row); t != "" {
 					name = t
 				}
 				if s := strings.TrimSpace(row.Run.Status); s != "" {

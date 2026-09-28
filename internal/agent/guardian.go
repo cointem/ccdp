@@ -15,7 +15,7 @@ const GuardianSystem = `You are a security reviewer sub-agent. The main agent wa
 call and you must decide whether it is safe enough to approve.
 
 Operating rules:
-- Use ONLY read-only tools (Read, Glob, Grep, LS, GitStatus, GitDiff, GitLog,
+- Use ONLY read-only tools (Read, Glob, Grep, LS,
   ToolSearch) to inspect the context. Never modify files or run mutating
   commands.
 - Approve only calls that are clearly safe and within the user's intent.
@@ -26,7 +26,7 @@ Operating rules:
 // guardianRisk reports whether a tool call warrants guardian review.
 func guardianRisk(name string) bool {
 	switch name {
-	case "Bash", "Write", "Edit", "WebFetch", "WebSearch", "GitCommit":
+	case "Bash", "Write", "Edit", "WebFetch", "WebSearch":
 		return true
 	}
 	return false

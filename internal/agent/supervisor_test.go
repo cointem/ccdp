@@ -11,7 +11,6 @@ import (
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
-	"ccdp/internal/tools"
 )
 
 func waitManaged(t *testing.T, r *managedRun) {
@@ -39,7 +38,7 @@ func TestSupervisorObservationDoesNotOwnExecution(t *testing.T) {
 		return llm.StreamResult{Text: "finished", FinishReason: "stop", PromptTokens: 3, CompletionTok: 2}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "observe me"}, childPurposeTask, "call", 0)
+	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "observe me"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,12 +102,12 @@ func TestSupervisorRegistersQueuedChildrenAndCancelsOnlyTarget(t *testing.T) {
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
 	a.childSlots = newChildSlots(1)
-	r1, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "first"}, childPurposeTask, "batch", 0)
+	r1, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "first"}, childPurposeTask, nextRuntimeID("test-call"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-started
-	r2, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "second"}, childPurposeTask, "batch", 1)
+	r2, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "second"}, childPurposeTask, nextRuntimeID("test-call"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +149,7 @@ func TestSupervisorAcceptedFollowupIsJoined(t *testing.T) {
 		return llm.StreamResult{Text: "followup answer", FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "initial"}, childPurposeTask, "call", 0)
+	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "initial"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +181,7 @@ func TestSupervisorContinueKeepsOriginalOutcomeAndRejectsStaleControl(t *testing
 		return llm.StreamResult{Text: text, FinishReason: "stop", PromptTokens: 2, CompletionTok: 1}, nil
 	}
 	a, cfg := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "original"}, childPurposeTask, "call", 0)
+	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "original"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}

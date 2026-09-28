@@ -478,6 +478,7 @@ func (m *Model) submitInput(strategy protocol.InputStrategy) (tea.Model, tea.Cmd
 	m.closeFileMention()
 	m.history = append(m.history, text)
 	m.historyIdx = len(m.history)
+	m.historyDraft = nil
 	m.followOutput = true
 	// The line above the composer is ephemeral: every new submission either
 	// replaces it with fresh status or clears it before producing durable output.
@@ -540,6 +541,9 @@ func (m *Model) historyPrev() tea.Model {
 	if len(m.history) == 0 {
 		return m
 	}
+	if m.historyIdx >= len(m.history) {
+		m.historyDraft = &composerDraft{text: m.textarea.Value(), images: cloneInputImages(m.inputImages), paste: clonePasteFold(m.pasteFold)}
+	}
 	if m.historyIdx <= 0 {
 		m.historyIdx = 1
 	}
@@ -557,14 +561,24 @@ func (m *Model) historyPrev() tea.Model {
 }
 
 func (m *Model) historyNext() tea.Model {
-	if len(m.history) == 0 {
+	if len(m.history) == 0 || m.historyIdx >= len(m.history) {
 		return m
 	}
 	if m.historyIdx >= len(m.history)-1 {
 		m.historyIdx = len(m.history)
 		m.pasteFold = nil
-		m.textarea.SetValue("")
-		m.recallHistoryImages()
+		if m.historyDraft != nil {
+			m.textarea.SetValue(m.historyDraft.text)
+			m.inputImages = m.historyDraft.images
+			m.pasteFold = m.historyDraft.paste
+			m.historyDraft = nil
+			m.missingHistoryImages = false
+			m.selectedImage = -1
+		} else {
+			m.textarea.SetValue("")
+			m.recallHistoryImages()
+		}
+		m.textarea.CursorEnd()
 		m.syncInputHeight()
 		m.refreshCmdSuggest()
 		return m

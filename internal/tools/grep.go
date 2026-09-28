@@ -14,10 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"ccdp/internal/execution"
+	"ccdp/internal/fsops"
 )
 
 // Grep runs through ripgrep when it is available and falls back to an
@@ -43,6 +43,7 @@ type grepLine struct {
 }
 
 type grepRequest struct {
+	singleFile string
 	pattern    string
 	base       string
 	globs      []string
@@ -172,7 +173,11 @@ func ripgrepSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
 		}
 		args = append(args, "--json")
 	}
-	args = append(args, "--", r.pattern, ".")
+	target := "."
+	if r.singleFile != "" {
+		target = "./" + r.singleFile
+	}
+	args = append(args, "--", r.pattern, target)
 
 	timeout := ctx.Timeout
 	if timeout <= 0 || timeout > grepTimeout {
@@ -250,6 +255,9 @@ func parseRipgrepJSON(out string, r *grepRequest) []grepLine {
 	sc := bufio.NewScanner(strings.NewReader(out))
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	limit := r.fetchLines()
+	if r.outputMode == grepModeContent {
+		limit *= 1 + r.before + r.after
+	}
 	files := map[string]bool{}
 	for sc.Scan() {
 		var ev rgJSONEvent
@@ -363,8 +371,15 @@ func inProcessSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
 		truncated bool
 	)
 	limit := r.fetchLines()
+	if r.outputMode == grepModeContent {
+		limit *= 1 + r.before + r.after
+	}
 	entries := 0
-	walkErr := filepath.WalkDir(r.base, func(path string, d fs.DirEntry, err error) error {
+	walkRoot := r.base
+	if r.singleFile != "" {
+		walkRoot = filepath.Join(r.base, r.singleFile)
+	}
+	walkErr := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -385,7 +400,7 @@ func inProcessSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
 			_ = ign.loadDir(path, filepath.ToSlash(rel))
 			return nil
 		}
-		if ign.ignored(rel, false) || !filter.match(filepath.ToSlash(rel), d.Name()) {
+		if (r.singleFile == "" && ign.ignored(rel, false)) || !filter.match(filepath.ToSlash(rel), d.Name()) {
 			return nil
 		}
 		fileLines, ferr := grepFile(ctx, path, filepath.ToSlash(rel), re, r)
@@ -516,7 +531,7 @@ func grepFile(ctx *Context, path, rel string, re *regexp.Regexp, r *grepRequest)
 // "skip this file", not an error: an unreadable or oversized file is noise.
 func readGrepFile(ctx *Context, path string) ([]byte, bool) {
 	info, err := os.Stat(path)
-	if err != nil || info.IsDir() || info.Size() > int64(ctx.readLimit()) {
+	if err != nil || !info.Mode().IsRegular() || info.Size() > int64(ctx.readLimit()) {
 		return nil, false
 	}
 	if ctx == nil || ctx.Sandbox == nil {
@@ -526,9 +541,7 @@ func readGrepFile(ctx *Context, path string) ([]byte, bool) {
 	if err != nil {
 		return nil, false
 	}
-	flags := os.O_RDONLY
-	flags |= syscall.O_NOFOLLOW
-	f, err := os.OpenFile(readPath, flags, 0)
+	f, err := fsops.OpenRegular("", readPath)
 	if err != nil {
 		return nil, false
 	}
@@ -889,7 +902,7 @@ func formatGrepResult(lines []grepLine, r *grepRequest, truncated bool) string {
 			writeTruncationNote(&sb, max(0, len(entries)-r.offset-len(windowed)))
 		}
 	default:
-		windowed := applyGrepWindow(lines, r)
+		windowed, omitted := grepContentWindow(lines, r)
 		matches := 0
 		for _, l := range windowed {
 			if l.match {
@@ -910,7 +923,7 @@ func formatGrepResult(lines []grepLine, r *grepRequest, truncated bool) string {
 			fmt.Fprintf(&sb, "%s%s%d%s%s\n", l.file, sep, l.line, sep, l.text)
 			prevFile, prevLine = l.file, l.line
 		}
-		truncated = truncated || len(lines) > r.fetchLines()
+		truncated = truncated || omitted
 		if truncated {
 			writeTruncationNote(&sb, max(0, len(lines)-r.offset-len(windowed)))
 		}
@@ -922,7 +935,7 @@ func writeTruncationNote(sb *strings.Builder, remaining int) {
 	if remaining < 0 {
 		remaining = 0
 	}
-	fmt.Fprintf(sb, "…(%d more result(s) available — refine the pattern or pass offset/head_limit)\n", remaining)
+	fmt.Fprintf(sb, "…(%d more result(s) available — refine the pattern or increase limit)\n", remaining)
 }
 
 // grepFileEntries collapses matches to their files, preserving first-seen order.
@@ -973,4 +986,42 @@ func applyGrepWindow(lines []grepLine, r *grepRequest) []grepLine {
 		return lines[:limit]
 	}
 	return lines
+}
+
+func grepContentWindow(lines []grepLine, r *grepRequest) ([]grepLine, bool) {
+	limit := r.maxLines
+	if limit <= 0 {
+		limit = grepDefaultMaxLines
+	}
+	seen := 0
+	first, last := -1, -1
+	omitted := false
+	for i, l := range lines {
+		if !l.match {
+			continue
+		}
+		seen++
+		if seen <= r.offset {
+			continue
+		}
+		if seen > r.offset+limit {
+			omitted = true
+			break
+		}
+		if first < 0 {
+			first = i
+		}
+		last = i
+	}
+	if first < 0 {
+		return nil, omitted
+	}
+	lo, hi := first, last+1
+	for lo > 0 && !lines[lo-1].match && lines[lo-1].file == lines[first].file && lines[first].line-lines[lo-1].line <= r.before {
+		lo--
+	}
+	for hi < len(lines) && !lines[hi].match && lines[hi].file == lines[last].file && lines[hi].line-lines[last].line <= r.after {
+		hi++
+	}
+	return lines[lo:hi], omitted
 }

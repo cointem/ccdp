@@ -36,12 +36,23 @@ func TestTurnDoneIsAnIdleBoundary(t *testing.T) {
 	}
 
 	var done protocol.EventView
+	sawFinalizing := false
 	deadline := time.After(5 * time.Second)
 	for {
 		select {
 		case update, ok := <-sub.Updates():
 			if !ok {
 				t.Fatal("watch closed before TurnDone")
+			}
+			if update.Snapshot != nil {
+				if update.Snapshot.Phase == protocol.PhaseFinalizing {
+					sawFinalizing = true
+				}
+				for _, item := range update.Snapshot.Transcript {
+					if item.Kind == "turn_summary" && update.Snapshot.Phase == protocol.PhaseStreaming {
+						t.Fatal("completed turn still advertises streaming")
+					}
+				}
 			}
 			if update.Type == protocol.UpdateStream && update.Event != nil && update.Event.Kind == protocol.EventTurnDone {
 				done = *update.Event
@@ -53,6 +64,9 @@ func TestTurnDoneIsAnIdleBoundary(t *testing.T) {
 	}
 
 terminal:
+	if !sawFinalizing {
+		t.Fatal("turn did not publish its finalization phase")
+	}
 	if done.TurnID == "" {
 		t.Fatalf("TurnDone has no turn identity: %+v", done)
 	}

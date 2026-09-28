@@ -14,13 +14,13 @@ func (a *Agent) applyQueryCommand(cmd protocol.Command) protocol.Receipt {
 	if cmd.Query == nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "query payload is required")
 	}
-	return a.scheduleCommandOperationWithBusy(cmd, "query:"+string(cmd.Query.Kind), func(ctx context.Context) (string, error) {
+	return a.scheduleOperation(cmd, "query:"+string(cmd.Query.Kind), func(ctx context.Context) (string, error) {
 		report, err := a.Query(ctx, cmd.Query.Kind)
 		if err != nil {
 			return "", err
 		}
 		return report.Text, nil
-	}, false)
+	}, operationConcurrent)
 }
 
 func (a *Agent) applySetWorkspaceCommand(cmd protocol.Command) protocol.Receipt {
@@ -92,7 +92,7 @@ func (a *Agent) applySaveSessionCommand(cmd protocol.Command) protocol.Receipt {
 	if cmd.SaveSession == nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "save payload is required")
 	}
-	return a.scheduleCommandOperationWithBusy(cmd, "save", func(ctx context.Context) (string, error) {
+	return a.scheduleOperation(cmd, "save", func(ctx context.Context) (string, error) {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
@@ -102,5 +102,5 @@ func (a *Agent) applySaveSessionCommand(cmd protocol.Command) protocol.Receipt {
 			return "", err
 		}
 		return "session saved", nil
-	}, false)
+	}, operationConcurrent)
 }

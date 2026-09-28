@@ -19,7 +19,7 @@ func TestQuietExecutionIsNotUnresponsive(t *testing.T) {
 	m := astraModel(t, 100, 24)
 	m.busy = true
 	m.activity = Activity{Phase: ActivityStreaming, UpdatedAt: now().Add(-time.Minute)}
-	m.items = []historyCell{{kind: "tool", toolName: "Task", status: "running"}}
+	m.items = []historyCell{{kind: "tool", toolName: "SpawnAgent", status: "running"}}
 	if m.turnStalled() {
 		t.Fatal("active tool mislabeled")
 	}

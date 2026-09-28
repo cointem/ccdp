@@ -138,6 +138,9 @@ func (m *Model) composeChrome() frameChrome {
 			c.footer = indentBlock(state) + "\n" + c.footer
 		}
 	}
+	if shelf := m.renderAgentShelf(); shelf != "" {
+		c.footer += "\n" + shelf
+	}
 	return c
 }
 func (c frameChrome) fixedHeight(width int) int {

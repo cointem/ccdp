@@ -18,7 +18,7 @@ func TestTurnDurationRendersBelowFinalAnswer(t *testing.T) {
 	m.layout()
 	frame := ansi.Strip(m.View())
 	answer := strings.Index(frame, "The work is done.")
-	duration := strings.Index(frame, "· 完成 · 用时 2m 35s")
+	duration := strings.Index(frame, "· 运行结束 · 用时 2m 35s")
 	if answer < 0 || duration <= answer {
 		t.Fatalf("turn duration was not shown below the final answer:\n%s", frame)
 	}
@@ -36,5 +36,29 @@ func TestTurnDurationShowsFailureAndCancellation(t *testing.T) {
 		if !strings.Contains(ansi.Strip(renderItemWidth(&cell, 80)), tc.label+" · 用时 4s") {
 			t.Fatalf("%s duration cell = %q", tc.outcome, cell.text)
 		}
+	}
+}
+
+func TestCompletedStreamTransitionsToFinalizingThenIdle(t *testing.T) {
+	m := astraModel(t, 100, 24)
+	view := protocol.SessionView{SessionID: protocol.SessionID(m.sessionID), Busy: true, Phase: protocol.PhaseStreaming}
+	view.Transcript = []protocol.TranscriptItem{{ID: "answer", Kind: "assistant", Text: "hello", Status: "streaming"}}
+	m.applySnapshot(view)
+	if !m.streaming {
+		t.Fatal("streaming snapshot did not set output state")
+	}
+	view.Phase = protocol.PhaseFinalizing
+	view.Transcript = []protocol.TranscriptItem{{ID: "answer", Kind: "assistant", Text: "done", Status: "completed"}}
+	m.applySnapshot(view)
+	status := ansi.Strip(m.renderStatus())
+	if m.streaming || strings.Contains(status, "正在输出") || !strings.Contains(status, "正在保存本轮结果") {
+		t.Fatalf("completed response still looks like streaming: %s", status)
+	}
+	// Resync may deliver only the idle snapshot, without a TurnDone event.
+	view.Busy, view.Phase = false, protocol.PhaseIdle
+	view.LastTurn = &protocol.TurnOutcome{TurnID: "1", Status: protocol.TurnSucceeded}
+	m.applySnapshot(view)
+	if m.streaming || m.busy || m.activity.Active() || strings.Contains(ansi.Strip(m.renderStatus()), "正在") {
+		t.Fatalf("idle snapshot left a running status: %s", m.renderStatus())
 	}
 }

@@ -32,6 +32,7 @@ type sessionRouting struct {
 	pending        *agentViewOpenedMsg
 	switching      bool
 	catalogLoading bool
+	agentShelf     map[protocol.SessionID]agentShelfState
 }
 
 type agentCatalogMsg struct {
@@ -124,9 +125,20 @@ func (m *Model) agentPicker() tea.Cmd {
 		if string(row.SessionID) == m.sessionID {
 			selected = len(options)
 		}
-		options = append(options, SelectorOption{ID: string(row.SessionID), Label: fmt.Sprintf("%s · %s · %s%s\n    %s", row.Title, row.Purpose, row.Run.Status, mark, row.SessionID)})
+		kind := row.Purpose
+		if row.Purpose == "task" {
+			kind = row.Role + " / " + row.WorkspaceMode
+		}
+		options = append(options, SelectorOption{ID: string(row.SessionID), Label: fmt.Sprintf("%s · %s · %s%s\n    %s", childDisplayName(row), kind, row.Run.Status, mark, row.SessionID)})
 	}
 	return m.startSelectorAt("Agents · select to view, Esc returns", options, selected, true, selectorAction{Kind: selectorAgent})
+}
+
+func childDisplayName(row protocol.ChildSession) string {
+	if name := strings.TrimSpace(row.Name); name != "" {
+		return name
+	}
+	return strings.TrimSpace(row.Title)
 }
 
 func (m *Model) openAgentView(id string) tea.Cmd {
@@ -166,7 +178,7 @@ func (m *Model) parentAgentID() string {
 }
 
 // agentSpawnOrder returns every child session in the tree ordered by spawn
-// (CreatedAt, then BatchIndex, then SessionID for stability). The active view's
+// (CreatedAt, then SessionID for stability). The active view's
 // position in this list drives both sibling cycling and the header ordinal.
 func (m *Model) agentSpawnOrder() []protocol.ChildSession {
 	if m.routing == nil || len(m.routing.rows) == 0 {
@@ -177,9 +189,6 @@ func (m *Model) agentSpawnOrder() []protocol.ChildSession {
 	sort.SliceStable(rows, func(i, j int) bool {
 		if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
 			return rows[i].CreatedAt.Before(rows[j].CreatedAt)
-		}
-		if rows[i].BatchIndex != rows[j].BatchIndex {
-			return rows[i].BatchIndex < rows[j].BatchIndex
 		}
 		return rows[i].SessionID < rows[j].SessionID
 	})
@@ -232,31 +241,17 @@ func (m *Model) cycleAgent(delta int) tea.Cmd {
 	return m.openAgentView(string(target.SessionID))
 }
 
-// childSessionForCallID resolves the child sessions spawned by a Task/Agent
-// tool call. A batch fan-out shares one ParentCallID and is distinguished by
-// BatchIndex, so the result is ordered by BatchIndex then CreatedAt to render in
-// input order. It returns nil when the directory is unavailable or the call has
-// not (yet) produced children.
-func (m *Model) childSessionForCallID(callID string) []protocol.ChildSession {
+// Each SpawnAgent call owns exactly one stable child session/card.
+func (m *Model) childSessionForCallID(callID string) *protocol.ChildSession {
 	if m.routing == nil || callID == "" {
 		return nil
 	}
-	var matches []protocol.ChildSession
 	for _, row := range m.routing.rows {
 		if string(row.ParentCallID) == callID {
-			matches = append(matches, row)
+			return &row
 		}
 	}
-	if len(matches) < 2 {
-		return matches
-	}
-	sort.SliceStable(matches, func(i, j int) bool {
-		if matches[i].BatchIndex != matches[j].BatchIndex {
-			return matches[i].BatchIndex < matches[j].BatchIndex
-		}
-		return matches[i].CreatedAt.Before(matches[j].CreatedAt)
-	})
-	return matches
+	return nil
 }
 
 // isAgentTool reports whether a tool name delegates to or inspects child
@@ -264,13 +259,13 @@ func (m *Model) childSessionForCallID(callID string) []protocol.ChildSession {
 // instead of dumping the child's final answer as ordinary tool output.
 func isAgentTool(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "task", "agent", "subagent":
+	case "spawnagent", "followupagent", "waitagent", "listagents", "readagent", "stopagent":
 		return true
 	}
 	return false
 }
 
-// attachAgentMarkers resolves the child sessions for every Task/Agent tool row
+// attachAgentMarkers resolves the child sessions for every SpawnAgent tool row
 // in the composed transcript. It runs on compose and on each directory refresh
 // so the marker's status and usage stay current while a child is running.
 func (m *Model) attachAgentMarkers() {
@@ -288,7 +283,7 @@ func (m *Model) attachAgentMarkers() {
 
 // applyChildUpdate folds one multiplexed child event from the root stream into
 // the directory cache, then refreshes the parent's agent markers. The runtime
-// republishes each child's current session row as it runs, so the parent Task
+// republishes each child's current session row as it runs, so the parent SpawnAgent
 // marker tracks live status and usage without waiting for the polling fallback.
 // The child's nested transcript update is deliberately ignored: a child being
 // viewed owns its own subscription, and child text must never enter the parent.
@@ -313,7 +308,9 @@ func (m *Model) applyChildUpdate(child protocol.ChildSession) {
 	if !replaced {
 		m.routing.rows = append(m.routing.rows, child)
 	}
+	m.syncAgentShelf()
 	m.attachAgentMarkers()
+	m.syncViewportHeight()
 }
 
 func childAwaitingApproval(child protocol.ChildSession) bool {
@@ -329,6 +326,8 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	r.pending = nil
 	fromChild := m.sessionID != r.rootID
 	targetID := string(opened.snapshot.SessionID)
+	m.releaseAgentShelf(m.sessionID)
+	m.retainAgentShelf(targetID)
 	toChild := targetID != "" && targetID != r.rootID
 	// Already-dispatched print messages are joined before clearing the screen.
 	// Not-yet-dispatched old-generation messages are discarded at admission.
@@ -556,6 +555,32 @@ func (m *Model) upsertTranscript(item protocol.TranscriptItem) {
 		return
 	}
 	value := projectTranscriptCell(item)
+	if item.PreviousID != "" && item.PreviousID != item.ID {
+		for _, old := range m.confirmedItems {
+			if old.messageID != item.PreviousID {
+				continue
+			}
+			m.inline.reconcile(old, value)
+			if pending := m.delivery.pending; pending != nil && pending.next.epoch == m.inline.epoch {
+				pending.next.reconcile(old, value)
+			}
+			converted := make([]historyCell, 0, len(m.confirmedItems))
+			inserted := false
+			for _, cell := range m.confirmedItems {
+				if cell.messageID == item.PreviousID || cell.messageID == item.ID {
+					if !inserted {
+						converted = append(converted, value)
+						inserted = true
+					}
+				} else {
+					converted = append(converted, cell)
+				}
+			}
+			m.confirmedItems = converted
+			m.composeItems()
+			return
+		}
+	}
 	if m.CellStore.replace(value) {
 		if isAgentTool(value.toolName) {
 			m.attachAgentMarkers()
@@ -580,11 +605,14 @@ func projectTranscriptCell(item protocol.TranscriptItem) historyCell {
 		args = protocolToolArgs(&protocol.ToolView{Name: item.Tool, Args: item.Args})
 	}
 	text := item.Text
+	if item.Kind == "assistant" && strings.HasPrefix(item.ID, "review-report-") {
+		text = codingReport(text)
+	}
 	if item.Kind == "turn_summary" {
 		label := "结束"
 		switch item.Status {
 		case "success":
-			label = "完成"
+			label = "运行结束"
 		case "error":
 			label = "失败"
 		case "cancelled", "interrupted":
@@ -593,7 +621,7 @@ func projectTranscriptCell(item protocol.TranscriptItem) historyCell {
 		const maxDurationMs = int64((1<<63 - 1) / int64(time.Millisecond))
 		text = label + " · 用时 " + formatElapsed(time.Duration(min(item.DurationMs, maxDurationMs))*time.Millisecond)
 	}
-	return historyCell{kind: item.Kind, text: text, messageID: item.ID, turnID: item.TurnID,
+	return historyCell{kind: item.Kind, text: text, textOffset: int(item.TextOffset), messageID: item.ID, turnID: item.TurnID,
 		toolID: string(item.CallID), status: item.Status, toolName: item.Tool, toolArgs: args,
 		toolArgsRaw: string(item.Args), toolTruncated: item.Truncated}
 }

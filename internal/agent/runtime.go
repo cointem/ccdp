@@ -99,17 +99,17 @@ func (a *Agent) CloseContext(ctx context.Context) error {
 func (a *Agent) closeAsync() {
 	a.mu.Lock()
 	a.closing = true
-	a.phase = protocol.PhaseStopping
+	if a.finalizeRun != nil && !a.busy {
+		a.phase = protocol.PhaseFinalizing
+	} else {
+		a.phase = protocol.PhaseStopping
+	}
 	a.stop = true
 	cancel := a.turnCancel
 	compactCancel := a.compactCancel
 	rootCancel := a.rootCancel
 	runStarted := a.runStartedFlag
-	sandboxPolicy := a.sandbox
 	a.mu.Unlock()
-	if sandboxPolicy != nil && sandboxPolicy.ExternalExecutionPossible() {
-		a.emitStatus("session shutdown will clean up managed leaders and process groups, but detached Seatbelt descendants cannot be proven exited")
-	}
 	if cancel != nil {
 		cancel()
 	}
@@ -307,6 +307,14 @@ func (a *Agent) receiptWithFact(cmd protocol.Command, status protocol.ReceiptSta
 }
 
 func (a *Agent) receiptWithFactAndOutput(cmd protocol.Command, status protocol.ReceiptStatus, op protocol.OperationID, err *protocol.CommandError, completion *session.CommandCompleted, output string) protocol.Receipt {
+	receipt, _ := a.completeCommand(cmd, status, op, err, completion, output, nil)
+	return receipt
+}
+
+// completeCommand publishes durable completion and releases its optional owner
+// under the watcher/owner locks. The caller must drain a reserved next turn only
+// after publishing its remaining operation diagnostics.
+func (a *Agent) completeCommand(cmd protocol.Command, status protocol.ReceiptStatus, op protocol.OperationID, err *protocol.CommandError, completion *session.CommandCompleted, output string, owner context.Context) (protocol.Receipt, bool) {
 	if cmd.ID != "" && status != protocol.ReceiptScheduled && a.persistenceHandle() != nil {
 		fact := session.CommandCompleted{CommandID: string(cmd.ID), Outcome: "rejected"}
 		if completion != nil {
@@ -329,21 +337,44 @@ func (a *Agent) receiptWithFactAndOutput(cmd protocol.Command, status protocol.R
 			op = ""
 		}
 	}
+	a.watchMu.Lock()
+	a.flushStreamsLocked()
 	a.mu.Lock()
+	drain := false
+	if owner != nil && a.turnCtx == owner {
+		a.turnCtx, a.turnCancel = nil, nil
+		a.busy, a.settling = false, false
+		a.phase = protocol.PhaseIdle
+		if a.closing || a.closed {
+			a.phase = protocol.PhaseStopping
+		}
+		a.ensureTypedPendingLocked()
+		drain = owner.Err() == nil && !a.closing && !a.closed && !a.stop && !a.interruptFlag && a.persistenceErr == nil && a.hasTurnStartingInputLocked()
+	}
 	a.logSeq++
 	r := protocol.Receipt{CommandID: cmd.ID, SessionID: cmd.SessionID, Status: status,
 		Revision: a.revisionLocked(), OperationID: op, Error: err}
 	if cmd.ID != "" {
 		a.seenReceipts[cmd.ID] = r
 	}
+	view := a.snapshotLocked()
+	state := protocol.Update{Type: protocol.UpdateState, Cursor: protocol.Cursor{LogSeq: r.Revision.LogSeq, ViewGeneration: r.Revision.ViewGeneration}, Revision: r.Revision, Snapshot: &view}
+	terminal := protocol.Update{Type: protocol.UpdateReceipt, Cursor: state.Cursor, Revision: r.Revision, Receipt: &r}
+	a.stampUpdateLocked(&state)
+	a.stampUpdateLocked(&terminal)
+	for _, w := range a.watchers {
+		a.sendWatcherLocked(w, state)
+		a.sendWatcherLocked(w, terminal)
+	}
+	if drain {
+		a.busy = true
+		a.workStartedAt = time.Now()
+		a.workLabel = ""
+		a.phase = protocol.PhasePreparing
+	}
 	a.mu.Unlock()
-	// Completion advances the revision after command handlers publish their
-	// settings/history changes. Publish that final boundary too, otherwise
-	// Watch clients keep a snapshot one revision behind and their next guarded
-	// command is rejected even when nothing else has changed.
-	a.publishState()
-	a.publishReceipt(r)
-	return r
+	a.watchMu.Unlock()
+	return r, drain
 }
 
 // restoredCommandReceipt converts a durable command admission into the
@@ -616,141 +647,6 @@ func (a *Agent) rewindMessagesCommand(n int, turnID string) error {
 	return nil
 }
 
-func (a *Agent) scheduleCompact(cmd protocol.Command) protocol.Receipt {
-	ctx, cancel := context.WithCancel(a.rootCtx)
-	a.mu.Lock()
-	revoking := a.capabilityRevoking
-	if a.closing || a.closed || revoking {
-		a.mu.Unlock()
-		cancel()
-		if revoking {
-			return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox capability revocation is in progress")
-		}
-		return a.rejectedReceipt(cmd, protocol.ErrorClosed, "session is closed")
-	}
-	a.busy = true
-	a.phase = protocol.PhaseCompacting
-	// Compaction is a new operation boundary. Clear cancellation inherited from
-	// an earlier completed turn here; an interrupt delivered after this lock is
-	// observed by the worker and any turn it may hand off.
-	a.interruptFlag = false
-	a.stop = false
-	a.compactCancel = cancel
-	a.operationWG.Add(1)
-	a.sandboxOperationWG.Add(1)
-	a.mu.Unlock()
-	a.publishState()
-	receipt := a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
-	go func() {
-		defer a.operationWG.Done()
-		defer a.sandboxOperationWG.Done()
-		defer cancel()
-		a.compactContext(ctx)
-		canceled := ctx.Err() != nil
-		a.mu.Lock()
-		a.compactCancel = nil
-		closing := a.closing || a.closed
-		canDrain := !closing && !canceled && a.persistenceErr == nil
-		nextTurnID := fmt.Sprintf("turn-%d", a.turnSeq+1)
-		a.mu.Unlock()
-		if !canDrain {
-			a.mu.Lock()
-			a.busy = false
-			if a.closing || a.closed {
-				a.phase = protocol.PhaseStopping
-			} else {
-				a.phase = protocol.PhaseIdle
-			}
-			a.mu.Unlock()
-			a.publishState()
-			return
-		}
-
-		// A typed input is not removed from the in-memory inbox until its
-		// durable delivery fact commits. This keeps a failed commit visible and
-		// prevents a compaction worker from starting a turn that cannot be
-		// recovered after restart.
-		next, ok, deliveryErr := a.claimPendingInputAndAppend(nextTurnID, "")
-		if deliveryErr != nil {
-			a.markPersistenceFailure(deliveryErr)
-			a.mu.Lock()
-			a.busy = false
-			if !a.closing && !a.closed {
-				a.phase = protocol.PhaseIdle
-			}
-			a.mu.Unlock()
-			a.emit(Event{Type: EventError, Text: "queued input delivery failed: " + deliveryErr.Error()})
-			a.publishState()
-			return
-		}
-		if !ok || ctx.Err() != nil {
-			a.mu.Lock()
-			a.busy = false
-			if a.closing || a.closed {
-				a.phase = protocol.PhaseStopping
-			} else {
-				a.phase = protocol.PhaseIdle
-			}
-			a.mu.Unlock()
-			a.publishState()
-			return
-		}
-		a.mu.Lock()
-		if a.closing || a.closed || a.stop || a.interruptFlag || a.persistenceErr != nil {
-			a.busy = false
-			if !a.closing && !a.closed {
-				a.phase = protocol.PhaseIdle
-			}
-			a.mu.Unlock()
-			a.publishState()
-			return
-		}
-		a.turnSeq++
-		a.turnWG.Add(1)
-		// The queued input becomes the next turn only under this owner lock.
-		// Reset the old terminal flags before publishing the new preparing
-		// state; a later Interrupt/Stop cannot be erased by runTurn because it
-		// no longer clears them asynchronously.
-		a.interruptFlag = false
-		a.stop = false
-		a.phase = protocol.PhasePreparing
-		a.mu.Unlock()
-		a.publishState()
-		go a.runTurn(next)
-	}()
-	return receipt
-}
-
-func (a *Agent) scheduleFork(cmd protocol.Command) protocol.Receipt {
-	a.mu.Lock()
-	revoking := a.capabilityRevoking
-	if a.closing || a.closed || revoking {
-		a.mu.Unlock()
-		if revoking {
-			return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox capability revocation is in progress")
-		}
-		return a.rejectedReceipt(cmd, protocol.ErrorClosed, "session is closed")
-	}
-	a.operationWG.Add(1)
-	a.sandboxOperationWG.Add(1)
-	a.mu.Unlock()
-	receipt := a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
-	go func() {
-		defer a.operationWG.Done()
-		defer a.sandboxOperationWG.Done()
-		id, err := a.Fork(cmd.Fork.Count)
-		if err != nil {
-			// Fork is an independent operation and may finish after a new turn
-			// has started. Keep its diagnostic out of the turn outcome bridge.
-			a.emitStatus("fork failed: %v", err)
-			return
-		}
-		a.emitStatus("forked session %s", id)
-		a.publishState()
-	}()
-	return receipt
-}
-
 func (a *Agent) isBusy() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -824,7 +720,7 @@ func (a *Agent) applySubmitInput(cmd protocol.Command) protocol.Receipt {
 	}
 	turnSeq := a.turnSeq
 	closing := a.closing || a.closed
-	if !a.busy && !a.settling {
+	if !a.busy && !a.settling && input.Strategy != protocol.InputMessage {
 		// Initialize the new turn at admission, before any durable I/O. A
 		// cancellation delivered after this lock must remain set through the
 		// eventual start; runTurn deliberately does not reset it.
@@ -845,7 +741,11 @@ func (a *Agent) applySubmitInput(cmd protocol.Command) protocol.Receipt {
 	}
 	// Capture all referenced images at the durable-input boundary. The path is
 	// only an input locator; subsequent requests use the frozen bytes/blob.
-	attachments, captureErr := a.freezeImageAttachments(input.Text)
+	var attachments []messages.ImageAttachment
+	var captureErr error
+	if input.Strategy != protocol.InputMessage {
+		attachments, captureErr = a.freezeImageAttachments(input.Text)
+	}
 	if captureErr != nil {
 		a.persistMu.Unlock()
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, captureErr.Error())
@@ -891,12 +791,13 @@ func (a *Agent) applySubmitInput(cmd protocol.Command) protocol.Receipt {
 		a.persistMu.Unlock()
 		return a.rejectedReceipt(cmd, protocol.ErrorClosed, "session is closed")
 	}
-	if a.inputAttachments == nil {
-		a.inputAttachments = make(map[protocol.InputID]frozenInputAttachments)
-	}
-	a.inputAttachments[inputID] = frozenInputAttachments{Attachments: cloneImageAttachments(attachments), Frozen: true}
-	if a.busy || a.settling {
+	if a.busy || a.settling || input.Strategy == protocol.InputMessage {
+		if a.inputAttachments == nil {
+			a.inputAttachments = make(map[protocol.InputID]frozenInputAttachments)
+		}
+		a.inputAttachments[inputID] = frozenInputAttachments{Attachments: cloneImageAttachments(attachments), Frozen: true}
 		a.pendingInputs = append(a.pendingInputs, protocol.InputView{ID: inputID, Text: input.Text, Strategy: input.Strategy, State: "queued", CreatedAt: createdAt})
+		a.signalAgentActivityLocked()
 		a.syncLegacyPendingLocked()
 		a.mu.Unlock()
 		a.persistMu.Unlock()
@@ -1191,6 +1092,9 @@ func (a *Agent) toolDefsSnapshotFromLease(lease *tools.Lease) []llm.ToolDef {
 	}
 	a.mu.Unlock()
 	schemas := lease.SchemasFiltered(func(name string) bool {
+		if a.childState != nil && a.childState.allowed != nil && !a.childState.allowed[name] {
+			return false
+		}
 		return !deferred[name] || discovered[name]
 	})
 	defs := make([]llm.ToolDef, 0, len(schemas))
@@ -1458,6 +1362,10 @@ func (a *Agent) snapshotLocked() protocol.SessionView {
 			InputTokens: a.usage.InputTokens, OutputTokens: a.usage.OutputTokens,
 			CachedTokens: a.usage.CachedTokens, Cache: a.usage.Cache, Cost: a.usage.Cost, TurnCount: a.usage.TurnCount,
 		}}
+	if a.busy {
+		view.WorkStartedAt = a.workStartedAt
+		view.WorkLabel = a.workLabel
+	}
 	view.SandboxRuntime.RevocationPending = a.capabilityRevoking
 	if a.sandbox != nil {
 		view.SandboxRuntime.ExternalExecutionPossible = a.sandbox.ExternalExecutionPossible()
@@ -1676,6 +1584,7 @@ func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 
 func (a *Agent) publishState() {
 	a.watchMu.Lock()
+	a.flushStreamsLocked()
 	defer a.watchMu.Unlock()
 	a.mu.Lock()
 	view := a.snapshotLocked()
@@ -1698,6 +1607,7 @@ func (a *Agent) publishState() {
 // TurnDone after a new user message has started.
 func (a *Agent) publishTerminal(turnID protocol.TurnID) bool {
 	a.watchMu.Lock()
+	a.flushStreamsLocked()
 	a.mu.Lock()
 	// turnFinished established the terminal outcome before entering this
 	// helper. Reassert the externally visible idle boundary while the locks are
@@ -1710,7 +1620,7 @@ func (a *Agent) publishTerminal(turnID protocol.TurnID) bool {
 	}
 	a.settling = false
 	a.ensureTypedPendingLocked()
-	canDrain := !a.closing && !a.closed && !a.stop && !a.interruptFlag && a.persistenceErr == nil && len(a.pendingInputs) > 0
+	canDrain := !a.closing && !a.closed && !a.stop && !a.interruptFlag && a.persistenceErr == nil && a.hasTurnStartingInputLocked()
 	view := a.snapshotLocked()
 	rev := view.Revision
 	done := protocol.EventView{
@@ -1735,6 +1645,8 @@ func (a *Agent) publishTerminal(turnID protocol.TurnID) bool {
 		// arrives after TurnDone therefore queues behind this handoff instead of
 		// racing the old turn's claim and starting a second turn.
 		a.busy = true
+		a.workStartedAt = time.Now()
+		a.workLabel = ""
 		a.phase = protocol.PhasePreparing
 		next := a.snapshotLocked()
 		nextRev := next.Revision
@@ -1766,20 +1678,87 @@ func (a *Agent) stampUpdateLocked(update *protocol.Update) {
 
 func (a *Agent) publishEvent(ev Event) {
 	view := a.eventView(ev)
+	a.watchMu.Lock()
+	defer a.watchMu.Unlock()
+	streaming := (view.Kind == protocol.EventStream && view.Text != "") || view.Kind == protocol.EventReasoning || view.Kind == protocol.EventToolProgress
+	if !streaming {
+		a.flushStreamsLocked()
+	}
+	a.transcript.event(view)
+	if !streaming {
+		a.publishViewLocked(view)
+		return
+	}
+	if a.streamPending == nil {
+		a.streamPending = map[string]protocol.EventView{}
+	}
+	key := string(view.Kind) + ":" + string(view.TurnID)
+	if view.Tool != nil {
+		key += ":" + string(view.Tool.ID)
+	}
+	prior, exists := a.streamPending[key]
+	if !exists {
+		a.streamOrder = append(a.streamOrder, key)
+	} else {
+		view.Text = prior.Text + view.Text
+	}
+	// Raw stream fields are previews too; the cumulative transcript carries
+	// explicit offsets and the committed message retains the full content.
+	if len(view.Text) > transcriptTextLimit {
+		view.Text, _ = transcriptTail(view.Text, transcriptTextLimit)
+	}
+	a.streamPending[key] = view
+	delay := 50*time.Millisecond - time.Since(a.lastStream)
+	if delay <= 0 {
+		a.flushStreamsLocked()
+		return
+	}
+	if a.streamTimer == nil {
+		var timer *time.Timer
+		timer = time.AfterFunc(delay, func() {
+			a.watchMu.Lock()
+			defer a.watchMu.Unlock()
+			if a.streamTimer == timer {
+				a.flushStreamsLocked()
+			}
+		})
+		a.streamTimer = timer
+	}
+}
+
+// Caller holds watchMu. All progress sources use the same ordered publisher.
+func (a *Agent) publishViewLocked(view protocol.EventView) {
 	a.mu.Lock()
 	rev := a.revisionLocked()
 	a.mu.Unlock()
-	update := protocol.Update{Type: protocol.UpdateStream,
-		Cursor:   protocol.Cursor{LogSeq: rev.LogSeq, ViewGeneration: rev.ViewGeneration},
-		Revision: rev, Event: &view, Text: view.Text}
-	a.watchMu.Lock()
-	defer a.watchMu.Unlock()
+	if view.Transcript == nil {
+		view.Transcript = a.transcript.eventItem(view)
+	}
+	if view.Transcript == nil && (view.Kind == protocol.EventReasoning || view.Kind == protocol.EventStream && view.Text != "" || view.Kind == protocol.EventToolProgress) {
+		// A durable commit already replaced this live item. The final snapshot
+		// is authoritative; do not replay an orphan delta after its replacement.
+		return
+	}
+	update := protocol.Update{Type: protocol.UpdateStream, Cursor: protocol.Cursor{LogSeq: rev.LogSeq, ViewGeneration: rev.ViewGeneration}, Revision: rev, Event: &view, Text: view.Text}
 	a.stampUpdateLocked(&update)
-	a.transcript.event(view)
-	view.Transcript = a.transcript.eventItem(view)
 	for _, watcher := range a.watchers {
 		a.sendWatcherLocked(watcher, update)
 	}
+}
+
+func (a *Agent) flushStreamsLocked() {
+	if a.streamTimer != nil {
+		a.streamTimer.Stop()
+		a.streamTimer = nil
+	}
+	if len(a.streamOrder) > 0 {
+		a.lastStream = time.Now()
+	}
+	for _, key := range a.streamOrder {
+		a.publishViewLocked(a.streamPending[key])
+	}
+	a.streamPending = nil
+	a.streamOrder = nil
 }
 
 // eventView is the only bridge from the legacy Event channel to the typed
@@ -1791,7 +1770,6 @@ func (a *Agent) eventView(ev Event) protocol.EventView {
 	if turnID == "" {
 		turnID = protocol.TurnID(fmt.Sprintf("%d", a.turnSeq))
 	}
-	a.observeTurnEventLocked(ev, turnID)
 	view := protocol.EventView{SessionID: protocol.SessionID(a.sessionID), TurnID: turnID, StepID: protocol.StepID(fmt.Sprintf("%d", a.stepSeq)), Phase: a.phase, Workflow: a.workflow, MessageID: ev.MessageID, Text: ev.Text}
 	mode := a.perms.CurrentMode()
 	a.mu.Unlock()
@@ -1855,45 +1833,6 @@ func (a *Agent) eventView(ev Event) protocol.EventView {
 	return view
 }
 
-// observeTurnEventLocked keeps a small recovery projection alongside the
-// transient event stream. It intentionally keys updates off a running turn,
-// rather than merely EventError, so diagnostics from commands and operations
-// (for example a failed fork) cannot change the latest turn outcome.
-func (a *Agent) observeTurnEventLocked(ev Event, turnID protocol.TurnID) {
-	if a.turnSeq == 0 {
-		return
-	}
-	sameTurn := a.lastTurn != nil && a.lastTurn.TurnID == turnID
-	if !a.busy && ev.Type != EventTurnDone {
-		return
-	}
-	switch ev.Type {
-	case EventUserMsg:
-		if !sameTurn {
-			a.lastTurn = &protocol.TurnOutcome{TurnID: turnID, Status: protocol.TurnRunning}
-		}
-	case EventError:
-		// Only a turn that announced its user input can own an error. This
-		// excludes command/operation diagnostics even when a turn is busy.
-		if sameTurn && a.lastTurn.Status == protocol.TurnRunning {
-			a.lastTurn.Status = protocol.TurnFailed
-			a.lastTurn.Error = ev.Text
-		}
-	case EventTurnDone:
-		if !sameTurn || (a.lastTurn.Status != protocol.TurnRunning && a.lastTurn.Status != protocol.TurnFailed) {
-			return
-		}
-		if a.lastTurn.Status == protocol.TurnFailed {
-			return
-		}
-		if a.interruptFlag || a.stop || a.closing || a.closed {
-			a.lastTurn.Status = protocol.TurnCancelled
-		} else {
-			a.lastTurn.Status = protocol.TurnSucceeded
-		}
-	}
-}
-
 // sendWatcherLocked reserves one channel slot for a resync marker. Once a
 // consumer falls behind, no later update can silently erase the recovery
 // signal; the terminal subscription tells it to Snapshot and re-Watch.
@@ -1929,6 +1868,7 @@ func (a *Agent) sendWatcherLocked(w *runtimeWatcher, update protocol.Update) {
 
 func (a *Agent) closeWatchers() {
 	a.watchMu.Lock()
+	a.flushStreamsLocked()
 	defer a.watchMu.Unlock()
 	for key, watcher := range a.watchers {
 		a.closeWatcherLocked(watcher)
@@ -1964,6 +1904,7 @@ func (a *Agent) Watch(ctx context.Context, cursor protocol.Cursor) (protocol.Sub
 	}
 	w := &runtimeWatcher{owner: a, ch: make(chan protocol.Update, 64), closed: make(chan struct{})}
 	a.watchMu.Lock()
+	a.flushStreamsLocked()
 	a.mu.Lock()
 	if a.closed || a.closing {
 		a.mu.Unlock()
@@ -2029,6 +1970,7 @@ func cloneMessages(src []messages.Message) []messages.Message {
 	dst := make([]messages.Message, len(src))
 	for i, m := range src {
 		dst[i] = m
+		dst[i].StreamSegments = append([]messages.StreamSegment(nil), m.StreamSegments...)
 		dst[i].ToolCalls = append([]messages.ToolCall(nil), m.ToolCalls...)
 		dst[i].Content = m.Content
 		if m.ImageAttachments != nil {

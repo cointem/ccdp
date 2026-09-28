@@ -2,6 +2,7 @@ package tools
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -55,5 +56,14 @@ func (t *ReadSkillTool) Run(ctx *Context) (string, error) {
 		}
 		return "", fmt.Errorf("ReadSkill: no skill %q (available: %s)", name, strings.Join(names, ", "))
 	}
-	return boundedToolString(ctx, fmt.Sprintf("# Skill: %s (source: %s)\n\n%s", sk.Name, sk.Source, sk.Body)), nil
+	path := filepath.Join(sk.Path, "SKILL.md")
+	header := fmt.Sprintf("# Skill: %s (source: %s; path: %s)\n\n", sk.Name, sk.Source, path)
+	budget := min(50<<10, ctx.outputLimit())
+	if len(header)+len(sk.Body) > budget {
+		if budget < len(header)+200 {
+			return "", fmt.Errorf("ReadSkill: output budget too small; read %q", path)
+		}
+		return header + truncateUTF8(sk.Body, budget-len(header)-150) + fmt.Sprintf("\n[incomplete; read %q to continue]", path), nil
+	}
+	return header + sk.Body, nil
 }

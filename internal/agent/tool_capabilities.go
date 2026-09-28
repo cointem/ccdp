@@ -9,9 +9,8 @@ import "ccdp/internal/tools"
 func planAllowedImplementation(tool tools.Tool) bool {
 	switch tool.(type) {
 	case *tools.ReadTool, *tools.GlobTool, *tools.GrepTool, *tools.LSTool,
-		*tools.GitStatusTool, *tools.GitDiffTool, *tools.GitLogTool,
-		*tools.ReadSkillTool, *toolSearchTool,
-		*tools.TodoWriteTool, *tools.TaskTool, *tools.AgentTool,
+		*tools.ReadSkillTool, *tools.CodeNavigateTool, *toolSearchTool,
+		*tools.TodoWriteTool, *tools.AgentTool,
 		*tools.WebFetchTool, *tools.WebSearchTool,
 		*enterPlanModeTool, *exitPlanModeTool, *askUserQuestionTool:
 		return true
@@ -26,8 +25,7 @@ func planAllowedImplementation(tool tools.Tool) bool {
 func readOnlyImplementation(tool tools.Tool) bool {
 	switch tool.(type) {
 	case *tools.ReadTool, *tools.GlobTool, *tools.GrepTool, *tools.LSTool,
-		*tools.GitStatusTool, *tools.GitDiffTool, *tools.GitLogTool,
-		*tools.ReadSkillTool, *toolSearchTool:
+		*tools.ReadSkillTool, *tools.CodeNavigateTool, *toolSearchTool:
 		return true
 	default:
 		return false

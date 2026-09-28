@@ -2,6 +2,7 @@ package tui
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -114,7 +115,8 @@ func (m *Model) handleHistorySearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool
 		return m, nil, true
 	case "backspace":
 		if len(s.query) > 0 {
-			s.query = s.query[:len(s.query)-1]
+			_, size := utf8.DecodeLastRuneInString(s.query)
+			s.query = s.query[:len(s.query)-size]
 			m.recomputeHistorySearch()
 		}
 		return m, nil, true

@@ -10,6 +10,31 @@ import (
 	"ccdp/internal/hooks"
 )
 
+func TestNetworkAccessDefaultsAndExplicitOverrides(t *testing.T) {
+	defaults := defaultConfig()
+	if !defaults.Sandbox().NetworkAllowed() {
+		t.Fatal("default sandbox must allow outbound network")
+	}
+	for _, enabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "disabled", true: "enabled"}[enabled], func(t *testing.T) {
+			cfg := defaultConfig()
+			src := Config{NetworkAccess: enabled}
+			value, err := json.Marshal(enabled)
+			if err != nil {
+				t.Fatal(err)
+			}
+			applyConfigFields(&cfg, &src, map[string]json.RawMessage{"network_access": value}, SourceUserFile, "config.json", true)
+			if cfg.Sandbox().NetworkAllowed() != enabled {
+				t.Fatalf("explicit network_access=%v was not respected", enabled)
+			}
+		})
+	}
+	t.Setenv("CCDP_NETWORK_ACCESS", "false")
+	if Default().NetworkAccess {
+		t.Fatal("explicit environment override must disable network")
+	}
+}
+
 func TestLoadFromEnvironmentOverridesFile(t *testing.T) {
 	t.Setenv("CCDP_API_KEY", "env-key")
 	t.Setenv("CCDP_BASE_URL", "https://env.example/v1")

@@ -5,6 +5,21 @@ import (
 	"testing"
 )
 
+func TestWebLookupAllowedWithoutPerCallApproval(t *testing.T) {
+	for _, mode := range []Mode{ModeDefault, ModeAcceptEdits, ModeBypass} {
+		for _, name := range []string{"WebSearch", "WebFetch"} {
+			m := NewManager(mode, Policy{})
+			if decision, reason := m.Check(name, nil); decision != DecisionAllow {
+				t.Errorf("%s/%s: %s (%s)", mode, name, decision, reason)
+			}
+			m = NewManager(mode, Policy{AlwaysDeny: []string{name}})
+			if decision, _ := m.Check(name, nil); decision != DecisionDeny {
+				t.Errorf("%s/%s ignored explicit deny", mode, name)
+			}
+		}
+	}
+}
+
 func TestParseModeIncludesPlan(t *testing.T) {
 	if m, err := ParseMode("plan"); err != nil || m != ModePlan {
 		t.Errorf("plan mode not parsed: %v %v", m, err)
@@ -146,10 +161,10 @@ func TestGitSafeRejectsOperators(t *testing.T) {
 func TestQuotedArgvReadOnlyGitAutoAllowed(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{})
 	for _, cmd := range []string{
-		"'git' 'diff'",
+		"'git' 'diff' '--no-ext-diff' '--no-textconv'",
 		"'git' 'status' '--short'",
-		"'git' 'diff' '--' 'a b.txt'",
-		"git 'diff'",
+		"'git' 'diff' '--no-ext-diff' '--no-textconv' '--' 'a b.txt'",
+		"git 'diff' --no-ext-diff --no-textconv",
 		"env ls",
 	} {
 		if d, reason := m.Check("Bash", map[string]any{"command": cmd}); d != DecisionAllow {

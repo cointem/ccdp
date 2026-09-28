@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ccdp/internal/events"
+	"ccdp/internal/fsops"
 	"ccdp/internal/hooks"
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
@@ -24,7 +25,8 @@ type compactFailureState struct {
 // needsCompact reports whether the conversation has grown past the configured
 // fraction of the model's context window.
 func (a *Agent) needsCompact() bool {
-	return a.estimateTokens() > int(float64(a.cfg.ContextWindowFor(a.cfg.Model))*a.cfg.CompactThreshold)
+	cfg := a.configSnapshot()
+	return a.estimateTokens() > int(float64(cfg.ContextWindowFor(cfg.Model))*cfg.CompactThreshold)
 }
 
 // estimateTokens approximates the prompt size of the current history. When the
@@ -80,14 +82,14 @@ func (a *Agent) compact() {
 		a.compactCancel = nil
 		a.mu.Unlock()
 	}()
-	a.compactContextMode(ctx, false)
+	_ = a.compactContextMode(ctx, false)
 }
 
 // compactContext is also used by the asynchronous command worker. Keeping the
 // cancellation context explicit ensures an interrupt can abort the provider
 // summarization instead of being stuck behind the command loop.
-func (a *Agent) compactContext(hctx context.Context) {
-	a.compactContextMode(hctx, true)
+func (a *Agent) compactContext(hctx context.Context) error {
+	return a.compactContextMode(hctx, true)
 }
 
 // compactFailureKeyLocked identifies the immutable state an automatic
@@ -146,94 +148,57 @@ func (a *Agent) rememberCompactFailure(key string, reason error) {
 	a.mu.Unlock()
 }
 
-func (a *Agent) compactContextMode(hctx context.Context, manual bool) {
-	if hctx == nil {
-		hctx = context.Background()
+func (a *Agent) compactContextMode(ctx context.Context, manual bool) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	a.mu.Lock()
-	attemptKey := a.compactFailureKeyLocked()
-	if !manual && a.compactFailure != nil && a.compactFailure.key == attemptKey {
-		a.mu.Unlock()
-		a.emitStatus("automatic compaction paused after a provider failure; use /compact or change model to retry")
-		return
-	}
+	key := a.compactFailureKeyLocked()
+	paused := !manual && a.compactFailure != nil && a.compactFailure.key == key
 	a.mu.Unlock()
-	// PreCompact hooks get a chance to veto or log before history is touched.
-	// hookCtx: a nil turn context (turn not started yet) would panic inside
-	// hooks, and an already-cancelled one would instantly "time out" them.
-	if ho := a.runHookWithJournal(hctx, hooks.EventPreCompact, func(hookCtx context.Context) hooks.Output {
-		return a.hooks.PreCompact(hookCtx)
+	if paused {
+		return nil
+	}
+	if ho := a.runHookWithJournal(ctx, hooks.EventPreCompact, func(hctx context.Context) hooks.Output {
+		return a.hooks.PreCompact(hctx)
 	}); ho.Decision == hooks.DecisionBlock || ho.Decision == hooks.DecisionDeny {
-		a.emitStatus("compaction blocked by hook: %s", ho.Reason)
-		return
+		return fmt.Errorf("compaction blocked by hook: %s", ho.Reason)
 	}
-
-	head, toSummarize, keptTail, lastTs, keep, ok := a.compactSpans()
+	head, span, tail, lastTs, keep, ok := a.compactSpans()
 	if !ok {
-		return
+		return nil
 	}
-
-	summary, err := a.summarize(hctx, toSummarize)
+	summary, err := a.summarize(ctx, span)
+	if err == nil {
+		err = a.commitCompaction(ctx, head, summary, tail, lastTs, keep)
+	}
 	if err != nil {
-		if isRequestJournalFailure(err) {
-			// A prepared request is admitted only after its journal fact is
-			// durable. Never hide that failure by dropping history locally or
-			// trying another summarization path.
-			a.emit(Event{Type: EventError, Text: "compaction journal error: " + err.Error()})
-			return
+		if !manual && ctx.Err() == nil {
+			a.rememberCompactFailure(key, err)
 		}
-		if hctx.Err() != nil {
-			a.emitStatus("compaction interrupted")
-			return
-		}
-		if !manual {
-			a.rememberCompactFailure(attemptKey, err)
-		}
-		a.emitStatus("compaction failed (%v)", err)
-		// A failed summarization has not produced a confirmed replacement
-		// projection. Keep the existing history byte-for-byte; dropping tool
-		// results here would silently destroy recoverable context after a
-		// transient provider failure.
-		if manual {
-			a.emitStatus("compaction kept existing history; retry after fixing the provider or context")
-		} else {
-			a.emitStatus("compaction kept existing history; use /compact or change model to retry")
-		}
-		return
+		a.emitStatus("compaction kept existing history: %v", err)
 	}
-
-	a.commitCompaction(hctx, head, summary, keptTail, lastTs, keep)
+	return err
 }
 
 // compactSpans snapshots the history spans needed by a compaction under one
 // lock: the leading system facts (head), the region to summarize
-// (toSummarize), and the newest complete turn kept verbatim (keptTail). ok is
+// (toSummarize), and complete recent tool groups kept verbatim (keptTail). ok is
 // false when the history is already small enough that no compaction is needed.
 func (a *Agent) compactSpans() (head, toSummarize, keptTail []messages.Message, lastTs time.Time, keep int, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	keep = a.cfg.KeepAfterCompact
 	if keep < 4 {
 		keep = 4
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if len(a.history) <= 1+keep {
+	budget := a.cfg.ContextWindowFor(a.cfg.Model) / 3
+	if len(a.history) <= 1+keep && estimateHistoryTokens(a.history) <= budget {
 		return nil, nil, nil, time.Time{}, keep, false
 	}
-	cut := len(a.history) - keep // messages[cut:] stays intact
-	// Never split a tool_call↔result pair at the boundary: walk cut back past
-	// any tool results whose caller would land in the summarized head.
-	for cut > 1 && a.history[cut].Role == messages.RoleTool {
-		cut--
-	}
-	// A model step is part of the user turn that produced it. Move the
-	// boundary to the beginning of that turn so compaction never leaves a
-	// user message or an assistant/tool round on the opposite side of its
-	// own context. The newest complete turn remains in the tail even when it
-	// is larger than the nominal keep count; the budget/admission layer can
-	// then decide whether another compaction or an explicit user action is
-	// required.
-	for cut > 1 && a.history[cut].Role != messages.RoleUser {
-		cut--
+	cut := compactCut(a.history, keep, budget)
+	if cut <= 0 {
+		return nil, nil, nil, time.Time{}, keep, false
 	}
 	// History does not contain the wire system prompt. Preserve only any
 	// explicit leading system facts; pinning history[0] would permanently keep
@@ -256,7 +221,10 @@ func (a *Agent) compactSpans() (head, toSummarize, keptTail []messages.Message, 
 // message plus the kept tail, persists it (so an older full projection cannot
 // overwrite it), resets the token baseline, and publishes the compacted events
 // and post-compact hook.
-func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, summary string, keptTail []messages.Message, lastTs time.Time, keep int) {
+func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, summary string, keptTail []messages.Message, lastTs time.Time, keep int) error {
+	a.mu.Lock()
+	originalTokens := estimateHistoryTokens(a.history)
+	a.mu.Unlock()
 	// Restore context that the model may otherwise lose (Claude Code's compact
 	// restore: discovered tools, active todos, recently touched files).
 	if restore := a.restoreContextSnippet(keptTail); restore != "" {
@@ -266,27 +234,30 @@ func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, 
 	// post-compaction file attachments) so the model keeps its working set
 	// without having to re-Read everything.
 	if att := a.postCompactFileAttachments(keptTail); att != "" {
-		summary += "\n\n" + att
+		if estimateHistoryTokens(head)+estimateHistoryTokens(keptTail)+llm.EstimateTokens(summary+att) < originalTokens {
+			summary += "\n\n" + att
+		}
 	}
 
 	// Commit the replacement under the lock. The summary is injected as a user
 	// message with a marker, mirroring Codex's CompactionSummary and Claude
 	// Code's isCompactSummary (never a mid-conversation system message).
-	// sanitizeToolPairs is a belt-and-braces no-op here (the cut boundary
-	// never splits a pair) but keeps the invariant explicit.
-	newHistory := sanitizeToolPairs(func() []messages.Message {
-		nh := make([]messages.Message, 0, 2+len(keptTail))
-		nh = append(nh, head...)
-		nh = append(nh, messages.Message{
-			Role: messages.RoleUser,
-			Content: summaryPrefix + "\n<ccdp-context-summary>\nThis is a structured summary of the earlier conversation; treat it as accurate context.\n\n" +
-				summary + "\n</ccdp-context-summary>" +
-				a.traceEscapeHatch(),
-			CreatedAt: lastTs,
-		})
-		nh = append(nh, keptTail...)
-		return nh
-	}())
+	// compactCut admits only complete tool groups.
+	newHistory := make([]messages.Message, 0, len(head)+1+len(keptTail))
+	newHistory = append(newHistory, head...)
+	newHistory = append(newHistory, messages.Message{
+		Role: messages.RoleUser,
+		Content: summaryPrefix + "\n<ccdp-context-summary>\nThis is a structured summary of the earlier conversation; treat it as accurate context.\n\n" +
+			summary + "\n</ccdp-context-summary>" + a.traceEscapeHatch(),
+		CreatedAt: lastTs,
+	})
+	newHistory = append(newHistory, keptTail...)
+	if err := hctx.Err(); err != nil {
+		return err
+	}
+	if estimateHistoryTokens(newHistory) >= originalTokens {
+		return fmt.Errorf("compaction did not reduce context; existing history kept")
+	}
 	// A compaction summary is confirmed by the store before it becomes visible
 	// in memory or through the event stream. This also serializes the rewrite
 	// with Save so an older full projection cannot overwrite it.
@@ -301,7 +272,7 @@ func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, 
 	if persistErr != nil {
 		a.persistMu.Unlock()
 		a.failTurnPersistence(persistErr)
-		return
+		return persistErr
 	}
 	a.mu.Lock()
 	a.history = newHistory
@@ -319,7 +290,7 @@ func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, 
 	a.runHookWithJournal(hctx, hooks.EventPostCompact, func(hookCtx context.Context) hooks.Output {
 		return a.hooks.PostCompact(hookCtx)
 	})
-	_ = a.Save()
+	return nil
 }
 
 // summaryPrefix frames the summary so the model continues rather than restarts
@@ -559,27 +530,17 @@ func (a *Agent) postCompactFileAttachments(keptTail []messages.Message) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
-// readBoundedRegularFile is intentionally local to compaction.  The regular
-// file check and the +1 read happen on the same opened descriptor, so a path
-// replacement cannot turn a bounded attachment read into an unbounded or
-// blocking operation.  The caller applies the user-visible truncation marker
-// after converting the bounded bytes to UTF-8 text.
+// readBoundedRegularFile uses the shared nonblocking, regular-file open.
+// The caller requests an extra byte to detect truncation.
 func readBoundedRegularFile(path string, maxBytes int) ([]byte, error) {
 	if maxBytes <= 0 {
 		return nil, fmt.Errorf("attachment byte limit must be positive")
 	}
-	f, err := os.Open(path)
+	f, err := fsops.OpenRegular("", path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("attachment is not a regular file")
-	}
 	return io.ReadAll(io.LimitReader(f, int64(maxBytes)))
 }
 

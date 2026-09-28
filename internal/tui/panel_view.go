@@ -243,12 +243,13 @@ func (m *Model) renderQuestionInline() string {
 	if s.scroll < 0 {
 		offset = min(max(0, focusRow-bodyRows+1), max(0, len(body)-bodyRows))
 	}
-	if focusRow < offset {
+	if s.scroll < 0 && focusRow < offset {
 		offset = focusRow
-	} else if focusRow >= offset+bodyRows {
+	} else if s.scroll < 0 && focusRow >= offset+bodyRows {
 		offset = focusRow - bodyRows + 1
 	}
 	offset = min(max(0, offset), max(0, len(body)-bodyRows))
+	s.scroll = offset
 	if offset > 0 {
 		rows = append(rows, styleHints.Render(fmt.Sprintf("↑ more · %d–%d/%d", offset+1, min(len(body), offset+bodyRows), len(body))))
 	}

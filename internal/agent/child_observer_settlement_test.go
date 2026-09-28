@@ -8,6 +8,30 @@ import (
 	"time"
 )
 
+func TestClosedRuntimeSnapshotKeepsDurableRevision(t *testing.T) {
+	a := newRuntimeAgent(t)
+	for _, id := range []protocol.InputID{"mail-1", "mail-2", "mail-3"} {
+		r := a.applySubmitInput(protocol.NewSubmitInput(protocol.CommandID(id), "", id, "progress", protocol.InputMessage))
+		if r.Rejected() {
+			t.Fatal(r.Error)
+		}
+	}
+	before, err := a.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.CloseContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := a.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Revision.LogSeq < before.Revision.LogSeq {
+		t.Fatalf("closed snapshot rolled revision backward: before=%+v after=%+v", before.Revision, after.Revision)
+	}
+}
+
 func TestChildWatchPublishesIdleOnRuntimeDetach(t *testing.T) {
 	a := newRuntimeAgent(t)
 	a.mu.Lock()

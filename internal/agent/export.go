@@ -459,7 +459,6 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	// Keep checkpoint git operations on the newly published boundary after a
 	// reload or /cd. Typed operations still pass their own cancellable context
 	// through CreateContext/RestoreContext below.
-	a.checkpoints.SetExecutionBoundary(a.rootCtx, candidate.sandbox)
 	a.syncHookContext()
 	policyPublished = true
 	return nil
@@ -656,6 +655,8 @@ func (a *Agent) reserveSettingsMutation() (string, error) {
 	}
 	workspace := a.cfg.Workspace
 	a.busy = true
+	a.workStartedAt = time.Now()
+	a.workLabel = ""
 	a.phase = protocol.PhasePreparing
 	return workspace, nil
 }

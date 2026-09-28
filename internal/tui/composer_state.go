@@ -19,6 +19,7 @@ type composerState struct {
 	missingHistoryImages bool
 	history              []string
 	historyIdx           int
+	historyDraft         *composerDraft
 	// cmdSug is the live slash-command autocomplete list (popup above the
 	// input) while the user is typing a command name after "/". cmdSugIdx is
 	// the highlighted entry; navigation covers the complete result set while
@@ -36,4 +37,11 @@ type composerState struct {
 	// pasteFold retains the original long paste while its compact preview is
 	// shown near the composer. The underlying textarea always remains editable.
 	pasteFold *pasteFoldState
+}
+
+// composerDraft preserves the unsent input while browsing submitted history.
+type composerDraft struct {
+	text   string
+	images []protocol.InputImage
+	paste  *pasteFoldState
 }

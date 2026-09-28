@@ -21,7 +21,7 @@ func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 		return llm.StreamResult{Text: text, FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "original"}, childPurposeTask, "call", 0)
+	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "original"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestReasoningOnlyChildCompletesAndRestoresThinking(t *testing.T) {
 		return llm.StreamResult{Reasoning: "I need to implement the task", FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "write a file"}, childPurposeTask, "call", 0)
+	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "write a file"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,9 +112,9 @@ func TestReasoningOnlyChildCompletesAndRestoresThinking(t *testing.T) {
 	if !found {
 		t.Fatal("settled child lost saved reasoning")
 	}
-	output, err := tools.NewAgentTool().Run(&tools.Context{
-		Context: context.Background(), Sessions: a.Sessions(),
-		Args: map[string]any{"action": "output", "session_id": string(view.SessionID)},
+	output, err := tools.NewAgentTool("ReadAgent").Run(&tools.Context{
+		Context: context.Background(), Sessions: a.Sessions(), ReadAgent: a.supervisor.readAgent,
+		Args: map[string]any{"view": "transcript", "agent_id": string(view.SessionID)},
 	})
 	if err != nil {
 		t.Fatal(err)

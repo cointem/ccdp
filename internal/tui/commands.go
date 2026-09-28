@@ -289,27 +289,15 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			Remove: &protocol.RemoveMessages{Count: n}}, fmt.Sprintf("removing last %d message(s)…", n))
 
 	case "rewind":
-		// No argument → interactive picker over the recent messages.
-		if len(args) == 0 {
-			total, previews := m.historyPreview()
-			if len(previews) == 0 {
-				m.pushLog("error", "nothing to rewind to")
+		if len(args) == 0 || args[0] == "list" || args[0] == "prepare" || args[0] == "apply" || args[0] == "recover" {
+			workflow, err := commands.ParseCodingWorkflow(cmd, args)
+			if err != nil {
+				m.pushLog("error", err.Error())
 				return m, nil
 			}
-			lines := make([]string, len(previews))
-			for i, p := range previews {
-				lines[i] = p
-			}
-			options := make([]SelectorOption, len(lines))
-			for i, line := range lines {
-				keep := total - len(lines) + i + 1
-				if keep < 0 {
-					keep = 0
-				}
-				options[i] = SelectorOption{ID: "keep:" + strconv.Itoa(keep), Label: line}
-			}
-			return m, m.startSelectorAt("Rewind to message", options, len(options)-1, true, selectorAction{Kind: selectorRewind})
+			return m, m.submitCommand(protocol.Command{Type: protocol.CommandRunWorkflow, Workflow: &workflow}, "recovery workflow submitted")
 		}
+
 		n, err := strconv.Atoi(args[0])
 		if err != nil || n < 0 {
 			m.pushLog("error", "usage: /rewind [<n>] (keep the first n messages; no arg picks interactively)")
@@ -352,10 +340,13 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		return m, m.submitCommand(protocol.Command{Type: protocol.CommandCheckpoint,
 			Checkpoint: &protocol.CheckpointCommand{Action: action, ID: id, Summary: summary}}, "checkpoint request submitted")
 
-	case "review":
-		m.pushStatus("loading review…")
-		return m, m.submitCommand(protocol.Command{Type: protocol.CommandRunWorkflow,
-			Workflow: &protocol.WorkflowCommand{Kind: protocol.WorkflowReview}}, "review workflow submitted")
+	case "review", "merge", "index":
+		workflow, err := commands.ParseCodingWorkflow(cmd, args)
+		if err != nil {
+			m.pushLog("error", err.Error())
+			return m, nil
+		}
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandRunWorkflow, Workflow: &workflow}, "/"+cmd)
 
 	case "add-dir":
 		readOnly := false
@@ -625,14 +616,12 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 			External: &protocol.ExternalCommand{Program: "gh", Args: []string{"pr", "view", "--comments"}}}, "PR comments requested")
 
 	case "commit-push-pr":
-		msg := strings.Join(args, " ")
-		if msg == "" {
-			m.pushLog("error", "usage: /commit-push-pr <commit message>")
+		workflow, err := commands.ParseCodingWorkflow(cmd, args)
+		if err != nil {
+			m.pushLog("error", err.Error())
 			return m, nil
 		}
-		m.pushStatus("committing, pushing and opening PR…")
-		return m, m.submitCommand(protocol.Command{Type: protocol.CommandRunWorkflow,
-			Workflow: &protocol.WorkflowCommand{Kind: protocol.WorkflowCommitPushPR, Message: msg}}, "commit/push/PR workflow submitted")
+		return m, m.submitCommand(protocol.Command{Type: protocol.CommandRunWorkflow, Workflow: &workflow}, "delivery submitted")
 
 	case "reload":
 		if len(args) != 0 {

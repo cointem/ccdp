@@ -15,7 +15,6 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
-	"ccdp/internal/tools"
 )
 
 func TestSupervisorInterruptCancelsQueuedInputsAndPreservesReceipt(t *testing.T) {
@@ -26,7 +25,7 @@ func TestSupervisorInterruptCancelsQueuedInputsAndPreservesReceipt(t *testing.T)
 		return llm.StreamResult{}, ctx.Err()
 	}}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "block"}, childPurposeTask, "call", 0)
+	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "block"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +84,7 @@ func TestSupervisorMemoryContinueRetainsHistoryAndCommandIdentity(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer a.Close()
-	r, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "memory original"}, childPurposeTask, "call", 0)
+	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "memory original"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +258,7 @@ func TestSupervisorStopTreeJoinsAllTargets(t *testing.T) {
 	}}
 	a, _ := newChildRuntimeTestAgent(t, p)
 	for i := 0; i < 2; i++ {
-		if _, err := a.supervisor.launch(a, a.rootCtx, tools.SubagentTask{Description: "block", WaitPolicy: "notify"}, childPurposeTask, fmt.Sprint(i), i); err != nil {
+		if _, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "block", WaitPolicy: "notify"}, childPurposeTask, fmt.Sprint(i)); err != nil {
 			t.Fatal(err)
 		}
 	}

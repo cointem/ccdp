@@ -1,128 +1,178 @@
 package tools
 
 import (
+	"ccdp/internal/protocol"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
-
-	"ccdp/internal/protocol"
+	"strconv"
+	"strings"
 )
 
-type AgentTool struct{}
+// AgentTool is a narrow adapter; execution, delivery and reading live in the runtime.
+type AgentTool struct{ name string }
 
-func NewAgentTool() *AgentTool  { return &AgentTool{} }
-func (*AgentTool) Name() string { return "Agent" }
-func (*AgentTool) Description() string {
-	return "Inspect and control this root's child sessions. Task launches children; Agent lists progress, reads history/full output, waits, sends steer or followup input, interrupts, cancels, or explicitly continues a settled task. read (or output without item_id) returns a page of session history; output with an item_id from that history returns the full text of that item, paged by offset. Mutations require the exact run_id from list to reject stale commands. No permission approvals or nested delegation are available. Read/wait never launch a model."
-}
-func (*AgentTool) Parameters() map[string]any {
-	return map[string]any{
-		"type": "object", "additionalProperties": false, "required": []string{"action"}, "properties": map[string]any{
-			"action":     map[string]any{"type": "string", "enum": []string{"list", "read", "output", "wait", "send", "followup", "interrupt", "cancel", "continue"}},
-			"session_id": map[string]any{"type": "string"}, "run_id": map[string]any{"type": "string"}, "text": map[string]any{"type": "string"},
-			"before": map[string]any{"type": "integer", "minimum": 0}, "item_id": map[string]any{"type": "string"}, "offset": map[string]any{"type": "integer", "minimum": 0},
-			"timeout_seconds": map[string]any{"type": "integer", "minimum": 1, "maximum": 60},
-		}}
-}
-func (*AgentTool) Run(ctx *Context) (string, error) {
-	if ctx.Sessions == nil {
-		return "", errors.New("agent directory unavailable in this session")
+func NewAgentTool(name string) *AgentTool { return &AgentTool{name: name} }
+func (t *AgentTool) Name() string         { return t.name }
+func (t *AgentTool) Description() string {
+	switch t.name {
+	case "SpawnAgent":
+		return "Start an independent task. Returns a stable agent_id immediately; final results arrive automatically as collaboration messages. Defaults: worker/shared/fresh. Children cannot delegate."
+	case "SendMessage":
+		return "Send information to an agent (or parent) without starting another task. Not user authorization."
+	case "FollowupAgent":
+		return "Assign the next task to an idle agent. Busy agents reject follow-ups; use SendMessage for information during a task. Uses the same stable agent_id."
+	case "StopAgent":
+		return "Request cancellation of the agent's current task. Retains its session and saved results."
+	case "WaitAgent":
+		return "Wait for a new collaboration event or user input when you have no independent work. Does not read reports or target a particular run. No periodic timeout. Returns immediately if no work remains."
+	case "ListAgents":
+		return "List compact agent identities, live states and outcomes. No report bodies."
+	default:
+		return "Read saved child data without running a model. Defaults to the latest completed result (possibly the previous task if currently busy). Use view=transcript for history, or view=output and item_id for a full item. Continue using next_cursor."
 	}
-	var args struct {
-		Action    string             `json:"action"`
-		SessionID protocol.SessionID `json:"session_id"`
-		RunID     protocol.RunID     `json:"run_id"`
-		Text      string             `json:"text"`
-		Before    uint64             `json:"before"`
-		ItemID    string             `json:"item_id"`
-		Offset    int64              `json:"offset"`
-		Timeout   int                `json:"timeout_seconds"`
+}
+func (t *AgentTool) Parameters() map[string]any {
+	str := func(d string) map[string]any { return map[string]any{"type": "string", "description": d} }
+	enum := func(v ...string) map[string]any { return map[string]any{"type": "string", "enum": v} }
+	props := map[string]any{}
+	required := []string{}
+	switch t.name {
+	case "SpawnAgent":
+		props = map[string]any{"task": str("Self-contained assignment"), "name": str("Short display name"), "role": enum("worker", "explorer"), "workspace": enum("shared", "isolated"), "context": enum("fresh", "fork")}
+		required = []string{"task"}
+	case "SendMessage":
+		props = map[string]any{"agent_id": str("Stable child agent_id, or parent"), "text": str("Information, not a new task")}
+		required = []string{"agent_id", "text"}
+	case "FollowupAgent", "StopAgent":
+		props["agent_id"] = str("Stable agent_id")
+		required = []string{"agent_id"}
+		if t.name == "FollowupAgent" {
+			props["task"] = str("Next assignment for an idle agent")
+			required = append(required, "task")
+		}
+	case "ReadAgent":
+		props = map[string]any{"agent_id": str("Stable agent_id"), "view": enum("result", "transcript", "output"), "cursor": str("next_cursor from the previous page"), "item_id": str("Required only for view=output")}
+		required = []string{"agent_id"}
+	case "ListAgents":
+		props["cursor"] = str("next_cursor from the previous page")
 	}
-	data, err := json.Marshal(ctx.Args)
-	if err != nil {
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": props, "required": required}
+}
+func (t *AgentTool) Run(ctx *Context) (string, error) {
+	if err := ctx.checkResources(); err != nil {
 		return "", err
 	}
-	if err := json.Unmarshal(data, &args); err != nil {
-		return "", err
+	// Tools may be called without provider-side schema validation.
+	props := t.Parameters()["properties"].(map[string]any)
+	for key := range ctx.Args {
+		if _, ok := props[key]; !ok {
+			return "", fmt.Errorf("%s: unknown parameter %q", t.name, key)
+		}
 	}
-	encode := func(value any, err error) (string, error) {
+	encode := func(v any) (string, error) { b, err := json.Marshal(v); return string(b), err }
+	if t.name == "WaitAgent" {
+		if ctx.WaitAgentEvent == nil {
+			return "", errors.New("collaboration wait unavailable")
+		}
+		reason, err := ctx.WaitAgentEvent(ctx.Context)
 		if err != nil {
 			return "", err
 		}
-		data, err := json.Marshal(value)
-		return string(data), err
+		return encode(struct {
+			Reason string `json:"reason"`
+		}{reason})
 	}
-	if args.Action == "list" {
-		return encode(ctx.Sessions.ListChildren(ctx.Context))
+	if t.name == "SpawnAgent" {
+		task := strings.TrimSpace(StringArg(ctx.Args, "task", ""))
+		if task == "" || ctx.SpawnAgent == nil {
+			return "", errors.New("task and child launcher required")
+		}
+		receipt, err := ctx.SpawnAgent(SpawnAgentRequest{Task: task, Name: StringArg(ctx.Args, "name", ""), Role: StringArg(ctx.Args, "role", "worker"), Workspace: StringArg(ctx.Args, "workspace", "shared"), Context: StringArg(ctx.Args, "context", "fresh")})
+		if err != nil {
+			return "", err
+		}
+		return encode(receipt)
 	}
-	if args.SessionID == "" {
-		return "", errors.New("session_id required")
+	id := protocol.SessionID(StringArg(ctx.Args, "agent_id", ""))
+	if t.name == "SendMessage" {
+		text := StringArg(ctx.Args, "text", "")
+		if id == "" || strings.TrimSpace(text) == "" || ctx.SendAgentMessage == nil {
+			return "", errors.New("agent_id, text and messaging capability required")
+		}
+		if err := ctx.SendAgentMessage(string(id), text); err != nil {
+			return "", err
+		}
+		return encode(protocol.AgentReceipt{AgentID: id, Status: "queued"})
 	}
-	switch args.Action {
-	case "read":
-		return encode(ctx.Sessions.ReadTranscript(ctx.Context, args.SessionID, args.Before, 64))
-	case "output":
-		if args.ItemID == "" {
-			if args.Offset != 0 {
-				return "", errors.New("offset requires item_id; use before to page session history")
+	if ctx.Sessions == nil {
+		return "", errors.New("agent directory unavailable")
+	}
+	if t.name == "ListAgents" {
+		rows, err := ctx.Sessions.ListChildren(ctx.Context)
+		if err != nil {
+			return "", err
+		}
+		start := 0
+		if cursor := StringArg(ctx.Args, "cursor", ""); cursor != "" {
+			start, err = strconv.Atoi(cursor)
+			if err != nil || start < 0 || start > len(rows) {
+				return "", errors.New("invalid list cursor")
 			}
-			return encode(ctx.Sessions.ReadTranscript(ctx.Context, args.SessionID, args.Before, 64))
 		}
-		return encode(ctx.Sessions.ReadOutput(ctx.Context, args.SessionID, args.ItemID, args.Offset, 32<<10))
-	case "wait":
-		timeout := args.Timeout
-		if timeout <= 0 {
-			timeout = 30
-		}
-		if timeout > 60 {
-			timeout = 60
-		}
-		deadline := time.NewTimer(time.Duration(timeout) * time.Second)
-		defer deadline.Stop()
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			rows, err := ctx.Sessions.ListChildren(ctx.Context)
-			if err != nil {
-				return "", err
+		page := protocol.AgentListPage{Agents: []protocol.AgentSummary{}}
+		for i := start; i < len(rows); i++ {
+			row := rows[i]
+			name := row.Name
+			if name == "" {
+				name = row.Title
 			}
-			var found *protocol.ChildSession
-			for _, row := range rows {
-				if row.SessionID == args.SessionID {
-					copy := row
-					found = &copy
-					break
+			entry := protocol.AgentSummary{AgentReceipt: protocol.AgentReceiptFor(row.SessionID, row.Run), Name: truncateUTF8(name, 256)}
+			page.Agents = append(page.Agents, entry)
+			page.NextCursor = ""
+			if i+1 < len(rows) {
+				page.NextCursor = strconv.Itoa(i + 1)
+			}
+			b, _ := json.Marshal(page)
+			if len(b) > ctx.outputLimit() {
+				page.Agents = page.Agents[:len(page.Agents)-1]
+				page.NextCursor = strconv.Itoa(i)
+				if len(page.Agents) == 0 {
+					return "", errors.New("output budget too small for an agent summary")
 				}
-			}
-			if found == nil {
-				return "", errors.New("session not found; use exact id from list")
-			}
-			if args.RunID != "" && found.Run.ID != args.RunID {
-				return "", errors.New("stale run id")
-			}
-			if !found.Run.Active() || found.Approval != nil {
-				return encode(found, nil)
-			}
-			select {
-			case <-ctx.Context.Done():
-				return "", ctx.Context.Err()
-			case <-deadline.C:
-				return encode(found, nil)
-			case <-ticker.C:
+				break
 			}
 		}
-	case "send", "followup", "interrupt", "cancel", "continue":
-		if args.RunID == "" || ctx.AgentCommandID == "" {
-			return "", errors.New("run_id and command identity required")
+		return encode(page)
+	}
+	if id == "" {
+		return "", errors.New("agent_id required")
+	}
+	switch t.name {
+	case "ReadAgent":
+		if ctx.ReadAgent == nil {
+			return "", errors.New("agent reader unavailable")
 		}
-		control := protocol.AgentControl{ID: ctx.AgentCommandID, SessionID: args.SessionID, RunID: args.RunID, Action: args.Action, Text: args.Text, Strategy: protocol.InputSteer}
-		if args.Action == "followup" {
-			control.Action = "send"
+		return ctx.ReadAgent(ctx.Context, protocol.AgentReadRequest{AgentID: id, View: StringArg(ctx.Args, "view", "result"), Cursor: StringArg(ctx.Args, "cursor", ""), ItemID: StringArg(ctx.Args, "item_id", "")}, ctx.outputLimit())
+	case "FollowupAgent", "StopAgent":
+		if ctx.AgentCommandID == "" {
+			return "", errors.New("command identity required")
+		}
+		control := protocol.AgentControl{ID: ctx.AgentCommandID, SessionID: id, Action: "cancel"}
+		if t.name == "FollowupAgent" {
+			control.Action = "continue"
+			control.Text = StringArg(ctx.Args, "task", "")
 			control.Strategy = protocol.InputFollowup
+			if strings.TrimSpace(control.Text) == "" {
+				return "", errors.New("task required")
+			}
 		}
-		return encode(ctx.Sessions.Control(ctx.Context, control))
+		run, err := ctx.Sessions.Control(ctx.Context, control)
+		if err != nil {
+			return "", err
+		}
+		return encode(protocol.AgentReceiptFor(id, run))
 	default:
-		return "", fmt.Errorf("unsupported agent action %q", args.Action)
+		return "", fmt.Errorf("unsupported agent tool %q", t.name)
 	}
 }

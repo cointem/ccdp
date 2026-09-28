@@ -51,8 +51,14 @@ func (t *toolSearchTool) Run(ctx *tools.Context) (string, error) {
 	name := strings.TrimSpace(tools.StringArg(ctx.Args, "name", ""))
 	query := strings.ToLower(strings.TrimSpace(tools.StringArg(ctx.Args, "query", "")))
 
+	if name == "" && query == "" {
+		return "", fmt.Errorf("ToolSearch: name or query required")
+	}
 	var matches []string
 	for _, n := range t.ag.registry.Names() {
+		if t.ag.childState != nil && t.ag.childState.allowed != nil && !t.ag.childState.allowed[n] {
+			continue
+		}
 		if name != "" {
 			if strings.EqualFold(n, name) {
 				matches = []string{n}
@@ -67,8 +73,7 @@ func (t *toolSearchTool) Run(ctx *tools.Context) (string, error) {
 		}
 	}
 	if len(matches) == 0 {
-		return "", fmt.Errorf("ToolSearch: no tool matches %q (available: %s)",
-			firstNonEmpty(name, query), strings.Join(t.ag.registry.Names(), ", "))
+		return "", fmt.Errorf("ToolSearch: no allowed tool matches %q", firstNonEmpty(name, query))
 	}
 	sort.Strings(matches)
 
@@ -81,8 +86,19 @@ func (t *toolSearchTool) Run(ctx *tools.Context) (string, error) {
 	for i, n := range matches {
 		tool, _ := t.ag.registry.Get(n)
 		schema, _ := json.MarshalIndent(tool.Parameters(), "  ", "  ")
-		if len(schema) > 4000 {
-			schema = schema[:4000]
+		if name == "" {
+			if i >= 5 {
+				break
+			}
+			fmt.Fprintf(&sb, "%s: %s\n", n, truncateRunes(tool.Description(), 240))
+			continue
+		}
+		limit := 50 << 10
+		if ctx.OutputLimit > 0 {
+			limit = min(limit, ctx.OutputLimit)
+		}
+		if len(schema)+len(tool.Description())+sb.Len()+100 > limit {
+			return "", fmt.Errorf("ToolSearch: complete schema exceeds output budget; tool not loaded")
 		}
 		if i > 0 {
 			sb.WriteString("\n\n")
@@ -134,6 +150,9 @@ func (a *Agent) inlineToolNames() []string {
 // non-deferred tools plus any discovered deferred tools.
 func (a *Agent) toolSchemas() []map[string]any {
 	return a.registry.SchemasFiltered(func(name string) bool {
+		if a.childState != nil && a.childState.allowed != nil && !a.childState.allowed[name] {
+			return false
+		}
 		return !a.deferTools[name] || a.isDiscovered(name)
 	})
 }

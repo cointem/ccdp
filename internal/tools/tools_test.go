@@ -1,10 +1,9 @@
 package tools
 
 import (
+	"ccdp/internal/fsops"
 	"context"
-	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,66 +11,11 @@ import (
 	"ccdp/internal/sandbox"
 )
 
-// newTestRepo creates a temp git repo with one committed file.
-func newTestRepo(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	run := func(args ...string) string {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
-			"GIT_CONFIG_NOSYSTEM=1", "HOME="+dir)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-		return string(out)
-	}
-	run("init", "-q", "-b", "main")
-	run("config", "user.name", "t")
-	run("config", "user.email", "t@t")
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	run("add", "a.txt")
-	run("commit", "-q", "-m", "initial")
-	return dir
-}
-
-func gitCtx(dir string) *Context {
-	resources := NewResources("git:"+dir, filepath.Join(dir, ".ccdp-session"))
-	return &Context{
-		Context:    context.Background(),
-		WorkingDir: dir,
-		SessionDir: resources.SessionDir(),
-		Resources:  resources,
-		Sandbox:    sandbox.New(dir),
-		Args:       map[string]any{},
-	}
-}
-
 func scopedTestContext(t *testing.T, dir string) *Context {
 	t.Helper()
 	resources := NewResources("test:"+t.Name(), filepath.Join(dir, ".ccdp-session"))
 	t.Cleanup(func() { _ = resources.Close() })
 	return resources.Context(context.Background(), dir, sandbox.New(dir))
-}
-
-func TestGitStatusTool(t *testing.T) {
-	dir := newTestRepo(t)
-	// Add an untracked file so status has output.
-	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out, err := NewGitStatusTool().Run(gitCtx(dir))
-	if err != nil {
-		t.Fatalf("GitStatus: %v", err)
-	}
-	if !strings.Contains(out, "main") || !strings.Contains(out, "b.txt") {
-		t.Errorf("GitStatus output missing branch/untracked:\n%s", out)
-	}
 }
 
 func TestWriteFileNoFollowRejectsHardlinkTarget(t *testing.T) {
@@ -84,7 +28,8 @@ func TestWriteFileNoFollowRejectsHardlinkTarget(t *testing.T) {
 	if err := os.Link(target, alias); err != nil {
 		t.Skipf("hard links unavailable: %v", err)
 	}
-	if err := writeFileNoFollow(alias, []byte("changed\n"), 0o600); err == nil {
+	v, _ := fsops.Observe(alias)
+	if _, err := fsops.Publish(alias, []byte("changed\n"), 0o600, &v); err == nil {
 		t.Fatal("writeFileNoFollow accepted a multiply-linked target")
 	}
 	data, err := os.ReadFile(target)
@@ -93,106 +38,6 @@ func TestWriteFileNoFollowRejectsHardlinkTarget(t *testing.T) {
 	}
 	if string(data) != "original\n" {
 		t.Fatalf("hard-linked target was modified: %q", data)
-	}
-}
-
-func TestGitDiffTool(t *testing.T) {
-	dir := newTestRepo(t)
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello world\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out, err := NewGitDiffTool().Run(gitCtx(dir))
-	if err != nil {
-		t.Fatalf("GitDiff: %v", err)
-	}
-	if !strings.Contains(out, "+hello world") {
-		t.Errorf("GitDiff output missing change:\n%s", out)
-	}
-}
-
-func TestGitDiffRejectsOptionRevision(t *testing.T) {
-	dir := newTestRepo(t)
-	target := filepath.Join(t.TempDir(), "must-not-exist.diff")
-	ctx := gitCtx(dir)
-	// Include the sentinel path so sandbox path denial cannot make this
-	// argument-validation assertion pass if Git is incorrectly invoked.
-	ctx.Sandbox.AddDir(filepath.Dir(target))
-	ctx.Args = map[string]any{"base": "--output=" + target}
-	if _, err := NewGitDiffTool().Run(ctx); err == nil {
-		t.Fatal("expected option-shaped diff revision to be rejected")
-	}
-	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("read-only GitDiff used base as an output-writing option: %v", err)
-	}
-}
-
-func TestGitDiffDoesNotExecuteRepositoryExternalDiff(t *testing.T) {
-	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
-	dir := newTestRepo(t)
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("after\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(dir, "external-diff-ran")
-	script := filepath.Join(dir, "external-diff.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf unexpected > \"$CCDP_GIT_SENTINEL\"\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("CCDP_GIT_SENTINEL", marker)
-	cmd := exec.Command("git", "config", "diff.external", script)
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("configure external diff: %v\n%s", err, out)
-	}
-	output, err := NewGitDiffTool().Run(gitCtx(dir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("read-only GitDiff executed project-configured command: %v", err)
-	}
-	if !strings.Contains(output, "-hello") || !strings.Contains(output, "+after") {
-		t.Fatalf("read-only built-in diff lost ordinary diff output: %s", output)
-	}
-}
-
-func TestGitLogTool(t *testing.T) {
-	dir := newTestRepo(t)
-	out, err := NewGitLogTool().Run(gitCtx(dir))
-	if err != nil {
-		t.Fatalf("GitLog: %v", err)
-	}
-	if !strings.Contains(out, "initial") {
-		t.Errorf("GitLog output missing commit message:\n%s", out)
-	}
-}
-
-func TestGitCommitTool(t *testing.T) {
-	dir := newTestRepo(t)
-	if err := os.WriteFile(filepath.Join(dir, "c.txt"), []byte("y\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	ctx := gitCtx(dir)
-	ctx.Args = map[string]any{"message": "add c.txt"}
-	out, err := NewGitCommitTool().Run(ctx)
-	if err != nil {
-		t.Fatalf("GitCommit: %v", err)
-	}
-	if !strings.Contains(out, "1 file changed") && !strings.Contains(out, "c.txt") {
-		t.Errorf("GitCommit output unexpected:\n%s", out)
-	}
-	// The file must now be committed.
-	status, _ := NewGitStatusTool().Run(gitCtx(dir))
-	if strings.Contains(status, "c.txt") {
-		t.Errorf("c.txt should be committed:\n%s", status)
-	}
-}
-
-func TestGitCommitRequiresMessage(t *testing.T) {
-	dir := newTestRepo(t)
-	_, err := NewGitCommitTool().Run(gitCtx(dir))
-	if err == nil {
-		t.Fatal("expected error for empty message")
 	}
 }
 

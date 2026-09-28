@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -96,62 +95,6 @@ func TestAgentPersistenceProjectionRoundTrip(t *testing.T) {
 	}
 }
 
-func TestLegacyResumeImportIsExplicitAndReadOnlyListing(t *testing.T) {
-	cfg := testPersistenceConfig(t)
-	snap := SessionSnapshot{ID: "legacy-one", CreatedAt: time.Unix(200, 0).UTC(), UpdatedAt: time.Unix(201, 0).UTC(), Workspace: cfg.Workspace, Model: cfg.Model,
-		History: []messages.Message{{Role: messages.RoleUser, Content: "old", CreatedAt: time.Unix(202, 0).UTC()}, {Role: messages.RoleAssistant, Content: "answer", CreatedAt: time.Unix(203, 0).UTC()}},
-		Usage:   Usage{InputTokens: 3, OutputTokens: 4, CachedTokens: 1, Cost: 0.2, TurnCount: 1}, Pending: []string{"queued"}}
-	data, err := json.Marshal(snap)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacyPath := filepath.Join(cfg.SessionDir, snap.ID+".json")
-	if err := os.MkdirAll(cfg.SessionDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(legacyPath, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	before, _ := os.ReadFile(legacyPath)
-	listed, issues, err := ListSessions(cfg.SessionDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(issues) != 0 {
-		t.Fatalf("session listing reported issues: %+v", issues)
-	}
-	if len(listed) != 1 || listed[0].ID != snap.ID {
-		t.Fatalf("legacy list = %+v", listed)
-	}
-	if _, err := os.Stat(filepath.Join(cfg.SessionDir, snap.ID)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("read-only listing created new session dir: %v", err)
-	}
-	loaded, err := LoadSession(cfg.SessionDir, snap.ID)
-	if err != nil || len(loaded.History) != 2 {
-		t.Fatalf("legacy load = %+v, err=%v", loaded, err)
-	}
-	if _, err := os.Stat(filepath.Join(cfg.SessionDir, snap.ID)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("read-only load created new session dir: %v", err)
-	}
-	if err := prepareResumePersistence(&cfg, snap); err != nil {
-		t.Fatal(err)
-	}
-	after, _ := os.ReadFile(legacyPath)
-	if string(after) != string(before) {
-		t.Fatal("legacy JSON was modified during import")
-	}
-	got, err := LoadSession(cfg.SessionDir, snap.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got.History) != 2 || len(got.Pending) != 1 || got.Usage != snap.Usage {
-		t.Fatalf("imported projection = %+v, want history/pending/usage from legacy", got)
-	}
-	if got.History[0].CreatedAt != snap.History[0].CreatedAt || got.History[1].CreatedAt != snap.History[1].CreatedAt {
-		t.Fatalf("import lost message timestamps: %+v", got.History)
-	}
-}
-
 func TestSessionPersistenceLockReleasedByClose(t *testing.T) {
 	cfg := testPersistenceConfig(t)
 	p, err := openSessionPersistence(&cfg, "locked", time.Now().UTC())
@@ -169,6 +112,36 @@ func TestSessionPersistenceLockReleasedByClose(t *testing.T) {
 		t.Fatalf("writer did not release after close: %v", err)
 	}
 	_ = second.Close()
+}
+
+func TestFlatJSONSessionIsNotImportedOrModified(t *testing.T) {
+	cfg := testPersistenceConfig(t)
+	if err := os.MkdirAll(cfg.SessionDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cfg.SessionDir, "retired.json")
+	data := []byte(`{"id":"retired","history":[]}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	listed, issues, err := ListSessions(cfg.SessionDir)
+	if err != nil || len(listed) != 0 || len(issues) != 0 {
+		t.Fatalf("list: %+v, %+v, %v", listed, issues, err)
+	}
+	if _, err := LoadSession(cfg.SessionDir, "retired"); err == nil {
+		t.Fatal("flat JSON loaded as a current session")
+	}
+	if a, err := Resume(&cfg, &SessionSnapshot{ID: "retired"}, nil); err == nil {
+		a.Close()
+		t.Fatal("resume created a session instead of rejecting missing JSONL")
+	}
+	if _, err := os.Stat(filepath.Join(cfg.SessionDir, "retired")); !os.IsNotExist(err) {
+		t.Fatalf("read-only rejection created session directory: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("old data modified: %q, %v", got, err)
+	}
 }
 
 func TestReplayStartedToolIsUnknownWithoutRerun(t *testing.T) {
@@ -192,79 +165,6 @@ func TestReplayStartedToolIsUnknownWithoutRerun(t *testing.T) {
 	}
 	if got.History[1].Content == "" || !strings.Contains(got.History[1].Content, "unknown") {
 		t.Fatalf("unknown result text = %q", got.History[1].Content)
-	}
-}
-
-func TestLegacyImportPublishesOnlyAfterCompletion(t *testing.T) {
-	cfg := testPersistenceConfig(t)
-	snap := SessionSnapshot{ID: "legacy-large", CreatedAt: time.Unix(400, 0).UTC(), UpdatedAt: time.Unix(401, 0).UTC(), Workspace: cfg.Workspace, Model: cfg.Model}
-	for i := 0; i < 70; i++ {
-		snap.History = append(snap.History, messages.Message{Role: messages.RoleUser, Content: "same text", CreatedAt: time.Unix(int64(500+i), 0).UTC()})
-	}
-	data, err := json.Marshal(snap)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(cfg.SessionDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	sourcePath := filepath.Join(cfg.SessionDir, snap.ID+".json")
-	if err := os.WriteFile(sourcePath, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	before, _ := os.ReadFile(sourcePath)
-
-	// Simulate a crash after the first data chunk. The completion marker has
-	// not been committed, so the directory must not become authoritative.
-	events, err := legacyEvents(snap, sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := openSessionPersistenceSource(&cfg, snap.ID, snap.CreatedAt, "legacy-import")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(events) <= 129 {
-		t.Fatalf("test import should require more than one chunk: %d events", len(events))
-	}
-	if _, err := p.Commit(session.Batch{TransactionID: legacyImportBatch, Events: events[:128]}); err != nil {
-		_ = p.close()
-		t.Fatal(err)
-	}
-	if err := p.close(); err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := LoadSession(cfg.SessionDir, snap.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(loaded.History) != len(snap.History) {
-		t.Fatalf("incomplete import should read legacy history: got %d, want %d", len(loaded.History), len(snap.History))
-	}
-
-	if err := prepareResumePersistence(&cfg, snap); err != nil {
-		t.Fatal(err)
-	}
-	// A retry after a completed import is a no-op, not a duplicate append.
-	if err := prepareResumePersistence(&cfg, snap); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := LoadSession(cfg.SessionDir, snap.ID); err != nil {
-		t.Fatal(err)
-	} else if len(got.History) != len(snap.History) {
-		t.Fatalf("completed import history = %d, want %d", len(got.History), len(snap.History))
-	} else {
-		seen := make(map[string]bool, len(got.History))
-		for _, message := range got.History {
-			if message.ID == "" || seen[message.ID] {
-				t.Fatalf("legacy message IDs are not stable/unique: %+v", got.History)
-			}
-			seen[message.ID] = true
-		}
-	}
-	after, _ := os.ReadFile(sourcePath)
-	if string(after) != string(before) {
-		t.Fatal("legacy source changed during resumed import")
 	}
 }
 

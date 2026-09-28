@@ -21,6 +21,7 @@ import (
 	"ccdp/internal/hooks"
 	"ccdp/internal/mcp"
 	"ccdp/internal/sandbox"
+	"ccdp/internal/workspace"
 )
 
 // Source identifies the layer which supplied a resolved field.  The values
@@ -75,7 +76,7 @@ var configFieldNames = []string{
 	"max_parallel_tools", "sandbox_limits", "network_access",
 	"additional_directories", "additional_read_only_directories", "disallowed_directories",
 	"hooks", "enable_web_tools", "tools", "mcp_servers", "pricing", "session_dir",
-	"verbose", "debug", "session_id", "no_session_persistence",
+	"verbose", "debug", "session_id", "no_session_persistence", "review", "delivery", "automatic_checkpoints", "language_servers",
 }
 
 func newProvenance() *provenanceState {
@@ -339,6 +340,14 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 	}
 	for field := range raw {
 		switch field {
+		case "language_servers":
+			dst.LanguageServers = cloneLanguageServers(src.LanguageServers)
+		case "review":
+			dst.Review = src.Review
+		case "delivery":
+			dst.Delivery = src.Delivery.Clone()
+		case "automatic_checkpoints":
+			dst.AutomaticCheckpoints = cloneBool(src.AutomaticCheckpoints)
 		case "api_key":
 			dst.APIKey = src.APIKey
 		case "base_url":
@@ -449,6 +458,10 @@ func cloneLimits(src *sandbox.Limits) *sandbox.Limits {
 // Clone returns a value copy whose mutable provenance state is independent.
 // Agent step snapshots use this instead of a plain struct copy.
 func (c Config) Clone() Config {
+	c.LanguageServers = cloneLanguageServers(c.LanguageServers)
+	c.Delivery = c.Delivery.Clone()
+	c.AutomaticCheckpoints = cloneBool(c.AutomaticCheckpoints)
+	c.AdditionalReadOnlyDirectories = append([]string(nil), c.AdditionalReadOnlyDirectories...)
 	c.provenance = c.provenance.clone()
 	c.EnableGuardian = cloneBool(c.EnableGuardian)
 	c.EnableMemory = cloneBool(c.EnableMemory)
@@ -644,16 +657,20 @@ func ProjectExecutableFingerprint(root string, cfg Config) (string, error) {
 		return "", err
 	}
 	payload := struct {
-		Root                  string                      `json:"root"`
-		Hooks                 map[string][]hooks.HookSpec `json:"hooks"`
-		Tools                 []ToolSpec                  `json:"tools"`
-		MCPServers            map[string]mcp.ServerConfig `json:"mcp_servers"`
-		AlwaysAllow           []string                    `json:"always_allow"`
-		EnableWebTools        *bool                       `json:"enable_web_tools"`
-		AdditionalDirectories []string                    `json:"additional_directories"`
-		NetworkAccess         bool                        `json:"network_access"`
+		Root                  string                              `json:"root"`
+		LanguageServers       map[string]workspace.LanguageServer `json:"language_servers"`
+		Delivery              DeliveryConfig                      `json:"delivery"`
+		Hooks                 map[string][]hooks.HookSpec         `json:"hooks"`
+		Tools                 []ToolSpec                          `json:"tools"`
+		MCPServers            map[string]mcp.ServerConfig         `json:"mcp_servers"`
+		AlwaysAllow           []string                            `json:"always_allow"`
+		EnableWebTools        *bool                               `json:"enable_web_tools"`
+		AdditionalDirectories []string                            `json:"additional_directories"`
+		NetworkAccess         bool                                `json:"network_access"`
 	}{
 		Root:                  normalized,
+		Delivery:              cfg.Delivery.Clone(),
+		LanguageServers:       cloneLanguageServers(cfg.LanguageServers),
 		Hooks:                 cloneHookSpecs(cfg.Hooks),
 		Tools:                 cloneToolsForFingerprint(cfg.Tools),
 		MCPServers:            cloneMCPServers(cfg.MCPServers),
@@ -834,4 +851,17 @@ func (s *TrustStore) Check(root string, cfg Config) (bool, ProjectTrust, error) 
 		return false, ProjectTrust{}, err
 	}
 	return trusted, record, nil
+}
+
+func cloneLanguageServers(src map[string]workspace.LanguageServer) map[string]workspace.LanguageServer {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]workspace.LanguageServer, len(src))
+	for k, v := range src {
+		v.Argv = append([]string(nil), v.Argv...)
+		v.Extensions = append([]string(nil), v.Extensions...)
+		out[k] = v
+	}
+	return out
 }

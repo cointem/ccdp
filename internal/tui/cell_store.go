@@ -13,6 +13,7 @@ type CellStore struct {
 type cellSourceVersion struct {
 	kind, text, status, name, args string
 	truncated                      bool
+	textOffset                     int
 	revision                       uint64
 }
 
@@ -24,7 +25,7 @@ func (s *CellStore) reconcileVersions() {
 		cell := &s.items[i]
 		key := itemIdentity(*cell, i)
 		source := cellSourceVersion{kind: cell.kind, text: cell.text, status: cell.status,
-			name: cell.toolName, args: cell.toolArgsRaw, truncated: cell.toolTruncated}
+			name: cell.toolName, args: cell.toolArgsRaw, truncated: cell.toolTruncated, textOffset: cell.textOffset}
 		old := s.versions[key]
 		source.revision = old.revision
 		if source != old || source.revision == 0 {
@@ -93,7 +94,7 @@ func (s *CellStore) replace(cell historyCell) bool {
 	if s.confirmedItems[pos.confirmed].messageID != cell.messageID || s.items[pos.display].messageID != cell.messageID {
 		return false
 	}
-	source := cellSourceVersion{kind: cell.kind, text: cell.text, status: cell.status, name: cell.toolName, args: cell.toolArgsRaw, truncated: cell.toolTruncated}
+	source := cellSourceVersion{kind: cell.kind, text: cell.text, status: cell.status, name: cell.toolName, args: cell.toolArgsRaw, truncated: cell.toolTruncated, textOffset: cell.textOffset}
 	key := itemIdentity(cell, pos.display)
 	old := s.versions[key]
 	source.revision = old.revision

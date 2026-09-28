@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -240,15 +241,20 @@ func (c *Client) responsesStreamOnce(ctx context.Context, body []byte, onDelta f
 
 	type slot struct {
 		id, name string
-		args     string
+		args     strings.Builder
 	}
 	toolSlots := map[int]*slot{}
 	thinking := &reasoningPhase{onDelta: onDelta}
+	var textBuffer, reasoningBuffer strings.Builder
+	defer func() {
+		result.Text = textBuffer.String()
+		result.Reasoning = reasoningBuffer.String()
+	}()
 	emitDelta := func(s string) {
 		if s == "" {
 			return
 		}
-		result.Text += s
+		textBuffer.WriteString(s)
 		emitted = true
 		thinking.markClosed()
 		if onDelta != nil {
@@ -259,7 +265,7 @@ func (c *Client) responsesStreamOnce(ctx context.Context, body []byte, onDelta f
 		if s == "" {
 			return
 		}
-		result.Reasoning += s
+		reasoningBuffer.WriteString(s)
 		emitted = true
 		thinking.start()
 		if onReasoning != nil {
@@ -267,6 +273,7 @@ func (c *Client) responsesStreamOnce(ctx context.Context, body []byte, onDelta f
 		}
 	}
 
+	terminal := false
 	scanner := bufio.NewScanner(hr.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 loop:
@@ -302,12 +309,13 @@ loop:
 			// The reasoning item is over once the call arguments stream.
 			thinking.end()
 			if s := toolSlots[ev.OutputIndex]; s != nil {
-				s.args += ev.Delta
+				s.args.WriteString(ev.Delta)
 			}
 		case "response.function_call_arguments.done":
 			thinking.end()
 			if s := toolSlots[ev.OutputIndex]; s != nil {
-				s.args = ev.Arguments
+				s.args.Reset()
+				s.args.WriteString(ev.Arguments)
 			}
 		case "response.output_item.added":
 			if ev.Item == nil {
@@ -338,10 +346,12 @@ loop:
 					s.name = ev.Item.Name
 				}
 				if ev.Item.Arguments != "" {
-					s.args = ev.Item.Arguments
+					s.args.Reset()
+					s.args.WriteString(ev.Item.Arguments)
 				}
 			}
 		case "response.completed", "response.incomplete", "response.failed":
+			terminal = true
 			if ev.Response != nil {
 				if u := ev.Response.Usage; u != nil {
 					result.PromptTokens = u.InputTokens
@@ -391,7 +401,7 @@ loop:
 			Type:  "function",
 			Function: Function{
 				Name:      s.name,
-				Arguments: ArgumentsJSON(s.args),
+				Arguments: ArgumentsJSON(s.args.String()),
 			},
 		})
 	}
@@ -401,6 +411,10 @@ loop:
 	}
 	if ctx.Err() != nil {
 		return result, false, emitted, 0, ctx.Err()
+	}
+	if !terminal {
+		result.ToolCalls = nil
+		return result, !emitted, emitted, 0, fmt.Errorf("llm: incomplete responses stream: %w", io.ErrUnexpectedEOF)
 	}
 	return result, false, emitted, 0, nil
 }

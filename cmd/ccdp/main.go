@@ -31,6 +31,9 @@ const version = "0.2.0"
 const maxCLIPromptBytes = 4 << 20
 
 func main() {
+	if len(os.Args) > 1 && isCodingCommand(os.Args[1]) {
+		os.Exit(runCodingCLI(os.Args[1:], os.Stdout, os.Stderr))
+	}
 	var (
 		effortFlag    = flag.String("effort", "", "reasoning effort (empty = built-in default medium)")
 		verbosityFlag = flag.String("verbosity", "", "response verbosity: low|medium|high (empty = provider default)")

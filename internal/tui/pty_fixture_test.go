@@ -25,7 +25,7 @@ func TestPTYRearchitectureFixture(t *testing.T) {
 		{ID: "b", Kind: "tool", Tool: "Bash", CallID: "exec", Status: "success", Args: json.RawMessage(`{"command":"go test ./..."}`), Text: "first\nsecond\nthird\nfourth\nfifth\nsixth\nlast"},
 		{ID: "done", Kind: "assistant", Status: "completed", Text: "PTY_RESULT_COMPLETE\n[file.go](src/file.go)"},
 	}
-	snapshot.Transcript = append(snapshot.Transcript, protocol.TranscriptItem{ID: "task", Kind: "tool", Tool: "Task", CallID: "task-call", Status: "running"})
+	snapshot.Transcript = append(snapshot.Transcript, protocol.TranscriptItem{ID: "spawn-one", Kind: "tool", Tool: "SpawnAgent", CallID: "spawn-one", Status: "success"}, protocol.TranscriptItem{ID: "spawn-two", Kind: "tool", Tool: "SpawnAgent", CallID: "spawn-two", Status: "success"})
 	client := &recordingClient{snapshot: snapshot}
 	m := NewWithClient(client, "/workspace/ccdp", false)
 	childOne, childTwo := protocolSnapshot("child-one"), protocolSnapshot("child-two")
@@ -34,8 +34,8 @@ func TestPTYRearchitectureFixture(t *testing.T) {
 	m.installSessionRouting(&testSessionDirectory{clients: map[protocol.SessionID]*recordingClient{
 		"pty-root": client, "child-one": {snapshot: childOne}, "child-two": {snapshot: childTwo},
 	}, rows: []protocol.ChildSession{
-		{SessionID: "child-one", ParentSessionID: "pty-root", ParentCallID: "task-call", Title: "FIRST_AGENT", Run: protocol.RunView{Status: "running"}},
-		{SessionID: "child-two", ParentSessionID: "pty-root", ParentCallID: "task-call", Title: "SECOND_AGENT", Run: protocol.RunView{Status: "running"}},
+		{SessionID: "child-one", ParentSessionID: "pty-root", ParentCallID: "spawn-one", Title: "FIRST_AGENT", Run: protocol.RunView{Status: "running"}},
+		{SessionID: "child-two", ParentSessionID: "pty-root", ParentCallID: "spawn-two", Title: "SECOND_AGENT", Run: protocol.RunView{Status: "running"}},
 	}})
 	m.inline.prime(m.items)
 	m.inline.showInitialFrame()

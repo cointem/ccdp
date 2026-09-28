@@ -6,20 +6,20 @@ import (
 	"testing"
 )
 
-func TestAgentGroupClicksOpenEachSessionIncludingWrappedRows(t *testing.T) {
+func TestIndependentAgentCardsOpenTheirOwnSessions(t *testing.T) {
 	for _, width := range []int{40, 100} {
 		m, d := routingTestModel()
 		t.Cleanup(m.watchCancel)
 		d.clients["second"] = &recordingClient{snapshot: protocolSnapshot("second")}
 		children := []protocol.ChildSession{
-			{SessionID: "child", Title: "FIRST_AGENT", Run: protocol.RunView{Status: "running"}},
-			{SessionID: "second", Title: "SECOND_AGENT", Run: protocol.RunView{Status: "needs approval"}},
+			{SessionID: "child", Title: "ONE", Run: protocol.RunView{Status: "running"}},
+			{SessionID: "second", Title: "TWO", Run: protocol.RunView{Status: "waiting_approval"}},
 		}
-		m.items = []historyCell{agentTaskItem("running", map[string]any{}, "", children...)}
+		m.items = []historyCell{agentTaskItem("running", nil, "", children[0]), agentTaskItem("running", nil, "", children[1])}
 		m.width, m.height = width, 30
 		m.layout()
 		rows := strings.Split(sanitizeANSI(m.View()), "\n")
-		for _, entry := range []struct{ title, id string }{{"FIRST_AGENT", "child"}, {"SECOND_AGENT", "second"}} {
+		for _, entry := range []struct{ title, id string }{{"ONE", "child"}, {"TWO", "second"}} {
 			y := -1
 			for i, line := range rows {
 				if strings.Contains(line, entry.title) {

@@ -22,6 +22,7 @@ const (
 	ActivityPreparing       ActivityPhase = "preparing"
 	ActivityWaitingResponse ActivityPhase = "waiting_response"
 	ActivityStreaming       ActivityPhase = "streaming"
+	ActivityFinalizing      ActivityPhase = "finalizing"
 	ActivityRunningTool     ActivityPhase = "running_tool"
 	ActivityWaitingApproval ActivityPhase = "waiting_approval"
 	ActivityWaitingQuestion ActivityPhase = "waiting_question"
@@ -74,6 +75,9 @@ func (m *Model) activityForSnapshot(snapshot protocol.SessionView) Activity {
 	// returns the empty value for protocol versions that have no terminal turn.
 	a.Phase = activityPhase(snapshot.Phase)
 	a.Label, a.Detail = activityCopy(snapshot.Phase, snapshot.Busy, "")
+	if snapshot.Busy && snapshot.WorkLabel != "" && snapshot.Phase == protocol.PhaseExecutingTools {
+		a.Label = snapshot.WorkLabel
+	}
 	if len(snapshot.PendingInputs) > 0 && (a.Phase == ActivityIdle || a.Phase == "") {
 		a.Phase = ActivityQueued
 		a.Label = "等待队列"
@@ -82,7 +86,7 @@ func (m *Model) activityForSnapshot(snapshot protocol.SessionView) Activity {
 	if snapshot.Phase == protocol.PhaseClosed {
 		a.Phase = ActivityClosed
 		a.Label = "会话已关闭"
-	} else if snapshot.Closing {
+	} else if snapshot.Closing && snapshot.Phase != protocol.PhaseFinalizing {
 		a.Phase = ActivityStopping
 		a.Label = "正在停止"
 	}
@@ -127,6 +131,8 @@ func activityPhase(phase protocol.RuntimePhase) ActivityPhase {
 		return ActivityPreparing
 	case protocol.PhaseStreaming:
 		return ActivityStreaming
+	case protocol.PhaseFinalizing:
+		return ActivityFinalizing
 	case protocol.PhaseExecutingTools:
 		return ActivityRunningTool
 	case protocol.PhaseWaitingApproval:
@@ -151,6 +157,8 @@ func activityCopy(phase protocol.RuntimePhase, busy bool, detail string) (string
 		return "准备请求", detail
 	case protocol.PhaseStreaming:
 		return "正在输出", detail
+	case protocol.PhaseFinalizing:
+		return "正在保存本轮结果", detail
 	case protocol.PhaseExecutingTools:
 		return "正在运行工具", detail
 	case protocol.PhaseWaitingApproval:

@@ -21,7 +21,6 @@ import (
 	"ccdp/internal/permissions"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
-	"ccdp/internal/tools"
 )
 
 // childRuntimeTestProvider is intentionally a generic llm.Provider. These
@@ -56,6 +55,9 @@ func newChildRuntimeTestAgent(t *testing.T, p llm.Provider) (*Agent, config.Conf
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Exercise the synchronous driver through a test-only tool; production
+	// SpawnAgent is asynchronous.
+	a.registry.Register(joinChildTestTool{parent: a})
 	t.Cleanup(a.Close)
 	return a, cfg
 }
@@ -121,7 +123,7 @@ func TestTaskChildUsesRealLoopAndAggregatesUsageOnce(t *testing.T) {
 		default:
 			result.FinishReason = "tool_calls"
 			result.ToolCalls = []llm.ToolCall{{ID: "child-call", Type: "function", Function: llm.Function{
-				Name: "Task", Arguments: llm.ArgumentsJSON(`{"description":"independent-child"}`),
+				Name: "JoinChildTest", Arguments: llm.ArgumentsJSON(`{"description":"independent-child"}`),
 			}}}
 		}
 		return result, nil
@@ -219,7 +221,7 @@ func TestTaskChildInterruptJoinsAndAggregatesPartialUsage(t *testing.T) {
 		case "cancel-parent":
 			return llm.StreamResult{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{{
 				ID: "cancel-child-call", Type: "function", Function: llm.Function{
-					Name: "Task", Arguments: llm.ArgumentsJSON(`{"description":"cancel-child"}`),
+					Name: "JoinChildTest", Arguments: llm.ArgumentsJSON(`{"description":"cancel-child"}`),
 				},
 			}}}, nil
 		case "cancel-child":
@@ -266,7 +268,7 @@ func TestTaskChildInterruptJoinsAndAggregatesPartialUsage(t *testing.T) {
 	}
 }
 
-func TestTaskBatchSharesBoundedChildSlots(t *testing.T) {
+func TestIndependentChildrenShareBoundedSlots(t *testing.T) {
 	var active int32
 	var maxActive int32
 	p := &childRuntimeTestProvider{name: "slots-child-test-provider", stream: func(ctx context.Context, _ llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
@@ -293,11 +295,11 @@ func TestTaskBatchSharesBoundedChildSlots(t *testing.T) {
 	// mutating a live config after construction.
 	a.childSlots = newChildSlots(2)
 	a.mu.Unlock()
-	tasks := make([]tools.SubagentTask, 4)
+	tasks := make([]childTask, 4)
 	for i := range tasks {
 		tasks[i].Description = fmt.Sprintf("slot-%d", i)
 	}
-	results, err := a.runSubagents(tasks)
+	results, err := runTestChildren(a, tasks, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +316,7 @@ func TestTaskBatchSharesBoundedChildSlots(t *testing.T) {
 	}
 }
 
-func TestTaskBatchesShareParentChildSlots(t *testing.T) {
+func TestConcurrentLaunchersShareParentChildSlots(t *testing.T) {
 	var active int32
 	var maxActive int32
 	p := &childRuntimeTestProvider{name: "shared-slots-child-test-provider"}
@@ -349,7 +351,7 @@ func TestTaskBatchesShareParentChildSlots(t *testing.T) {
 	const tasksPerBatch = 3
 	start := make(chan struct{})
 	var wg sync.WaitGroup
-	results := make([][]tools.SubagentResult, batchCount)
+	results := make([][]testChildResult, batchCount)
 	errs := make([]error, batchCount)
 	for batch := 0; batch < batchCount; batch++ {
 		batch := batch
@@ -357,11 +359,11 @@ func TestTaskBatchesShareParentChildSlots(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			tasks := make([]tools.SubagentTask, tasksPerBatch)
+			tasks := make([]childTask, tasksPerBatch)
 			for i := range tasks {
 				tasks[i].Description = fmt.Sprintf("shared-batch-%d-task-%d", batch, i)
 			}
-			results[batch], errs[batch] = a.runSubagents(tasks)
+			results[batch], errs[batch] = runTestChildren(a, tasks, "")
 		}()
 	}
 	close(start)
@@ -385,7 +387,7 @@ func TestTaskBatchesShareParentChildSlots(t *testing.T) {
 	}
 }
 
-func TestTaskChildHooksApplyToSingleAndBatch(t *testing.T) {
+func TestChildHooksApplyToEachIndependentLaunch(t *testing.T) {
 	p := &childRuntimeTestProvider{name: "hooks-child-test-provider", stream: func(_ context.Context, _ llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
 		return llm.StreamResult{Text: "hooked", FinishReason: "stop", PromptTokens: 1, CompletionTok: 1}, nil
 	}}
@@ -399,11 +401,11 @@ func TestTaskChildHooksApplyToSingleAndBatch(t *testing.T) {
 		hooks.EventSubagentStart: {{Command: `printf 'start\n' >> "$CCDP_TEST_HOOK_FILE"`}},
 		hooks.EventSubagentStop:  {{Command: `printf 'stop\n' >> "$CCDP_TEST_HOOK_FILE"`}},
 	}, hooks.Options{SessionID: a.SessionID(), Workspace: a.cfg.Workspace, Env: []string{"CCDP_TEST_HOOK_FILE=" + hookFile}, Sandbox: a.sandbox})
-	if _, err := a.runSubagent("single-hook", ""); err != nil {
+	if _, err := runTestChild(a, "single-hook"); err != nil {
 		t.Fatal(err)
 	}
-	tasks := []tools.SubagentTask{{Description: "batch-hook-0"}, {Description: "batch-hook-1"}, {Description: "batch-hook-2"}}
-	results, err := a.runSubagents(tasks)
+	tasks := []childTask{{Description: "batch-hook-0"}, {Description: "batch-hook-1"}, {Description: "batch-hook-2"}}
+	results, err := runTestChildren(a, tasks, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,7 +455,7 @@ func TestTaskChildInheritsFrozenGoPreToolDecision(t *testing.T) {
 		}
 		return plugin.DecisionNone, ""
 	})
-	out, err := a.runSubagent("inherit-parent-policy", "")
+	out, err := runTestChild(a, "inherit-parent-policy")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +520,7 @@ func TestTaskChildUsesStepProviderAndConfigSnapshot(t *testing.T) {
 		})
 		return llm.StreamResult{FinishReason: "tool_calls", PromptTokens: 1, CompletionTok: 1,
 			ToolCalls: []llm.ToolCall{{ID: "step-task", Type: "function", Function: llm.Function{
-				Name: "Task", Arguments: llm.ArgumentsJSON(`{"description":"step-child"}`),
+				Name: "JoinChildTest", Arguments: llm.ArgumentsJSON(`{"description":"step-child"}`),
 			}}}}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, original)
@@ -590,7 +592,7 @@ func TestChildToolGateHardPolicies(t *testing.T) {
 		nonInteractive: true,
 		perms:          permissions.NewManager(permissions.ModeBypass, permissions.Policy{}),
 	}}}
-	for _, name := range []string{"Write", "Edit", "Bash", "WebSearch", "Task", "EnterPlanMode", "ExitPlanMode", "unknown"} {
+	for _, name := range []string{"Write", "Edit", "Bash", "WebSearch", "SpawnAgent", "EnterPlanMode", "ExitPlanMode", "unknown"} {
 		if denied, reason := ChildToolGate(guardian, messages.ToolCall{Name: name}); !denied || reason == "" {
 			t.Fatalf("guardian tool %q escaped hard gate: denied=%v reason=%q", name, denied, reason)
 		}
@@ -604,8 +606,8 @@ func TestChildToolGateHardPolicies(t *testing.T) {
 		nonInteractive: true,
 		perms:          permissions.NewManager(permissions.ModeDefault, permissions.Policy{}),
 	}}}
-	if denied, reason := ChildToolGate(task, messages.ToolCall{Name: "Task"}); !denied || reason == "" {
-		t.Fatalf("nested Task escaped hard gate: denied=%v reason=%q", denied, reason)
+	if denied, reason := ChildToolGate(task, messages.ToolCall{Name: "SpawnAgent"}); !denied || reason == "" {
+		t.Fatalf("nested delegation escaped hard gate: denied=%v reason=%q", denied, reason)
 	}
 	if denied, reason := ChildToolGate(task, messages.ToolCall{Name: "Write", Arguments: map[string]any{"file_path": "x"}}); !denied || !strings.Contains(reason, "non-interactive") {
 		t.Fatalf("approval Ask escaped non-interactive gate: denied=%v reason=%q", denied, reason)

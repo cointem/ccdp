@@ -131,8 +131,6 @@ func TestNormalizeRejectsInvalidWorkflowCommands(t *testing.T) {
 	cases := []Command{
 		{ID: "unknown", SessionID: "session", Type: CommandRunWorkflow,
 			Workflow: &WorkflowCommand{Kind: WorkflowKind("other")}},
-		{ID: "review-message", SessionID: "session", Type: CommandRunWorkflow,
-			Workflow: &WorkflowCommand{Kind: WorkflowReview, Message: "unexpected"}},
 		{ID: "missing-message", SessionID: "session", Type: CommandRunWorkflow,
 			Workflow: &WorkflowCommand{Kind: WorkflowCommitPushPR}},
 		{ID: "nul-message", SessionID: "session", Type: CommandRunWorkflow,

@@ -318,8 +318,8 @@ func (a *Agent) imageContentPartsForMessage(workspaceDir string, message message
 var planReadOnlyTools = map[string]bool{
 	"Read": true, "Glob": true, "Grep": true, "LS": true,
 	"TodoWrite": true, "WebSearch": true, "WebFetch": true,
-	"GitStatus": true, "GitDiff": true, "GitLog": true,
-	"Task": true, "ToolSearch": true, "ReadSkill": true,
+	"CodeNavigate": true,
+	"SpawnAgent":   true, "SendMessage": true, "FollowupAgent": true, "WaitAgent": true, "ListAgents": true, "ReadAgent": true, "StopAgent": true, "ToolSearch": true, "ReadSkill": true,
 	"EnterPlanMode": true, "ExitPlanMode": true, "AskUserQuestion": true,
 }
 
@@ -329,8 +329,8 @@ You are in PLAN MODE. Do NOT execute anything yet.
 - Analyze the user's request and produce a concise, concrete execution plan.
 - Structure the plan as a numbered list of steps; name the exact files, commands
   and tools each step will use.
-- You may call read-only tools (Read, Glob, Grep, LS, TodoWrite, WebSearch,
-  WebFetch, GitStatus, GitDiff, GitLog, Task) to investigate before planning.
+- You may call read-only tools (Read, Glob, Grep, LS, TodoWrite,
+  CodeNavigate, ListAgents, ReadAgent, WaitAgent) to investigate before planning.
 - Do NOT call any tool that modifies files, runs builds or tests with side
   effects, touches git history, or makes network calls.
 - Use AskUserQuestion for structured clarification when requirements are ambiguous.
@@ -393,7 +393,28 @@ func (a *Agent) buildSystemBlocks(cfg config.Config, sessionStartAt time.Time, s
 		a.mu.Lock()
 		a.wsInfo = info
 		a.mu.Unlock()
-		add(true, "\n\n# Repository layout\n\n"+info.RepoMap(120))
+		a.mu.Lock()
+		query := ""
+		for n := len(a.history) - 1; n >= 0; n-- {
+			if a.history[n].Role == messages.RoleUser {
+				query = a.history[n].Content
+				break
+			}
+		}
+		policy := a.sandbox.Snapshot()
+		a.mu.Unlock()
+		filtered := *info
+		filtered.Files = nil
+		filtered.FileCount = 0
+		for _, entry := range info.Files {
+			if _, err := policy.ResolveRead(filepath.Join(cfg.Workspace, entry.RelPath)); err == nil {
+				filtered.Files = append(filtered.Files, entry)
+				if !entry.IsDir {
+					filtered.FileCount++
+				}
+			}
+		}
+		add(false, "\n\n# Repository layout\n\n"+filtered.RelevantRepoMap(120, query))
 	}
 	add(true, skillsSection)
 	if instructions != "" {

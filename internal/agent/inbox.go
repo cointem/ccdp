@@ -27,7 +27,7 @@ type turnInput struct {
 }
 
 func newTurnInput(id protocol.InputID, text string, strategy protocol.InputStrategy, createdAt time.Time) turnInput {
-	if strategy != "" && strategy != protocol.InputSteer && strategy != protocol.InputFollowup {
+	if strategy != "" && strategy != protocol.InputSteer && strategy != protocol.InputFollowup && strategy != protocol.InputMessage {
 		strategy = protocol.InputFollowup
 	}
 	return turnInput{ID: id, Text: text, Strategy: strategy, CreatedAt: createdAt}
@@ -96,6 +96,8 @@ func (a *Agent) startTurnInput(input turnInput) {
 		return
 	}
 	a.busy = true
+	a.workStartedAt = time.Now()
+	a.workLabel = ""
 	a.turnSeq++
 	a.turnWG.Add(1)
 	a.phase = protocol.PhasePreparing
@@ -128,7 +130,7 @@ func (a *Agent) hydrateInput(input *turnInput) error {
 		if input.Text == "" {
 			input.Text = queued.Text
 		}
-		if input.Strategy != protocol.InputSteer && input.Strategy != protocol.InputFollowup {
+		if input.Strategy != protocol.InputSteer && input.Strategy != protocol.InputFollowup && input.Strategy != protocol.InputMessage {
 			input.Strategy = protocol.InputStrategy(queued.Strategy)
 		}
 		input.CreatedAt = queued.CreatedAt
@@ -234,7 +236,29 @@ func (a *Agent) claimPendingInputAndAppend(turnID string, strategy protocol.Inpu
 		a.mu.Unlock()
 		return turnInput{}, false, nil
 	}
-	input = turnInputFromView(a.pendingInputs[0])
+	index := 0
+	if strategy == protocol.InputMessage {
+		index = -1
+		for i, pending := range a.pendingInputs {
+			if pending.Strategy == protocol.InputMessage {
+				index = i
+				break
+			}
+		}
+	} else {
+		index = -1
+		for i, pending := range a.pendingInputs {
+			if pending.Strategy != protocol.InputMessage {
+				index = i
+				break
+			}
+		}
+	}
+	if index < 0 {
+		a.mu.Unlock()
+		return turnInput{}, false, nil
+	}
+	input = turnInputFromView(a.pendingInputs[index])
 	if frozen, ok := a.inputAttachments[input.ID]; ok {
 		input.ImageAttachments = cloneImageAttachments(frozen.Attachments)
 		input.ImagesFrozen = frozen.Frozen
@@ -257,13 +281,13 @@ func (a *Agent) claimPendingInputAndAppend(turnID string, strategy protocol.Inpu
 
 	a.mu.Lock()
 	a.ensureTypedPendingLocked()
-	if len(a.pendingInputs) == 0 || a.pendingInputs[0].ID != input.ID || a.pendingInputs[0].Text != input.Text {
+	if len(a.pendingInputs) <= index || a.pendingInputs[index].ID != input.ID || a.pendingInputs[index].Text != input.Text {
 		a.mu.Unlock()
 		err := errors.New("agent: queued input changed during durable delivery")
 		a.markPersistenceFailure(err)
 		return turnInput{}, false, err
 	}
-	a.pendingInputs = a.pendingInputs[1:]
+	a.pendingInputs = append(a.pendingInputs[:index], a.pendingInputs[index+1:]...)
 	a.syncLegacyPendingLocked()
 	message := input.message()
 	alreadyPresent := false

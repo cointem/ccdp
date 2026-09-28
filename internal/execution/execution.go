@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"ccdp/internal/sandbox"
@@ -32,8 +31,6 @@ const DefaultOutputLimit = 512 * 1024
 // PipeWaitDelay bounds lingering after a shell exits while descendants keep
 // inherited stdout/stderr open.
 const PipeWaitDelay = 3 * time.Second
-
-var startScratchCleanup sync.Map // map[*exec.Cmd]func()
 
 // EnvironmentPurpose identifies the owner of a local process environment.
 // Every purpose starts from a credential-filtered host environment; callers
@@ -99,7 +96,7 @@ type StartRequest struct {
 
 // StartArgv starts one admitted process without interpreting argument values
 // as shell syntax. The process and its descendants inherit Seatbelt.
-func StartArgv(req StartRequest) (*exec.Cmd, error) {
+func StartArgv(req StartRequest) (*Process, error) {
 	if len(req.Argv) == 0 || strings.TrimSpace(req.Argv[0]) == "" {
 		return nil, fmt.Errorf("execution: empty argv")
 	}
@@ -132,20 +129,17 @@ func StartArgv(req StartRequest) (*exec.Cmd, error) {
 		return nil, err
 	}
 	argv = applyArgvLimits(policy, argv)
-	cmd := exec.CommandContext(ctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, argv...)...)
-	cmd.Dir = req.Dir
-	cmd.Env = procEnv
-	setProcessGroup(cmd)
-	if cleanupScratch != nil {
-		startScratchCleanup.Store(cmd, cleanupScratch)
-	}
+	cmd := newProcess(exec.CommandContext(ctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, argv...)...))
+	cmd.cmd.Dir = req.Dir
+	cmd.cmd.Env = procEnv
+	cmd.cleanup = cleanupScratch
 	return cmd, nil
 }
 
 // StartShell creates a fixed /bin/sh invocation inside Seatbelt for a
 // long-running shell command. The owner remains responsible for process pipes
 // and lifetime.
-func StartShell(ctx context.Context, command, dir string, env []string, policy *sandbox.Sandbox) (*exec.Cmd, error) {
+func StartShell(ctx context.Context, command, dir string, env []string, policy *sandbox.Sandbox) (*Process, error) {
 	if strings.TrimSpace(command) == "" {
 		return nil, fmt.Errorf("execution: empty command")
 	}
@@ -173,13 +167,10 @@ func StartShell(ctx context.Context, command, dir string, env []string, policy *
 		cleanupScratch()
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, sandbox.BackendPath, "-p", profile, "--", "/bin/sh", "-c", prepared)
-	cmd.Dir = dir
-	cmd.Env = procEnv
-	setProcessGroup(cmd)
-	if cleanupScratch != nil {
-		startScratchCleanup.Store(cmd, cleanupScratch)
-	}
+	cmd := newProcess(exec.CommandContext(ctx, sandbox.BackendPath, "-p", profile, "--", "/bin/sh", "-c", prepared))
+	cmd.cmd.Dir = dir
+	cmd.cmd.Env = procEnv
+	cmd.cleanup = cleanupScratch
 	return cmd, nil
 }
 
@@ -294,7 +285,7 @@ func Run(req Request) (Result, error) {
 	argv, procEnv = preferNativeCLTPython(argv, req.Command, procEnv, req.Dir, nativeCLTPythonPath())
 	defer cleanupScratch()
 	addExecutionReadRoots(policy, argv, req.Command, req.Dir, procEnv)
-	var cmd *exec.Cmd
+	var cmd *Process
 	if len(req.Argv) > 0 {
 		if argv[0] == "" {
 			return Result{}, fmt.Errorf("execution: empty argv")
@@ -307,27 +298,32 @@ func Run(req Request) (Result, error) {
 			return Result{}, err
 		}
 		if err := verifyProfileContext(cctx, profile); err != nil {
+			if cctx.Err() != nil {
+				return Result{TimedOut: true, ExitCode: -1}, nil
+			}
 			return Result{}, err
 		}
 		limitedArgv := applyArgvLimits(policy, argv)
-		cmd = exec.CommandContext(cctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, limitedArgv...)...)
+		cmd = newProcess(exec.CommandContext(cctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, limitedArgv...)...))
 	} else {
 		command, err := sandbox.PrepareCommandContext(cctx, policy, req.Command)
 		if err != nil {
+			if cctx.Err() != nil {
+				return Result{TimedOut: true, ExitCode: -1}, nil
+			}
 			return Result{}, err
 		}
 		profile, err := policy.Profile()
 		if err != nil {
 			return Result{}, err
 		}
-		cmd = exec.CommandContext(cctx, sandbox.BackendPath, "-p", profile, "--", "/bin/sh", "-c", command)
+		cmd = newProcess(exec.CommandContext(cctx, sandbox.BackendPath, "-p", profile, "--", "/bin/sh", "-c", command))
 	}
-	cmd.Dir = req.Dir
-	cmd.Env = procEnv
+	cmd.cmd.Dir = req.Dir
+	cmd.cmd.Env = procEnv
 	if req.Input != nil {
-		cmd.Stdin = req.Input
+		cmd.cmd.Stdin = req.Input
 	}
-	setProcessGroup(cmd)
 	if err := cctx.Err(); err == nil {
 		policy.MarkExternalExecution()
 	}
@@ -344,10 +340,9 @@ func Run(req Request) (Result, error) {
 	if req.Progress == nil && notify == nil {
 		stdoutCollector := &limitedBuffer{limit: limit}
 		stderrCollector := &limitedBuffer{limit: limit}
-		cmd.Stdout = stdoutCollector
-		cmd.Stderr = stderrCollector
+		cmd.cmd.Stdout = stdoutCollector
+		cmd.cmd.Stderr = stderrCollector
 		runErr = cmd.Run()
-		terminateProcessGroup(cmd)
 		resOutput := stdoutCollector.String()
 		if stderrText := stderrCollector.String(); stderrText != "" {
 			if resOutput != "" {
@@ -364,8 +359,8 @@ func Run(req Request) (Result, error) {
 		// goroutine. Sending is non-blocking and therefore cannot leak a worker
 		// when the owner stops consuming progress.
 		pr, pw := io.Pipe()
-		cmd.Stdout = pw
-		cmd.Stderr = pw
+		cmd.cmd.Stdout = pw
+		cmd.cmd.Stderr = pw
 		drainDone := make(chan struct{})
 		go func() {
 			defer close(drainDone)
@@ -382,13 +377,12 @@ func Run(req Request) (Result, error) {
 			}
 		}()
 		runErr = cmd.Run()
-		terminateProcessGroup(cmd)
 		_ = pw.Close()
 		<-drainDone
 	} else {
 		pr, pw := io.Pipe()
-		cmd.Stdout = pw
-		cmd.Stderr = pw
+		cmd.cmd.Stdout = pw
+		cmd.cmd.Stderr = pw
 		notifyCh := make(chan string, 64)
 		notifyDone := make(chan struct{})
 		notifyCtx, notifyCancel := context.WithCancel(cctx)
@@ -447,7 +441,6 @@ func Run(req Request) (Result, error) {
 			}
 		}()
 		runErr = cmd.Run()
-		terminateProcessGroup(cmd)
 		notifyCancel()
 		_ = pw.Close()
 		<-drainDone
@@ -685,16 +678,37 @@ func setEnvironment(entries []string, key, value string) []string {
 	return append(filtered, prefix+value)
 }
 
-// CleanupStartedProcess releases an invocation scratch directory after a
-// long-lived command has exited. Callers that start a command must call this
-// after Wait, even when Wait reports an error.
-func CleanupStartedProcess(cmd *exec.Cmd) {
+// CleanupStartedProcess releases a prepared process abandoned before Start.
+// Started processes call it themselves after reaping; repeated calls are safe.
+func CleanupStartedProcess(cmd *Process) {
 	if cmd == nil {
 		return
 	}
-	if value, ok := startScratchCleanup.LoadAndDelete(cmd); ok {
-		value.(func())()
-	}
+	cmd.cleanupOnce.Do(func() {
+		cmd.mu.Lock()
+		started := cmd.started
+		cmd.mu.Unlock()
+		if !started {
+			if cmd.stdinRead != nil {
+				_ = cmd.stdinRead.Close()
+			}
+			if cmd.stdoutRead != nil {
+				_ = cmd.stdoutRead.Close()
+			}
+			if cmd.stdoutWrite != nil {
+				_ = cmd.stdoutWrite.Close()
+			}
+			if cmd.input != nil {
+				_ = cmd.input.Close()
+			}
+			if cmd.slave != nil {
+				_ = cmd.slave.Close()
+			}
+		}
+		if cmd.cleanup != nil {
+			cmd.cleanup()
+		}
+	})
 }
 
 func applyArgvLimits(policy *sandbox.Sandbox, argv []string) []string {
@@ -995,35 +1009,6 @@ func verifyProfileContext(ctx context.Context, profile string) error {
 		return fmt.Errorf("execution: Seatbelt rejected the profile: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
 	return nil
-}
-
-func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-			return err
-		}
-		return os.ErrProcessDone
-	}
-	cmd.WaitDelay = PipeWaitDelay
-}
-
-// terminateProcessGroup reclaims descendants that inherited the shell's
-// stdout/stderr. CommandContext kills the group on cancellation, but a
-// normal shell exit does not invoke cmd.Cancel; without this explicit cleanup
-// a background child could survive a short command indefinitely.
-func terminateProcessGroup(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-		// The command result remains authoritative; cleanup is best effort after
-		// Wait has already completed.
-		return
-	}
 }
 
 func sendProgress(ctx context.Context, progress chan<- string, line string) {

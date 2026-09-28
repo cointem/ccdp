@@ -2,7 +2,6 @@ package tools
 
 import (
 	"fmt"
-	"strings"
 
 	"ccdp/internal/execution"
 )
@@ -53,53 +52,11 @@ func NewBashTool() *BashTool { return &BashTool{} }
 func (b *BashTool) Name() string { return "Bash" }
 
 func (b *BashTool) Description() string {
-	return `Run a bash command. Use this tool to execute shell commands, scripts,
-tests, build steps and inspect the environment. Returns stdout and stderr,
-followed by the exit code. Long-running commands are interrupted after the
-configured timeout (default 120s). If the command needs resources outside the
-workspace, list only the specific requested_capabilities it needs. Requests
-are approved separately from permission to run the command.`
+	return "Start one /bin/sh command (use $? for exit status). Wait up to yield_ms (default 1000) and return its process_id, output and state. Continue via Process; never rerun merely to wait. timeout_ms is the execution deadline (default 120000; explicit 0 means none). stdin defaults to closed (immediate EOF); use stdin=pipe for Process.write or tty=true for a terminal, not both. TMPDIR is a private writable scratch directory; put temporary compiler outputs there or in the workspace, not at hard-coded /tmp paths. HOME is isolated: a missing toolchain configuration there does not prove the host lacks one. Additional access requires requested_capabilities approval."
 }
-
 func (b *BashTool) Parameters() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"command": map[string]any{
-				"type":        "string",
-				"description": "The shell command to execute. Use && between commands that must all succeed.",
-			},
-			"description": map[string]any{
-				"type":        "string",
-				"description": "A short note describing what the command does and why. Useful for the log.",
-			},
-			"requested_capabilities": capabilityRequestSchema(),
-		},
-		"required": []string{"command"},
-	}
+	return map[string]any{"type": "object", "properties": map[string]any{
+		"stdin":   map[string]any{"type": "string", "enum": []string{"closed", "pipe"}},
+		"command": map[string]any{"type": "string"}, "cwd": map[string]any{"type": "string"}, "description": map[string]any{"type": "string"}, "yield_ms": map[string]any{"type": "integer", "minimum": 0, "maximum": 10000}, "timeout_ms": map[string]any{"type": "integer", "minimum": 0, "maximum": 3600000}, "tty": map[string]any{"type": "boolean"}, "requested_capabilities": capabilityRequestSchema()}, "required": []string{"command"}}
 }
-
-func (b *BashTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
-	}
-	command := StringArg(ctx.Args, "command", "")
-	if strings.TrimSpace(command) == "" {
-		return "", fmt.Errorf("bash: empty command")
-	}
-	res, err := RunShell(ctx, command)
-	if err != nil {
-		return "", err
-	}
-	var sb strings.Builder
-	sb.WriteString(res.Output)
-	if !strings.HasSuffix(res.Output, "\n") && res.Output != "" {
-		sb.WriteString("\n")
-	}
-	if res.Timeout {
-		fmt.Fprintf(&sb, "\nExit code: %d (timed out)\n", res.ExitCode)
-	} else {
-		fmt.Fprintf(&sb, "\nExit code: %d\n", res.ExitCode)
-	}
-	return boundedToolString(ctx, sb.String()), nil
-}
+func (b *BashTool) Run(ctx *Context) (string, error) { return startCommand(ctx) }

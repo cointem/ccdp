@@ -118,6 +118,8 @@ type InputStrategy string
 const (
 	InputSteer    InputStrategy = "steer"
 	InputFollowup InputStrategy = "followup"
+	// InputMessage is collaboration data: queued without starting an idle turn.
+	InputMessage InputStrategy = "message"
 )
 
 type ExecutionMode string
@@ -391,7 +393,7 @@ func (c Command) Normalize() (Command, error) {
 		if c.Input.Strategy == "" {
 			c.Input.Strategy = InputSteer
 		}
-		if c.Input.Strategy != InputSteer && c.Input.Strategy != InputFollowup {
+		if c.Input.Strategy != InputSteer && c.Input.Strategy != InputFollowup && c.Input.Strategy != InputMessage {
 			return Command{}, fmt.Errorf("protocol: unknown input strategy %q", c.Input.Strategy)
 		}
 	case CommandSetGeneration:
@@ -699,6 +701,7 @@ const (
 	PhaseIdle            RuntimePhase = "idle"
 	PhasePreparing       RuntimePhase = "preparing"
 	PhaseStreaming       RuntimePhase = "streaming"
+	PhaseFinalizing      RuntimePhase = "finalizing"
 	PhaseExecutingTools  RuntimePhase = "executing_tools"
 	PhaseWaitingApproval RuntimePhase = "waiting_approval"
 	PhaseCompacting      RuntimePhase = "compacting"
@@ -850,20 +853,21 @@ type PlanView struct {
 type EventKind string
 
 const (
-	EventStatus          EventKind = "status"
-	EventUserMessage     EventKind = "user_message"
-	EventStream          EventKind = "stream"
-	EventReasoning       EventKind = "reasoning"
-	EventToolStarted     EventKind = "tool_started"
-	EventToolProgress    EventKind = "tool_progress"
-	EventToolResult      EventKind = "tool_result"
-	EventApprovalRequest EventKind = "approval_request"
-	EventQuestionRequest EventKind = "question_request"
-	EventPlanReady       EventKind = "plan_ready"
-	EventError           EventKind = "error"
-	EventTurnDone        EventKind = "turn_done"
-	EventUsage           EventKind = "usage"
-	EventStateChanged    EventKind = "state_changed"
+	EventStatus            EventKind = "status"
+	EventOperationProgress EventKind = "operation_progress"
+	EventUserMessage       EventKind = "user_message"
+	EventStream            EventKind = "stream"
+	EventReasoning         EventKind = "reasoning"
+	EventToolStarted       EventKind = "tool_started"
+	EventToolProgress      EventKind = "tool_progress"
+	EventToolResult        EventKind = "tool_result"
+	EventApprovalRequest   EventKind = "approval_request"
+	EventQuestionRequest   EventKind = "question_request"
+	EventPlanReady         EventKind = "plan_ready"
+	EventError             EventKind = "error"
+	EventTurnDone          EventKind = "turn_done"
+	EventUsage             EventKind = "usage"
+	EventStateChanged      EventKind = "state_changed"
 )
 
 type ToolView struct {
@@ -919,21 +923,24 @@ type SandboxRuntimeView struct {
 // SessionView is a read-only projection. Agent returns copies of all slices
 // and nested values so a client cannot mutate or race runtime state.
 type SessionView struct {
-	Question          *QuestionRequest `json:"question,omitempty"`
-	RunID             RunID            `json:"run_id,omitempty"`
-	Transcript        []TranscriptItem `json:"transcript,omitempty"`
-	TranscriptMore    bool             `json:"transcript_more,omitempty"`
-	SessionID         SessionID        `json:"session_id"`
-	Revision          Revision         `json:"revision"`
-	Phase             RuntimePhase     `json:"phase"`
-	Workflow          WorkflowState    `json:"workflow"`
-	Busy              bool             `json:"busy"`
-	Closing           bool             `json:"closing"`
-	Settings          SettingsSnapshot `json:"settings"`
+	Question       *QuestionRequest `json:"question,omitempty"`
+	RunID          RunID            `json:"run_id,omitempty"`
+	Transcript     []TranscriptItem `json:"transcript,omitempty"`
+	TranscriptMore bool             `json:"transcript_more,omitempty"`
+	SessionID      SessionID        `json:"session_id"`
+	Revision       Revision         `json:"revision"`
+	Phase          RuntimePhase     `json:"phase"`
+	Workflow       WorkflowState    `json:"workflow"`
+	Busy           bool             `json:"busy"`
+	// WorkStartedAt is the runtime start of the current turn or exclusive operation.
+	WorkLabel         string             `json:"work_label,omitempty"`
+	WorkStartedAt     time.Time          `json:"work_started_at,omitempty"`
+	Closing           bool               `json:"closing"`
+	Settings          SettingsSnapshot   `json:"settings"`
 	SandboxRuntime    SandboxRuntimeView `json:"sandbox_runtime"`
-	Catalog           CatalogSnapshot  `json:"catalog"`
-	Usage             UsageSnapshot    `json:"usage"`
-	ContextUsedTokens int              `json:"context_used_tokens"`
+	Catalog           CatalogSnapshot    `json:"catalog"`
+	Usage             UsageSnapshot      `json:"usage"`
+	ContextUsedTokens int                `json:"context_used_tokens"`
 	// SystemTokens / ToolsTokens / MessagesTokens split ContextUsedTokens into
 	// the exact context detail the UI shows. They always sum to
 	// ContextUsedTokens (system absorbs the remainder after messages/tools).

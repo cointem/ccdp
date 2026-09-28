@@ -1,14 +1,18 @@
 package tui
 
-import "ccdp/internal/protocol"
+import (
+	"ccdp/internal/protocol"
+	"fmt"
+)
 
 // historyCell is one rendered entry in the conversation viewport.
 type historyCell struct {
-	revision uint64
-	kind     string // user | command | assistant | system | welcome | tool | status | error | thinking
-	text     string
-	toolID   string
-	status   string // running | success | error | denied
+	revision   uint64
+	kind       string // user | command | assistant | system | welcome | tool | status | error | thinking
+	text       string
+	textOffset int // byte offset of text in the original message
+	toolID     string
+	status     string // running | success | error | denied
 	// messageID is set for confirmed history entries. Local report entries use
 	// reportAnchor/reportIndex to retain their position when a later snapshot
 	// rebuilds the confirmed transcript.
@@ -26,12 +30,12 @@ type historyCell struct {
 	toolArgsRaw   string
 	toolTruncated bool
 
-	// agent carries the child sessions spawned by a Task/Agent tool call,
+	// agent carries the child session spawned by a SpawnAgent tool call,
 	// resolved by ParentCallID == toolID from the routing directory. It is
 	// attached at compose time so both the managed live tail and the
 	// native-scrollback flush render the same compact agent marker instead of
 	// dumping the child's final answer as ordinary tool output.
-	agent []protocol.ChildSession
+	agent *protocol.ChildSession
 
 	// Display cache compares source content, including equal-length corrections.
 	sanitized       string
@@ -42,6 +46,9 @@ func (c *historyCell) cleanText() string {
 	if c.sanitizedSource != c.text {
 		c.sanitized = sanitizeANSI(c.text)
 		c.sanitizedSource = c.text
+	}
+	if c.textOffset > 0 {
+		return fmt.Sprintf("[已省略前 %d 字节；显示最新内容]\n", c.textOffset) + c.sanitized
 	}
 	return c.sanitized
 }

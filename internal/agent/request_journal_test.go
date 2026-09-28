@@ -469,7 +469,12 @@ func TestSessionCacheWeightedPersistedAndExcludesChildUsage(t *testing.T) {
 	if want.InputTokens != 1000 || want.CachedTokens != 900 || want.ReportedInputTokens != 1000 || want.UnknownHistory {
 		t.Fatalf("wrong weighted counters: %+v", want)
 	}
-	if err := a.recordChildUsage(Usage{InputTokens: 500, CachedTokens: 50, TurnCount: 1}); err != nil {
+	run := &managedRun{parent: a, fact: session.ChildRunRecorded{Version: 1, Child: protocol.ChildSession{
+		SessionID: "child", RootSessionID: protocol.SessionID(a.sessionID), ParentSessionID: protocol.SessionID(a.sessionID),
+		DelegationID: "cache-test", Purpose: childPurposeTask,
+		Run: protocol.RunView{ID: "cache-run", Status: "succeeded", WaitPolicy: "join", Usage: protocol.UsageSnapshot{InputTokens: 500, CachedTokens: 50, TurnCount: 1}},
+	}}}
+	if err := a.supervisor.recordOutcome(run); err != nil {
 		t.Fatal(err)
 	}
 	if a.Usage().Cache != want {

@@ -132,6 +132,25 @@ func renderFileChangePreview(p toolPresentation, width int) string {
 			lines = append(lines, diffLine{kind: diffContext, newNo: i + 1, text: " " + sanitizeANSI(line)})
 		}
 	case "edit":
+		if edits, ok := p.Args["edits"].([]any); ok {
+			for _, raw := range edits {
+				if edit, ok := raw.(map[string]any); ok {
+					for _, pair := range []struct {
+						key    string
+						kind   diffLineKind
+						prefix string
+					}{{"old_text", diffDeletion, "-"}, {"new_text", diffAddition, "+"}} {
+						text, _ := edit[pair.key].(string)
+						if text != "" {
+							for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+								lines = append(lines, diffLine{kind: pair.kind, text: pair.prefix + sanitizeANSI(line)})
+							}
+						}
+					}
+				}
+			}
+			break
+		}
 		old, ok := p.Args["old_string"].(string)
 		if !ok {
 			return ""

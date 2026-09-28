@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strings"
@@ -106,7 +105,7 @@ type Client struct {
 	pending map[int]chan json.RawMessage
 	writeMu sync.Mutex // serializes stdin writes
 
-	cmd        *exec.Cmd
+	cmd        *execution.Process
 	stdin      io.WriteCloser
 	procCancel context.CancelFunc
 	closed     chan struct{} // closed when the process exits or Close is called
@@ -256,6 +255,12 @@ func (c *Client) Start(ctx context.Context) error {
 		procCancel()
 		return fmt.Errorf("mcp %s: prepare process: %w", c.name, err)
 	}
+	started := false
+	defer func() {
+		if !started {
+			execution.CleanupStartedProcess(cmd)
+		}
+	}()
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -268,7 +273,7 @@ func (c *Client) Start(ctx context.Context) error {
 		return fmt.Errorf("mcp %s: stdout: %w", c.name, err)
 	}
 	stderr := &boundedBuffer{limit: maxMCPStderr}
-	cmd.Stderr = stderr
+	cmd.SetStderr(stderr)
 
 	if sb != nil {
 		sb.MarkExternalExecution()
@@ -278,10 +283,11 @@ func (c *Client) Start(ctx context.Context) error {
 		return fmt.Errorf("mcp %s: start %s: %w", c.name, c.cfg.Command, err)
 	}
 	c.cmd = cmd
+	started = true
 	c.stdin = stdin
 	c.procCancel = procCancel
 
-	go c.readLoop(stdout)
+	go func() { defer stdout.Close(); c.readLoop(stdout) }()
 
 	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
@@ -322,15 +328,11 @@ const callTimeout = 5 * time.Minute
 func (c *Client) Call(ctx context.Context, name string, args map[string]any) (string, error) {
 	params := map[string]any{"name": name, "arguments": args}
 	var resp struct {
-		Content []struct {
-			Type     string `json:"type"`
-			Text     string `json:"text"`
-			MimeType string `json:"mimeType"`
-			Data     string `json:"data"`
-			URI      string `json:"uri"`
-		} `json:"content"`
-		IsError bool `json:"isError"`
+		Content           []json.RawMessage `json:"content"`
+		StructuredContent json.RawMessage   `json:"structuredContent,omitempty"`
+		IsError           bool              `json:"isError"`
 	}
+
 	// Bound the call when the caller gave us no deadline of its own.
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -341,22 +343,33 @@ func (c *Client) Call(ctx context.Context, name string, args map[string]any) (st
 		return "", err
 	}
 	var sb strings.Builder
-	for _, piece := range resp.Content {
-		switch piece.Type {
-		case "text":
+	structured := len(resp.StructuredContent) > 0
+	for _, raw := range resp.Content {
+		var piece struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &piece); err != nil {
+			return "", err
+		}
+		if piece.Type == "text" {
 			sb.WriteString(piece.Text)
-			sb.WriteString("\n")
-		case "image":
-			fmt.Fprintf(&sb, "[image: %s, %d bytes of base64 data — the tool returned an image]\n",
-				piece.MimeType, len(piece.Data))
-		case "resource":
-			uri := piece.URI
-			if uri == "" {
-				uri = "embedded resource"
-			}
-			fmt.Fprintf(&sb, "[resource: %s (%s)]\n", uri, piece.MimeType)
+			sb.WriteByte('\n')
+		} else {
+			structured = true
 		}
 	}
+	if structured {
+		data, err := json.Marshal(resp)
+		if err != nil {
+			return "", err
+		}
+		if resp.IsError {
+			return string(data), errors.New("MCP tool reported an error")
+		}
+		return string(data), nil
+	}
+
 	out := strings.TrimRight(sb.String(), "\n")
 	if resp.IsError {
 		if out == "" {
@@ -824,7 +837,6 @@ func (c *Client) Close() error {
 		sseClient.CloseIdleConnections()
 	}
 	var err error
-	intentionalStop := false
 	if c.cmd != nil && !c.waited {
 		// Closing stdin first unblocks any in-flight stdin.Write before the
 		// kill. readLoop is deliberately not joined: Wait reaps the child and
@@ -833,24 +845,11 @@ func (c *Client) Close() error {
 		if c.stdin != nil {
 			_ = c.stdin.Close()
 		}
-		if c.cmd.Process != nil {
-			if killErr := c.cmd.Process.Kill(); killErr == nil {
-				intentionalStop = true
-			}
-		}
-		err = c.cmd.Wait()
-		execution.CleanupStartedProcess(c.cmd)
-		c.waited = true
+		err = c.cmd.Stop("cancelled")
+		c.waited = err == nil
 	}
 	if procCancel != nil {
 		procCancel()
-	}
-	if err != nil && intentionalStop {
-		// A process that already observed its context cancellation can report
-		// exec's synthetic cancel/kill error even though it was intentionally
-		// reaped successfully. A caller that needs the child's exit status can
-		// inspect ProcessState before invoking Close.
-		return nil
 	}
 	return err
 }
@@ -1037,18 +1036,25 @@ func (c *Client) writeSSE(body []byte) error {
 		}()
 		return nil
 	}
-	// Plain JSON response: read it (bounded to 1MB) and route it through the
+	// Plain JSON response: use the same limit as streamed frames and route it through the
 	// normal dispatcher — the body holds a single JSON-RPC response object,
 	// which is exactly dispatchRaw's input contract.
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxLineLen+1))
 	cancel()
 	if err != nil {
 		return fmt.Errorf("mcp %s: sse post body: %w", c.name, err)
 	}
-	if raw = bytes.TrimSpace(raw); len(raw) > 0 {
-		c.dispatchRaw(raw)
+	if len(raw) > maxLineLen {
+		return fmt.Errorf("mcp %s: response exceeds %d bytes", c.name, maxLineLen)
 	}
+	if len(bytes.TrimSpace(raw)) == 0 && (resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusNoContent || !strings.Contains(resp.Header.Get("Content-Type"), "application/json")) {
+		return nil // Legacy SSE delivers the response on its separate event stream.
+	}
+	if !json.Valid(raw) {
+		return fmt.Errorf("mcp %s: invalid JSON response", c.name)
+	}
+	c.dispatchRaw(raw)
 	return nil
 }
 

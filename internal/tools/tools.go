@@ -12,41 +12,27 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// SubagentFunc runs an independent sub-agent: a full mini agent loop with its
-// own system prompt and history, sharing the parent's tools, sandbox and
-// permissions. It returns the sub-agent's final text output.
-type SubagentFunc func(description, systemPrompt string) (string, error)
-
-// SubagentTask is one unit of work in a batched Task invocation.
-type SubagentTask struct {
-	WaitPolicy   string `json:"wait_policy,omitempty"`
-	Description  string `json:"description"`
-	SystemPrompt string `json:"system_prompt,omitempty"`
+// SpawnAgentRequest is one model-facing assignment; lifecycle policy stays in the runtime.
+type SpawnAgentRequest struct {
+	Task      string
+	Name      string
+	Role      string
+	Workspace string
+	Context   string
 }
-
-// SubagentResult is one batched task's outcome. Error is "" on success.
-type SubagentResult struct {
-	SessionID   string `json:"session_id,omitempty"`
-	RunID       string `json:"run_id,omitempty"`
-	Index       int    `json:"index"`
-	Description string `json:"description"`
-	Output      string `json:"output"`
-	Error       string `json:"error,omitempty"`
-}
-
-// SubagentsFunc runs a batch of independent sub-agents concurrently, returning
-// one result per task in input order (Claude Code's parallel Task agents).
-type SubagentsFunc func(tasks []SubagentTask) ([]SubagentResult, error)
 
 // Context carries per-invocation state into a tool.
 type Context struct {
 	context.Context
+	ReadRoot   string         // optional strict snapshot-only read boundary
 	WorkingDir string         // directory the tool should operate in
 	SessionDir string         // directory where the session persists (todos, etc.)
 	Args       map[string]any // parsed JSON arguments from the model
@@ -82,16 +68,22 @@ type Context struct {
 	// Notify is called with transient progress updates (e.g. command output)
 	// that the UI can stream live for long-running tools.
 	Notify func(line string)
-	// Subagent launches an independent sub-agent loop (Claude Code's Task tool
-	// idea). Nil means sub-agents are unavailable in this session.
-	Subagent SubagentFunc
-	// Subagents runs a batch of sub-agents concurrently (parallel Task agents).
-	// Nil falls back to Subagent when only one task is requested.
-	Subagents      SubagentsFunc
-	Sessions       protocol.SessionDirectory
-	AgentCommandID protocol.CommandID
+	// SpawnAgent admits one independent assignment and returns its stable identity.
+	SpawnAgent       func(SpawnAgentRequest) (protocol.AgentReceipt, error)
+	Sessions         protocol.SessionDirectory
+	AgentCommandID   protocol.CommandID
+	SendAgentMessage func(target, text string) error
+	WaitAgentEvent   func(context.Context) (string, error)
+	ReadAgent        func(context.Context, protocol.AgentReadRequest, int) (string, error)
 	// Skills exposes the loaded skill store for ReadSkill lookups.
 	Skills skills.Provider
+	// BeforeWrite durably captures a directly attributed mutation. The returned
+	// finalizer records a successful mutation; failed/uncertain publication is
+	// left incomplete rather than attributing another writer's bytes to us.
+	// knownBefore is supplied by Edit to reuse its already-read original bytes;
+	// nil means the recorder must capture the old file itself (Write).
+	BeforeWrite      func(path string, knownBefore []byte) (func() error, error)
+	NavigateSemantic func(operation, path string, line, character int) (string, error)
 }
 
 const (
@@ -232,7 +224,25 @@ func (c *Context) ResolveRead(p string) (string, error) {
 	if c.Sandbox == nil {
 		return "", fmt.Errorf("tools: sandbox policy is unavailable")
 	}
-	return c.Sandbox.ResolveRead(p)
+	resolved, err := c.Sandbox.ResolveRead(p)
+	if err != nil {
+		return "", err
+	}
+	if c.ReadRoot != "" {
+		root, e := filepath.EvalSymlinks(c.ReadRoot)
+		if e != nil {
+			return "", e
+		}
+		target, e := filepath.EvalSymlinks(resolved)
+		if e != nil {
+			return "", e
+		}
+		rel, e := filepath.Rel(root, target)
+		if e != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("read outside snapshot")
+		}
+	}
+	return resolved, nil
 }
 
 // ResolveWrite resolves p for writing. A missing policy is a denied operation.
@@ -735,7 +745,7 @@ func boundedToolString(ctx *Context, value string) string {
 	}
 	marker := "\n…[tool output truncated]"
 	if limit <= len(marker) {
-		return value[:limit]
+		return truncateUTF8(value, limit)
 	}
-	return value[:limit-len(marker)] + marker
+	return truncateUTF8(value, limit-len(marker)) + marker
 }

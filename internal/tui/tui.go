@@ -358,7 +358,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.routing.rows = msg.rows
+		m.syncAgentShelf()
 		m.attachAgentMarkers()
+		m.syncViewportHeight()
 		var command tea.Cmd
 		if msg.show {
 			command = m.agentPicker()
@@ -587,6 +589,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// bounded expiry path for a notice added after the dedicated notice tick
 		// stopped at an empty queue.
 		m.expireNotices(now())
+		if m.routing != nil && len(m.routing.rows) > 0 {
+			m.syncAgentShelf()
+			m.syncViewportHeight()
+		}
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		if m.animateWork() {
@@ -826,6 +832,11 @@ func (m *Model) selPointAt(screenY, screenX int) selPoint {
 // model/mode/context toggles, context-card dismissal, header agent navigation,
 // and transcript tool/agent row expansion.
 func (m *Model) doMouseClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if !m.overlaySurface() {
+		if handled, cmd := m.clickAgentShelf(msg.X, msg.Y); handled {
+			return *m, cmd
+		}
+	}
 	for _, hit := range m.footerHitCells() {
 		if msg.Y != hit.y || msg.X < hit.x || msg.X >= hit.x+hit.width {
 			continue

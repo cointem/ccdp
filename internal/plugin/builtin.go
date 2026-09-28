@@ -21,24 +21,23 @@ func (p *toolsPlugin) Requires() []string { return nil }
 func (p *toolsPlugin) Init(ctx *Context) error {
 	builtins := []tools.Tool{
 		tools.NewBashTool(),
+		tools.NewProcessTool(),
 		tools.NewReadTool(),
 		tools.NewWriteTool(),
 		tools.NewEditTool(),
 		tools.NewGlobTool(),
 		tools.NewGrepTool(),
+		tools.NewCodeNavigateTool(),
 		tools.NewLSTool(),
 		tools.NewTodoWriteTool(),
-		tools.NewTaskTool(),
-		tools.NewAgentTool(),
+		tools.NewAgentTool("SpawnAgent"),
+		tools.NewAgentTool("SendMessage"),
+		tools.NewAgentTool("FollowupAgent"),
+		tools.NewAgentTool("WaitAgent"),
+		tools.NewAgentTool("ListAgents"),
+		tools.NewAgentTool("ReadAgent"),
+		tools.NewAgentTool("StopAgent"),
 		tools.NewReadSkillTool(),
-		tools.NewGitStatusTool(),
-		tools.NewGitDiffTool(),
-		tools.NewGitLogTool(),
-		tools.NewGitCommitTool(),
-		tools.NewProcessStartTool(),
-		tools.NewProcessWriteTool(),
-		tools.NewProcessOutputTool(),
-		tools.NewProcessStopTool(),
 	}
 	if p.enableWeb {
 		ctx.Tools.RegisterIn("web", tools.NewWebFetchTool())

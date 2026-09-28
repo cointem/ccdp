@@ -13,7 +13,13 @@ import (
 )
 
 const transcriptWindow = 256
-const transcriptTextLimit = 16 << 10
+
+// A rolling live window, not a model output limit. Complete messages remain
+// in the journal. Tool arguments use a smaller structured-payload preview.
+const (
+	transcriptTextLimit = 256 << 10
+	transcriptArgsLimit = 16 << 10
+)
 
 func toolTranscriptID(turn, step, call string) string {
 	if step == "" {
@@ -42,15 +48,60 @@ func toolEventTranscriptID(ev protocol.EventView) string {
 // The projection is fed at commit/publication, not through a lossy Watch.
 // Its mutex never calls back into Agent or persistence.
 type transcriptState struct {
-	index       map[string]uint64
-	before      uint64
-	window      int
-	mu          sync.Mutex
-	items       []protocol.TranscriptItem
-	more        bool
-	reasoningID string
-	liveID      string
-	serial      uint64
+	buffers           map[string]*transcriptBuffer
+	index             map[string]uint64
+	before            uint64
+	window            int
+	mu                sync.Mutex
+	items             []protocol.TranscriptItem
+	more              bool
+	reasoningID       string
+	closedReasoningID string
+	previewIDs        []string
+	liveID            string
+	serial            uint64
+}
+
+// Keep append work linear. Snapshots materialize only the visible tail; spare
+// capacity amortizes front removal rather than copying 256 KiB per token.
+type transcriptBuffer struct {
+	data   []byte
+	offset int64
+}
+
+func (t *transcriptState) appendLive(item protocol.TranscriptItem, delta string) {
+	if t.buffers == nil {
+		t.buffers = map[string]*transcriptBuffer{}
+	}
+	b := t.buffers[item.ID]
+	if b == nil {
+		b = &transcriptBuffer{data: []byte(item.Text), offset: item.TextOffset}
+	}
+	b.data = append(b.data, delta...)
+	if len(b.data) > 2*transcriptTextLimit {
+		drop := len(b.data) - transcriptTextLimit
+		for drop < len(b.data) && !utf8.RuneStart(b.data[drop]) {
+			drop++
+		}
+		b.offset += int64(drop)
+		b.data = append([]byte(nil), b.data[drop:]...)
+	}
+	item.Text = ""
+	t.put(item)
+	t.buffers[item.ID] = b
+}
+
+func (t *transcriptState) materialize(item protocol.TranscriptItem) protocol.TranscriptItem {
+	if b := t.buffers[item.ID]; b != nil {
+		start := max(0, len(b.data)-transcriptTextLimit)
+		for start < len(b.data) && !utf8.RuneStart(b.data[start]) {
+			start++
+		}
+		item.Text = string(b.data[start:])
+		item.TextOffset = b.offset + int64(start)
+		item.Truncated = item.Truncated || item.TextOffset > 0
+	}
+	return item
 }
 
 func clipTranscript(s string) (string, bool) {
@@ -64,7 +115,17 @@ func clipTranscript(s string) (string, bool) {
 	return s[:n], true
 }
 
+func transcriptTail(s string, limit int) (string, int64) {
+	start := max(0, len(s)-limit)
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:], int64(start)
+}
+
 func (t *transcriptState) put(item protocol.TranscriptItem) {
+	delete(t.buffers, item.ID)
+	delete(t.buffers, item.PreviousID)
 	if t.index != nil {
 		ordinal := t.index[item.ID]
 		if ordinal == 0 {
@@ -78,13 +139,40 @@ func (t *transcriptState) put(item protocol.TranscriptItem) {
 			return
 		}
 	}
-	var clipped bool
-	item.Text, clipped = clipTranscript(item.Text)
-	item.Truncated = item.Truncated || clipped
+	if (item.Kind == "assistant" || item.Kind == "thinking") && len(item.Text) > transcriptTextLimit {
+		var dropped int64
+		item.Text, dropped = transcriptTail(item.Text, transcriptTextLimit)
+		item.TextOffset += dropped
+		item.Truncated = true
+	} else {
+		var clipped bool
+		item.Text, clipped = clipTranscript(item.Text)
+		item.Truncated = item.Truncated || clipped
+	}
 	item.Args = append(json.RawMessage(nil), item.Args...)
-	if len(item.Args) > transcriptTextLimit {
+	if len(item.Args) > transcriptArgsLimit {
 		item.Args = nil
 		item.Truncated = true
+	}
+	// Forwarded progress can change from a live ID to its durable ID without
+	// passing through applyAssistantCommitted. Preserve the original position.
+	if item.PreviousID != "" && item.PreviousID != item.ID {
+		found := false
+		kept := t.items[:0]
+		for _, old := range t.items {
+			if old.ID == item.PreviousID || old.ID == item.ID {
+				if !found {
+					kept = append(kept, item)
+					found = true
+				}
+			} else {
+				kept = append(kept, old)
+			}
+		}
+		t.items = kept
+		if found {
+			return
+		}
 	}
 	for i := range t.items {
 		if t.items[i].ID == item.ID {
@@ -98,6 +186,9 @@ func (t *transcriptState) put(item protocol.TranscriptItem) {
 		window = transcriptWindow
 	}
 	if len(t.items) > window {
+		for _, old := range t.items[:len(t.items)-window] {
+			delete(t.buffers, old.ID)
+		}
 		t.items = append([]protocol.TranscriptItem(nil), t.items[len(t.items)-window:]...)
 		t.more = true
 	}
@@ -111,6 +202,7 @@ func (t *transcriptState) snapshot() ([]protocol.TranscriptItem, bool) {
 	defer t.mu.Unlock()
 	items := append([]protocol.TranscriptItem(nil), t.items...)
 	for i := range items {
+		items[i] = t.materialize(items[i])
 		items[i].Args = append(json.RawMessage(nil), items[i].Args...)
 	}
 	return items, t.more
@@ -165,8 +257,10 @@ func transcriptRelevantEvent(typ session.EventType) bool {
 func (t *transcriptState) applyConversationReset() {
 	if t.index == nil {
 		t.items = nil
+		t.buffers = nil
 		t.more = false
-		t.liveID = ""
+		t.liveID, t.reasoningID, t.closedReasoningID = "", "", ""
+		t.previewIDs = nil
 	}
 }
 
@@ -179,7 +273,11 @@ func (t *transcriptState) applyInputQueued(b []byte) {
 	if id == "" {
 		id = inputMessageID(e.InputID)
 	}
-	t.put(protocol.TranscriptItem{ID: id, Kind: "user", Text: e.Text, Status: "queued"})
+	kind := "user"
+	if e.Strategy == string(protocol.InputMessage) {
+		kind = "collaboration"
+	}
+	t.put(protocol.TranscriptItem{ID: id, Kind: kind, Text: e.Text, Status: "queued"})
 }
 
 func (t *transcriptState) applyInputCancelled(b []byte) {
@@ -207,9 +305,13 @@ func (t *transcriptState) applyAssistantCommitted(b []byte) {
 			text.WriteString(block.Text)
 		}
 	}
-	if e.Message.Role == "assistant" && e.Message.ReasoningContent != "" {
+	segmented := e.Message.Role == "assistant" && t.commitSegments(e, text.String())
+	if !segmented && e.Message.Role == "assistant" && e.Message.ReasoningContent != "" {
 		id := "reasoning:" + e.Message.MessageID
 		previous := t.reasoningID
+		if previous == "" {
+			previous = t.closedReasoningID
+		}
 		for i := range t.items {
 			if previous != "" && t.items[i].ID == previous {
 				t.items[i].ID = id
@@ -235,8 +337,12 @@ func (t *transcriptState) applyAssistantCommitted(b []byte) {
 		}
 		t.liveID = ""
 	}
-	if text.Len() > 0 {
+	if text.Len() > 0 && !segmented {
 		t.put(protocol.TranscriptItem{ID: e.Message.MessageID, PreviousID: previousID, Kind: e.Message.Role, TurnID: protocol.TurnID(e.TurnID), Text: text.String(), Status: "completed"})
+	}
+	if e.Message.Role == "assistant" {
+		t.previewIDs = nil
+		t.closedReasoningID = ""
 	}
 	for _, block := range e.Message.Content {
 		if block.ToolCall != nil {
@@ -308,6 +414,15 @@ func (t *transcriptState) applyTurnFinished(b []byte) {
 		}
 		t.liveID = ""
 	}
+	for i := range t.items {
+		for _, id := range t.previewIDs {
+			if t.items[i].ID == id && t.items[i].Status == "streaming" {
+				t.items[i].Status = "interrupted"
+			}
+		}
+	}
+	t.previewIDs = nil
+	t.reasoningID, t.closedReasoningID = "", ""
 	if e.Error != "" {
 		t.put(protocol.TranscriptItem{ID: "error:" + e.TurnID, Kind: "error", Text: e.Error, TurnID: protocol.TurnID(e.TurnID), Status: e.Outcome})
 	}
@@ -331,21 +446,30 @@ func (t *transcriptState) event(ev protocol.EventView) {
 		// Reasoning and answer deltas may interleave within one completion.
 		// Usage/status events are not a new reasoning segment either.
 		switch ev.Kind {
-		case protocol.EventToolStarted, protocol.EventTurnDone, protocol.EventUserMessage, protocol.EventError:
+		case protocol.EventStream, protocol.EventToolStarted, protocol.EventTurnDone, protocol.EventUserMessage, protocol.EventError:
+			t.closedReasoningID = t.reasoningID
 			t.reasoningID = ""
 		}
 	}
 	switch ev.Kind {
 	case protocol.EventReasoning:
+		if ev.Text == "" {
+			return
+		}
 		for _, old := range t.items {
 			if old.ID == t.reasoningID && old.TurnID != ev.TurnID {
 				t.reasoningID = ""
 				break
 			}
 		}
+		if t.liveID != "" {
+			t.closePreview(t.liveID)
+			t.liveID = ""
+		}
 		if t.reasoningID == "" {
 			t.serial++
 			t.reasoningID = fmt.Sprintf("reasoning:%s:%d", ev.TurnID, t.serial)
+			t.previewIDs = append(t.previewIDs, t.reasoningID)
 		}
 		item := protocol.TranscriptItem{ID: t.reasoningID, Kind: "thinking", TurnID: ev.TurnID, Status: "streaming"}
 		for _, old := range t.items {
@@ -354,10 +478,7 @@ func (t *transcriptState) event(ev protocol.EventView) {
 				break
 			}
 		}
-		if !item.Truncated {
-			item.Text += ev.Text
-		}
-		t.put(item)
+		t.appendLive(item, ev.Text)
 	case protocol.EventStream:
 		if ev.Text == "" {
 			// An empty text delta only closes a still-open reasoning cell (the
@@ -369,6 +490,7 @@ func (t *transcriptState) event(ev protocol.EventView) {
 		if t.liveID == "" {
 			t.serial++
 			t.liveID = fmt.Sprintf("stream:%s:%d", ev.TurnID, t.serial)
+			t.previewIDs = append(t.previewIDs, t.liveID)
 		}
 		item := protocol.TranscriptItem{ID: t.liveID, Kind: "assistant", TurnID: ev.TurnID, Status: "streaming"}
 		for _, old := range t.items {
@@ -377,10 +499,7 @@ func (t *transcriptState) event(ev protocol.EventView) {
 				break
 			}
 		}
-		if !item.Truncated {
-			item.Text += ev.Text
-		}
-		t.put(item)
+		t.appendLive(item, ev.Text)
 	case protocol.EventToolProgress:
 		if ev.Tool == nil {
 			return
@@ -388,10 +507,7 @@ func (t *transcriptState) event(ev protocol.EventView) {
 		id := toolEventTranscriptID(ev)
 		for _, old := range t.items {
 			if old.ID == id && old.Status == "running" {
-				if !old.Truncated {
-					old.Text += ev.Tool.Output
-				}
-				t.put(old)
+				t.appendLive(old, ev.Tool.Output)
 				return
 			}
 		}
@@ -414,7 +530,7 @@ func (t *transcriptState) eventItem(ev protocol.EventView) *protocol.TranscriptI
 		// Project that reasoning cell so subscribers see it flip to "completed"
 		// immediately rather than on the next full snapshot.
 		if id == "" && ev.Text == "" {
-			id = t.reasoningID
+			id = t.closedReasoningID
 		}
 	}
 	if ev.Kind == protocol.EventReasoning {
@@ -431,7 +547,7 @@ func (t *transcriptState) eventItem(ev protocol.EventView) *protocol.TranscriptI
 	}
 	for _, item := range t.items {
 		if item.ID == id {
-			copy := item
+			copy := t.materialize(item)
 			copy.Args = append(json.RawMessage(nil), item.Args...)
 			return &copy
 		}

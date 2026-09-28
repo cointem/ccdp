@@ -46,20 +46,20 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 	if _, err := NewReadTool().Run(aCtx); err != nil {
 		t.Fatalf("A Read: %v", err)
 	}
-	bCtx.Args = map[string]any{"file_path": aFile, "old_string": "original", "new_string": "B"}
-	if _, err := NewEditTool().Run(bCtx); err == nil || !strings.Contains(err.Error(), "has not been read") {
+	bCtx.Args = map[string]any{"file_path": aFile, "content": "B", "mode": "replace"}
+	if _, err := NewWriteTool().Run(bCtx); err == nil || !strings.Contains(err.Error(), "has not been read") {
 		t.Fatalf("B used A's freshness state: %v", err)
 	}
 
 	// The two managers intentionally allocate distinct scope-tagged handles.
 	aCtx.Args = map[string]any{"command": "sleep 30"}
-	startedA, err := NewProcessStartTool().Run(aCtx)
+	startedA, err := NewBashTool().Run(aCtx)
 	if err != nil {
 		t.Fatalf("A ProcessStart: %v", err)
 	}
 	aPID := extractPID(t, startedA)
-	bCtx.Args = map[string]any{"command": "cat"}
-	startedB, err := NewProcessStartTool().Run(bCtx)
+	bCtx.Args = map[string]any{"command": "cat", "stdin": "pipe"}
+	startedB, err := NewBashTool().Run(bCtx)
 	if err != nil {
 		t.Fatalf("B ProcessStart: %v", err)
 	}
@@ -67,8 +67,8 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 	if aPID == bPID {
 		t.Fatalf("scope-tagged handles unexpectedly collided: A=%d B=%d", aPID, bPID)
 	}
-	bCtx.Args = map[string]any{"pid": aPID, "wait_ms": 0}
-	if _, err := NewProcessOutputTool().Run(bCtx); err == nil || !strings.Contains(err.Error(), "another session") {
+	bCtx.Args = map[string]any{"id": aPID, "action": "read", "wait_ms": 0}
+	if _, err := NewProcessTool().Run(bCtx); err == nil || !strings.Contains(err.Error(), "another session") {
 		t.Fatalf("B accepted A's process handle: %v", err)
 	}
 	// Closing A must not touch B. Write a marker to B after closing A and read it
@@ -76,20 +76,20 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 	if err := a.Close(); err != nil {
 		t.Fatalf("close A: %v", err)
 	}
-	if _, err := NewProcessOutputTool().Run(aCtx); err == nil || !strings.Contains(err.Error(), "closed") {
+	if _, err := NewProcessTool().Run(aCtx); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("closed A accepted a new process operation: %v", err)
 	}
-	bCtx.Args = map[string]any{"pid": bPID, "input": "marker-from-b\n"}
-	if _, err := NewProcessWriteTool().Run(bCtx); err != nil {
+	bCtx.Args = map[string]any{"id": bPID, "action": "write", "input": "marker-from-b\n"}
+	if _, err := NewProcessTool().Run(bCtx); err != nil {
 		t.Fatalf("B process was killed by closing A: %v", err)
 	}
-	bCtx.Args = map[string]any{"pid": bPID, "wait_ms": 1000}
-	output, err := NewProcessOutputTool().Run(bCtx)
+	bCtx.Args = map[string]any{"id": bPID, "action": "read", "wait_ms": 1000}
+	output, err := NewProcessTool().Run(bCtx)
 	if err != nil || !strings.Contains(output, "marker-from-b") {
 		t.Fatalf("B output after A close = %q, %v", output, err)
 	}
-	bCtx.Args = map[string]any{"pid": bPID}
-	if _, err := NewProcessStopTool().Run(bCtx); err != nil {
+	bCtx.Args = map[string]any{"id": bPID, "action": "stop"}
+	if _, err := NewProcessTool().Run(bCtx); err != nil {
 		t.Fatalf("close B process: %v", err)
 	}
 }

@@ -388,14 +388,20 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 
 	var (
 		toolCalls = map[int]*ToolCall{} // index → call being assembled
-		callOrder []int                 // preserve first-seen order of indexes
+		arguments = map[int]*strings.Builder{}
+		callOrder []int // preserve first-seen order of indexes
 		thinking  = &reasoningPhase{onDelta: onDelta}
 	)
+	var textBuffer, reasoningBuffer strings.Builder
+	defer func() {
+		result.Text = textBuffer.String()
+		result.Reasoning = reasoningBuffer.String()
+	}()
 	emitDelta := func(s string) {
 		if s == "" {
 			return
 		}
-		result.Text += s
+		textBuffer.WriteString(s)
 		emitted = true
 		thinking.markClosed()
 		if onDelta != nil {
@@ -406,7 +412,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		if s == "" {
 			return
 		}
-		result.Reasoning += s
+		reasoningBuffer.WriteString(s)
 		emitted = true
 		thinking.start()
 		if onReasoning != nil {
@@ -480,6 +486,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 			if !ok {
 				call = &ToolCall{Type: "function", Function: Function{}}
 				toolCalls[idx] = call
+				arguments[idx] = &strings.Builder{}
 				callOrder = append(callOrder, idx)
 			}
 			if tc.ID != "" {
@@ -489,7 +496,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 				call.Function.Name += tc.Function.Name
 			}
 			if tc.Function.Arguments != "" {
-				call.Function.Arguments += tc.Function.Arguments
+				arguments[idx].WriteString(string(tc.Function.Arguments))
 				emitted = true // tool-call bytes reached the wire too
 			}
 		}
@@ -506,6 +513,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		if call.ID == "" || call.Function.Name == "" {
 			continue
 		}
+		call.Function.Arguments = ArgumentsJSON(arguments[idx].String())
 		result.ToolCalls = append(result.ToolCalls, *call)
 	}
 

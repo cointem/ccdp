@@ -245,7 +245,7 @@ func TestJSONLRejectsCompleteCorruptionAndFutureVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	futureData = []byte(strings.Replace(string(futureData), `"schema_version":1`, `"schema_version":99`, 1))
+	futureData = []byte(strings.Replace(string(futureData), fmt.Sprintf(`"schema_version":%d`, SchemaVersion), `"schema_version":99`, 1))
 	if err := os.WriteFile(futurePath, futureData, 0o600); err != nil {
 		t.Fatal(err)
 	}

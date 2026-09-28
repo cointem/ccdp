@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -20,14 +21,14 @@ func (t *GlobTool) Name() string { return "Glob" }
 
 func (t *GlobTool) Description() string {
 	return `Find files matching a glob pattern, like "**/*.go" or "src/*.ts".
-Returns up to 100 matches sorted by modification time (newest last is typical;
-here newest first for visibility). Use Grep to search file contents.`
+Returns up to limit matches (default 100, maximum 1000) in lexical path order. Use Grep to search file contents.`
 }
 
 func (t *GlobTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 1000},
 			"pattern": map[string]any{
 				"type":        "string",
 				"description": "The glob pattern to match.",
@@ -88,15 +89,28 @@ func (t *GlobTool) Run(ctx *Context) (string, error) {
 	}
 
 	sort.Strings(matches)
-	const max = 100
-	if len(matches) > max {
-		matches = matches[:max]
+	limit, err := boundedInt(ctx.Args, "limit", 100, 1, 1000)
+	if err != nil {
+		return "", err
+	}
+	total := len(matches)
+	if len(matches) > limit {
+		matches = matches[:limit]
 	}
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Found %d matching path(s):\n", len(matches))
+	shown := 0
 	for _, m := range matches {
-		fmt.Fprintf(&sb, "  %s\n", m)
+		row := fmt.Sprintf("  %s\n", m)
+		if sb.Len()+len(row) > min(50<<10, ctx.outputLimit())-120 {
+			break
+		}
+		sb.WriteString(row)
+		shown++
+	}
+	if shown < total {
+		fmt.Fprintf(&sb, "[incomplete: showing %d of %d paths; narrow pattern/path or increase limit]", shown, total)
 	}
 	return boundedToolString(ctx, sb.String()), nil
 }
@@ -270,54 +284,12 @@ func (t *GrepTool) Description() string {
 	return `Search file contents with a regular expression (ripgrep syntax).
 Files ignored by .gitignore and VCS/dependency/cache directories are skipped.
 Output modes: "content" (default) prints matching lines with line numbers,
-"files_with_matches" prints only paths, "count" prints matches per file.
-Use -A/-B/-C for surrounding context, glob or type to restrict files, and
-head_limit/offset to page through results (200 lines by default).`
+"files" prints only paths, "count" prints matches per file.
+Use context for surrounding lines and limit for result entries (default 100, maximum 1000). literal=true searches exact text.`
 }
 
 func (t *GrepTool) Parameters() map[string]any {
-	intArg := func(desc string) map[string]any {
-		return map[string]any{"type": "integer", "description": desc}
-	}
-	boolArg := func(desc string) map[string]any {
-		return map[string]any{"type": "boolean", "description": desc}
-	}
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"pattern": map[string]any{
-				"type":        "string",
-				"description": "The regular expression to search for.",
-			},
-			"path": map[string]any{
-				"type":        "string",
-				"description": "Directory to search (default: current working directory).",
-			},
-			"glob": map[string]any{
-				"type":        "string",
-				"description": `Glob restricting files, e.g. "*.go" or "**/*.ts". Prefix with "!" to exclude.`,
-			},
-			"type": map[string]any{
-				"type":        "string",
-				"description": "File type to restrict the search, e.g. go, ts, py, rust, json.",
-			},
-			"output_mode": map[string]any{
-				"type":        "string",
-				"enum":        []string{grepModeContent, grepModeFiles, grepModeCount},
-				"description": "Output format (default: content).",
-			},
-			"-A":         intArg("Lines to show after each match (rg -A)."),
-			"-B":         intArg("Lines to show before each match (rg -B)."),
-			"-C":         intArg("Lines to show before and after each match (rg -C)."),
-			"-i":         boolArg("Case-insensitive search."),
-			"-n":         boolArg("Show line numbers (default: true)."),
-			"-o":         boolArg("Print only the matched part, one match per line."),
-			"multiline":  boolArg("Enable multiline mode where . matches newlines and patterns can span lines."),
-			"head_limit": intArg("Limit output to the first N lines/entries (0 uses the default 200)."),
-			"offset":     intArg("Skip the first N lines/entries before applying head_limit."),
-		},
-		"required": []string{"pattern"},
-	}
+	return map[string]any{"type": "object", "properties": map[string]any{"pattern": map[string]any{"type": "string"}, "path": map[string]any{"type": "string"}, "mode": map[string]any{"type": "string", "enum": []string{"content", "files", "count"}}, "literal": map[string]any{"type": "boolean"}, "context": map[string]any{"type": "integer", "minimum": 0, "maximum": 20}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 1000}}, "required": []string{"pattern"}}
 }
 
 func (t *GrepTool) Run(ctx *Context) (string, error) {
@@ -340,17 +312,27 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Grep: %w", err)
 	}
+	singleFile := ""
 	if !info.IsDir() {
-		return "", fmt.Errorf("Grep: path %q is not a directory", base)
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("Grep: path %q is not a regular file or directory", base)
+		}
+		singleFile, base = filepath.Base(base), filepath.Dir(base)
 	}
 
-	mode := StringArg(ctx.Args, "output_mode", grepModeContent)
+	if BoolArg(ctx.Args, "literal", false) {
+		pattern = regexp.QuoteMeta(pattern)
+	}
+	mode := StringArg(ctx.Args, "mode", StringArg(ctx.Args, "output_mode", grepModeContent))
+	if mode == "files" {
+		mode = grepModeFiles
+	}
 	switch mode {
 	case grepModeContent, grepModeFiles, grepModeCount:
 	default:
 		return "", fmt.Errorf("Grep: unknown output_mode %q", mode)
 	}
-	headLimit, err := IntArgChecked(ctx.Args, "head_limit", 0)
+	headLimit, err := IntArgChecked(ctx.Args, "limit", IntArg(ctx.Args, "head_limit", 100))
 	if err != nil {
 		return "", fmt.Errorf("Grep: %w", err)
 	}
@@ -358,7 +340,13 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Grep: %w", err)
 	}
-	contextLines := IntArg(ctx.Args, "-C", 0)
+	if headLimit < 1 || headLimit > 1000 {
+		return "", fmt.Errorf("Grep: limit must be 1..1000")
+	}
+	contextLines, err := boundedInt(ctx.Args, "context", IntArg(ctx.Args, "-C", 0), 0, 20)
+	if err != nil {
+		return "", err
+	}
 	before := IntArg(ctx.Args, "-B", 0)
 	after := IntArg(ctx.Args, "-A", 0)
 	if contextLines > 0 {
@@ -371,6 +359,7 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 	}
 
 	req := &grepRequest{
+		singleFile: singleFile,
 		pattern:    pattern,
 		base:       base,
 		outputMode: mode,
@@ -393,6 +382,9 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 		}
 	}
 
+	copy := *ctx
+	copy.OutputLimit = min(50<<10, ctx.outputLimit())
+	ctx = &copy
 	out, err := searchGrep(ctx, req)
 	if err != nil {
 		return "", err
@@ -418,7 +410,7 @@ Directories are listed first.`
 func (t *LSTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
-		"properties": map[string]any{
+		"properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 1000},
 			"path": map[string]any{
 				"type":        "string",
 				"description": "Directory to list (default: current working directory).",
@@ -460,7 +452,15 @@ func (t *LSTool) Run(ctx *Context) (string, error) {
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Contents of %s (%d entries):\n", dir, len(entries))
+	limit, err := boundedInt(ctx.Args, "limit", 100, 1, 1000)
+	if err != nil {
+		return "", err
+	}
+	shown := 0
 	for _, e := range entries {
+		if shown >= limit || sb.Len() > min(50<<10, ctx.outputLimit())-400 {
+			break
+		}
 		info, err := e.Info()
 		if err != nil {
 			continue
@@ -469,7 +469,15 @@ func (t *LSTool) Run(ctx *Context) (string, error) {
 		if e.IsDir() {
 			marker = "d"
 		}
-		fmt.Fprintf(&sb, "%s %10d  %s  %s\n", marker, info.Size(), info.ModTime().Format("2006-01-02 15:04"), e.Name())
+		row := fmt.Sprintf("%s %10d  %s  %s\n", marker, info.Size(), info.ModTime().Format("2006-01-02 15:04"), e.Name())
+		if sb.Len()+len(row) > min(50<<10, ctx.outputLimit())-120 {
+			break
+		}
+		sb.WriteString(row)
+		shown++
+	}
+	if shown < len(entries) {
+		fmt.Fprintf(&sb, "[incomplete: showing %d of %d entries; increase limit or narrow directory]", shown, len(entries))
 	}
 	return boundedToolString(ctx, sb.String()), nil
 }

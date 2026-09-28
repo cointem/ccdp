@@ -3,8 +3,39 @@ package agent
 import (
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"fmt"
+	"strings"
 	"testing"
 )
+
+func TestForwardedReviewReasoningReconcilesFinalSnapshot(t *testing.T) {
+	tr := &transcriptState{}
+	for i := 0; i < 20; i++ {
+		tr.put(protocol.TranscriptItem{ID: fmt.Sprintf("review:live:%d", i), Kind: "thinking", Text: "partial", Status: "completed"})
+		tr.put(protocol.TranscriptItem{ID: fmt.Sprintf("review:tool:%d", i), Kind: "tool", Status: "success"})
+	}
+	for repeat := 0; repeat < 2; repeat++ {
+		for i := 0; i < 20; i++ {
+			tr.put(protocol.TranscriptItem{ID: fmt.Sprintf("review:saved:%d", i), PreviousID: fmt.Sprintf("review:live:%d", i), Kind: "thinking", Text: "complete thought", Status: "completed"})
+		}
+	}
+	if len(tr.items) != 40 {
+		t.Fatalf("duplicate thoughts: %d", len(tr.items))
+	}
+	for i := 0; i < 20; i++ {
+		if tr.items[2*i].ID != fmt.Sprintf("review:saved:%d", i) || tr.items[2*i+1].Kind != "tool" {
+			t.Fatal("final snapshot moved thoughts after tools")
+		}
+	}
+}
+
+func TestEmptyReasoningDeltaDoesNotCreateThought(t *testing.T) {
+	tr := &transcriptState{}
+	tr.event(protocol.EventView{Kind: protocol.EventReasoning, TurnID: "1"})
+	if len(tr.items) != 0 {
+		t.Fatal("empty reasoning created a visible item")
+	}
+}
 
 func TestReasoningProjectionIsCumulativeAndIdentified(t *testing.T) {
 	transcript := &transcriptState{}
@@ -30,6 +61,31 @@ func TestReasoningProjectionIsCumulativeAndIdentified(t *testing.T) {
 	}
 }
 
+func TestReasoningProjectionContinuesPastLegacyLimit(t *testing.T) {
+	transcript := &transcriptState{}
+	ev := protocol.EventView{Kind: protocol.EventReasoning, TurnID: "1", Text: strings.Repeat("a", 16<<10)}
+	transcript.event(ev)
+	ev.Text = "still streaming"
+	transcript.event(ev)
+	item := transcript.eventItem(ev)
+	if item == nil || !strings.HasSuffix(item.Text, ev.Text) || item.Truncated {
+		t.Fatalf("reasoning stopped at legacy 16 KiB limit: %#v", item)
+	}
+
+	ev.Text = strings.Repeat("b", transcriptTextLimit)
+	transcript.event(ev)
+	item = transcript.eventItem(ev)
+	if item == nil || len(item.Text) != transcriptTextLimit || !item.Truncated {
+		t.Fatalf("reasoning did not stop at the new bounded limit: len=%d item=%#v", len(item.Text), item)
+	}
+	ev.Text = "最新思考内容"
+	transcript.event(ev)
+	item = transcript.eventItem(ev)
+	if !strings.HasSuffix(item.Text, ev.Text) || item.TextOffset == 0 {
+		t.Fatal("bounded stream froze", item.TextOffset)
+	}
+}
+
 // Anthropic closes a thinking block that is followed by a tool_use (no answer
 // text) with an empty text delta. That close signal must project the reasoning
 // cell it just finalized so the TUI stops the "Thinking…" spinner at the
@@ -51,7 +107,7 @@ func TestReasoningCloseSignalProjectsCompletedReasoning(t *testing.T) {
 	}
 }
 
-func TestReasoningInterleavedWithAnswerKeepsOneSegment(t *testing.T) {
+func TestReasoningInterleavedWithAnswerStartsNewSegment(t *testing.T) {
 	transcript := &transcriptState{}
 	reasoning := protocol.EventView{Kind: protocol.EventReasoning, TurnID: "1", Text: "Analyzing"}
 	transcript.event(reasoning)
@@ -64,7 +120,7 @@ func TestReasoningInterleavedWithAnswerKeepsOneSegment(t *testing.T) {
 	reasoning.Text = "."
 	transcript.event(reasoning)
 	item := transcript.eventItem(reasoning)
-	if item.ID != id || item.Text != "Analyzing." || len(transcript.items) != 2 || transcript.items[0].Kind != "thinking" {
+	if item.ID == id || item.Text != "." || item.Status != "streaming" || len(transcript.items) != 3 || transcript.items[0].Kind != "thinking" {
 		t.Fatalf("interleaved reasoning created an out-of-order fragment: %+v", transcript.items)
 	}
 	transcript.event(protocol.EventView{Kind: protocol.EventToolStarted, TurnID: "1"})

@@ -67,6 +67,15 @@ func (m *Model) applySnapshot(snapshot protocol.SessionView) {
 		m.receiptKeys = nil
 		m.receiptOrder = nil
 	}
+	if snapshot.Busy {
+		if !snapshot.WorkStartedAt.IsZero() {
+			m.turnStarted = snapshot.WorkStartedAt
+		} else if !m.busy || sessionChanged || m.turnStarted.IsZero() {
+			m.turnStarted = now()
+		}
+	} else if sessionChanged {
+		m.turnStarted = time.Time{}
+	}
 	m.busy = snapshot.Busy
 	m.pendingInputs = clonePendingInputs(snapshot.PendingInputs)
 	m.modelName = snapshot.Settings.Model.Model
@@ -103,6 +112,9 @@ func (m *Model) applySnapshot(snapshot protocol.SessionView) {
 		m.resetNativeHistory()
 	}
 	m.applyTranscript(snapshot.Transcript)
+	// Transcript previews can survive a reconnect; the runtime phase owns
+	// whether those rows still represent an active stream.
+	m.streaming = m.streaming && snapshot.Busy && snapshot.Phase == protocol.PhaseStreaming
 	m.associateInputOperationsFromSnapshot(snapshot)
 	if snapshot.LastTurn != nil && snapshot.Phase == protocol.PhaseIdle && !snapshot.Busy {
 		m.finishInputOperations(snapshot.LastTurn.TurnID, snapshot.LastTurn.Status, snapshot.LastTurn.Error)
@@ -391,6 +403,14 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 	if ev.SessionID != "" && ev.SessionID.String() != m.sessionID {
 		return
 	}
+	if ev.Kind == protocol.EventOperationProgress {
+		// Review progress uses ordinary transcript cells but does not own a
+		// conversation turn or its streaming/completion lifecycle.
+		if ev.Transcript != nil && ev.Transcript.ID != "" {
+			m.upsertTranscript(*ev.Transcript)
+		}
+		return
+	}
 	// Project the event into the activity lane before handling transcript data.
 	// The transcript path can return early for a typed stream/tool update, but
 	// its phase still needs to be visible to the renderer.
@@ -422,9 +442,11 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 		if ev.MessageID != "" {
 			m.upsertTranscript(protocol.TranscriptItem{ID: ev.MessageID, Kind: "user", TurnID: ev.TurnID, Text: ev.Text, Status: "completed"})
 		}
+		if !m.busy || m.turnStarted.IsZero() {
+			m.turnStarted = now()
+		}
 		m.busy, m.streaming, m.turnDone = true, false, false
 		m.turnFailed, m.interruptRequested = false, false
-		m.turnStarted = now()
 	case protocol.EventStream, protocol.EventReasoning, protocol.EventToolStarted, protocol.EventToolProgress:
 		// Transcript events must carry an identified cumulative projection.
 		// Missing projections never create a second, id-less transcript.
@@ -434,7 +456,7 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 		if ev.Tool != nil {
 			_, operationReport = m.operationReports[protocol.CommandID(ev.Tool.ID.String())]
 		}
-		if ev.Tool != nil && (strings.HasPrefix(ev.Tool.Name, "query:") || operationReport) {
+		if ev.Tool != nil && (strings.HasPrefix(ev.Tool.Name, "query:") || operationReport || ev.Tool.Name == "review" || ev.Tool.Name == "restore" || ev.Tool.Name == "delivery" || ev.Tool.Name == "merge child") {
 			// Typed operation/query commands use the generic operation event bridge.
 			// Promote their bounded output to a permanent report rather than a
 			// transient tool row that a later snapshot would erase.
@@ -442,7 +464,7 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 			if ev.Tool.Status == "error" || ev.Tool.Status == "denied" {
 				kind = "error"
 			}
-			text := strings.TrimSpace(ev.Tool.Output)
+			text := codingReport(strings.TrimSpace(ev.Tool.Output))
 			if text == "" {
 				text = "(empty query result)"
 			}
@@ -845,8 +867,16 @@ func (m *Model) applyReceipt(receipt protocol.Receipt, purpose string) {
 			m.updateOperation(receipt.CommandID, OperationQueued, receipt)
 		}
 		if knownOperation && currentOperation {
-			m.activity.Phase = ActivityQueued
-			m.activity.Label = "已排队"
+			if m.busy && op.Type != protocol.CommandSubmitInput {
+				m.activity.Phase = ActivityRunningTool
+				m.activity.Label = "正在执行"
+				if m.snapshot.WorkLabel != "" {
+					m.activity.Label = m.snapshot.WorkLabel
+				}
+			} else {
+				m.activity.Phase = ActivityQueued
+				m.activity.Label = "已排队"
+			}
 			m.activity.OperationID = receipt.OperationID
 			m.activity.UpdatedAt = now()
 			m.clearNotice(receipt.CommandID)

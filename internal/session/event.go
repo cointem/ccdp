@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"encoding/json"
 	"errors"
@@ -148,10 +149,11 @@ func (b ContentBlock) validate() error {
 }
 
 type Message struct {
-	ReasoningContent string         `json:"reasoning_content,omitempty"`
-	MessageID        string         `json:"message_id"`
-	Role             string         `json:"role"`
-	Content          []ContentBlock `json:"content"`
+	StreamSegments   []messages.StreamSegment `json:"stream_segments,omitempty"`
+	ReasoningContent string                   `json:"reasoning_content,omitempty"`
+	MessageID        string                   `json:"message_id"`
+	Role             string                   `json:"role"`
+	Content          []ContentBlock           `json:"content"`
 	// CreatedAt is the source timestamp for imported and newly committed
 	// messages.  It is deliberately part of the typed message value instead
 	// of being regenerated while replaying a log, so a projection can retain
@@ -750,10 +752,8 @@ type ToolsDiscovered struct {
 	Tools          []ToolSchema `json:"tools"`
 }
 
-// UsageChanged records an aggregate usage projection when an older session
-// only has totals rather than request-level attempt facts.  New runtimes
-// should prefer AttemptFinished for per-request accounting; this event keeps
-// legacy import observable without inventing manifests or attempts.
+// UsageChanged records aggregate usage for snapshots without request-level
+// facts, including in-memory resume. Live requests use AttemptFinished.
 type UsageChanged struct {
 	Revision uint64 `json:"revision"`
 	Usage    Usage  `json:"usage"`
@@ -908,7 +908,7 @@ func (e InputQueued) validate() error {
 			return fmt.Errorf("attachments[%d]: %w", i, err)
 		}
 	}
-	if e.Strategy != "steer" && e.Strategy != "followup" {
+	if e.Strategy != "steer" && e.Strategy != "followup" && e.Strategy != "message" {
 		return fmt.Errorf("unknown input strategy %q", e.Strategy)
 	}
 	return nil
@@ -1134,6 +1134,16 @@ func decodeEvent(w wireEvent) (Event, error) {
 	}
 	var event Event
 	switch w.Type {
+	case EventTypeDeliveryRecorded:
+		event = &DeliveryRecorded{}
+	case EventTypeRestoreRecorded:
+		event = &RestoreRecorded{}
+	case EventTypeRecoveryPointRecorded:
+		event = &RecoveryPointRecorded{}
+	case EventTypeReviewRecorded:
+		event = &ReviewRecorded{}
+	case EventTypeFileMutationRecorded:
+		event = &FileMutationRecorded{}
 	case EventTypeChildRunRecorded:
 		event = &ChildRunRecorded{}
 	case EventTypeSessionCreated:

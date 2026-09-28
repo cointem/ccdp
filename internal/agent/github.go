@@ -163,7 +163,7 @@ func (a *Agent) GitHubStatusContext(ctx context.Context) string {
 		sb.WriteString("pr: unavailable — gh not installed\n")
 	} else {
 		fmt.Fprintf(&sb, "branch: %s\n", branch)
-		url, urlErr := a.localCommandContext(ctx, []string{"gh", "pr", "view", "--json", "url", "--jq", ".url", "--head", branch}, true)
+		url, urlErr := a.localCommandContext(ctx, []string{"gh", "pr", "view", "--json", "url", "--jq", ".url", branch}, true)
 		if urlErr != nil {
 			fmt.Fprintf(&sb, "pr: unavailable — %s\n", commandDiagnostic(url, urlErr))
 		} else if url != "" {
@@ -182,7 +182,7 @@ func (a *Agent) PRComments() string {
 	if branch == "" {
 		return "not on a branch — cannot find the current PR"
 	}
-	out, err := a.ghCmd("pr", "view", "--comments", "--head", branch)
+	out, err := a.ghCmd("pr", "view", "--comments", branch)
 	if err != nil {
 		return fmt.Sprintf("GitHub CLI request failed for branch %s: %s", branch, commandDiagnostic(out, err))
 	}

@@ -323,32 +323,17 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 		default:
 			return DecisionAllow, "allowed by mode"
 		}
-	case "Read", "Glob", "Grep", "LS", "TodoWrite",
-		"GitStatus", "GitDiff", "GitLog",
+	case "Read", "Glob", "Grep", "LS", "CodeNavigate", "TodoWrite",
 		"ToolSearch", "ReadSkill", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion":
 		return DecisionAllow, "read-only tool"
-	case "GitCommit":
-		// Mutates history; bypass mode alone skips the gate.
-		if mode == ModeBypass {
-			return DecisionAllow, "bypass mode"
-		}
-		return DecisionAsk, "GitCommit requires approval (mutates repository history)"
-	case "Agent":
-		switch StringArg(args, "action", "") {
-		case "list", "read", "output", "wait":
-			return DecisionAllow, "read-only child observation"
-		default:
-			if mode == ModePlan {
-				return DecisionDeny, "child control is unavailable in plan mode"
-			}
-			return DecisionAllow, "control within an existing delegated session; child policy remains enforced"
-		}
+	case "ReadAgent", "WaitAgent", "ListAgents":
+		return DecisionAllow, "child observation"
+	case "SpawnAgent", "SendMessage", "FollowupAgent", "StopAgent":
+		return DecisionAllow, "delegation remains subject to inherited policy"
 	case "WebFetch", "WebSearch":
-		// Network access is a side effect; ask outside bypass mode.
-		if mode == ModeBypass {
-			return DecisionAllow, "bypass mode"
-		}
-		return DecisionAsk, fmt.Sprintf("%s requires approval (network access)", toolName)
+		// Built-in web lookup is a baseline capability. The runtime still
+		// enforces network policy, and explicit deny rules were checked above.
+		return DecisionAllow, "web lookup"
 	}
 
 	// Unknown tool: ask to be safe.
@@ -406,25 +391,22 @@ func (m *Manager) IsHardDenied(toolName string, args map[string]any) bool {
 // independently verified a narrower capability.
 func InvocationEffects(toolName string, args map[string]any) []Effect {
 	switch toolName {
-	case "Agent":
-		switch StringArg(args, "action", "") {
-		case "list", "read", "output", "wait":
-			return []Effect{EffectRead}
-		default:
-			return []Effect{EffectDelegate}
-		}
-	case "Read", "Glob", "Grep", "LS", "GitStatus", "GitDiff", "GitLog", "ToolSearch", "ReadSkill":
+	case "ReadAgent", "WaitAgent", "ListAgents":
+		return []Effect{EffectRead}
+	case "SendMessage", "StopAgent":
+		return []Effect{EffectPlan}
+	case "SpawnAgent", "FollowupAgent":
+		return []Effect{EffectDelegate}
+	case "Read", "Glob", "Grep", "LS", "CodeNavigate", "ToolSearch", "ReadSkill":
 		return []Effect{EffectRead}
 	case "TodoWrite", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion":
 		return []Effect{EffectPlan}
-	case "Write", "Edit", "GitCommit":
+	case "Write", "Edit":
 		return []Effect{EffectWrite}
-	case "Bash", "ProcessStart", "ProcessWrite", "ProcessOutput", "ProcessStop":
+	case "Bash", "Process":
 		return []Effect{EffectProcess}
 	case "WebFetch", "WebSearch":
 		return []Effect{EffectNetwork}
-	case "Task":
-		return []Effect{EffectDelegate}
 	default:
 		return []Effect{EffectUnknown}
 	}
@@ -888,8 +870,29 @@ func gitSafe(words []string) bool {
 	sub := words[1]
 	args := words[2:]
 	switch sub {
-	case "status", "diff", "log", "show", "blame", "rev-parse", "describe", "shortlog", "ls-files", "grep":
+	case "status", "log", "show", "blame", "rev-parse", "describe", "shortlog", "ls-files", "grep":
 		return true
+	case "diff":
+		// Diff can write --output and invoke configured helpers. Require the
+		// explicit read-only form; do not silently rewrite the command.
+		noExternal, noTextconv := false, false
+		for _, arg := range args {
+			if arg == "--" {
+				break
+			}
+			switch arg {
+			case "--no-ext-diff":
+				noExternal = true
+			case "--no-textconv":
+				noTextconv = true
+			case "--ext-diff", "--textconv", "--output":
+				return false
+			}
+			if strings.HasPrefix(arg, "--out") {
+				return false
+			}
+		}
+		return noExternal && noTextconv
 	case "branch":
 		return gitListOnlySubcommand(args, map[string]bool{
 			"-d": true, "-D": true, "--delete": true,
@@ -955,7 +958,7 @@ var safeTokens = map[string]bool{
 	"find": true, "which": true, "whoami": true, "env": true, "printenv": true,
 	"du": true, "df": true, "uname": true, "uptime": true, "true": true,
 	"false": true, "sleep": true, "less": true, "file": true, "stat": true,
-	"touch": true, "base64": true, "hexdump": true, "xxd": true, "tree": true,
+	"base64": true, "hexdump": true, "xxd": true, "tree": true,
 	"nl": true, "diff": true,
 }
 

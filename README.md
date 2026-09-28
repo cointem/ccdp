@@ -15,7 +15,7 @@ ccdp 0.2.0 · Go 1.27+ · 无第三方 LLM SDK 依赖（纯 HTTP 流式实现）
 - **权限体系** — `manual` / `edits`（默认）/ `bypass` 审批策略与独立 plan 工作流；兼容 `/mode plan`，always_allow / always_deny 规则（glob）、会话级审批记忆、turn 级审批缓存
 - **沙箱** — macOS 上所有模型驱动的本地命令与外部程序固定进入 Seatbelt；后端不可用时拒绝执行。通过具体现授权目录和网络能力调整访问范围，`/sandbox` 显示运行诊断
 - **上下文管理** — 结构化自动压缩（6 段式摘要 + 最近读取文件重附 + trace 逃生通道）、token 原生用量锚定估算、`/fork` 会话分支（废弃方向自动摘要）、`/rewind` / `/remove`、checkpoint
-- **会话** — 事务 JSONL 存储、持久化 inbox、稳定输入 ID、冻结请求 manifest 与附件 blob、工具副作用事实与 unknown 恢复；旧 JSON 只读导入、`-r` 恢复、`-c` 选择器、`--replay` 只读导出 Markdown。恢复不自动重跑结果未知的副作用
+- **会话** — 事务 JSONL 存储、持久化 inbox、稳定输入 ID、冻结请求 manifest 与附件 blob、工具副作用事实与 unknown 恢复；`-r` 恢复、`-c` 选择器、`--replay` 只读导出 Markdown。仅支持当前 JSONL 会话；恢复不自动重跑结果未知的副作用
 - **扩展** — MCP 客户端（stdio / SSE / Streamable HTTP，热刷新与断连清理）、自定义 shell 工具、Claude 风格 hooks、自定义斜杠命令、skills、Go 插件系统（依赖拓扑加载 / 级联卸载）
 - **LLM 兼容** — OpenAI 协议默认，DeepSeek / Kimi / 通义 / 本地 Ollama、vLLM 等改 `base_url` 即用；`providers` 表按模型路由多供应商；`fallback_model` 故障兜底；prompt cache 感知计费（`/cost`）
 
@@ -143,7 +143,7 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
   "max_tool_output_chars_per_turn": 200000,
 
   "sandbox_limits": { "cpu_seconds": 600, "memory_mb": 2048 },
-  "network_access": false,          // true 授予本地沙箱进程外联能力
+  "network_access": true,           // 默认允许外网访问；false 显式关闭
   "additional_directories": ["/data"],
   "additional_read_only_directories": ["/reference"],
   "disallowed_directories": ["~/.ssh"],
@@ -187,7 +187,7 @@ ccdp --allowedTools Bash,Read    # 跳过审批门的工具
 }
 ```
 
-项目级覆盖（`.ccdp/settings.json`，`/reload` 热加载）：`permission_mode`、`always_allow` / `always_deny`、`hooks`、`enable_web_tools`。项目设置不能扩大沙箱授权；其中 `network_access: false` 可收紧外联能力，`disallowed_directories` 只能增加拒绝目录。额外授权目录和外联能力由用户配置或本会话的明确 capability approval 授予。
+项目级覆盖（`.ccdp/settings.json`，`/reload` 热加载）：`permission_mode`、`always_allow` / `always_deny`、`hooks`、`enable_web_tools`。项目设置不能扩大沙箱授权；其中 `network_access: false` 可收紧外联能力，`disallowed_directories` 只能增加拒绝目录。外网访问默认开启，普通 worker 子 agent 继承父级设置；内置 WebSearch/WebFetch 无需逐次审批，但显式拒绝规则仍生效。额外授权目录以及关闭网络后的临时联网，由用户配置或本会话的明确 capability approval 授予。恢复旧会话会保留其已保存的网络限制；调整默认值不会覆盖这些限制。
 
 ## macOS Seatbelt 沙箱
 
@@ -273,7 +273,7 @@ workspace 默认可读写，工作区外的主机文件默认可读、不可写�
 
 不同终端的原生快捷键配置可能不同。自动化已覆盖布局和 PTY 控制序列，但尚未在 Ghostty 实测触控板、拖选与 `⌘C`。
 
-子 Agent 支持同步等待和后台通知、独立会话续跑、输出分页及持久化结果去重；命令行为可通过 `/help` 与 `/agents` 视图查看。
+普通子 Agent 统一异步委派，模型只维护稳定的 `agent_id`。最终结果自动进入父收件箱，不必再用 Read 搬运报告；`WaitAgent()` 只等待事件，默认界面不显示重复等待卡片。运行中补充信息用 SendMessage，空闲后派新任务用 FollowupAgent；超长结果通过 cursor 分页读取。详见[子 Agent 设计与工具契约](docs/subagent-redesign.md)，终端命令可通过 `/help` 与 `/agents` 查看。
 
 支持截图粘贴、多图或纯图片消息；输入区显示附件编号、尺寸和大小。macOS 请使用 **Control+V**，不是 Command+V。Linux 需要 `wl-paste` 或 `xclip`，Windows/WSL 使用 PowerShell；图片只在粘贴时读取，并随会话保存。
 
@@ -297,7 +297,7 @@ internal/
   execution/       受控本地进程执行、输出限额与取消收束
   atomicfile/      原子文件发布与同步
   tui/             bubbletea 界面、斜杠命令、渲染与清洗
-  tools/           内置工具（Bash/文件/搜索/git/进程/Task/Web…）
+  tools/           内置工具（Bash/Process/文件/搜索/Agent/Web…）
   llm/             OpenAI 兼容流式客户端
   mcp/             JSON-RPC over stdio/SSE 的 MCP 客户端
   permissions/     权限规则与审批判定
@@ -305,7 +305,8 @@ internal/
   hooks/           shell hooks 执行器
   plugin/          插件 Host、ModelRegistry、GoHooks
   config/          配置加载与合并
-  checkpoint/      文件检查点
+  changes/         内容寻址快照、变更计划与恢复
+  fsops/           文件版本观察、路径写锁与原子发布
   events/          进程内事件通知（不是权威会话存储）
 ```
 

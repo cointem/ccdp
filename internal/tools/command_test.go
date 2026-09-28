@@ -31,8 +31,8 @@ func TestCommandToolFailureReported(t *testing.T) {
 	ctx := scopedTestContext(t, dir)
 	ctx.Args = map[string]any{}
 	out, err := tool.Run(ctx)
-	if err != nil {
-		t.Fatalf("Run should not error, got %v", err)
+	if err == nil {
+		t.Fatalf("nonzero exit must be a tool error")
 	}
 	if !strings.Contains(out, "failed") {
 		t.Errorf("expected failure note, got %q", out)
@@ -46,8 +46,8 @@ func TestCommandToolTimeout(t *testing.T) {
 	ctx.Args = map[string]any{}
 	ctx.Timeout = 50 * time.Millisecond // much shorter than the 5s sleep
 	out, err := tool.Run(ctx)
-	if err != nil {
-		t.Fatalf("timeout should return output, got %v", err)
+	if err == nil {
+		t.Fatalf("timeout must be a tool error")
 	}
 	if !strings.Contains(out, "timed out") {
 		t.Errorf("expected timeout note, got %q", out)

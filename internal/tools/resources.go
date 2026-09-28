@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"ccdp/internal/sandbox"
@@ -54,6 +55,11 @@ func NewResourcesWithContext(owner, sessionDir string, ownerCtx context.Context)
 	scratch, _ := os.MkdirTemp("", "ccdp-session-")
 	r := &Resources{owner: owner, sessionDir: sessionDir, ownerCtx: ownerCtx, ownerCancel: ownerCancel, scratchDir: scratch}
 	r.Processes = NewProcessManager(owner)
+	if sessionDir != "" {
+		r.Processes.logDir = filepath.Join(sessionDir, "processes")
+	} else {
+		r.Processes.logDir = scratch
+	}
 	r.Todos = NewTodoStore(owner, sessionDir)
 	r.Files = NewFileState(owner)
 	return r
@@ -154,7 +160,7 @@ func (r *Resources) Close() error {
 		if r.Files != nil {
 			r.Files.Close()
 		}
-		if r.scratchDir != "" {
+		if r.scratchDir != "" && closeErr == nil {
 			if err := os.RemoveAll(r.scratchDir); err != nil && closeErr == nil {
 				closeErr = fmt.Errorf("remove session execution scratch: %w", err)
 			}

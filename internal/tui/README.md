@@ -70,9 +70,11 @@ trackpad feel; pyte is not a substitute for those device-level checks.
 
 Markdown file and web links emit validated OSC 8 hyperlinks; relative file targets resolve against the session workspace. Because the transcript enables mouse reporting, the terminal never sees a plain click on a link, so the TUI opens the destination itself (the platform opener, with `file://` targets passed as paths) and reports a failure as a notice; Cmd-click still works where the terminal supports it. Unknown/default reasoning effort is omitted from the footer, and resolved decisions clear their notice on authoritative snapshots.
 
-The managed transcript enables mouse reporting. Each child row in a Task group opens that exact session; the group heading opens the agent list. Esc returns from a child to its parent. Native terminal text selection uses the terminal mouse override (usually Shift-drag).
+The managed transcript enables mouse reporting. Each SpawnAgent card opens its own child session; there is no batch Task/group renderer. Esc returns from a child to its parent. Native terminal text selection uses the terminal mouse override (usually Shift-drag).
 
 All transient surfaces (tool/thought details, model/permission/effort selectors, approvals, questions, history search, tasks, context and completion menus) overlay the base frame. They do not reserve transcript rows or change its scroll offset. Focus-owning dialogs may cover the composer; closing reveals its original position and draft. Tool/thought details start at the clicked transcript record and cover subsequent rows in place; they scroll independently, and popup wheel events never scroll the underlying transcript. The full transcript reader remains an explicit separate screen.
+
+SpawnAgent cards use supervisor projections for live child status. WaitAgent() has no target and only returns an event reason: collaboration, user_input, attention, or no_pending_work. Routine waits are hidden in the default conversation and native scrollback, without blank rows or click targets. Attention, failures, interruptions, and unrecognized results remain visible. All wait calls and their raw results remain in the full transcript reader; hiding a running call never finalizes its history entry early. Typed collaboration cells show progress with its source or a compact final-result notice, never a raw JSON user bubble. Followup/Stop receipts describe control acceptance, not task completion.
 
 ### Session cache indicator
 

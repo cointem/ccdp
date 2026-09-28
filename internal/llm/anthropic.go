@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -360,6 +361,7 @@ type anthropicStreamDelta struct {
 	Text        string `json:"text,omitempty"`
 	Thinking    string `json:"thinking,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
+	StopReason  string `json:"stop_reason,omitempty"`
 }
 
 type anthropicErr struct {
@@ -374,7 +376,6 @@ type anthropicEvent struct {
 	ContentBlock *anthropicStreamBlock   `json:"content_block,omitempty"`
 	Delta        *anthropicStreamDelta   `json:"delta,omitempty"`
 	Usage        *anthropicUsage         `json:"usage,omitempty"`
-	StopReason   string                  `json:"stop_reason,omitempty"`
 	Error        *anthropicErr           `json:"error,omitempty"`
 }
 
@@ -406,7 +407,7 @@ func (c *Client) anthropicStreamOnce(ctx context.Context, body []byte, onDelta f
 
 	type slot struct {
 		id, name string
-		args     string
+		args     strings.Builder
 	}
 	toolSlots := map[int]*slot{}
 	// The thinking phase ends when a non-thinking block (text/tool_use) starts,
@@ -439,11 +440,16 @@ func (c *Client) anthropicStreamOnce(ctx context.Context, body []byte, onDelta f
 		}
 	}
 
+	var textBuffer, reasoningBuffer strings.Builder
+	defer func() {
+		result.Text = textBuffer.String()
+		result.Reasoning = reasoningBuffer.String()
+	}()
 	emitDelta := func(s string) {
 		if s == "" {
 			return
 		}
-		result.Text += s
+		textBuffer.WriteString(s)
 		emitted = true
 		thinking.markClosed()
 		if onDelta != nil {
@@ -454,7 +460,7 @@ func (c *Client) anthropicStreamOnce(ctx context.Context, body []byte, onDelta f
 		if s == "" {
 			return
 		}
-		result.Reasoning += s
+		reasoningBuffer.WriteString(s)
 		emitted = true
 		thinking.start()
 		if onReasoning != nil {
@@ -462,6 +468,7 @@ func (c *Client) anthropicStreamOnce(ctx context.Context, body []byte, onDelta f
 		}
 	}
 
+	terminal := false
 	scanner := bufio.NewScanner(hr.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 loop:
@@ -521,7 +528,7 @@ loop:
 				emitReasoning(ev.Delta.Thinking)
 			case "input_json_delta":
 				if s := toolSlots[ev.Index]; s != nil {
-					s.args += ev.Delta.PartialJSON
+					s.args.WriteString(ev.Delta.PartialJSON)
 				}
 			}
 		case "message_delta":
@@ -530,10 +537,11 @@ loop:
 			if ev.Usage != nil {
 				result.CompletionTok = ev.Usage.OutputTokens
 			}
-			if ev.StopReason != "" {
-				result.FinishReason = anthropicFinishReason(ev.StopReason)
+			if ev.Delta != nil && ev.Delta.StopReason != "" {
+				result.FinishReason = anthropicFinishReason(ev.Delta.StopReason)
 			}
 		case "message_stop":
+			terminal = true
 			break loop
 		}
 	}
@@ -560,7 +568,7 @@ loop:
 			Type:  "function",
 			Function: Function{
 				Name:      s.name,
-				Arguments: ArgumentsJSON(s.args),
+				Arguments: ArgumentsJSON(s.args.String()),
 			},
 		})
 	}
@@ -570,6 +578,10 @@ loop:
 	}
 	if ctx.Err() != nil {
 		return result, false, emitted, 0, ctx.Err()
+	}
+	if !terminal {
+		result.ToolCalls = nil
+		return result, !emitted, emitted, 0, fmt.Errorf("llm: incomplete anthropic stream: %w", io.ErrUnexpectedEOF)
 	}
 	return result, false, emitted, 0, nil
 }

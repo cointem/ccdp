@@ -253,13 +253,18 @@ func (m *Model) render() {
 	m.clickTargets = nil
 	m.linkTargets = nil
 	m.selGrid = m.selGrid[:0]
+	previousKind := ""
 	for i := range m.items {
-		if i > 0 && transcriptGap(m.items[i-1].kind, m.items[i].kind) {
+		item := m.renderLogItem(&m.items[i], contentWidth)
+		if item == "" {
+			continue
+		}
+		if previousKind != "" && transcriptGap(previousKind, m.items[i].kind) {
 			sb.WriteString("\n")
 			m.selGrid = append(m.selGrid, "")
 			currentLine++
 		}
-		item := m.renderLogItem(&m.items[i], contentWidth)
+		previousKind = m.items[i].kind
 		if contentWidth > 0 {
 			item = lipgloss.NewStyle().Width(contentWidth).Render(item)
 		}
@@ -281,29 +286,15 @@ func (m *Model) render() {
 		if m.items[i].kind == "tool" {
 			if isAgentTool(m.items[i].toolName) {
 				cell := &m.items[i]
-				children := cell.agent
+				child := cell.agent
 				addTarget := func(start, count int, kind, id string) {
 					for line := start; line < start+count; line++ {
 						m.clickTargets = append(m.clickTargets, clickTarget{line: line, kind: kind, id: id})
 					}
 				}
-				if len(children) > 1 {
-					heights := make([]int, len(children))
-					childRows := 0
-					for j, child := range children {
-						heights[j] = presentationHeight(renderAgentChildLine(child, j == len(children)-1, contentWidth), contentWidth)
-						childRows += heights[j]
-					}
-					headerRows := max(1, itemLines-childRows)
-					addTarget(currentLine, headerRows, "agents", "")
-					row := currentLine + headerRows
-					for j, child := range children {
-						addTarget(row, heights[j], "agent", string(child.SessionID))
-						row += heights[j]
-					}
-				} else if len(children) == 1 {
-					addTarget(currentLine, itemLines, "agent", string(children[0].SessionID))
-				} else if sid, ok := cell.toolArgs["session_id"].(string); ok && sid != "" {
+				if child != nil {
+					addTarget(currentLine, itemLines, "agent", string(child.SessionID))
+				} else if sid, ok := cell.toolArgs["agent_id"].(string); ok && sid != "" {
 					addTarget(currentLine, itemLines, "agent", sid)
 				} else if cell.toolID != "" {
 					addTarget(currentLine, itemLines, "tool", cell.toolID)
@@ -345,6 +336,8 @@ func renderItemWidth(it *historyCell, width int) string {
 
 	case "user":
 		return renderUserCell(text, width)
+	case "collaboration":
+		return renderCollaborationCell(text, width)
 
 	case "command":
 		return styleUser.Render("❯ " + text)

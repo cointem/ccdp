@@ -314,7 +314,21 @@ func (a *Agent) toolOutputPreview(value string, maxBytes int) string {
 	if maxBytes <= 0 {
 		maxBytes = toolJournalMaxText
 	}
-	return truncateUTF8Bytes(value, maxBytes)
+	if len(value) <= maxBytes {
+		return value
+	}
+	marker := "[tool result exceeds output limit; request a smaller result]"
+	if json.Valid([]byte(value)) {
+		if len(marker) > maxBytes {
+			return ""
+		}
+		return marker
+	}
+	marker = "\n[incomplete: tool output limit]"
+	if maxBytes < len(marker) {
+		return ""
+	}
+	return truncateUTF8Bytes(value, maxBytes-len(marker)) + marker
 }
 
 // finishUnexecutedTool records a rejected/cancelled call that never crossed
@@ -468,7 +482,18 @@ func (a *Agent) projectToolResults(jc toolJournalContext, calls []messages.ToolC
 			}
 			if int64(len(out)) > outputLimit {
 				budget.Truncated = true
-				out = truncateUTF8Bytes(out, int(outputLimit))
+				if json.Valid([]byte(out)) {
+					out = "" // typed data is either whole or explicitly unavailable
+					results[i].isErr, results[i].status = true, "error"
+				} else {
+					marker := "\n[incomplete: tool output budget exhausted]"
+					if outputLimit >= int64(len(marker)) {
+						out = truncateUTF8Bytes(out, int(outputLimit)-len(marker)) + marker
+					} else {
+						out = ""
+						results[i].isErr, results[i].status = true, "error"
+					}
+				}
 			}
 			budget.Used += reserve + int64(len(out))
 			if budget.Used > budget.Limit {
@@ -478,6 +503,16 @@ func (a *Agent) projectToolResults(jc toolJournalContext, calls []messages.ToolC
 			}
 		} else {
 			budget.Used += int64(len(out))
+		}
+		if out != results[i].output && calls[i].Name == "Read" {
+			a.mu.Lock()
+			resources, sb := a.resources, a.sandbox
+			a.mu.Unlock()
+			if resources != nil && sb != nil {
+				if path, e := sb.ResolveRead(tools.StringArg(calls[i].Arguments, "file_path", "")); e == nil {
+					resources.Files.ForgetFile(path)
+				}
+			}
 		}
 		results[i].output = out
 	}

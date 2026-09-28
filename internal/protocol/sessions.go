@@ -22,20 +22,26 @@ type AgentCapabilities struct {
 }
 
 type ChildSession struct {
-	SessionID       SessionID         `json:"session_id"`
-	RootSessionID   SessionID         `json:"root_session_id"`
-	ParentSessionID SessionID         `json:"parent_session_id"`
-	DelegationID    DelegationID      `json:"delegation_id"`
-	ParentTurnID    TurnID            `json:"parent_turn_id,omitempty"`
-	ParentCallID    CallID            `json:"parent_call_id,omitempty"`
-	BatchIndex      int               `json:"batch_index"`
-	Title           string            `json:"title"`
-	Purpose         string            `json:"purpose"`
-	CreatedAt       time.Time         `json:"created_at"`
-	Run             RunView           `json:"run"`
-	Capabilities    AgentCapabilities `json:"capabilities"`
-	Approval        *ApprovalView     `json:"approval,omitempty"`
-	DeliveryPending bool              `json:"delivery_pending,omitempty"`
+	Role             string            `json:"role,omitempty"`
+	WorkspaceMode    string            `json:"workspace_mode,omitempty"`
+	Name             string            `json:"name,omitempty"`
+	Workspace        string            `json:"workspace,omitempty"`
+	BaselineID       string            `json:"baseline_id,omitempty"`
+	ResultSnapshotID string            `json:"result_snapshot_id,omitempty"`
+	MergeStatus      string            `json:"merge_status,omitempty"`
+	SessionID        SessionID         `json:"session_id"`
+	RootSessionID    SessionID         `json:"root_session_id"`
+	ParentSessionID  SessionID         `json:"parent_session_id"`
+	DelegationID     DelegationID      `json:"delegation_id"`
+	ParentTurnID     TurnID            `json:"parent_turn_id,omitempty"`
+	ParentCallID     CallID            `json:"parent_call_id,omitempty"`
+	Title            string            `json:"title"`
+	Purpose          string            `json:"purpose"`
+	CreatedAt        time.Time         `json:"created_at"`
+	Run              RunView           `json:"run"`
+	Capabilities     AgentCapabilities `json:"capabilities"`
+	Approval         *ApprovalView     `json:"approval,omitempty"`
+	DeliveryPending  bool              `json:"delivery_pending,omitempty"`
 }
 
 type RunView struct {
@@ -46,13 +52,14 @@ type RunView struct {
 	FinishedAt time.Time     `json:"finished_at,omitempty"`
 	Output     string        `json:"output,omitempty"`
 	Error      string        `json:"error,omitempty"`
+	SaveError  string        `json:"save_error,omitempty"`
 	Usage      UsageSnapshot `json:"usage"`
 	ToolUses   int           `json:"tool_uses,omitempty"`
 }
 
 func (r RunView) Active() bool {
 	switch r.Status {
-	case "queued", "starting", "running", "waiting_approval", "settling":
+	case "queued", "starting", "running", "waiting_approval", "stopping", "settling":
 		return true
 	}
 	return false
@@ -67,6 +74,7 @@ type TranscriptItem struct {
 	StepID     StepID          `json:"step_id,omitempty"`
 	CallID     CallID          `json:"call_id,omitempty"`
 	Text       string          `json:"text,omitempty"`
+	TextOffset int64           `json:"text_offset,omitempty"`
 	Tool       string          `json:"tool,omitempty"`
 	Args       json.RawMessage `json:"args,omitempty"`
 	Status     string          `json:"status,omitempty"`

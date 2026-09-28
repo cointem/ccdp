@@ -325,8 +325,10 @@ func TestSandboxLimitsApplyToAllExecutionEntrances(t *testing.T) {
 		}
 		defer CleanupStartedProcess(cmd)
 		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		out, err := cmd.Output()
+		var stdout bytes.Buffer
+		cmd.SetIO(nil, &stdout, &stderr)
+		err = cmd.Run()
+		out := stdout.Bytes()
 		if err != nil {
 			return fmt.Errorf("%s/StartArgv: %w", label, err)
 		}
@@ -440,8 +442,8 @@ func TestRunCleansDescendantsAfterPipeWait(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Truncated || !strings.Contains(res.Output, "descendant cleanup") {
-		t.Fatalf("expected descendant pipe cleanup marker, result=%+v", res)
+	if res.Output != "done" || res.Truncated {
+		t.Fatalf("expected drained output without pipe timeout, result=%+v", res)
 	}
 	data, err := os.ReadFile(pidFile)
 	if err != nil {

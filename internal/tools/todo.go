@@ -274,7 +274,7 @@ func (t *TodoWriteTool) Run(ctx *Context) (string, error) {
 	for i, item := range raw {
 		m, ok := item.(map[string]any)
 		if !ok {
-			continue
+			return "", fmt.Errorf("TodoWrite: item %d must be an object", i+1)
 		}
 		st := TodoState{
 			ID:       fmt.Sprintf("%d", i+1),
@@ -282,8 +282,14 @@ func (t *TodoWriteTool) Run(ctx *Context) (string, error) {
 			Status:   StringArg(m, "status", "pending"),
 			Priority: StringArg(m, "priority", "medium"),
 		}
-		if st.Content == "" {
-			continue
+		if strings.TrimSpace(st.Content) == "" {
+			return "", fmt.Errorf("TodoWrite: item %d has empty content", i+1)
+		}
+		if st.Status != "pending" && st.Status != "in_progress" && st.Status != "completed" {
+			return "", fmt.Errorf("TodoWrite: invalid status in item %d", i+1)
+		}
+		if st.Priority != "high" && st.Priority != "medium" && st.Priority != "low" {
+			return "", fmt.Errorf("TodoWrite: invalid priority in item %d", i+1)
 		}
 		newState[st.ID] = st
 		states = append(states, st)

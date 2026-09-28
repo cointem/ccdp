@@ -454,6 +454,8 @@ func (t *shadowCapabilityTool) Run(*tools.Context) (string, error) {
 func capabilityTestAgent(t *testing.T) *Agent {
 	t.Helper()
 	cfg := isolatedTestConfig(t, "capability-model")
+	// These tests exercise explicit grants from a network-disabled baseline.
+	cfg.NetworkAccess = false
 	provider := &policyTestProvider{name: cfg.Model}
 	models := plugin.NewModelRegistry()
 	models.Register(provider)

@@ -16,12 +16,12 @@ type Matcher struct {
 }
 
 type ignoreRule struct {
+	baseDir  string
 	pattern  string // normalized pattern (no leading ! or /)
 	negate   bool
 	dirOnly  bool
 	anchored bool
 	hasSlash bool // whether the pattern contains a slash
-	hasDbl   bool // whether the pattern contains **
 }
 
 // NewMatcher returns an empty matcher.
@@ -93,10 +93,7 @@ func (m *Matcher) loadFile(path, baseDir string) error {
 		}
 		rule := parseIgnoreLine(line)
 		// Patterns from a nested .gitignore are relative to that directory.
-		if baseDir != "" && !rule.anchored {
-			rule.pattern = baseDir + "/" + rule.pattern
-			rule.hasSlash = strings.Contains(rule.pattern, "/")
-		}
+		rule.baseDir = baseDir
 		m.patterns = append(m.patterns, rule)
 	}
 	return nil
@@ -122,7 +119,6 @@ func parseIgnoreLine(line string) ignoreRule {
 	}
 	r.pattern = line
 	r.hasSlash = strings.Contains(line, "/")
-	r.hasDbl = strings.Contains(line, "**")
 	return r
 }
 
@@ -150,51 +146,28 @@ func (m *Matcher) Match(rel string, isDir bool) (ignored, matched bool) {
 }
 
 func matchRule(r ignoreRule, rel string, isDir bool) bool {
-	p := r.pattern
-	if p == "" {
-		return false
-	}
-	if p == rel {
-		return true
-	}
-
-	// Directory-only rules also cover everything beneath the matched dir.
-	if r.dirOnly {
-		if strings.HasPrefix(rel, p+"/") {
-			return true
-		}
-		if !isDir {
+	if r.baseDir != "" {
+		var inside bool
+		rel, inside = strings.CutPrefix(rel, r.baseDir+"/")
+		if !inside {
 			return false
 		}
 	}
-
-	// Patterns containing a slash are relative to the ignore-file location.
-	if r.hasSlash {
-		if r.hasDbl {
-			return doubleStarMatch(p, rel)
-		}
-		if strings.HasSuffix(rel, "/"+p) {
-			return true
-		}
-		if isDir && strings.HasPrefix(rel, p+"/") {
-			return true
-		}
+	if r.pattern == "" {
 		return false
 	}
-
-	// Slash-less pattern.
-	if r.anchored {
-		// Anchored to the ignore-file's directory: only matches at root.
-		if strings.Contains(rel, "/") {
-			return false
-		}
-		return globMatchSeg(p, rel)
-	}
-
-	// Non-anchored slash-less patterns match any basename segment.
 	segments := strings.Split(rel, "/")
-	for _, seg := range segments {
-		if globMatchSeg(p, seg) {
+	for i := 1; i <= len(segments); i++ {
+		// Directory patterns match an ancestor or a directory entry, not a file
+		// with the same basename.
+		if r.dirOnly && i == len(segments) && !isDir {
+			continue
+		}
+		if r.hasSlash {
+			if doubleStarMatch(r.pattern, strings.Join(segments[:i], "/")) {
+				return true
+			}
+		} else if (!r.anchored || i == 1) && globMatchSeg(r.pattern, segments[i-1]) {
 			return true
 		}
 	}

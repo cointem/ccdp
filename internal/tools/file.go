@@ -1,487 +1,356 @@
 package tools
 
 import (
+	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
-	"syscall"
+	"unicode/utf8"
 
+	"ccdp/internal/fsops"
 )
 
-// ---------- Read ----------
-
-// ReadTool reads files with optional offset/limit and line numbers.
 type ReadTool struct{}
 
-// NewReadTool creates the read tool.
-func NewReadTool() *ReadTool { return &ReadTool{} }
-
-func (t *ReadTool) Name() string { return "Read" }
-
-func (t *ReadTool) Description() string {
-	return `Read a file from the filesystem. Supports optional byte offset and limit
-for reading large files in chunks. Output is prefixed with line numbers so the
-agent can reference exact locations. Never read entire huge files at once.`
+func NewReadTool() *ReadTool   { return &ReadTool{} }
+func (*ReadTool) Name() string { return "Read" }
+func (*ReadTool) Description() string {
+	return "Read UTF-8 text with line numbers. offset is a 1-based LINE number, limit a LINE count (maximum 2000). Results include actual range and next_offset. Use Glob/LS for paths and Grep for text search."
 }
-
-func (t *ReadTool) Parameters() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"file_path": map[string]any{
-				"type":        "string",
-				"description": "Absolute path to the file to read.",
-			},
-			"offset": map[string]any{
-				"type":        "integer",
-				"description": "Optional byte offset to start reading from (default 0).",
-			},
-			"limit": map[string]any{
-				"type":        "integer",
-				"description": "Optional number of bytes to read (default 2000 lines worth, capped at 64KB).",
-			},
-		},
-		"required": []string{"file_path"},
-	}
+func (*ReadTool) Parameters() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "offset": map[string]any{"type": "integer", "minimum": 1}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 2000}}, "required": []string{"file_path"}}
 }
-
-func (t *ReadTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
+func (*ReadTool) Run(ctx *Context) (string, error) {
+	if e := ctx.checkResources(); e != nil {
+		return "", e
 	}
-	path, err := ctx.ResolveRead(StringArg(ctx.Args, "file_path", ""))
-	if err != nil {
-		return "", err
+	if _, ok := ctx.Args["unit"]; ok {
+		return "", fmt.Errorf("Read: unit is no longer supported; offset and limit always use lines")
 	}
-	if path == "" {
+	raw := StringArg(ctx.Args, "file_path", "")
+	if raw == "" {
 		return "", fmt.Errorf("Read: missing file_path")
 	}
-	state, err := ctx.fileStateForUse()
-	if err != nil {
-		return "", err
+	path, e := ctx.ResolveRead(raw)
+	if e != nil {
+		return "", e
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", fmt.Errorf("Read: %w", err)
+	offset, e := IntArgChecked(ctx.Args, "offset", 1)
+	if e != nil || offset < 1 {
+		return "", fmt.Errorf("Read: offset must be a positive line number")
 	}
-	if info.IsDir() {
-		return "", fmt.Errorf("Read: %s is a directory, use LS", path)
+	limit, e := IntArgChecked(ctx.Args, "limit", 2000)
+	if e != nil || limit < 1 || limit > 2000 {
+		return "", fmt.Errorf("Read: limit must be 1..2000 lines")
 	}
-
-	offset, err := IntArgChecked(ctx.Args, "offset", 0)
-	if err != nil {
-		return "", fmt.Errorf("Read: %w", err)
+	state, e := ctx.fileStateForUse()
+	if e != nil {
+		return "", e
 	}
-	limit, err := IntArgChecked(ctx.Args, "limit", 0)
-	if err != nil {
-		return "", fmt.Errorf("Read: %w", err)
+	canonical, e := filepath.EvalSymlinks(path)
+	if e != nil {
+		return "", e
 	}
-	if offset < 0 {
-		offset = 0
+	if _, e = ctx.ResolveRead(canonical); e != nil {
+		return "", e
 	}
-	if limit <= 0 {
-		limit = 64 * 1024
-	}
-	if limit > ctx.readLimit() {
-		limit = ctx.readLimit()
-	}
-
-	readPath := path
-	noFollow := false
-	// ResolveRead checks containment using the resolved form but deliberately
-	// returns the caller-visible alias. Canonicalize once more at the open
-	// boundary so O_NOFOLLOW can reject a final-link swap while preserving
-	// legitimate links whose target is inside an authorized root.
-	readPath, err = filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", fmt.Errorf("Read: path resolution: %w", err)
-	}
-	if readPath, err = ctx.Sandbox.ResolveRead(readPath); err != nil {
-		return "", fmt.Errorf("Read: path resolution: %w", err)
-	}
-	noFollow = true
-	data, snapshot, err := readRangeSnapshot(readPath, offset, limit, noFollow)
-	if err != nil {
-		return "", fmt.Errorf("Read: %w", err)
-	}
-	// Record the observed mtime so Edit/Write can detect external changes.
-	state.MarkFileReadSnapshot(path, snapshot)
-	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
-	var sb strings.Builder
-	if !snapshot.Complete {
-		warning := fmt.Sprintf("[partial read: %d of %d bytes; read from offset 0 with limit=%d before Edit/Write]", len(data), snapshot.Size, snapshot.Size)
-		if snapshot.Size > int64(ctx.readLimit()) {
-			warning = fmt.Sprintf("[partial read: %d of %d bytes; full-file Edit/Write requires raising the read limit to at least %d and then reading with offset 0 and limit=%d]", len(data), snapshot.Size, snapshot.Size, snapshot.Size)
-		}
-		appendBounded(&sb, warning+"\n", ctx.outputLimit())
-	}
-	startLine := countLinesChecked(readPath, offset, noFollow)
-	for i, line := range lines {
-		appendBounded(&sb, fmt.Sprintf("%d\t%s\n", startLine+i, line), ctx.outputLimit())
-	}
-	return sb.String(), nil
-}
-
-func readRangeChecked(path string, offset, limit int, noFollow bool) ([]byte, error) {
-	data, _, err := readRangeSnapshot(path, offset, limit, noFollow)
-	return data, err
-}
-
-// readRangeSnapshot returns bytes and the exact stat/digest snapshot observed
-// from the same descriptor. The shared advisory lock pairs with the exclusive
-// lock in writeFileNoFollow for all built-in file mutations.
-func readRangeSnapshot(path string, offset, limit int, noFollow bool) ([]byte, FileReadSnapshot, error) {
-	flags := os.O_RDONLY
-	if noFollow {
-		flags |= syscall.O_NOFOLLOW
-	}
-	f, err := os.OpenFile(path, flags, 0)
-	if err != nil {
-		return nil, FileReadSnapshot{}, err
+	f, e := fsops.OpenRegular(ctx.ReadRoot, canonical)
+	if e != nil {
+		return "", e
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
-		return nil, FileReadSnapshot{}, err
+	info, e := f.Stat()
+	if e != nil {
+		return "", e
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-	for attempt := 0; attempt < 2; attempt++ {
-		before, statErr := f.Stat()
-		if statErr != nil {
-			return nil, FileReadSnapshot{}, statErr
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("Read: not a regular file; use LS for directories")
+	}
+	budget := min(50*1024, ctx.readLimit(), ctx.outputLimit())
+	if budget < 256 {
+		return "", fmt.Errorf("Read: output budget too small (minimum 256 bytes)")
+	}
+	r := bufio.NewReaderSize(f, budget)
+	line := 1
+	for line < offset {
+		_, e = r.ReadSlice('\n')
+		if e == bufio.ErrBufferFull {
+			continue
 		}
-		buf := make([]byte, limit)
-		if _, err := f.Seek(int64(offset), 0); err != nil {
-			return nil, FileReadSnapshot{}, err
+		if e == io.EOF {
+			return "", fmt.Errorf("Read: offset %d is beyond EOF", offset)
 		}
-		n, readErr := f.Read(buf)
-		if readErr != nil && readErr != io.EOF && n == 0 {
-			return nil, FileReadSnapshot{}, readErr
+		if e != nil {
+			return "", e
 		}
-		after, statErr := f.Stat()
-		if statErr != nil {
-			return nil, FileReadSnapshot{}, statErr
+		line++
+	}
+	var out strings.Builder
+	count := 0
+	eof := false
+	longLine := false
+	budgetStopped := false
+	for count < limit {
+		part, err := r.ReadSlice('\n')
+		if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
+			return "", err
 		}
-		beforeDev, beforeInode := fileIdentity(before)
-		afterDev, afterInode := fileIdentity(after)
-		if before.ModTime().Equal(after.ModTime()) && before.Size() == after.Size() &&
-			beforeDev == afterDev && beforeInode == afterInode {
-			snapshot := FileReadSnapshot{
-				Mtime: after.ModTime(), Size: after.Size(), Dev: afterDev, Inode: afterInode,
+		if err == bufio.ErrBufferFull {
+			longLine = true
+			break
+		}
+		if len(part) == 0 && err == io.EOF {
+			eof = true
+			break
+		}
+		if !utf8.Valid(part) || bytes.IndexByte(part, 0) >= 0 {
+			return "", fmt.Errorf("Read: binary or unsupported text encoding; use an appropriate binary tool")
+		}
+		decorated := fmt.Sprintf("%d\t%s", line, part)
+		if !strings.HasSuffix(decorated, "\n") {
+			decorated += "\n"
+		}
+		if out.Len()+len(decorated) > budget-180 {
+			budgetStopped = true
+			if count == 0 {
+				longLine = true
 			}
-			// A bounded/ranged read is intentionally not a full-file
-			// fingerprint. Edit/Write must require a subsequent complete Read,
-			// otherwise a prefix hash could be mistaken for freshness of a large
-			// file. An offset-zero read that reaches EOF is complete even when
-			// its requested limit exceeds the file size.
-			if offset <= 0 && int64(n) == after.Size() {
-				snapshot.Digest = sha256.Sum256(buf[:n])
-				snapshot.Complete = true
-			}
-			return buf[:n], snapshot, nil
+			break
 		}
-	}
-	return nil, FileReadSnapshot{}, fmt.Errorf("file changed while it was being read")
-}
-
-// countLines estimates the 1-based line number at a byte offset. It reads in
-// fixed 64KB chunks (an offset-sized allocation would let a huge offset OOM
-// the process) and loops to survive short reads.
-func countLines(path string, offset int) int {
-	return countLinesChecked(path, offset, false)
-}
-
-func countLinesChecked(path string, offset int, noFollow bool) int {
-	if offset <= 0 {
-		return 1
-	}
-	flags := os.O_RDONLY
-	if noFollow {
-		flags |= syscall.O_NOFOLLOW
-	}
-	f, err := os.OpenFile(path, flags, 0)
-	if err != nil {
-		return 1
-	}
-	defer f.Close()
-
-	buf := make([]byte, 64*1024)
-	lines := 1
-	for remaining := offset; remaining > 0; {
-		chunk := buf
-		if remaining < len(chunk) {
-			chunk = chunk[:remaining]
-		}
-		n, err := f.Read(chunk)
-		lines += bytes.Count(chunk[:n], []byte("\n"))
-		remaining -= n
-		if err != nil || n == 0 {
+		out.WriteString(decorated)
+		count++
+		line++
+		if err == io.EOF {
+			eof = true
 			break
 		}
 	}
-	return lines
-}
-
-// ---------- Write ----------
-
-// WriteTool creates or overwrites a file with the given content.
-type WriteTool struct{}
-
-// NewWriteTool creates the write tool.
-func NewWriteTool() *WriteTool { return &WriteTool{} }
-
-func (t *WriteTool) Name() string { return "Write" }
-
-func (t *WriteTool) Description() string {
-	return `Write content to a file, creating it (and parent directories) if needed.
-Overwrites the entire file. Use Edit instead when you only need to change a
-small part of an existing file. Overwriting an existing file requires reading
-it first in this session; new files can be written directly.`
-}
-
-func (t *WriteTool) Parameters() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"file_path": map[string]any{
-				"type":        "string",
-				"description": "Absolute path of the file to write.",
-			},
-			"content": map[string]any{
-				"type":        "string",
-				"description": "The full content to write to the file.",
-			},
-		},
-		"required": []string{"file_path", "content"},
-	}
-}
-
-func (t *WriteTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
-	}
-	path, err := ctx.ResolveWrite(StringArg(ctx.Args, "file_path", ""))
-	if err != nil {
-		return "", err
-	}
-	content := StringArg(ctx.Args, "content", "")
-	if path == "" {
-		return "", fmt.Errorf("Write: missing file_path")
-	}
-	state, err := ctx.fileStateForUse()
-	if err != nil {
-		return "", err
-	}
-	state.writeMu.Lock()
-	defer state.writeMu.Unlock()
-	// Overwriting an existing file requires a fresh Read (file safety); new
-	// files are exempt.
-	if _, err := os.Stat(path); err == nil {
-		if err := state.CheckFileFresh(path); err != nil {
+	if !eof && !longLine && !budgetStopped {
+		_, err := r.Peek(1)
+		eof = err == io.EOF
+		if err != nil && err != io.EOF {
 			return "", err
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", fmt.Errorf("Write: %w", err)
+	if count == 0 && eof && offset > 1 {
+		return "", fmt.Errorf("Read: offset %d is beyond EOF", offset)
 	}
-	oldLen := 0
-	if info, err := os.Stat(path); err == nil {
-		oldLen = int(info.Size())
+	after, e := f.Stat()
+	if e != nil {
+		return "", e
 	}
-	if err := writeFileNoFollow(path, []byte(content), 0o644); err != nil {
-		return "", fmt.Errorf("Write: %w", err)
+	if fsops.FromInfo(info) != fsops.FromInfo(after) {
+		return "", fmt.Errorf("Read: file changed while reading; retry the requested region")
 	}
-	// The agent just wrote it: refresh the record so a follow-up Edit works.
-	state.MarkFileRead(path)
-	verb := "wrote"
-	if oldLen > 0 {
-		verb = "overwrote"
+	if count > 0 || eof {
+		state.MarkVersion(path, fsops.FromInfo(after))
 	}
-	return fmt.Sprintf("%s %d bytes to %s (previous size %d bytes)", verb, len(content), path, oldLen), nil
+	if count == 0 && eof {
+		return "[empty file; EOF]", nil
+	}
+	if longLine {
+		fmt.Fprintf(&out, "[line %d exceeds output budget; content incomplete. Use Bash for targeted extraction; this Read cannot advance through that line.]", line)
+	} else if eof {
+		fmt.Fprintf(&out, "[lines %d-%d; EOF]", offset, line-1)
+	} else {
+		fmt.Fprintf(&out, "[lines %d-%d; more content; next_offset=%d]", offset, line-1, line)
+	}
+	return out.String(), nil
 }
 
-// ---------- Edit ----------
+type WriteTool struct{}
 
-// EditTool performs exact string replacement in an existing file.
+func NewWriteTool() *WriteTool  { return &WriteTool{} }
+func (*WriteTool) Name() string { return "Write" }
+func (*WriteTool) Description() string {
+	return "Create a file (mode=create, default), or explicitly replace an existing file (mode=replace). Replacement requires a successful recent Read of the current file version; a partial Read is sufficient. For local changes use Edit."
+}
+func (*WriteTool) Parameters() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}, "mode": map[string]any{"type": "string", "enum": []string{"create", "replace"}}}, "required": []string{"file_path", "content"}}
+}
+func (*WriteTool) Run(ctx *Context) (output string, runErr error) {
+	if e := ctx.checkResources(); e != nil {
+		return "", e
+	}
+	raw := StringArg(ctx.Args, "file_path", "")
+	if raw == "" {
+		return "", fmt.Errorf("Write: missing file_path")
+	}
+	content, ok := ctx.Args["content"].(string)
+	if !ok {
+		return "", fmt.Errorf("Write: content must be explicitly supplied")
+	}
+	mode := StringArg(ctx.Args, "mode", "create")
+	if mode != "create" && mode != "replace" {
+		return "", fmt.Errorf("Write: mode must be create or replace")
+	}
+	path, e := ctx.ResolveWrite(raw)
+	if e != nil {
+		return "", e
+	}
+	state, e := ctx.fileStateForUse()
+	if e != nil {
+		return "", e
+	}
+	lock, e := fsops.LockPath(path)
+	if e != nil {
+		return "", e
+	}
+	defer lock.Close()
+	var expected *fsops.Version
+	if mode == "create" {
+		if _, e = os.Lstat(path); e == nil {
+			return "", fmt.Errorf("Write: file exists; use mode=replace after Read, or Edit")
+		} else if !os.IsNotExist(e) {
+			return "", e
+		}
+	} else {
+		v, e := state.ObservedVersion(path)
+		if e != nil {
+			return "", e
+		}
+		expected = &v
+	}
+	if ctx.BeforeWrite != nil {
+		finish, e := ctx.BeforeWrite(path, nil)
+		if e != nil {
+			return "", e
+		}
+		defer func() {
+			if runErr == nil {
+				runErr = finish()
+			}
+		}()
+	}
+	version, e := fsops.Publish(path, []byte(content), 0644, expected)
+	if e != nil {
+		return "", e
+	}
+	state.MarkVersion(path, version)
+	return fmt.Sprintf("%s: wrote %d bytes (%s)", path, len(content), mode), nil
+}
+
 type EditTool struct{}
 
-// NewEditTool creates the edit tool.
-func NewEditTool() *EditTool { return &EditTool{} }
-
-func (t *EditTool) Name() string { return "Edit" }
-
-func (t *EditTool) Description() string {
-	return `Edit an existing file by replacing an exact string with a new string.
-The old_string must match exactly, including whitespace, and must appear
-exactly once in the file. Prefer this over Write for surgical changes.
-
-You MUST Read the file in this session before editing it; if it changed on
-disk after your Read (by the user or a linter), the edit is rejected — Read
-it again and retry.`
+func NewEditTool() *EditTool   { return &EditTool{} }
+func (*EditTool) Name() string { return "Edit" }
+func (*EditTool) Description() string {
+	return "Apply exact, unique, nonoverlapping text replacements in one file. All edits match the original current content. Reading only the relevant portion is sufficient. A missing new_text is invalid; an explicit empty new_text deletes text. No fuzzy matching."
 }
-
-func (t *EditTool) Parameters() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"file_path": map[string]any{
-				"type":        "string",
-				"description": "Absolute path of the file to edit.",
-			},
-			"old_string": map[string]any{
-				"type":        "string",
-				"description": "The exact text to find and replace.",
-			},
-			"new_string": map[string]any{
-				"type":        "string",
-				"description": "The replacement text.",
-			},
-		},
-		"required": []string{"file_path", "old_string", "new_string"},
-	}
+func (*EditTool) Parameters() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "edits": map[string]any{"type": "array", "minItems": 1, "items": map[string]any{"type": "object", "properties": map[string]any{"old_text": map[string]any{"type": "string", "minLength": 1}, "new_text": map[string]any{"type": "string"}}, "required": []string{"old_text", "new_text"}}}}, "required": []string{"file_path", "edits"}}
 }
-
-func (t *EditTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
+func (*EditTool) Run(ctx *Context) (output string, runErr error) {
+	if e := ctx.checkResources(); e != nil {
+		return "", e
 	}
-	path, err := ctx.ResolveWrite(StringArg(ctx.Args, "file_path", ""))
-	if err != nil {
-		return "", err
+	raw := StringArg(ctx.Args, "file_path", "")
+	if raw == "" {
+		return "", fmt.Errorf("Edit: missing file_path")
 	}
-	oldStr := StringArg(ctx.Args, "old_string", "")
-	newStr := StringArg(ctx.Args, "new_string", "")
-	if path == "" || oldStr == "" {
-		return "", fmt.Errorf("Edit: file_path and old_string are required")
+	path, e := ctx.ResolveWrite(raw)
+	if e != nil {
+		return "", e
 	}
-	state, err := ctx.fileStateForUse()
-	if err != nil {
-		return "", err
+	edits, ok := ctx.Args["edits"].([]any)
+	if !ok || len(edits) == 0 {
+		return "", fmt.Errorf("Edit: supply edits=[{old_text,new_text}]; legacy old_string/new_string parameters are unsupported")
 	}
-	state.writeMu.Lock()
-	defer state.writeMu.Unlock()
-	// File safety (Claude Code's freshness gate): the file must have been read
-	// this session and must not have changed on disk since.
-	if err := state.CheckFileFresh(path); err != nil {
-		return "", err
+	state, e := ctx.fileStateForUse()
+	if e != nil {
+		return "", e
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("Edit: %w", err)
+	lock, e := fsops.LockPath(path)
+	if e != nil {
+		return "", e
+	}
+	defer lock.Close()
+	data, version, e := fsops.Read(path, 32<<20)
+	if e != nil {
+		return "", e
+	}
+	if !utf8.Valid(data) {
+		return "", fmt.Errorf("Edit: unsupported text encoding")
 	}
 	content := string(data)
-	count := strings.Count(content, oldStr)
-	if count == 0 {
-		return "", fmt.Errorf("Edit: old_string not found in %s", path)
+	type replacement struct {
+		start, end int
+		old, next  string
 	}
-	if count > 1 {
-		return "", fmt.Errorf("Edit: old_string appears %d times in %s; it must be unique. Include more surrounding context", count, path)
+	var replacements []replacement
+	for i, item := range edits {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("Edit: invalid entry %d", i+1)
+		}
+		old, ok := m["old_text"].(string)
+		next, nok := m["new_text"].(string)
+		if !ok || old == "" || !nok {
+			return "", fmt.Errorf("Edit: entry %d requires nonempty old_text and explicit new_text", i+1)
+		}
+		at := strings.Index(content, old)
+		if at < 0 {
+			return "", fmt.Errorf("Edit: old_text in entry %d not found; read the current region", i+1)
+		}
+		if strings.Contains(content[at+1:], old) {
+			return "", fmt.Errorf("Edit: old_text in entry %d is not unique; include more context", i+1)
+		}
+		replacements = append(replacements, replacement{at, at + len(old), old, next})
 	}
-	updated := strings.Replace(content, oldStr, newStr, 1)
-	if err := writeFileNoFollow(path, []byte(updated), 0o644); err != nil {
-		return "", fmt.Errorf("Edit: %w", err)
-	}
-	// The agent just wrote it: refresh the record so a follow-up Edit works.
-	state.MarkFileRead(path)
-	// A short diff summary helps the model verify the change.
-	return diffSummary(oldStr, newStr), nil
-}
-
-// appendBounded appends at most limit bytes and records truncation explicitly.
-// A tool result is model-visible output, so it must remain bounded even when
-// line-number decoration makes it larger than the input read.
-func appendBounded(sb *strings.Builder, value string, limit int) {
-	if limit <= 0 {
-		return
-	}
-	remaining := limit - sb.Len()
-	if remaining <= 0 {
-		return
-	}
-	if len(value) <= remaining {
-		sb.WriteString(value)
-		return
-	}
-	const marker = "\n…[tool output truncated]"
-	if remaining <= len(marker) {
-		sb.WriteString(value[:remaining])
-		return
-	}
-	sb.WriteString(value[:remaining-len(marker)])
-	sb.WriteString(marker)
-}
-
-// writeFileNoFollow rejects a final symlink immediately before opening it and
-// uses O_NOFOLLOW where available. ResolveWrite performs the workspace check;
-// this second check closes the common symlink-swap gap between resolution and
-// mutation. Kernel sandboxing remains the authoritative boundary in strict
-// mode, since userspace checks alone cannot eliminate all TOCTOU races.
-func writeFileNoFollow(path string, data []byte, mode os.FileMode) error {
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to write through symlink %s", path)
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|syscall.O_NOFOLLOW, mode)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return err
-	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-	// Re-check the opened descriptor, not just the path resolved by Sandbox.
-	// A rename or hard-link can race the path check; refusing a multiply-linked
-	// target here prevents truncating the protected inode through an alias.
-	if info, err := f.Stat(); err != nil {
-		return err
-	} else if fileInfoHasMultipleLinks(info) {
-		return fmt.Errorf("refusing to write multiply-linked file %s", path)
-	}
-	if err := f.Truncate(0); err != nil {
-		return err
-	}
-	if _, err := f.Seek(0, 0); err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		return err
-	}
-	return f.Close()
-}
-
-func fileInfoHasMultipleLinks(info os.FileInfo) bool {
-	if info == nil || !info.Mode().IsRegular() {
-		return false
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	return ok && stat.Nlink > 1
-}
-
-func diffSummary(oldStr, newStr string) string {
-	lines := func(s string) []string {
-		return strings.Split(strings.TrimSuffix(s, "\n"), "\n")
-	}
-	oldLines, newLines := lines(oldStr), lines(newStr)
-	n := len(oldLines)
-	if len(newLines) > n {
-		n = len(newLines)
-	}
-	var sb strings.Builder
-	sb.WriteString("Applied edit. Diff summary:\n")
-	for i := 0; i < n; i++ {
-		switch {
-		case i < len(oldLines) && i < len(newLines):
-			if oldLines[i] != newLines[i] {
-				fmt.Fprintf(&sb, "  - %s\n  + %s\n", oldLines[i], newLines[i])
-			}
-		case i < len(oldLines):
-			fmt.Fprintf(&sb, "  - %s\n", oldLines[i])
-		case i < len(newLines):
-			fmt.Fprintf(&sb, "  + %s\n", newLines[i])
+	sort.Slice(replacements, func(i, j int) bool { return replacements[i].start < replacements[j].start })
+	for i := 1; i < len(replacements); i++ {
+		if replacements[i].start < replacements[i-1].end {
+			return "", fmt.Errorf("Edit: overlapping replacements; merge them into one")
 		}
 	}
-	return sb.String()
+	var b strings.Builder
+	pos := 0
+	var summary strings.Builder
+	for _, r := range replacements {
+		b.WriteString(content[pos:r.start])
+		b.WriteString(r.next)
+		pos = r.end
+		fmt.Fprintf(&summary, "%s:%d\n%s\n", path, 1+strings.Count(content[:r.start], "\n"), diffSummary(r.old, r.next))
+	}
+	b.WriteString(content[pos:])
+	updated := b.String()
+	if updated == content {
+		return "No changes.", nil
+	}
+	if ctx.BeforeWrite != nil {
+		finish, e := ctx.BeforeWrite(path, data)
+		if e != nil {
+			return "", e
+		}
+		defer func() {
+			if runErr == nil {
+				runErr = finish()
+			}
+		}()
+	}
+	version, e = fsops.Publish(path, []byte(updated), 0644, &version)
+	if e != nil {
+		return "", e
+	}
+	state.MarkVersion(path, version)
+	return boundedToolString(ctx, summary.String()), nil
+}
+
+func appendBounded(sb *strings.Builder, value string, limit int) {
+	if remaining := limit - sb.Len(); remaining > 0 {
+		if len(value) > remaining {
+			value = value[:remaining]
+			for !utf8.ValidString(value) && len(value) > 0 {
+				value = value[:len(value)-1]
+			}
+		}
+		sb.WriteString(value)
+	}
+}
+func diffSummary(old, next string) string {
+	return "Applied edit.\n- " + strings.ReplaceAll(strings.TrimSuffix(old, "\n"), "\n", "\n- ") + "\n+ " + strings.ReplaceAll(strings.TrimSuffix(next, "\n"), "\n", "\n+ ")
 }

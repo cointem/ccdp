@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -15,7 +18,7 @@ import (
 	"ccdp/internal/netguard"
 )
 
-const maxHTTPBytes = 2 * 1024 * 1024 // 2 MiB cap on any fetched body
+const maxHTTPBytes = 10 * 1024 * 1024 // 10 MiB cap on any fetched body
 
 // ---------- WebFetch ----------
 
@@ -71,26 +74,44 @@ func (t *WebFetchTool) Run(ctx *Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("WebFetch: %w", err)
 	}
-	if maxChars < 256 {
-		maxChars = 256
-	}
-	if maxChars > 40000 {
-		maxChars = 40000
+	if maxChars < 256 || maxChars > 40000 {
+		return "", fmt.Errorf("WebFetch: max_chars must be 256..40000")
 	}
 
-	body, err := httpGet(ctx.Context, u.String())
+	body, finalURL, contentType, status, err := httpGetDetails(ctx.Context, u.String())
 	if err != nil {
 		return "", fmt.Errorf("WebFetch: %w", err)
 	}
-	text := htmlToText(string(body))
-	text = strings.Join(strings.Fields(text), " ") // collapse whitespace
-	if len(text) > maxChars {
-		text = text[:maxChars] + fmt.Sprintf(" …[truncated at %d chars]", maxChars)
+	text := string(body)
+	media, _, _ := mime.ParseMediaType(contentType)
+	switch media {
+	case "text/html", "application/xhtml+xml":
+		text = htmlToText(text)
+	case "", "text/plain", "text/markdown", "application/json", "application/xml", "text/xml":
+	default:
+		if !strings.HasPrefix(media, "text/") {
+			return "", fmt.Errorf("WebFetch: unsupported content type %s", media)
+		}
 	}
-	if text == "" {
-		return "WebFetch: page returned no readable text", nil
+	if strings.TrimSpace(text) == "" {
+		return fmt.Sprintf("URL: %s\nHTTP %d: no readable text", finalURL, status), nil
 	}
-	return boundedToolString(ctx, text), nil
+	header := fmt.Sprintf("URL: %s\nHTTP %d; content-type: %s\n\n", finalURL, status, contentType)
+	runes := []rune(text)
+	budget := min(50<<10, ctx.outputLimit()) - len(header) - 300
+	if budget < 0 {
+		return "", fmt.Errorf("WebFetch: output budget too small")
+	}
+	if len(runes) > maxChars || len(text) > budget {
+		path, e := saveToolText(ctx, "web-", text)
+		if e != nil {
+			return "", e
+		}
+		text = string(runes[:min(len(runes), maxChars)])
+		text = truncateUTF8(text, budget)
+		text += fmt.Sprintf("\n[incomplete; use Read on %q to continue]", path)
+	}
+	return header + text, nil
 }
 
 // ---------- WebSearch ----------
@@ -157,7 +178,10 @@ func (t *WebSearchTool) Run(ctx *Context) (string, error) {
 	}
 	results := parseDuckDuckGo(string(body), max)
 	if len(results) == 0 {
-		return fmt.Sprintf("WebSearch: no results for %q", q), nil
+		if strings.Contains(strings.ToLower(string(body)), "no results") {
+			return fmt.Sprintf("WebSearch: no results for %q", q), nil
+		}
+		return "", fmt.Errorf("WebSearch: response contained no recognized results (blocked or changed page format)")
 	}
 
 	var sb strings.Builder
@@ -276,18 +300,22 @@ func checkExternalRedirect(req *http.Request, via []*http.Request) error {
 // httpGet performs a GET with a timeout, an SSRF address check (initial URL
 // and every redirect hop) and a browser-ish user agent.
 func httpGet(ctx context.Context, u string) ([]byte, error) {
+	b, _, _, _, e := httpGetDetails(ctx, u)
+	return b, e
+}
+func httpGetDetails(ctx context.Context, u string) (body []byte, finalURL, contentType string, status int, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := validateExternalURL(u); err != nil {
-		return nil, err
+		return nil, "", "", 0, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", "", 0, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; ccdp/0.1)")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
@@ -297,17 +325,20 @@ func httpGet(ctx context.Context, u string) ([]byte, error) {
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", "", 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP %s", resp.Status)
+		return nil, "", "", 0, fmt.Errorf("HTTP %s", resp.Status)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBytes))
+	body, err = io.ReadAll(io.LimitReader(resp.Body, maxHTTPBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, "", "", 0, err
 	}
-	return body, nil
+	if len(body) > maxHTTPBytes {
+		return nil, "", "", 0, fmt.Errorf("HTTP response exceeds 10 MiB")
+	}
+	return body, resp.Request.URL.String(), resp.Header.Get("Content-Type"), resp.StatusCode, nil
 }
 
 // htmlToText strips markup into readable plain text.
@@ -319,6 +350,10 @@ func htmlToText(html string) string {
 		html = re.ReplaceAllString(html, " ")
 	}
 
+	html = regexp.MustCompile(`(?is)<a\s[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>`).ReplaceAllString(html, "[$2]($1)")
+	html = regexp.MustCompile(`(?i)<pre[^>]*>`).ReplaceAllString(html, "\n```\n")
+	html = regexp.MustCompile(`(?i)</pre>`).ReplaceAllString(html, "\n```\n")
+	html = regexp.MustCompile(`(?i)<br\s*/?>`).ReplaceAllString(html, "\n")
 	// Block-level elements become line breaks.
 	reBreak := regexp.MustCompile(`(?i)</(p|div|li|h[1-6]|tr|br|section|article|pre|table)>`)
 	html = reBreak.ReplaceAllString(html, "\n")
@@ -328,8 +363,7 @@ func htmlToText(html string) string {
 
 	var sb strings.Builder
 	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		sb.WriteString(line)
@@ -353,4 +387,28 @@ func htmlUnescape(s string) string {
 		s = strings.ReplaceAll(s, r.from, r.to)
 	}
 	return s
+}
+
+func saveToolText(ctx *Context, prefix, text string) (string, error) {
+	dir := ctx.SessionDir
+	if ctx.Resources != nil {
+		dir = ctx.Resources.SessionDir()
+		if dir == "" {
+			dir = ctx.Resources.ScratchDir()
+		}
+	}
+	if dir == "" {
+		return "", fmt.Errorf("session output directory unavailable")
+	}
+	dir = filepath.Join(dir, "outputs")
+	if e := os.MkdirAll(dir, 0700); e != nil {
+		return "", e
+	}
+	f, e := os.CreateTemp(dir, prefix+"*.txt")
+	if e != nil {
+		return "", e
+	}
+	_, e = f.WriteString(text)
+	e = errors.Join(e, f.Close())
+	return f.Name(), e
 }

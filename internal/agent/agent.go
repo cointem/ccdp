@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"ccdp/internal/checkpoint"
 	"ccdp/internal/config"
 	"ccdp/internal/events"
 	"ccdp/internal/hooks"
@@ -115,6 +115,8 @@ type seqState struct {
 
 // dedupState groups the protocol command/input dedup indexes (guarded by mu).
 type dedupState struct {
+	agentActivity    chan struct{}
+	agentAttention   map[protocol.SessionID]string
 	seenReceipts     map[protocol.CommandID]protocol.Receipt
 	seenCommands     map[protocol.CommandID]string
 	seenInputs       map[protocol.InputID]protocol.Receipt
@@ -125,8 +127,12 @@ type dedupState struct {
 
 // watchState groups the Watch subscription registry. Guarded by watchMu.
 type watchState struct {
-	watchers  map[uint64]*runtimeWatcher
-	nextWatch uint64
+	streamTimer   *time.Timer
+	streamPending map[string]protocol.EventView
+	streamOrder   []string
+	lastStream    time.Time
+	watchers      map[uint64]*runtimeWatcher
+	nextWatch     uint64
 }
 
 // deps groups the injected service dependencies, mirroring codex's separate
@@ -150,7 +156,7 @@ type deps struct {
 	sessionReg      *plugin.SessionRegistry
 	mcp             *mcp.Manager
 	skills          *skills.Store
-	checkpoints     *checkpoint.Store
+	coding          *codingState
 	resources       *tools.Resources
 	// persistence is the sole business-fact writer for this session.
 	persistence    *sessionPersistence
@@ -197,6 +203,8 @@ type toolDiscoveryData struct {
 // turnLifecycleData groups the per-turn inbox/interrupt state. Guarded by mu.
 type turnLifecycleData struct {
 	busy          bool
+	workStartedAt time.Time
+	workLabel     string
 	interruptFlag bool
 	stop          bool
 	turnCancel    context.CancelFunc
@@ -419,7 +427,7 @@ func newAgent(cfg *config.Config, evCh chan Event, initial *SessionSnapshot) (*A
 
 func validateAgentOptions(opts Options) error {
 	switch opts.Purpose {
-	case "", childPurposeTask, childPurposeGuardian:
+	case "", childPurposeTask, childPurposeGuardian, childPurposeReview:
 		// Valid purposes are intentionally closed: silently treating an unknown
 		// purpose as an ordinary task would weaken its execution policy.
 	default:
@@ -717,7 +725,7 @@ func buildEffectiveConfig(base config.Config, initial *SessionSnapshot, isolated
 		base.MCPServers = map[string]mcp.ServerConfig{}
 		base.EnableGuardian = config.BoolPtr(false)
 		base.EnableMemory = config.BoolPtr(false)
-		if opts.Purpose == childPurposeGuardian {
+		if opts.Purpose == childPurposeGuardian || opts.Purpose == childPurposeReview {
 			// Guardian's read-only gate is name based. Do not let a configured
 			// custom command replace a built-in name such as Read and turn that
 			// allowlisted name into arbitrary shell execution.
@@ -752,12 +760,6 @@ func validateResumeSession(cfg *config.Config, initial *SessionSnapshot) error {
 			return fmt.Errorf("agent: session %q already exists; use Resume", cfg.SessionID)
 		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("agent: inspect session %q: %w", cfg.SessionID, err)
-		}
-		legacyPath := filepath.Join(cfg.SessionDir, cfg.SessionID+".json")
-		if _, err := os.Stat(legacyPath); err == nil {
-			return fmt.Errorf("agent: legacy session %q exists; use Resume", cfg.SessionID)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("agent: inspect legacy session %q: %w", cfg.SessionID, err)
 		}
 	}
 	return nil
@@ -815,6 +817,9 @@ func buildExtensionHost(cfg *config.Config, opts Options, rootCancel context.Can
 	if err := host.Load(plugin.NewToolsPlugin(cfg.WebToolsEnabled())); err != nil {
 		rollback()
 		return nil, err
+	}
+	if len(cfg.LanguageServers) == 0 {
+		registry.Unregister("builtin", "CodeNavigate")
 	}
 	// A supplied registry may already contain an explicit fake/plugin route.
 	// Loading the default HTTP plugin in that case would overwrite a route for
@@ -879,7 +884,7 @@ func (a *Agent) finalizeConstruction(initial *SessionSnapshot, opts Options, iso
 		return err
 	}
 	a.initExecutionMode(initial)
-	if err := a.startSessionServices(rootCancel, isolated, opts.CapabilityCeiling, opts.ExecutionGuard); err != nil {
+	if err := a.startSessionServices(rootCancel, isolated, opts.InheritedCapabilities, opts.ExecutionGuard); err != nil {
 		return err
 	}
 	a.finalizeToolsAndSkills(isolated)
@@ -901,17 +906,13 @@ func (a *Agent) applySessionLineage(opts Options, isolated bool) {
 	}
 	a.childSlots = newChildSlots(a.cfg.MaxParallelTools)
 	if isolated {
-		ceiling := make(map[string]bool, len(opts.CapabilityCeiling))
-		for _, capability := range opts.CapabilityCeiling {
-			ceiling[capabilityKey(capability)] = true
-		}
 		a.childState = &childRuntimeState{
+			readOnlyWorkspace: opts.ReadOnlyWorkspace,
 			purpose:           opts.Purpose,
 			nonInteractive:    opts.NonInteractive,
 			allowed:           cloneChildAllowed(opts.AllowedTools),
 			parentSession:     opts.ParentSessionID,
 			perms:             a.perms,
-			capabilityCeiling: ceiling,
 		}
 	}
 }
@@ -943,11 +944,6 @@ func (a *Agent) acquirePersistence(initial *SessionSnapshot, rootCancel context.
 	}
 	a.resources = tools.NewResourcesWithContext(a.sessionID, resourceDir, a.rootCtx)
 	a.activeBinding = a.primaryBinding
-	if a.cfg.NoSessionPersistence {
-		a.checkpoints = checkpoint.NewMemoryStore(a.sessionID)
-	} else {
-		a.checkpoints = checkpoint.NewStore(a.cfg.SessionDir, a.sessionID)
-	}
 	openErr := error(nil)
 	if initial == nil && a.cfg.SessionID != "" {
 		openErr = a.openPersistenceFresh()
@@ -957,6 +953,10 @@ func (a *Agent) acquirePersistence(initial *SessionSnapshot, rootCancel context.
 	if openErr != nil {
 		a.abortConstruction(rootCancel, false)
 		return openErr
+	}
+	if err := a.resources.Processes.CleanPreviousLogs(); err != nil {
+		a.abortConstruction(rootCancel, true)
+		return fmt.Errorf("clean previous process logs: %w", err)
 	}
 	return nil
 }
@@ -986,7 +986,11 @@ func (a *Agent) replayOwnedStore(initial *SessionSnapshot, opts Options, rootCan
 			return replayErr
 		}
 		if owned != nil {
-			if (owned.Model != "" && owned.Model != a.cfg.Model) || (owned.Workspace != "" && owned.Workspace != a.cfg.Workspace) {
+			// A completed review can discuss its report after its disposable
+			// workspace is removed. This continuation has an empty hard tool
+			// allowlist; ordinary resumes still require identical settings.
+			reportOnly := opts.Purpose == childPurposeReview && opts.AllowedTools != nil && len(opts.AllowedTools) == 0
+			if (owned.Model != "" && owned.Model != a.cfg.Model) || (!reportOnly && owned.Workspace != "" && owned.Workspace != a.cfg.Workspace) {
 				a.abortConstruction(rootCancel, true)
 				return fmt.Errorf("agent: session settings changed while opening %q; retry resume", a.sessionID)
 			}
@@ -1061,7 +1065,6 @@ func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated boo
 			return fmt.Errorf("inherit parent sandbox capability: %w", err)
 		}
 	}
-	a.checkpoints.SetExecutionBoundary(a.rootCtx, a.sandbox)
 	a.hooks = hooks.NewManager(a.cfg.Hooks, hooks.Options{SessionID: a.sessionID, Workspace: a.cfg.Workspace, Mode: a.cfg.PermissionMode, Sandbox: a.sandbox, FailClosed: true})
 	a.mcp.SetSandbox(a.sandbox)
 	a.hooks.SetTranscript(a.cfg.SessionDir)
@@ -1124,61 +1127,6 @@ func (a *Agent) openTraceAndSupervisor(opts Options) {
 	a.emitSessionLifecycle(false)
 }
 
-// CreateCheckpoint snapshots the workspace under a git-based checkpoint and
-// returns its id. Non-git workspaces return an error.
-func (a *Agent) CreateCheckpoint(summary string) (string, error) {
-	if err := a.admitCheckpoint("git stash create -u ccdp checkpoint"); err != nil {
-		return "", err
-	}
-	id, err := a.checkpoints.Create(a.cfg.Workspace, summary)
-	if err != nil {
-		return "", err
-	}
-	if id == "" {
-		a.emitStatus("no changes to checkpoint")
-		return "", nil
-	}
-	a.emitStatus("checkpoint %s created", id)
-	return id, nil
-}
-
-// RestoreCheckpoint rewinds the working tree to a checkpoint snapshot.
-func (a *Agent) RestoreCheckpoint(id string) error {
-	if err := a.admitCheckpoint("git checkout <checkpoint> -- ."); err != nil {
-		return err
-	}
-	if err := a.checkpoints.Restore(a.cfg.Workspace, id); err != nil {
-		return err
-	}
-	workspace.Invalidate(a.cfg.Workspace)
-	a.emitStatus("restored checkpoint %s", id)
-	return nil
-}
-
-func (a *Agent) admitCheckpoint(command string) error {
-	a.mu.Lock()
-	perms := a.perms
-	plan := a.planMode
-	a.mu.Unlock()
-	if plan {
-		return fmt.Errorf("checkpoint operation is unavailable in plan mode")
-	}
-	if perms == nil {
-		return fmt.Errorf("checkpoint permission manager is unavailable")
-	}
-	if denied, reason := perms.HardDeny("Bash", map[string]any{"command": command}); denied {
-		return fmt.Errorf("checkpoint denied: %s", reason)
-	}
-	decision, reason := perms.Check("Bash", map[string]any{"command": command})
-	if decision == permissions.DecisionDeny || decision == permissions.DecisionAsk {
-		return fmt.Errorf("checkpoint requires explicit permission: %s", reason)
-	}
-	return nil
-}
-
-// CheckpointList returns the session's checkpoints, newest first.
-func (a *Agent) CheckpointList() []checkpoint.Record { return a.checkpoints.List() }
-
 // AddDirectory grants the sandbox access to an extra directory at runtime.
 func (a *Agent) AddDirectory(dir string) {
 	a.mu.Lock()
@@ -1222,8 +1170,10 @@ func Resume(cfg *config.Config, snap *SessionSnapshot, evCh chan Event) (*Agent,
 		copy.CreatedAt = time.Now().UTC()
 		snap = &copy
 	}
-	if err := prepareResumePersistence(cfg, *snap); err != nil {
-		return nil, err
+	if !cfg.NoSessionPersistence {
+		if _, err := os.Stat(filepath.Join(cfg.SessionDir, snap.ID, "events.v1.jsonl")); err != nil {
+			return nil, fmt.Errorf("agent: resume requires an existing JSONL session: %w", err)
+		}
 	}
 	// Construct every session-scoped component with the restored id from the
 	// start. This avoids creating hooks, traces and checkpoint stores under a
@@ -1529,7 +1479,14 @@ func (a *Agent) Run() {
 // runTurn processes one user message through the full agent loop:
 // Infer → ToolDispatch → ApprovalGate → Compact.
 func (a *Agent) runTurn(input turnInput) {
-	startedAt := time.Now()
+	var turnErr error
+	a.mu.Lock()
+	a.lastTurn = &protocol.TurnOutcome{TurnID: protocol.TurnID(fmt.Sprintf("%d", a.turnSeq)), Status: protocol.TurnRunning}
+	startedAt := a.workStartedAt
+	a.mu.Unlock()
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
 	defer a.turnWG.Done()
 	// turnFinished may hand off to a queued follow-up and add another turn to
 	// the same WaitGroup. Keep this turn counted until that hand-off has either
@@ -1556,26 +1513,20 @@ func (a *Agent) runTurn(input turnInput) {
 		if !turnStarted {
 			return
 		}
-		outcome := "success"
-		finishErr := ""
-		if err := a.persistenceFailure(); err != nil {
+		a.mu.Lock()
+		if turnErr != nil {
+			a.lastTurn.Status = protocol.TurnFailed
+			a.lastTurn.Error = turnErr.Error()
+		}
+		a.settleTurnLocked(protocol.TurnID(fmt.Sprintf("%d", turnSeq)), nil)
+		result := *a.lastTurn
+		a.mu.Unlock()
+		outcome, finishErr := "success", result.Error
+		switch result.Status {
+		case protocol.TurnFailed:
 			outcome = "error"
-			finishErr = err.Error()
-		} else {
-			// EventError is observed synchronously by publishEvent, so the
-			// canonical turn outcome is available before this deferred durable
-			// TurnFinished fact. Provider/input failures must not be recorded as
-			// successful turns merely because they did not poison persistence.
-			a.mu.Lock()
-			failed := a.lastTurn != nil && a.lastTurn.TurnID == protocol.TurnID(fmt.Sprintf("%d", turnSeq)) && a.lastTurn.Status == protocol.TurnFailed
-			if failed {
-				outcome = "error"
-				finishErr = a.lastTurn.Error
-			}
-			a.mu.Unlock()
-			if !failed && a.interrupted() {
-				outcome = "cancelled"
-			}
+		case protocol.TurnCancelled:
+			outcome = "cancelled"
 		}
 		if err := a.persistTurnFinished(turnID, outcome, finishErr, time.Since(startedAt)); err != nil {
 			a.failTurnPersistence(err)
@@ -1583,6 +1534,18 @@ func (a *Agent) runTurn(input turnInput) {
 	}()
 
 	a.beginTurnState(text)
+	finishCheckpoint, checkpointErr := a.beginAutomaticCheckpoint(a.rootCtx, turnID, text, userMessage.ID)
+	if checkpointErr != nil {
+		turnErr = fmt.Errorf("checkpoint: %w", checkpointErr)
+		a.emit(Event{Type: EventError, Text: turnErr.Error()})
+		return
+	}
+	defer func() {
+		// The model has finished. Snapshot sealing and session persistence can
+		// take time, but must not keep advertising a live response stream.
+		a.setPhase(protocol.PhaseFinalizing)
+		finishCheckpoint()
+	}()
 
 	// UserPromptSubmit hook can veto the message before any work happens. Tie
 	// it to the runtime root so Close can stop a hanging external hook; there
@@ -1599,6 +1562,7 @@ func (a *Agent) runTurn(input turnInput) {
 			reason = "blocked by UserPromptSubmit hook"
 		}
 		a.emit(Event{Type: EventUserMsg, Text: text, MessageID: userMessage.ID})
+		turnErr = errors.New(reason)
 		a.emit(Event{Type: EventError, Text: reason})
 		return
 	} else if ho.Continue != nil && !*ho.Continue {
@@ -1609,6 +1573,7 @@ func (a *Agent) runTurn(input turnInput) {
 			reason = "stopped by UserPromptSubmit hook"
 		}
 		a.emit(Event{Type: EventUserMsg, Text: text, MessageID: userMessage.ID})
+		turnErr = errors.New(reason)
 		a.emit(Event{Type: EventError, Text: reason})
 		return
 	} else if ho.AdditionalContext != "" {
@@ -1639,6 +1604,10 @@ func (a *Agent) runTurn(input turnInput) {
 			a.interruptNote = true
 			a.mu.Unlock()
 			a.emitStatus("turn interrupted")
+			return
+		}
+		if err := a.consumeAgentMessages(); err != nil {
+			a.failTurnPersistence(err)
 			return
 		}
 		// Compaction gate (Codex: compact between turns).
@@ -1690,6 +1659,7 @@ func (a *Agent) runTurn(input turnInput) {
 			cancelStepContext()
 			var inputErr *stepInputError
 			if errors.As(stepErr, &inputErr) {
+				turnErr = inputErr
 				a.emit(Event{Type: EventError, Text: inputErr.Error()})
 			} else {
 				a.failTurnPersistence(stepErr)
@@ -1710,6 +1680,7 @@ func (a *Agent) runTurn(input turnInput) {
 			releaseStep()
 			var inputErr *stepInputError
 			if errors.As(requestErr, &inputErr) {
+				turnErr = inputErr
 				a.emit(Event{Type: EventError, Text: inputErr.Error()})
 			} else {
 				a.failTurnPersistence(requestErr)
@@ -1723,11 +1694,25 @@ func (a *Agent) runTurn(input turnInput) {
 			if detail == "" {
 				detail = "request preparation failed"
 			}
-			a.emit(Event{Type: EventError, Text: "request preparation failed: " + detail})
+			turnErr = fmt.Errorf("request preparation failed: %s", detail)
+			a.emit(Event{Type: EventError, Text: turnErr.Error()})
 			return
 		}
 
 		var streamed strings.Builder
+		var segments []messages.StreamSegment
+		segmentKind := ""
+		addSegment := func(kind, delta string) {
+			if delta == "" {
+				segmentKind = ""
+				return
+			}
+			if segmentKind != kind {
+				segments = append(segments, messages.StreamSegment{Kind: kind})
+				segmentKind = kind
+			}
+			segments[len(segments)-1].Bytes += len(delta)
+		}
 		var res llm.StreamResult
 		var streamErr error
 		a.setPhase(protocol.PhaseStreaming)
@@ -1743,9 +1728,11 @@ func (a *Agent) runTurn(input turnInput) {
 				Turn: step.turn, Step: step.step, HistoryLen: len(step.history),
 			}
 			r, err := a.streamPrepared(turnCtx, purpose, call, metadata, func(delta string) {
+				addSegment("assistant", delta)
 				streamed.WriteString(delta)
 				a.emit(Event{Type: EventStream, Text: delta})
 			}, func(delta string) {
+				addSegment("thinking", delta)
 				a.emit(Event{Type: EventReasoning, Text: delta})
 			})
 			res = r
@@ -1753,10 +1740,16 @@ func (a *Agent) runTurn(input turnInput) {
 			close(streamDone)
 		}()
 		<-streamDone
+		// Stop the streaming phase before committing the answer or processing
+		// its tool calls. A completed provider stream is no longer live output.
+		a.setPhase(protocol.PhasePreparing)
 
 		if streamErr != nil {
-			if a.handleStreamError(streamErr, releaseStep) {
+			if a.handleStreamError(streamErr, releaseStep, len(segments) == 0 && res.Text == "" && res.Reasoning == "") {
 				continue // switched to the fallback model; retry this step
+			}
+			if !a.interrupted() {
+				turnErr = fmt.Errorf("LLM error: %w", streamErr)
 			}
 			return
 		}
@@ -1781,11 +1774,15 @@ func (a *Agent) runTurn(input turnInput) {
 				return
 			}
 			releaseStep()
-			a.emit(Event{Type: EventError, Text: "invalid tool call: " + toolCallErr.Error()})
+			turnErr = fmt.Errorf("invalid tool call: %w", toolCallErr)
+			a.emit(Event{Type: EventError, Text: turnErr.Error()})
 			return
 		}
 		assistant := messages.AssistantWithTools(callText, calls)
 		assistant.ReasoningContent = res.Reasoning
+		if validStreamSegments(segments, callText, res.Reasoning) {
+			assistant.StreamSegments = segments
+		}
 		if err := a.appendHistoryForStep(fmt.Sprintf("step-%d", step.step), assistant); err != nil {
 			releaseStep()
 			a.failTurnPersistence(err)
@@ -1838,6 +1835,25 @@ func (a *Agent) runTurn(input turnInput) {
 				continue
 			}
 			// AutoMem: remember the final assistant answer as the turn's outcome.
+			if a.childState == nil {
+				reason, err := a.waitAgentEvent(turnCtx)
+				if err != nil {
+					releaseStep()
+					turnErr = err
+					return
+				}
+				if reason != "no_pending_work" {
+					if reason == "user_input" {
+						if _, _, err := a.claimPendingInputAndAppend(fmt.Sprintf("turn-%d", a.currentTurnSeq()), protocol.InputSteer); err != nil {
+							releaseStep()
+							a.failTurnPersistence(err)
+							return
+						}
+					}
+					releaseStep()
+					continue
+				}
+			}
 			a.mu.Lock()
 			a.turnSummary = callText
 			a.mu.Unlock()
@@ -1996,7 +2012,7 @@ func (a *Agent) executeToolCallsForStep(calls []messages.ToolCall, step stepRunt
 // (the primary client failed once and the fallback budget for this turn is
 // unused); false ends the turn, having released the step lease and emitted the
 // appropriate error/interruption signal.
-func (a *Agent) handleStreamError(streamErr error, releaseStep func()) bool {
+func (a *Agent) handleStreamError(streamErr error, releaseStep func(), allowFallback bool) bool {
 	if isRequestJournalFailure(streamErr) {
 		releaseStep()
 		a.emit(Event{Type: EventError, Text: "request journal error: " + streamErr.Error()})
@@ -2016,7 +2032,7 @@ func (a *Agent) handleStreamError(streamErr error, releaseStep func()) bool {
 	// endpoint (req.Model comes from activeModelSnapshot).
 	a.mu.Lock()
 	fallback := a.fallbackBinding
-	if !a.usedFallback && fallback.client != nil {
+	if allowFallback && !a.usedFallback && fallback.client != nil {
 		a.usedFallback = true
 		a.client = fallback.client
 		a.activeModel = fallback.model
@@ -2144,6 +2160,8 @@ func (a *Agent) launchQueuedTurn(completedTurnSeq uint64) bool {
 	a.stop = false
 	a.settling = false
 	a.busy = true
+	a.workStartedAt = time.Now()
+	a.workLabel = ""
 	a.phase = protocol.PhasePreparing
 	a.mu.Unlock()
 	a.publishState()
@@ -2498,7 +2516,7 @@ func (a *Agent) hardAdmitTool(tc messages.ToolCall, journal toolJournalContext, 
 		a.emit(toolEvent(tc, "error", "unknown tool "+tc.Name))
 		return nil, fmt.Sprintf("Error: unknown tool %q", tc.Name), false, true
 	}
-	if purpose, _, _, child := ChildRuntime(a); child && purpose == childPurposeGuardian && !readOnlyImplementation(tool) {
+	if purpose, _, _, child := ChildRuntime(a); child && (purpose == childPurposeGuardian || purpose == childPurposeReview || a.childState.readOnlyWorkspace) && !readOnlyImplementation(tool) && !(purpose == childPurposeTask && childMessageTool(tool)) {
 		reason := fmt.Sprintf("guardian hard deny: tool %q is not the built-in read-only implementation", tc.Name)
 		a.emit(toolEvent(tc, "denied", reason))
 		return nil, fmt.Sprintf("permission denied: %s", reason), false, true
@@ -2577,7 +2595,16 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 			if err := execution.finish(a, tc, raw, failed); err != nil {
 				return "session persistence failed: " + err.Error(), true
 			}
-			return a.toolOutputPreview(raw, cfg.MaxResultSizeChars), failed
+			preview := a.toolOutputPreview(raw, cfg.MaxResultSizeChars)
+			if preview != raw && json.Valid([]byte(raw)) {
+				failed = true
+			}
+			if tc.Name == "Read" && preview != raw && resources != nil {
+				if path, e := sb.ResolveRead(tools.StringArg(tc.Arguments, "file_path", "")); e == nil {
+					resources.Files.ForgetFile(path)
+				}
+			}
+			return preview, failed
 		}
 		// Direct/legacy callers retain the historical output-file and
 		// per-agent clipping behavior. Canonical turns use the typed raw blob
@@ -2604,9 +2631,9 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 		}
 	}
 	elapsed := time.Since(start).Round(time.Millisecond)
-	status := errString(err)
-	if status == "" {
-		status = "ok"
+	status := "ok"
+	if err != nil {
+		status = err.Error()
 	}
 	a.logv("tool %s %s in %s", tc.Name, status, elapsed)
 
@@ -2674,6 +2701,9 @@ func (a *Agent) buildToolContext(tc messages.ToolCall, turnCtx context.Context, 
 		// New sessions always own a Resources container.
 		tctx = &tools.Context{Context: turnCtx, WorkingDir: cfg.Workspace, SessionDir: cfg.SessionDir, Sandbox: sb}
 	}
+	if a.childState != nil && a.childState.purpose == childPurposeReview {
+		tctx.ReadRoot = filepath.Dir(cfg.Workspace)
+	}
 	tctx.Args = make(map[string]any, len(tc.Arguments))
 	for name, value := range tc.Arguments {
 		if name == "requested_capabilities" {
@@ -2683,24 +2713,35 @@ func (a *Agent) buildToolContext(tc messages.ToolCall, turnCtx context.Context, 
 	}
 	tctx.HostNetworkAllowed = sb != nil && sb.NetworkAllowed()
 	tctx.Timeout = cfg.BashTimeout()
+	if cfg.MaxResultSizeChars > 0 {
+		tctx.OutputLimit = cfg.MaxResultSizeChars
+	}
 	if a.childState == nil {
 		tctx.Sessions = a.Sessions()
-		tctx.AgentCommandID = protocol.CommandID(stableID("agent-tool", struct{ Session, Turn, Call string }{a.sessionID, fmt.Sprint(a.turnSeq), tc.ID}))
 	}
-	tctx.Subagent = func(description, system string) (string, error) {
-		results, err := a.runManagedTasks([]tools.SubagentTask{{Description: description, SystemPrompt: system}}, tc.ID)
-		if err != nil {
-			return "", err
-		}
-		if results[0].Error != "" {
-			return results[0].Output, errors.New(results[0].Error)
-		}
-		return results[0].Output, nil
+	// Provider call IDs are response-local and may repeat on a later step.
+	a.mu.Lock()
+	turn, step := a.turnSeq, a.stepSeq
+	a.mu.Unlock()
+	tctx.AgentCommandID = protocol.CommandID(stableID("agent-tool", struct {
+		Session, Call string
+		Turn, Step    uint64
+	}{a.sessionID, tc.ID, turn, step}))
+	tctx.SendAgentMessage = func(target, text string) error { return a.sendAgentMessage(turnCtx, tctx.AgentCommandID, target, text) }
+	tctx.WaitAgentEvent = a.waitAgentEvent
+	if a.supervisor != nil {
+		tctx.ReadAgent = a.supervisor.readAgent
 	}
-	tctx.Subagents = func(tasks []tools.SubagentTask) ([]tools.SubagentResult, error) {
-		return a.runManagedTasks(tasks, tc.ID)
+	tctx.SpawnAgent = func(task tools.SpawnAgentRequest) (protocol.AgentReceipt, error) {
+		return a.spawnAgent(task, tc.ID)
+	}
+	tctx.NavigateSemantic = func(op, path string, line, character int) (string, error) {
+		return a.semanticNavigate(turnCtx, cfg, sb, op, path, line, character)
 	}
 	tctx.Skills = skills
+	if a.persistenceHandle() != nil && (cfg.AutomaticCheckpoints == nil || *cfg.AutomaticCheckpoints) {
+		tctx.BeforeWrite = a.beforeCodingWrite
+	}
 	if resources != nil {
 		tctx.Owner = resources.Owner()
 	}
@@ -2947,6 +2988,9 @@ func (a *Agent) interrupt() {
 	}
 	if compactCancel != nil {
 		compactCancel()
+	}
+	if a.childState == nil && a.supervisor != nil {
+		a.supervisor.cancelDelegated(a)
 	}
 }
 

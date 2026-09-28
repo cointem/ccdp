@@ -66,6 +66,32 @@ func TestPRCommentsNoRepo(t *testing.T) {
 	}
 }
 
+func TestPRQueriesUseBranchPositionArgument(t *testing.T) {
+	dir := t.TempDir()
+	git(t, dir, "init", "-q")
+	git(t, dir, "checkout", "-q", "-b", "feature-test")
+	git(t, dir, "remote", "add", "origin", "https://github.com/example/repo.git")
+	bin := dir + "/bin"
+	if err := os.Mkdir(bin, 0755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\ncase \"$*\" in\n'pr view --comments feature-test') echo comments;;\n'pr view --json url --jq .url feature-test') echo https://github.com/example/repo/pull/1;;\n'--version'|'auth status') echo ok;;\n*) echo wrong-argv >&2; exit 1;;\nesac\n"
+	if err := os.WriteFile(bin+"/gh", []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	a := newGithubAgent(t, dir)
+	defer a.Close()
+	a.perms.SetAllowAll(true)
+	a.sandbox.SetAllowNetwork(true)
+	if got := a.PRComments(); got != "comments" {
+		t.Fatalf("comments: %s", got)
+	}
+	if got := a.GitHubStatus(); !strings.Contains(got, "pr: https://github.com/example/repo/pull/1") {
+		t.Fatalf("status: %s", got)
+	}
+}
+
 func TestFirstLine(t *testing.T) {
 	cases := map[string]string{
 		"a\nb\nc":  "a",

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,14 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"ccdp/internal/atomicfile"
 	"ccdp/internal/execution"
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
-	"ccdp/internal/session"
 	"ccdp/internal/workspace"
 )
 
@@ -184,55 +183,35 @@ func (a *Agent) applyCheckpointCommand(cmd protocol.Command) protocol.Receipt {
 	if cmd.Checkpoint == nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "checkpoint payload is required")
 	}
-	action := cmd.Checkpoint.Action
-	if action == protocol.CheckpointList {
-		return a.scheduleCommandOperation(cmd, "checkpoint", func(context.Context) (string, error) {
-			records := a.CheckpointList()
-			if len(records) == 0 {
-				return "no checkpoints", nil
-			}
-			var b strings.Builder
-			for _, record := range records {
-				fmt.Fprintf(&b, "%s  %s  %s\n", record.ID, record.CreatedAt.Format(time.RFC3339), record.Summary)
-			}
-			return strings.TrimSpace(b.String()), nil
-		})
-	}
-	if a.inPlanMode() {
-		return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "checkpoint mutation is unavailable in plan mode")
-	}
-	command := "git stash create -u ccdp checkpoint"
-	if action == protocol.CheckpointRestore {
-		command = "git checkout <checkpoint> -- . && git reset -q <checkpoint> --"
-	}
-	if err := a.precheckCommand("Bash", map[string]any{"command": command}); err != nil {
-		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
-	}
 	return a.scheduleCommandOperation(cmd, "checkpoint", func(ctx context.Context) (string, error) {
-		if err := a.authorizeCommand(ctx, cmd.ID, "Bash", map[string]any{"command": command}); err != nil {
-			return "", err
-		}
-		a.mu.Lock()
-		dir := a.cfg.Workspace
-		a.mu.Unlock()
-		switch action {
+		switch cmd.Checkpoint.Action {
+		case protocol.CheckpointList:
+			points, e := a.recoveryPoints()
+			if e != nil {
+				return "", e
+			}
+			b, e := json.MarshalIndent(map[string]any{"recovery_points": points}, "", "  ")
+			return string(b), e
 		case protocol.CheckpointCreate:
-			id, err := a.checkpoints.CreateContext(ctx, dir, cmd.Checkpoint.Summary)
-			if err != nil {
-				return "", err
+			if a.inPlanMode() {
+				return "", errors.New("checkpoint creation is unavailable in plan mode")
 			}
-			if id == "" {
-				return "no changes to checkpoint", nil
+			p, e := a.captureRecoveryPoint(ctx, string(cmd.ID), cmd.Checkpoint.Summary)
+			if e != nil {
+				return "", e
 			}
-			return "checkpoint " + id + " created", nil
+			p.After = p.Before
+			if _, e = a.persistenceHandle().commitEvents(p.ID+"-sealed", p); e != nil {
+				return "", e
+			}
+			return "checkpoint " + p.ID + " created; /rewind prepare " + p.ID + " --mode both previews recovery", nil
 		case protocol.CheckpointRestore:
-			if err := a.checkpoints.RestoreContext(ctx, dir, cmd.Checkpoint.ID); err != nil {
-				return "", err
-			}
-			workspace.Invalidate(dir)
-			return "restored checkpoint " + cmd.Checkpoint.ID, nil
+			id := cmd.Checkpoint.ID
+			next := cmd
+			next.Workflow = &protocol.WorkflowCommand{Kind: protocol.WorkflowRestore, Action: "prepare", ID: id, Mode: "code", Scope: "snapshot"}
+			return a.runRestore(ctx, next)
 		default:
-			return "", fmt.Errorf("unknown checkpoint action %q", action)
+			return "", errors.New("unknown checkpoint action")
 		}
 	})
 }
@@ -331,235 +310,45 @@ func (a *Agent) applyWorkflowCommand(cmd protocol.Command) protocol.Receipt {
 	}
 	switch cmd.Workflow.Kind {
 	case protocol.WorkflowReview:
-		return a.scheduleCommandOperation(cmd, "review", func(ctx context.Context) (string, error) {
-			diff, err := a.runWorkflowStep(ctx, cmd.ID, "git-diff", []string{"git", "diff"}, false)
+		if cmd.Workflow.Action != "" {
+			return a.scheduleOperation(cmd, "review", func(ctx context.Context) (string, error) { return a.readReviews(cmd.Workflow) }, operationConcurrent)
+		}
+		return a.scheduleOperation(cmd, "review", func(ctx context.Context) (string, error) { return a.launchReview(cmd) }, operationConcurrent)
+	case protocol.WorkflowRestore:
+		if a.inPlanMode() && cmd.Workflow.Action != "list" && cmd.Workflow.Action != "prepare" {
+			return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "restore is unavailable in plan mode")
+		}
+		return a.scheduleCommandOperation(cmd, "restore", func(ctx context.Context) (string, error) { return a.runRestore(ctx, cmd) })
+	case protocol.WorkflowMerge:
+		return a.scheduleCommandOperation(cmd, "merge child", func(ctx context.Context) (string, error) { return a.runMergeChild(ctx, cmd) })
+	case protocol.WorkflowIndex:
+		return a.scheduleCommandOperation(cmd, "index", func(ctx context.Context) (string, error) {
+			a.mu.Lock()
+			root := a.cfg.Workspace
+			policy := a.sandbox.Snapshot()
+			a.mu.Unlock()
+			if cmd.Workflow.Action == "refresh" {
+				workspace.Invalidate(root)
+			}
+			paths, err := workspace.Inventory(ctx, root, policy)
 			if err != nil {
-				return diff, err
+				return "", err
 			}
-			records := a.CheckpointList()
-			var report strings.Builder
-			report.WriteString(diff)
-			if len(records) > 0 {
-				report.WriteString("\n\ncheckpoints:\n")
-				for _, record := range records {
-					fmt.Fprintf(&report, "%s  %s  %s\n", record.ID, record.CreatedAt.Format(time.RFC3339), record.Summary)
-				}
-			}
-			return strings.TrimSpace(report.String()), nil
+			return fmt.Sprintf("%d files in the complete accessible inventory. Use Glob/LS for paths and Grep for text. CodeNavigate supports outline, definition and references when a trusted language server is configured.", len(paths)), nil
 		})
 	case protocol.WorkflowCommitPushPR:
 		if a.inPlanMode() {
 			return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "commit/push/PR is unavailable in plan mode")
 		}
-		message := strings.TrimSpace(cmd.Workflow.Message)
-		steps := []struct {
-			label   string
-			argv    []string
-			network bool
-		}{
-			{label: "git-add", argv: []string{"git", "add", "-A"}},
-			{label: "git-commit", argv: []string{"git", "commit", "-m", message}},
-			{label: "git-push", argv: []string{"git", "push", "-u", "origin", "HEAD"}, network: true},
-			{label: "gh-pr-create", argv: []string{"gh", "pr", "create", "--fill"}, network: true},
-		}
-		return a.scheduleCommandOperation(cmd, "commit/push/PR", func(ctx context.Context) (string, error) {
-			var report strings.Builder
-			for i, step := range steps {
-				id := protocol.CommandID(fmt.Sprintf("%s-step-%d", cmd.ID, i+1))
-				out, err := a.runWorkflowStep(ctx, id, step.label, step.argv, step.network)
-				if out != "" {
-					if report.Len() > 0 {
-						report.WriteString("\n")
-					}
-					fmt.Fprintf(&report, "%s: %s", step.label, out)
-				}
-				if err != nil {
-					return strings.TrimSpace(report.String()), err
-				}
+		return a.scheduleCommandOperation(cmd, "delivery", func(ctx context.Context) (string, error) {
+			if cmd.Workflow.Action == "apply" || cmd.Workflow.Action == "resume" {
+				return a.applyDelivery(ctx, cmd)
 			}
-			return strings.TrimSpace(report.String()), nil
+			return a.prepareDelivery(ctx, cmd)
 		})
 	default:
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, fmt.Sprintf("unknown workflow %q", cmd.Workflow.Kind))
 	}
-}
-
-// runWorkflowStep performs one fixed, argv-only step after the normal hard
-// deny/approval gate.  It intentionally rechecks policy for every step so a
-// deny/reload cannot be bypassed by an earlier approval in the same workflow.
-func (a *Agent) runWorkflowStep(ctx context.Context, id protocol.CommandID, label string, argv []string, network bool) (string, error) {
-	if len(argv) == 0 {
-		return "", fmt.Errorf("%s: empty command", label)
-	}
-	if argv[0] != "git" && argv[0] != "gh" {
-		return "", fmt.Errorf("%s: command is not allowed", label)
-	}
-	command := formatExternalCommand(argv)
-	if err := a.precheckCommand("Bash", map[string]any{"command": command}); err != nil {
-		return "", err
-	}
-	if err := a.authorizeCommand(ctx, id, "Bash", map[string]any{"command": command}); err != nil {
-		return "", err
-	}
-	a.mu.Lock()
-	workspace := a.cfg.Workspace
-	sb := a.sandbox
-	a.mu.Unlock()
-	if network && (sb == nil || !sb.NetworkAllowed()) {
-		return "", fmt.Errorf("%s: network command denied: no network capability is authorized", label)
-	}
-	actualArgv := argv
-	readOnly := externalCommandReadOnly(argv)
-	if readOnly && argv[0] == "git" {
-		hardened, err := execution.ReadOnlyGitArgv(argv)
-		if err != nil {
-			return "", err
-		}
-		actualArgv = hardened
-	}
-	env := execution.SanitizedEnvironmentFor(execution.EnvironmentGit, os.Environ())
-	if readOnly && actualArgv[0] == "git" {
-		env = execution.ReadOnlyGitEnvironment(env)
-	}
-	res, err := execution.RunArgv(ctx, actualArgv, execution.Request{Context: ctx, Dir: workspace,
-		Sandbox: sb, Env: env, OutputLimit: commandOutputLimit})
-	out := strings.TrimSpace(res.Output)
-	if err != nil {
-		return out, fmt.Errorf("%s: %w", label, err)
-	}
-	if res.TimedOut {
-		return out, fmt.Errorf("%s: command timed out", label)
-	}
-	if res.ExitCode != 0 {
-		return out, fmt.Errorf("%s: exited with status %d", label, res.ExitCode)
-	}
-	return out, nil
-}
-
-type commandOperation func(context.Context) (string, error)
-
-func (a *Agent) scheduleCommandOperation(cmd protocol.Command, name string, operation commandOperation) protocol.Receipt {
-	return a.scheduleCommandOperationWithBusy(cmd, name, operation, true)
-}
-
-// scheduleCommandOperationWithBusy runs a typed operation with one durable
-// completion/receipt boundary. Read-only queries and an explicit Save may run
-// alongside a model turn; mutating operations reserve the session busy state.
-func (a *Agent) scheduleCommandOperationWithBusy(cmd protocol.Command, name string, operation commandOperation, requireIdle bool) protocol.Receipt {
-	a.mu.Lock()
-	revoking := a.capabilityRevoking
-	if (requireIdle && (a.busy || a.settling)) || a.closing || a.closed ||
-		revoking && name != "query:doctor" && name != "query:status" {
-		a.mu.Unlock()
-		if revoking {
-			return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox capability revocation is in progress")
-		}
-		if requireIdle {
-			return a.rejectedReceipt(cmd, protocol.ErrorBusy, "command requires an idle session")
-		}
-		return a.rejectedReceipt(cmd, protocol.ErrorClosed, "session is closing")
-	}
-	ctx, cancel := context.WithCancel(a.rootCtx)
-	if requireIdle {
-		a.busy = true
-		a.phase = protocol.PhaseExecutingTools
-		a.turnCancel = cancel
-		a.turnCtx = ctx
-	}
-	a.operationWG.Add(1)
-	trackForSandboxQuiescence := !sandboxQuiescenceOwner(name) && name != "query:doctor" && name != "query:status"
-	if trackForSandboxQuiescence {
-		a.sandboxOperationWG.Add(1)
-	}
-	a.mu.Unlock()
-	if err := a.persistCommandScheduled(cmd, name, a.revision().LogSeq); err != nil {
-		if requireIdle {
-			a.mu.Lock()
-			if a.turnCtx == ctx {
-				a.turnCancel = nil
-				a.turnCtx = nil
-				a.busy = false
-				a.phase = protocol.PhaseIdle
-			}
-			a.mu.Unlock()
-		}
-		cancel()
-		a.operationWG.Done()
-		if trackForSandboxQuiescence {
-			a.sandboxOperationWG.Done()
-		}
-		return a.rejectedReceipt(cmd, protocol.ErrorInternal, err.Error())
-	}
-	if requireIdle {
-		a.publishState()
-	}
-	receipt := a.receipt(cmd, protocol.ReceiptScheduled, protocol.OperationID(cmd.ID), nil)
-	go a.completeScheduledOperation(ctx, cancel, cmd, name, operation, requireIdle, trackForSandboxQuiescence)
-	return receipt
-}
-
-// completeScheduledOperation runs a long-lived command operation, releases its
-// busy reservation, and persists the terminal CommandCompleted admission ahead
-// of the final receipt so a restart cannot observe a success without it.
-func (a *Agent) completeScheduledOperation(ctx context.Context, cancel context.CancelFunc, cmd protocol.Command, name string, operation func(context.Context) (string, error), requireIdle, trackForSandboxQuiescence bool) {
-	defer a.operationWG.Done()
-	if trackForSandboxQuiescence {
-		defer a.sandboxOperationWG.Done()
-	}
-	output, err := operation(ctx)
-	status := "success"
-	if err != nil {
-		status = "error"
-	}
-	boundedOutput := boundedCommandOutput(output)
-	if requireIdle {
-		a.mu.Lock()
-		// context.CancelFunc is deliberately not comparable. The context returned
-		// by WithCancel is the operation's identity, so clear the cancellation
-		// handles only if this worker still owns that context.
-		if a.turnCtx == ctx {
-			a.turnCancel = nil
-			a.turnCtx = nil
-		}
-		if !a.closing && !a.closed {
-			a.busy = false
-			a.phase = protocol.PhaseIdle
-		}
-		a.mu.Unlock()
-	}
-	cancel()
-	// receipt persists CommandCompleted before publishing the final receipt.
-	// Keep that durable boundary ahead of all transient operation output so a
-	// restart cannot observe a successful report without its completion fact.
-	completion := &session.CommandCompleted{CommandID: string(cmd.ID), Outcome: status}
-	if err != nil {
-		completion.Code = string(protocol.ErrorInternal)
-		completion.Report = err.Error()
-	}
-	finalReceipt := a.receiptWithFactAndOutput(cmd, func() protocol.ReceiptStatus {
-		if err != nil {
-			return protocol.ReceiptRejected
-		}
-		return protocol.ReceiptApplied
-	}(), protocol.OperationID(cmd.ID), func() *protocol.CommandError {
-		if err == nil {
-			return nil
-		}
-		return &protocol.CommandError{Code: protocol.ErrorInternal, Message: err.Error()}
-	}(), completion, boundedOutput)
-	if finalReceipt.Rejected() {
-		reason := "command completion was not persisted"
-		if finalReceipt.Error != nil {
-			reason = finalReceipt.Error.Error()
-		}
-		a.emit(Event{Type: EventError, Text: name + ": " + reason})
-	} else {
-		a.emit(Event{Type: EventToolResult, Tool: &ToolEvent{ID: string(cmd.ID), Name: name, Status: status, Output: boundedOutput}})
-		if err != nil {
-			a.emit(Event{Type: EventError, Text: name + ": " + err.Error()})
-		}
-	}
-	a.publishState()
 }
 
 func boundedCommandOutput(value string) string {

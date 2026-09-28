@@ -1,8 +1,8 @@
 package agent
 
 // This file contains the shared child-runtime contract.  The provider/runtime
-// owner wires these values into Agent's single construction path; Task and the
-// guardian only use the lifecycle runner in subagent.go.  Keeping the options
+// owner wires these values into Agent's single construction path; all children
+// use the supervisor lifecycle. Keeping the options
 // small makes the frozen boundary explicit and avoids a second constructor
 // which could accidentally reload project settings or providers.
 
@@ -36,12 +36,12 @@ type Options struct {
 	ProviderRegistry      *plugin.ModelRegistry
 	Permissions           *permissions.Manager
 	NonInteractive        bool
+	ReadOnlyWorkspace     bool
 	AllowedTools          map[string]bool
 	Purpose               string
 	ParentSessionID       string
-	CapabilityCeiling     []protocol.CapabilityRequest
+	InheritedCapabilities []protocol.CapabilityRequest
 	ExecutionGuard        *sandbox.ExecutionGuard
-	toolBindingDigest     string
 	memoryResume          []session.Record
 	memoryBlobs           *memoryRequestArtifacts
 }
@@ -49,6 +49,7 @@ type Options struct {
 const (
 	childPurposeTask     = "task"
 	childPurposeGuardian = "guardian"
+	childPurposeReview   = "review"
 	defaultChildWorkers  = 4
 )
 
@@ -56,31 +57,52 @@ const (
 // The provider's executeTool path must invoke ChildToolGate before registry
 // lookup, hooks, permission checks, or Tool.Run.
 var guardianReadOnlyTools = map[string]bool{
-	"Read":       true,
-	"Glob":       true,
-	"Grep":       true,
-	"LS":         true,
-	"GitStatus":  true,
-	"GitDiff":    true,
-	"GitLog":     true,
-	"ToolSearch": true,
-	"ReadSkill":  true,
+	"Read":         true,
+	"Glob":         true,
+	"Grep":         true,
+	"LS":           true,
+	"ToolSearch":   true,
+	"ReadSkill":    true,
+	"CodeNavigate": true,
+}
+
+func childReadOnlyTools(purpose string) map[string]bool {
+	allowed := cloneChildAllowed(guardianReadOnlyTools)
+	if purpose != childPurposeGuardian {
+		allowed["WebSearch"], allowed["WebFetch"] = true, true
+	}
+	if purpose == childPurposeTask {
+		allowed["SendMessage"] = true
+	}
+	return allowed
+}
+
+// Workspace remapping and read-only roles revoke file-write grants only.
+// Outbound network and explicitly granted local services are independent.
+func withoutDirectoryGrants(grants []protocol.CapabilityRequest) []protocol.CapabilityRequest {
+	var kept []protocol.CapabilityRequest
+	for _, grant := range grants {
+		if grant.Kind != "directory" {
+			kept = append(kept, grant)
+		}
+	}
+	return kept
 }
 
 // childRuntimeState is stored directly on Agent by the provider-owned
 // constructor. It is intentionally not a package-level registry: lifecycle
 // state must be released with the Agent and must not outlive a session.
 type childRuntimeState struct {
+	readOnlyWorkspace bool
 	purpose           string
 	nonInteractive    bool
 	allowed           map[string]bool
 	parentSession     string
 	perms             *permissions.Manager
-	capabilityCeiling map[string]bool
 }
 
 // childStepSnapshot is populated by the provider/runtime owner at the
-// beginStep boundary. It lets a Task/guardian launched from a tool use the
+// beginStep boundary. It lets a task/guardian launched from a tool use the
 // exact effective config and model binding that produced that tool call,
 // rather than a later live config/reload. The owner stores it on Agent; this
 // type deliberately carries only frozen values and no parent pointer.
@@ -100,8 +122,8 @@ type childStepSnapshot struct {
 	revision uint64
 }
 
-// childSlots is stored on the parent Agent and shared by all Task calls in
-// that parent turn/session. A bounded semaphore prevents concurrent Task calls
+// childSlots is stored on the parent Agent and shared by all delegation calls in
+// that parent turn/session. A bounded semaphore prevents concurrent delegation calls
 // from multiplying unbounded child goroutines.
 type childSlots struct {
 	sem chan struct{}
@@ -171,9 +193,9 @@ func cloneChildAllowed(src map[string]bool) map[string]bool {
 }
 
 // childDecisionHooks is the only portion of a parent's shell-hook config that
-// a Task is allowed to inherit.  Prompt/tool decisions remain useful for the
+// a task is allowed to inherit.  Prompt/tool decisions remain useful for the
 // child, while lifecycle hooks are intentionally omitted so constructing a
-// child cannot replay SessionStart/SessionEnd or parent Task lifecycle work.
+// child cannot replay SessionStart/SessionEnd or parent task lifecycle work.
 func childDecisionHooks(src hooks.Config) hooks.Config {
 	if len(src) == 0 {
 		return hooks.Config{}
@@ -224,20 +246,20 @@ func ChildToolGate(a *Agent, tc messages.ToolCall) (bool, string) {
 		return false, ""
 	}
 	s := a.childState
-	if s.purpose == childPurposeGuardian && !guardianReadOnlyTools[tc.Name] {
+	if (s.purpose == childPurposeGuardian || s.purpose == childPurposeReview || s.readOnlyWorkspace) && !childReadOnlyTools(s.purpose)[tc.Name] {
 		return true, fmt.Sprintf("guardian hard deny: tool %q is outside the read-only allowlist", tc.Name)
 	}
 	if s.allowed != nil && !s.allowed[tc.Name] {
 		return true, fmt.Sprintf("child hard deny: tool %q is outside the frozen allowlist", tc.Name)
 	}
-	// Task is deliberately one level only for this batch. This remains a hard
+	// Delegation is deliberately one level only. This remains a hard
 	// gate even when a caller passed a nil allowlist.
-	if s.purpose == childPurposeTask && (tc.Name == "Task" || tc.Name == "Agent") {
-		return true, "child hard deny: nested Task is not available"
+	if s.purpose == childPurposeTask && childControlTool(tc.Name) {
+		return true, "child hard deny: nested task is not available"
 	}
-	if s.purpose == childPurposeGuardian {
+	if s.purpose == childPurposeGuardian || s.purpose == childPurposeReview {
 		for _, effect := range permissions.InvocationEffects(tc.Name, tc.Arguments) {
-			if effect != permissions.EffectRead {
+			if effect != permissions.EffectRead && !(s.purpose == childPurposeReview && effect == permissions.EffectNetwork) {
 				return true, fmt.Sprintf("guardian hard deny: tool %q is not read-only", tc.Name)
 			}
 		}
@@ -341,6 +363,9 @@ func (a *Agent) inheritBorrowedTools(lease *tools.Lease) {
 		return
 	}
 	for _, name := range lease.Names() {
+		if a.childState.allowed != nil && !a.childState.allowed[name] {
+			continue
+		}
 		if _, exists := a.registry.Get(name); exists {
 			continue
 		}
@@ -350,9 +375,6 @@ func (a *Agent) inheritBorrowedTools(lease *tools.Lease) {
 		}
 		a.registry.RegisterIn("inherited", tool)
 		a.deferTools[name] = true
-		if a.childState.allowed != nil {
-			a.childState.allowed[name] = true
-		}
 	}
 }
 
@@ -363,20 +385,21 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 	if a == nil {
 		return config.Config{}, Options{}, errors.New("agent: nil parent")
 	}
-	if purpose != childPurposeTask && purpose != childPurposeGuardian {
+	if purpose != childPurposeTask && purpose != childPurposeGuardian && purpose != childPurposeReview {
 		return config.Config{}, Options{}, fmt.Errorf("agent: unknown child purpose %q", purpose)
 	}
 	cfg, binding, sourceModels, parentID, registryNames, perms, parentCtx := a.childSourceSnapshot()
 	a.mu.Lock()
-	capabilityCeiling := make([]protocol.CapabilityRequest, 0, len(a.capabilityGrants))
+	inheritedCapabilities := make([]protocol.CapabilityRequest, 0, len(a.capabilityGrants))
 	var executionGuard *sandbox.ExecutionGuard
 	if a.sandbox != nil {
 		executionGuard = a.sandbox.ExecutionGuard()
 	}
 	for _, grant := range a.capabilityGrants {
-		capabilityCeiling = append(capabilityCeiling, grant)
+		inheritedCapabilities = append(inheritedCapabilities, grant)
 	}
 	revokingCapabilities := a.capabilityRevoking
+	readOnly := a.planMode || (a.childState != nil && a.childState.readOnlyWorkspace)
 	a.mu.Unlock()
 	if revokingCapabilities {
 		return config.Config{}, Options{}, errors.New("agent: parent sandbox capabilities are being revoked")
@@ -408,7 +431,7 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 	// The constructor filters cfg.Hooks to decision hooks. It must not replay
 	// project lifecycle commands, start MCP servers, or write AutoMem state as
 	// a startup side effect. Parent SubagentStart/Stop callbacks remain around
-	// Task itself; they are not duplicated inside the child.
+	// delegation itself; they are not duplicated inside the child.
 	cfg.MCPServers = nil
 	cfg.EnableMemory = config.BoolPtr(false)
 	return cfg, Options{
@@ -417,10 +440,11 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 		ProviderRegistry:      providers,
 		Permissions:           perms,
 		NonInteractive:        true,
+		ReadOnlyWorkspace:     readOnly,
 		AllowedTools:          allowed,
 		Purpose:               purpose,
 		ParentSessionID:       parentID,
-		CapabilityCeiling:     capabilityCeiling,
+		InheritedCapabilities: inheritedCapabilities,
 		ExecutionGuard:        executionGuard,
 	}, nil
 }
@@ -467,7 +491,7 @@ func (a *Agent) childSourceSnapshot() (cfg config.Config, binding modelBinding, 
 }
 
 // childAllowedTools computes the tool-name set a child may call for its
-// purpose: task children drop the Task/Agent tools, guardians are restricted to
+// purpose: task children drop the delegation tools, guardians are restricted to
 // the built-in read-only set.
 func childAllowedTools(purpose string, registryNames []string) map[string]bool {
 	allowed := make(map[string]bool, len(registryNames))
@@ -475,10 +499,11 @@ func childAllowedTools(purpose string, registryNames []string) map[string]bool {
 		allowed[name] = true
 	}
 	if purpose == childPurposeTask {
-		delete(allowed, "Task")
-		delete(allowed, "Agent")
+		for _, name := range []string{"SpawnAgent", "FollowupAgent", "StopAgent", "ListAgents", "ReadAgent", "WaitAgent"} {
+			delete(allowed, name)
+		}
 	}
-	if purpose == childPurposeGuardian {
+	if purpose == childPurposeGuardian || purpose == childPurposeReview {
 		allowed = make(map[string]bool, len(guardianReadOnlyTools))
 		for name := range guardianReadOnlyTools {
 			allowed[name] = true

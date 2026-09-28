@@ -138,6 +138,9 @@ func inlineItemComplete(item historyCell, turnDone bool) bool {
 		}
 		return turnDone || item.messageID != ""
 	case "tool":
+		if item.toolName == "SpawnAgent" && item.agent != nil {
+			return !item.agent.Run.Active()
+		}
 		switch strings.ToLower(strings.TrimSpace(item.status)) {
 		case "success", "done", "completed", "complete", "error", "failed", "failure", "denied", "rejected", "cancelled", "canceled", "stopped", "interrupted":
 			return true
@@ -290,10 +293,9 @@ func (t *historyLedger) plan(items []historyCell, width int, turnDone bool, rend
 			t.nextIndex, t.boundaryID = i+1, key
 			continue
 		}
-		offset := t.offsets[key]
-		if offset < 0 || offset > len(item.text) {
-			offset = 0
-		}
+		// The runtime may drop the old prefix while retaining this identity.
+		// Store absolute source offsets, translating only at the render boundary.
+		offset := min(max(0, t.offsets[key]-item.textOffset), len(item.text))
 		complete := inlineItemComplete(item, turnDone)
 		if !complete {
 			// A running delegation is shown as a compact marker in the managed
@@ -318,7 +320,7 @@ func (t *historyLedger) plan(items []historyCell, width int, turnDone bool, rend
 					completed = append(completed, strings.TrimRight(wrapped, "\n"))
 					t.lastKind = item.kind
 				}
-				t.offsets[key] = deltaEnd
+				t.offsets[key] = item.textOffset + deltaEnd
 			}
 			break
 		}
@@ -402,12 +404,13 @@ func (t *historyLedger) reconcile(old, next historyCell) {
 	if oldID == "" || newID == "" {
 		return
 	}
-	if old.text == next.text && t.seen(old, 0) {
+	if (old.text == next.text || old.kind == "thinking" && next.kind == "thinking") && t.seen(old, 0) {
 		t.printed[newID] = struct{}{}
 	}
 	if offset, ok := t.offsets[oldID]; ok {
-		offset = min(max(0, offset), len(old.text))
-		if offset <= len(next.text) && strings.HasPrefix(next.text, old.text[:offset]) {
+		offset = min(max(old.textOffset, offset), old.textOffset+len(old.text))
+		start := max(old.textOffset, next.textOffset)
+		if offset <= next.textOffset || offset <= next.textOffset+len(next.text) && old.text[start-old.textOffset:offset-old.textOffset] == next.text[start-next.textOffset:offset-next.textOffset] {
 			t.offsets[newID] = offset
 		}
 	}

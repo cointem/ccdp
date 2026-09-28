@@ -20,6 +20,5 @@
 *.swp
 .trae/
 
-# Keep the final sandbox contract; ignore intermediate design notes.
+# Keep maintained contracts and workflow documentation.
 /docs/*
-!/docs/macos-sandbox.md

@@ -50,7 +50,7 @@ func (m *Model) renderContextDetailPopover() string {
 		agentName := m.sessionID
 		for _, row := range m.routing.rows {
 			if string(row.SessionID) == m.sessionID {
-				if t := strings.TrimSpace(row.Title); t != "" {
+				if t := childDisplayName(row); t != "" {
 					agentName = t
 				}
 				break

@@ -117,11 +117,11 @@ func TestToolSearchRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
-	if !strings.Contains(out, "my-fmt") || !strings.Contains(out, "Schema:") {
+	if !strings.Contains(out, "my-fmt") || strings.Contains(out, "Schema:") {
 		t.Errorf("search output missing tool details: %.200s", out)
 	}
-	if !ag.isDiscovered("my-fmt") {
-		t.Error("search should mark the tool discovered")
+	if ag.isDiscovered("my-fmt") {
+		t.Error("keyword summaries must not load schemas")
 	}
 
 	// Exact-name search also works.

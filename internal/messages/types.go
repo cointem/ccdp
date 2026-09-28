@@ -39,9 +39,17 @@ type ImageAttachment struct {
 	Data      []byte `json:"-"`
 }
 
+// StreamSegment records presentation order without duplicating text. Bytes
+// indexes the next range of Content or ReasoningContent according to Kind.
+type StreamSegment struct {
+	Kind  string `json:"kind"`
+	Bytes int    `json:"bytes"`
+}
+
 // Message is a single entry in the conversation history.
 type Message struct {
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	StreamSegments   []StreamSegment `json:"stream_segments,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
 	// ID is stable for the lifetime of a message and is used by session
 	// projections/UI resync.  Legacy JSON may omit it; the persistence adapter
 	// assigns one when a message first enters the new log.

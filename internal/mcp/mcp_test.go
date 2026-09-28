@@ -549,8 +549,10 @@ func TestCloseReapsSpontaneousExit(t *testing.T) {
 	if !c.waited {
 		t.Fatal("Close skipped cmd.Wait for an already-exited server (zombie)")
 	}
-	if c.cmd.ProcessState == nil {
-		t.Fatal("cmd.ProcessState not set: child was not reaped")
+	select {
+	case <-c.cmd.Done():
+	default:
+		t.Fatal("child was not reaped")
 	}
 }
 

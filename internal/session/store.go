@@ -19,7 +19,7 @@ import (
 
 const (
 	// SchemaVersion is the only JSONL format this implementation writes.
-	SchemaVersion uint32 = 1
+	SchemaVersion uint32 = 2
 	// DefaultMaxTransactionBytes prevents a JSONL line from becoming an
 	// accidental unbounded allocation.
 	DefaultMaxTransactionBytes int64 = 8 << 20

@@ -30,7 +30,7 @@ func (p *backgroundTestProvider) Stream(ctx context.Context, req llm.CompletionR
 			toolResult = true
 		}
 	}
-	if strings.Contains(latest, "Background subagent") {
+	if strings.Contains(latest, `"kind":"final_result"`) {
 		delta("all finished")
 		return llm.StreamResult{Text: "all finished", FinishReason: "stop"}, nil
 	}
@@ -44,7 +44,7 @@ func (p *backgroundTestProvider) Stream(ctx context.Context, req llm.CompletionR
 		return llm.StreamResult{Text: "child done", FinishReason: "stop"}, nil
 	}
 	if !toolResult {
-		return llm.StreamResult{ToolCalls: []llm.ToolCall{{ID: "delegate", Type: "function", Function: llm.Function{Name: "Task", Arguments: `{"description":"child prompt","wait_policy":"notify"}`}}}, FinishReason: "tool_calls"}, nil
+		return llm.StreamResult{ToolCalls: []llm.ToolCall{{ID: "delegate", Type: "function", Function: llm.Function{Name: "SpawnAgent", Arguments: `{"task":"child prompt"}`}}}, FinishReason: "tool_calls"}, nil
 	}
 	delta("main returned early")
 	p.once.Do(func() { close(p.release) })

@@ -64,8 +64,12 @@ func (m *Model) renderStatus() string {
 			}
 		}
 		elapsed := ""
-		if !m.turnStarted.IsZero() {
-			elapsed = " · " + formatElapsed(time.Since(m.turnStarted))
+		startedAt := m.turnStarted
+		if !m.busy {
+			startedAt = m.activity.StartedAt
+		}
+		if !startedAt.IsZero() {
+			elapsed = " · " + formatElapsed(now().Sub(startedAt))
 		}
 		spinner := m.spinner.View()
 		if !m.animateWork() {

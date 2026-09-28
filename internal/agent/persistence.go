@@ -14,8 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -28,12 +26,6 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
-)
-
-const (
-	legacyImportSource   = "legacy-json"
-	legacyImportBatch    = "legacy-import"
-	legacyImportComplete = "legacy-import-complete"
 )
 
 var messageIDCounter uint64
@@ -111,6 +103,12 @@ func (a *Agent) closePersistence() error {
 	}
 	a.mu.Lock()
 	p := a.persistence
+	if p != nil {
+		// Once the store is detached, revisionLocked falls back to logSeq.
+		// Keep the durable cursor so the final idle/closed snapshot is not
+		// rejected by observers as older than the last running snapshot.
+		a.logSeq = max(a.logSeq, uint64(p.CurrentCursor()))
+	}
 	a.persistence = nil
 	a.mu.Unlock()
 	if p == nil {
@@ -243,7 +241,7 @@ func inputMessageID(inputID string) string {
 	return protocol.InputMessageID(protocol.InputID(inputID))
 }
 
-func legacyMessageID(sessionID string, index int) string {
+func snapshotMessageID(sessionID string, index int) string {
 	return stableID("legacy-message", struct {
 		SessionID string
 		Index     int
@@ -306,7 +304,7 @@ func (a *Agent) restoreInputDedup() error {
 		switch event := record.Event.(type) {
 		case *session.InputQueued:
 			strategy := protocol.InputStrategy(event.Strategy)
-			if strategy != protocol.InputSteer && strategy != protocol.InputFollowup {
+			if strategy != protocol.InputSteer && strategy != protocol.InputFollowup && strategy != protocol.InputMessage {
 				strategy = protocol.InputFollowup
 			}
 			id := protocol.InputID(event.InputID)
@@ -1472,7 +1470,7 @@ func (p *sessionPersistence) messageToSessionLocked(message messages.Message) (s
 // persisted.
 func messageToSession(message messages.Message) (session.Message, error) {
 	ensureMessageID(&message)
-	result := session.Message{ReasoningContent: message.ReasoningContent, MessageID: message.ID, Role: string(message.Role), CreatedAt: message.CreatedAt}
+	result := session.Message{StreamSegments: append([]messages.StreamSegment(nil), message.StreamSegments...), ReasoningContent: message.ReasoningContent, MessageID: message.ID, Role: string(message.Role), CreatedAt: message.CreatedAt}
 	if result.Role == "" {
 		result.Role = string(messages.RoleAssistant)
 	}
@@ -1519,7 +1517,7 @@ func messageToSession(message messages.Message) (session.Message, error) {
 }
 
 func messageFromSession(message session.Message) (messages.Message, error) {
-	result := messages.Message{ReasoningContent: message.ReasoningContent, ID: message.MessageID, Role: messages.Role(message.Role), CreatedAt: message.CreatedAt}
+	result := messages.Message{StreamSegments: append([]messages.StreamSegment(nil), message.StreamSegments...), ReasoningContent: message.ReasoningContent, ID: message.MessageID, Role: messages.Role(message.Role), CreatedAt: message.CreatedAt}
 	if result.Role == "" {
 		return messages.Message{}, errors.New("agent: replayed message has no role")
 	}
@@ -1575,95 +1573,6 @@ func messageFromSession(message session.Message) (messages.Message, error) {
 	return result, nil
 }
 
-// legacyEvents translates only data present in the old snapshot.  It does
-// not infer requests, approvals, tool starts, or successful side effects.
-func legacyEvents(snapshot SessionSnapshot, sourcePath string) ([]session.Event, error) {
-	createdAt := snapshot.CreatedAt
-	if createdAt.IsZero() {
-		createdAt = snapshot.UpdatedAt
-	}
-	if createdAt.IsZero() {
-		createdAt = time.Unix(0, 0).UTC()
-	}
-	importedAt := snapshot.UpdatedAt
-	if importedAt.IsZero() {
-		importedAt = createdAt
-	}
-	source := legacyImportSource
-	if sourcePath == "" {
-		source = "resume-snapshot"
-	}
-	importMarker := session.SessionImported{
-		SessionID: snapshot.ID, FormatVersion: session.SchemaVersion, Source: source,
-		OriginalPath: sourcePath, ImportedAt: importedAt,
-		ParentID: snapshot.ParentID, BranchPoint: snapshot.BranchPoint, BranchSummary: snapshot.BranchSummary,
-	}
-	// Keep the import marker out of the data chunks. Readers treat the marker's
-	// dedicated final transaction as the commit point; a crash after any
-	// earlier chunk therefore leaves the target non-authoritative and lets the
-	// explicit Resume path retry the deterministic chunks.
-	events := make([]session.Event, 0, len(snapshot.History)*2+3)
-	if snapshot.Model != "" || snapshot.Workspace != "" {
-		events = append(events, session.SettingsChanged{Revision: 1, Settings: session.Settings{Model: snapshot.Model, Workspace: snapshot.Workspace}})
-	}
-	if snapshot.Usage != (Usage{}) {
-		events = append(events, session.UsageChanged{Revision: 1, Usage: session.Usage{
-			InputTokens: int64(snapshot.Usage.InputTokens), OutputTokens: int64(snapshot.Usage.OutputTokens),
-			CachedTokens: int64(snapshot.Usage.CachedTokens), Cache: snapshot.Usage.Cache, TotalTokens: int64(snapshot.Usage.InputTokens + snapshot.Usage.OutputTokens),
-			Cost: snapshot.Usage.Cost, TurnCount: int64(snapshot.Usage.TurnCount),
-		}})
-	}
-	if snapshot.Settings != nil {
-		settings := *snapshot.Settings
-		events = append(events, session.SettingsChanged{Revision: 1, Settings: settings})
-	}
-	if snapshot.Workflow != nil {
-		events = append(events, session.WorkflowChanged{Workflow: *snapshot.Workflow})
-	}
-	if snapshot.Memory != "" {
-		events = append(events, session.MemoryChanged{Revision: 1, Text: snapshot.Memory})
-	}
-	if len(snapshot.Tasks) > 0 {
-		events = append(events, session.TasksChanged{Revision: 1, Tasks: append([]session.Task(nil), snapshot.Tasks...)})
-	}
-	for i, message := range snapshot.History {
-		turnID := fmt.Sprintf("legacy-turn-%06d", i)
-		message.ID = legacyMessageID(snapshot.ID, i)
-		if message.Role == messages.RoleUser && strings.TrimSpace(message.Content) != "" {
-			inputID := fmt.Sprintf("legacy-input-%06d", i)
-			events = append(events,
-				session.InputQueued{InputID: inputID, MessageID: message.ID, Text: message.Content, Strategy: "followup", TurnID: turnID, CreatedAt: message.CreatedAt},
-				session.InputDelivered{InputID: inputID, TurnID: turnID},
-			)
-			continue
-		}
-		converted, err := messageToSession(message)
-		if err != nil {
-			return nil, fmt.Errorf("legacy history[%d]: %w", i, err)
-		}
-		events = append(events, session.AssistantCommitted{TurnID: turnID, Message: converted, ToolCalls: sessionMessageToolCalls(converted)})
-	}
-	pendingInputs := pendingInputSnapshot(snapshot.ID, snapshot.Pending, snapshot.PendingInputs)
-	for i, text := range snapshot.Pending {
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
-		inputID := fmt.Sprintf("legacy-pending-%06d", i)
-		strategy := protocol.InputFollowup
-		if i < len(pendingInputs) {
-			if pendingInputs[i].ID != "" {
-				inputID = string(pendingInputs[i].ID)
-			}
-			if pendingInputs[i].Strategy == protocol.InputSteer || pendingInputs[i].Strategy == protocol.InputFollowup {
-				strategy = pendingInputs[i].Strategy
-			}
-		}
-		events = append(events, session.InputQueued{InputID: inputID, MessageID: inputMessageID(inputID), Text: text, Strategy: string(strategy), CreatedAt: importedAt})
-	}
-	events = append(events, importMarker)
-	return events, nil
-}
-
 func sessionMessageToolCalls(message session.Message) []session.ToolCall {
 	var calls []session.ToolCall
 	for _, block := range message.Content {
@@ -1672,85 +1581,6 @@ func sessionMessageToolCalls(message session.Message) []session.ToolCall {
 		}
 	}
 	return calls
-}
-
-// importLegacySnapshot is called only from explicit Resume paths.  It keeps
-// the old file untouched and uses deterministic transaction/event IDs so a
-// crash during a multi-batch import can be resumed without duplicates.
-func importLegacySnapshot(cfg *config.Config, snapshot SessionSnapshot, sourcePath string) (*sessionPersistence, error) {
-	p, err := openSessionPersistenceSource(cfg, snapshot.ID, snapshot.CreatedAt, "legacy-import")
-	if err != nil {
-		return nil, err
-	}
-	events, err := legacyEvents(snapshot, sourcePath)
-	if err != nil {
-		_ = p.close()
-		return nil, err
-	}
-	records, err := session.ReadAll(p.store)
-	if err != nil {
-		_ = p.close()
-		return nil, err
-	}
-	for _, record := range records {
-		if record.TransactionID == legacyImportComplete && record.Event.Type() == session.EventTypeSessionImported {
-			return p, nil
-		}
-	}
-	if len(events) == 0 {
-		_ = p.close()
-		return nil, errors.New("agent: legacy import has no completion marker")
-	}
-	// The marker is always the final event and gets its own transaction. Keep
-	// each data transaction comfortably below the Store event bound while
-	// retaining deterministic chunk identity for retries.
-	marker := events[len(events)-1]
-	dataEvents := events[:len(events)-1]
-	for offset, chunk := 0, 0; offset < len(dataEvents); chunk++ {
-		end := offset + 128
-		if end > len(dataEvents) {
-			end = len(dataEvents)
-		}
-		txID := legacyImportBatch
-		if chunk > 0 {
-			txID = fmt.Sprintf("%s-%04d", legacyImportBatch, chunk)
-		}
-		if _, err := p.Commit(session.Batch{TransactionID: txID, Events: dataEvents[offset:end]}); err != nil {
-			_ = p.close()
-			return nil, fmt.Errorf("agent: import legacy batch %d: %w", chunk, err)
-		}
-		offset = end
-	}
-	if _, err := p.Commit(session.Batch{TransactionID: legacyImportComplete, Events: []session.Event{marker}}); err != nil {
-		_ = p.close()
-		return nil, fmt.Errorf("agent: import legacy completion: %w", err)
-	}
-	return p, nil
-}
-
-func legacyImportEvidence(records []session.Record) bool {
-	for _, record := range records {
-		switch event := record.Event.(type) {
-		case *session.SessionCreated:
-			if event.Source == "legacy-import" {
-				return true
-			}
-		case *session.SessionImported:
-			if event.Source == legacyImportSource || event.Source == "resume-snapshot" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func legacyImportCompletePresent(records []session.Record) bool {
-	for _, record := range records {
-		if record.TransactionID == legacyImportComplete && record.Event.Type() == session.EventTypeSessionImported {
-			return true
-		}
-	}
-	return false
 }
 
 // SessionSnapshotProjection replays a read-only store into the compatibility
@@ -1867,9 +1697,7 @@ func (p *sessionPersistence) populateMemoryResume(snapshot *SessionSnapshot) err
 }
 
 // memoryResumeEvents maps a caller-owned snapshot to typed facts while
-// retaining existing message IDs and timestamps. Unlike legacy import, this
-// path is not an import boundary and therefore uses a distinct SessionImported
-// source without touching a legacy file or requiring an import-complete marker.
+// retaining existing message IDs and timestamps. This is the explicit in-memory resume path; disk sessions replay their JSONL log.
 func memoryResumeEvents(snapshot SessionSnapshot) ([]session.Event, error) {
 	_, importedAt := resumeTimestamps(snapshot)
 	events := make([]session.Event, 0, len(snapshot.History)*2+len(snapshot.Pending)+3)
@@ -1941,7 +1769,7 @@ func appendResumeHistoryEvents(events *[]session.Event, snapshot SessionSnapshot
 	for i, original := range snapshot.History {
 		message := original
 		if message.ID == "" {
-			message.ID = legacyMessageID(snapshot.ID, i)
+			message.ID = snapshotMessageID(snapshot.ID, i)
 		}
 		turnID := fmt.Sprintf("memory-resume-turn-%06d", i)
 		if message.Role == messages.RoleUser && strings.TrimSpace(message.Content) != "" {
@@ -1974,7 +1802,7 @@ func appendResumePendingInputs(events []session.Event, snapshot SessionSnapshot,
 			continue
 		}
 		strategy := input.Strategy
-		if strategy != protocol.InputSteer && strategy != protocol.InputFollowup {
+		if strategy != protocol.InputSteer && strategy != protocol.InputFollowup && strategy != protocol.InputMessage {
 			strategy = protocol.InputFollowup
 		}
 		created := input.CreatedAt
@@ -1990,9 +1818,6 @@ func appendResumePendingInputs(events []session.Event, snapshot SessionSnapshot,
 }
 
 func snapshotFromRecords(records []session.Record, id string) (*SessionSnapshot, error) {
-	if legacyImportEvidence(records) && !legacyImportCompletePresent(records) {
-		return nil, fmt.Errorf("agent: session has an incomplete legacy import")
-	}
 	projection, err := projectRecords(records)
 	if err != nil {
 		return nil, err
@@ -2173,7 +1998,7 @@ func (p *replayProjection) pendingInputViews() []protocol.InputView {
 			continue
 		}
 		strategy := protocol.InputStrategy(input.Strategy)
-		if strategy != protocol.InputSteer && strategy != protocol.InputFollowup {
+		if strategy != protocol.InputSteer && strategy != protocol.InputFollowup && strategy != protocol.InputMessage {
 			strategy = protocol.InputFollowup
 		}
 		views = append(views, protocol.InputView{
@@ -2656,50 +2481,4 @@ func (p *replayProjection) removePendingID(id string) {
 			return
 		}
 	}
-}
-
-// persistLegacySnapshot is kept separate from List/Replay so read-only
-// callers can never trigger import or directory creation.
-func persistLegacySnapshot(cfg *config.Config, snapshot SessionSnapshot, sourcePath string) error {
-	p, err := importLegacySnapshot(cfg, snapshot, sourcePath)
-	if err != nil {
-		return err
-	}
-	return p.close()
-}
-
-// prepareResumePersistence is the explicit import boundary used by Resume.
-// New() alone never reads a legacy file, so opening a session by ID cannot
-// silently migrate or merge two histories.
-func prepareResumePersistence(cfg *config.Config, snapshot SessionSnapshot) error {
-	if cfg == nil || cfg.NoSessionPersistence {
-		return nil
-	}
-	newEvents := filepath.Join(cfg.SessionDir, snapshot.ID, "events.v1.jsonl")
-	if _, err := os.Stat(newEvents); err == nil {
-		store, openErr := session.OpenJSONLReadOnly(cfg.SessionDir, snapshot.ID)
-		if openErr != nil {
-			return openErr
-		}
-		records, readErr := session.ReadAll(store)
-		_ = store.Close()
-		if readErr != nil {
-			return readErr
-		}
-		if !legacyImportEvidence(records) || legacyImportCompletePresent(records) {
-			return nil
-		}
-		// The target is a recognized incomplete import. Continue with the same
-		// deterministic transaction IDs below; Store deduplicates chunks already
-		// synced before the crash.
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	sourcePath := filepath.Join(cfg.SessionDir, snapshot.ID+".json")
-	if _, err := os.Stat(sourcePath); errors.Is(err, os.ErrNotExist) {
-		sourcePath = ""
-	} else if err != nil {
-		return err
-	}
-	return persistLegacySnapshot(cfg, snapshot, sourcePath)
 }

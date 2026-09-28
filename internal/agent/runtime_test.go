@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"ccdp/internal/checkpoint"
 	"ccdp/internal/config"
+	"ccdp/internal/fsops"
 	"ccdp/internal/hooks"
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
@@ -468,8 +467,13 @@ func TestPostCompactFileAttachments(t *testing.T) {
 	if err := os.WriteFile(dir+"/fresh.go", []byte(fresh), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ag.resources.Files.MarkFileRead(dir + "/old.go")
-	ag.resources.Files.MarkFileRead(dir + "/fresh.go")
+	for _, path := range []string{dir + "/old.go", dir + "/fresh.go"} {
+		v, err := fsops.Observe(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ag.resources.Files.MarkVersion(path, v)
+	}
 
 	// fresh.go is still referenced by the kept tail → skipped; old.go attached.
 	tail := []messages.Message{{
@@ -553,6 +557,7 @@ func TestResumeRestoresWorkspaceAndModel(t *testing.T) {
 	restored := t.TempDir()
 	cfg := config.Default()
 	cfg.Workspace = current
+	cfg.NoSessionPersistence = true
 	cfg.SessionDir = filepath.Join(current, "sessions")
 	snap := &SessionSnapshot{
 		ID:        "restore-context",
@@ -628,32 +633,6 @@ func TestUsageCostAccumulatesAtPerCallModelPrice(t *testing.T) {
 	ag.recordUsageNoBaseline(1_000_000, 500_000, 0)
 	if got, want := ag.Usage().Cost, 22.0; got != want {
 		t.Fatalf("mixed-model cost = %v, want %v", got, want)
-	}
-}
-
-func TestResumeRebindsCheckpointStore(t *testing.T) {
-	dir := t.TempDir()
-	cfg := config.Default()
-	cfg.Workspace = dir
-	cfg.SessionDir = filepath.Join(dir, "sessions")
-	sessionID := "resume-checkpoints"
-	recordDir := filepath.Join(cfg.SessionDir, "checkpoints", sessionID)
-	if err := os.MkdirAll(recordDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	records := []checkpoint.Record{{ID: "ck-existing", Summary: "existing", SHA: "deadbeef", CreatedAt: time.Now()}}
-	data, _ := json.Marshal(records)
-	if err := os.WriteFile(filepath.Join(recordDir, "records.json"), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	events := make(chan Event, 64)
-	ag, err := Resume(&cfg, &SessionSnapshot{ID: sessionID, CreatedAt: time.Now()}, events)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ag.Close()
-	if got := ag.CheckpointList(); len(got) != 1 || got[0].ID != "ck-existing" {
-		t.Fatalf("resumed checkpoints = %+v", got)
 	}
 }
 

@@ -134,11 +134,6 @@ func pendingTexts(inputs []protocol.InputView) []string {
 	return texts
 }
 
-// ensureTypedPendingLocked upgrades the compatibility text queue to the
-// durable typed representation. Callers must hold a.mu. Runtime admission
-// supplies pendingInputs directly; this bridge only fills identities for old
-// callers that still mutate pendingMsgs while retaining any already durable
-// IDs at matching positions.
 // sessionTitle derives a short list title from the first user message.
 func sessionTitle(history []messages.Message) string {
 	for _, m := range history {
@@ -149,9 +144,7 @@ func sessionTitle(history []messages.Message) string {
 		if line == "" {
 			continue
 		}
-		if len(line) > 60 {
-			line = line[:60] + "…"
-		}
+		line = truncateRunes(line, 60)
 		return line
 	}
 	return ""
@@ -212,14 +205,13 @@ func (a *Agent) Save() error {
 // new JSONL log is authoritative when present; the legacy flat JSON file is
 // consulted only when no new log exists.
 func LoadSession(dir, id string) (*SessionSnapshot, error) {
-	snapshot, _, err := loadSessionSnapshot(dir, id)
+	snapshot, err := loadSessionSnapshot(dir, id)
 	return snapshot, err
 }
 
 // OpenSession prepares an independent Agent handle for a saved session. It
 // never mutates this Agent: the caller can atomically replace its UI handle
-// only after OpenSession succeeds, then close the old handle. Legacy JSON
-// import, when needed, is performed through the explicit Resume boundary.
+// only after OpenSession succeeds, then close the old handle.
 func (a *Agent) OpenSession(id string) (*Agent, error) {
 	if a == nil || a.cfg == nil {
 		return nil, errors.New("agent: cannot open a session from a nil agent")
@@ -245,96 +237,19 @@ func (a *Agent) OpenSession(id string) (*Agent, error) {
 	return Resume(&cfg, snapshot, nil)
 }
 
-func loadSessionSnapshot(dir, id string) (*SessionSnapshot, bool, error) {
+func loadSessionSnapshot(dir, id string) (*SessionSnapshot, error) {
 	if dir == "" || id == "" {
-		return nil, false, fmt.Errorf("agent: session dir and id are required")
+		return nil, fmt.Errorf("agent: session dir and id are required")
 	}
 	if err := validateSessionID(id); err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	newEvents := filepath.Join(dir, id, "events.v1.jsonl")
-	_, statErr := os.Stat(newEvents)
-	if statErr == nil {
-		store, err := session.OpenJSONLReadOnly(dir, id)
-		if err != nil {
-			return nil, false, err
-		}
-		records, readErr := session.ReadAll(store)
-		closeErr := store.Close()
-		if readErr != nil {
-			return nil, false, readErr
-		}
-		if closeErr != nil {
-			return nil, false, closeErr
-		}
-		if legacyImportEvidence(records) && !legacyImportCompletePresent(records) {
-			// A partially imported log is not authoritative. Keep the old file as
-			// the read-only view until an explicit Resume completes the import.
-			legacyPath := filepath.Join(dir, id+".json")
-			if _, legacyErr := os.Stat(legacyPath); legacyErr == nil {
-				snapshot, loadErr := loadLegacySnapshotFile(legacyPath, id)
-				if loadErr != nil {
-					return nil, false, loadErr
-				}
-				return snapshot, true, nil
-			} else if !errors.Is(legacyErr, os.ErrNotExist) {
-				return nil, false, legacyErr
-			}
-			return nil, false, fmt.Errorf("agent: session %q has an incomplete legacy import", id)
-		}
-		projection, projectionErr := projectRecords(records)
-		if projectionErr != nil {
-			return nil, false, projectionErr
-		}
-		if projection.ID == "" {
-			projection.ID = id
-		}
-		if projection.ID != id {
-			return nil, false, fmt.Errorf("agent: replayed session id %q does not match requested id %q", projection.ID, id)
-		}
-		snapshot := &SessionSnapshot{
-			ID: projection.ID, CreatedAt: projection.CreatedAt, UpdatedAt: projection.updatedAt,
-			Workspace: projection.Workspace, Model: projection.Model, Title: sessionTitle(projection.History),
-			History: cloneMessages(projection.History), Usage: projection.Usage, Pending: append([]string(nil), projection.Pending...), PendingInputs: projection.pendingInputViews(), PendingAttachments: projection.pendingAttachments(),
-			Settings: snapshotSettings(projection.Settings), PendingCommands: projection.pendingCommands(), Workflow: snapshotWorkflow(projection.Workflow),
-			Memory: projection.MemoryText, Tasks: append([]session.Task(nil), projection.Tasks...),
-			ParentID: projection.ParentID, BranchPoint: projection.BranchPoint, BranchSummary: projection.BranchSummary,
-			turnSeq: projection.turnSeq, stepSeq: projection.stepSeq,
-		}
-		return snapshot, false, nil
-	}
-	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return nil, false, statErr
-	}
-	path := filepath.Join(dir, id+".json")
-	snap, err := loadLegacySnapshotFile(path, id)
-	if err != nil {
-		return nil, true, err
-	}
-	return snap, true, nil
-}
-
-func loadLegacySnapshotFile(path, id string) (*SessionSnapshot, error) {
-	data, err := os.ReadFile(path)
+	store, err := session.OpenJSONLReadOnly(dir, id)
 	if err != nil {
 		return nil, err
 	}
-	var snap SessionSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return nil, err
-	}
-	if err := validateSessionID(snap.ID); err != nil {
-		return nil, err
-	}
-	if snap.ID != id {
-		return nil, fmt.Errorf("agent: session file id %q does not match requested id %q", snap.ID, id)
-	}
-	// Old flat snapshots only carried the compatibility text queue. Assign
-	// deterministic in-memory identities at this read boundary; this does not
-	// write or import the legacy file. Explicit Resume will persist the durable
-	// InputQueued facts with these identities.
-	snap.PendingInputs = pendingInputSnapshot(snap.ID, snap.Pending, snap.PendingInputs)
-	return &snap, nil
+	defer store.Close()
+	return SessionSnapshotProjection(store, id)
 }
 
 func validateSessionID(id string) error {
@@ -353,11 +268,8 @@ type SessionListIssue struct {
 	Reason string
 }
 
-// ListSessions returns both authoritative JSONL sessions and legacy flat JSON
-// sessions, newest first, plus an issue for every session it had to skip.  It is
-// strictly read-only: it never imports, creates a directory, repairs a tail, or
-// writes a snapshot.  If both layouts contain an ID, the JSONL directory wins and
-// the legacy file is omitted.
+// ListSessions returns authoritative JSONL sessions, newest first, plus an
+// issue for every damaged session it had to skip. It never writes or repairs.
 func ListSessions(dir string) ([]SessionSnapshot, []SessionListIssue, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -368,7 +280,6 @@ func ListSessions(dir string) ([]SessionSnapshot, []SessionListIssue, error) {
 	}
 	var sessions []SessionSnapshot
 	var issues []SessionListIssue
-	newIDs := make(map[string]bool)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -380,34 +291,13 @@ func ListSessions(dir string) ([]SessionSnapshot, []SessionListIssue, error) {
 		if _, statErr := os.Stat(filepath.Join(dir, id, "events.v1.jsonl")); statErr != nil {
 			continue
 		}
-		snap, legacy, err := loadSessionSnapshot(dir, id)
+		snap, err := loadSessionSnapshot(dir, id)
 		if err != nil {
 			issues = append(issues, SessionListIssue{ID: id, Reason: err.Error()})
 			continue
 		}
-		if legacy {
-			// A non-authoritative/incomplete import is represented by the legacy
-			// file below; do not hide it behind the unfinished directory.
-			continue
-		}
-		newIDs[id] = true
 		if info, infoErr := os.Stat(filepath.Join(dir, id, "events.v1.jsonl")); infoErr == nil && info.ModTime().After(snap.UpdatedAt) {
 			snap.UpdatedAt = info.ModTime()
-		}
-		sessions = append(sessions, *snap)
-	}
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
-			continue
-		}
-		id := strings.TrimSuffix(e.Name(), ".json")
-		if validateSessionID(id) != nil || newIDs[id] {
-			continue
-		}
-		snap, err := LoadSession(dir, id)
-		if err != nil {
-			issues = append(issues, SessionListIssue{ID: id, Reason: err.Error()})
-			continue
 		}
 		sessions = append(sessions, *snap)
 	}
@@ -689,6 +579,10 @@ func (c *managedClient) Snapshot(ctx context.Context) (protocol.SessionView, err
 	if r.agent != nil {
 		view, err := r.agent.Snapshot(ctx)
 		view.RunID = r.fact.Child.Run.ID
+		if r.fact.Child.Run.Status == "settling" {
+			view.Phase = protocol.PhaseFinalizing
+			view.Closing = false
+		}
 		r.mu.Unlock()
 		return view, err
 	}
@@ -717,11 +611,23 @@ func (c *managedClient) Snapshot(ctx context.Context) (protocol.SessionView, err
 	if row.Run.Active() {
 		view.Phase = protocol.PhasePreparing
 	}
+	if row.Approval != nil {
+		view.Approval, view.Phase = row.Approval, protocol.PhaseWaitingApproval
+	}
 	page, err := c.supervisor.ReadTranscript(ctx, row.SessionID, 0, transcriptWindow)
 	if err != nil && !errors.Is(err, os.ErrNotExist) && row.Run.Status != "queued" && row.Run.Status != "starting" {
 		return view, err
 	}
 	view.Transcript, view.TranscriptMore = page.Items, page.More
+	if row.Purpose == childPurposeReview && !row.Run.Active() && len(view.Transcript) == 0 {
+		text := row.Run.Output
+		if text == "" {
+			text = row.Run.Error
+		}
+		if text != "" {
+			view.Transcript = []protocol.TranscriptItem{{ID: "review-report-" + string(row.Run.ID), Kind: "assistant", Text: text, Status: "completed"}}
+		}
+	}
 	// Recover presentation metadata without starting a runtime/provider.
 	records, _, readErr := c.supervisor.readSessionRecords(ctx, row.SessionID)
 	if readErr == nil {
@@ -740,14 +646,14 @@ func (c *managedClient) Snapshot(ctx context.Context) (protocol.SessionView, err
 					maxOutputTokens = *s.MaxOutputTokens
 				}
 				view.Settings = protocol.SettingsSnapshot{
-					Revision:        changed.Revision,
-					Model:           protocol.ModelBinding{Model: s.Model, Provider: s.Provider, Endpoint: s.Endpoint},
-					ExecutionMode:   protocol.ExecutionMode(s.ExecutionMode),
-					Permission:      protocol.PermissionPolicy{Mode: s.PermissionPolicy, AlwaysAllow: s.AlwaysAllow, AlwaysDeny: s.AlwaysDeny, Revision: changed.Revision},
+					Revision:      changed.Revision,
+					Model:         protocol.ModelBinding{Model: s.Model, Provider: s.Provider, Endpoint: s.Endpoint},
+					ExecutionMode: protocol.ExecutionMode(s.ExecutionMode),
+					Permission:    protocol.PermissionPolicy{Mode: s.PermissionPolicy, AlwaysAllow: s.AlwaysAllow, AlwaysDeny: s.AlwaysDeny, Revision: changed.Revision},
 					Sandbox: protocol.SandboxPolicy{NetworkAccess: s.NetworkAccess,
-						AdditionalDirectories: s.AdditionalDirectories,
+						AdditionalDirectories:         s.AdditionalDirectories,
 						AdditionalReadOnlyDirectories: s.AdditionalReadOnlyDirectories,
-						DisallowedDirectories: s.DisallowedDirectories, Revision: changed.Revision},
+						DisallowedDirectories:         s.DisallowedDirectories, Revision: changed.Revision},
 					ReasoningEffort: s.ReasoningEffort, Verbosity: s.Verbosity,
 					ContextWindow: window, CompactThreshold: s.CompactThreshold,
 					MaxOutputTokens: maxOutputTokens, MaxTurns: s.MaxTurns, MaxBudgetUSD: s.MaxBudgetUSD,
@@ -904,7 +810,7 @@ func (c *managedClient) Submit(ctx context.Context, cmd protocol.Command) (proto
 	}
 	switch cmd.Type {
 	case protocol.CommandSubmitInput:
-		if row.Purpose != childPurposeTask {
+		if row.Purpose != childPurposeTask && row.Purpose != childPurposeReview {
 			return protocol.Receipt{}, errors.New("guardian is read-only")
 		}
 	case protocol.CommandApproveTool:
@@ -1050,6 +956,20 @@ func (s *SessionSupervisor) ReadOutput(ctx context.Context, id protocol.SessionI
 				found = true
 			}
 		case *session.AssistantCommitted:
+			if strings.HasPrefix(itemID, e.Message.MessageID+":segment:") {
+				var answer strings.Builder
+				for _, block := range e.Message.Content {
+					if block.Kind == session.ContentText {
+						answer.WriteString(block.Text)
+					}
+				}
+				for _, item := range committedSegmentItems(*e, answer.String()) {
+					if item.ID == itemID {
+						text, found = item.Text, true
+						break
+					}
+				}
+			}
 			if "reasoning:"+e.Message.MessageID == itemID && e.Message.ReasoningContent != "" {
 				text = e.Message.ReasoningContent
 				found = true
@@ -1125,7 +1045,12 @@ func (a *Agent) cancelRunInputs(runID string) error {
 	a.mu.Lock()
 	a.ensureTypedPendingLocked()
 	var facts []session.Event
+	var retained []protocol.InputView
 	for _, input := range a.pendingInputs {
+		if input.Strategy == protocol.InputMessage {
+			retained = append(retained, input)
+			continue
+		}
 		facts = append(facts, session.InputCancelled{InputID: string(input.ID), Reason: "run settled"})
 	}
 	a.mu.Unlock()
@@ -1136,7 +1061,8 @@ func (a *Agent) cancelRunInputs(runID string) error {
 		return err
 	}
 	a.mu.Lock()
-	a.pendingInputs, a.pendingMsgs = nil, nil
+	a.pendingInputs = retained
+	a.syncLegacyPendingLocked()
 	a.mu.Unlock()
 	return nil
 }

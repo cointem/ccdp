@@ -22,10 +22,10 @@ type toolPresentation struct {
 	Arguments string
 	Output    string
 	Truncated bool
-	// Agent holds the child sessions spawned by a Task/Agent call, resolved by
+	// Agent holds the child session spawned by a SpawnAgent call, resolved by
 	// ParentCallID. It drives the compact agent marker so the child's final
 	// answer never floods the parent transcript as ordinary tool output.
-	Agent                []protocol.ChildSession
+	Agent                *protocol.ChildSession
 	ContinuesExploration bool
 	Expanded             bool
 }
@@ -78,8 +78,11 @@ func (m *Model) renderToolView(item *historyCell, width int) string {
 }
 
 func renderToolPresentation(p toolPresentation, width int) string {
+	if quietAgentWait(p) {
+		return ""
+	}
 	width = max(1, width)
-	// Task/Agent rows are delegations, not ordinary tools. They render a compact
+	// SpawnAgent rows are delegations, not ordinary tools. They render a compact
 	// status marker (with a bounded preview of the child's answer) instead of
 	// streaming the child's full output into the parent transcript.
 	if isAgentTool(p.Name) {
@@ -263,6 +266,27 @@ func toolArgumentSummary(name string, args map[string]any, raw string) string {
 	case "read", "edit", "write", "multiedit", "delete":
 		if path := firstArg(args, "file_path", "path", "file"); path != "" {
 			line := path
+			if strings.EqualFold(name, "Read") {
+				_, hasOffset := args["offset"]
+				_, hasLimit := args["limit"]
+				if hasOffset || hasLimit {
+					unit := "lines"
+					if args["unit"] == "bytes" {
+						unit = "bytes"
+					}
+					start, count := any(1), any(2000)
+					if unit == "bytes" {
+						start, count = 0, 65536
+					}
+					if hasOffset {
+						start = args["offset"]
+					}
+					if hasLimit {
+						count = args["limit"]
+					}
+					line += fmt.Sprintf(" · %s offset=%v limit=%v", unit, start, count)
+				}
+			}
 			if start := value("start_line"); start != "" {
 				line += ":" + start
 				if end := value("end_line"); end != "" {
@@ -301,7 +325,7 @@ func toolArgumentSummary(name string, args map[string]any, raw string) string {
 		if q := firstArg(args, "query", "q"); q != "" {
 			return fmt.Sprintf("%q", q)
 		}
-	case "todo", "task", "todowrite", "todoread", "todo_write", "todo_read":
+	case "todo", "todowrite", "todoread", "todo_write", "todo_read":
 		if action := firstArg(args, "action", "task"); action != "" {
 			return action
 		}
@@ -405,19 +429,9 @@ func stripANSI(text string) string {
 // carries enough to recognize the result (aligned with codex's 240-cell mark).
 const agentPreviewLimit = 240
 
-// renderAgentPresentation renders a Task/Agent row as a compact status marker.
-// A single delegation becomes one marker line (plus a bounded answer preview on
-// completion); a batch fan-out becomes a header with one line per child.
+// renderAgentPresentation keeps each delegated task on its own status card.
 func renderAgentPresentation(p toolPresentation, width int) string {
-	notify := isNotifyPolicy(p.Args)
-	if len(p.Agent) > 1 {
-		return renderAgentGroup(p, p.Agent, notify, width)
-	}
-	var child *protocol.ChildSession
-	if len(p.Agent) == 1 {
-		child = &p.Agent[0]
-	}
-	return renderAgentSingle(p, child, notify, width)
+	return renderAgentSingle(p, p.Agent, width)
 }
 
 // agentMarkerStatus maps a tool or child-run status onto the marker glyph, its
@@ -432,6 +446,22 @@ func agentMarkerStatus(status string) (string, lipgloss.Style, string) {
 		return "■", styleStatus, "stopped"
 	case "waiting_approval":
 		return "◆", styleAgentRun, "needs approval"
+	case "started":
+		return "◆", styleAgentRun, "已启动"
+	case "queued":
+		return "◆", styleAgentRun, "排队中"
+	case "starting":
+		return "◆", styleAgentRun, "准备中"
+	case "settling":
+		return "◆", styleAgentRun, "正在收尾"
+	case "stopping":
+		return "◆", styleAgentRun, "正在停止"
+	case "partial":
+		return "■", styleStatus, "部分完成"
+	case "interrupted":
+		return "■", styleStatus, "已中断"
+	case "unknown":
+		return "■", styleStatus, "状态未知"
 	default:
 		return "◆", styleAgentRun, "running"
 	}
@@ -474,29 +504,21 @@ func agentChildStats(c protocol.ChildSession) string {
 	return agentUsageSummary(c.Run)
 }
 
-// agentDescription is the short brief shown after the tool name: the child's
-// title for a delegation, the action for an Agent control call, or the batch
-// size before any child has registered.
+// agentDescription uses the child identity or the current tool arguments.
 func agentDescription(p toolPresentation, child *protocol.ChildSession) string {
 	if child != nil {
-		if title := strings.TrimSpace(child.Title); title != "" {
+		if title := childDisplayName(*child); title != "" {
 			return title
 		}
 	}
-	if strings.EqualFold(strings.TrimSpace(p.Name), "agent") {
-		action := firstArg(p.Args, "action")
-		if action != "" {
-			if sid := firstArg(p.Args, "session_id"); sid != "" {
-				return action + " " + shortID(sid)
-			}
-			return action
-		}
+	if name := firstArg(p.Args, "name"); name != "" {
+		return name
 	}
-	if desc := firstArg(p.Args, "description"); desc != "" {
-		return desc
+	if task := firstArg(p.Args, "task"); task != "" {
+		return task
 	}
-	if agents, ok := p.Args["agents"].([]any); ok && len(agents) > 0 {
-		return fmt.Sprintf("%d agents", len(agents))
+	if sid := firstArg(p.Args, "agent_id"); sid != "" {
+		return shortID(sid)
 	}
 	if p.Arguments != "" {
 		return truncateDisplay(p.Arguments, 64)
@@ -509,43 +531,74 @@ func agentPreview(text string) string {
 	return truncateDisplay(sanitizeANSI(text), agentPreviewLimit)
 }
 
-func isNotifyPolicy(args map[string]any) bool {
-	return strings.EqualFold(strings.TrimSpace(firstArg(args, "wait_policy")), "notify")
+// Wait reports only why the mailbox wait returned; it never describes a run.
+func agentWaitSummary(output string) string {
+	var result struct {
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal([]byte(output), &result) != nil {
+		return "本次等待结束"
+	}
+	switch result.Reason {
+	case "collaboration":
+		return "收到协作消息"
+	case "attention":
+		return "需要审批"
+	case "user_input":
+		return "收到用户输入"
+	case "no_pending_work":
+		return "无待处理子任务"
+	}
+	return "本次等待结束"
 }
 
-// aggregateChildStatus folds a batch into one label: any live child keeps the
-// group running, otherwise a failure dominates, else the group is done.
-func aggregateChildStatus(children []protocol.ChildSession) string {
-	failed := false
-	for _, c := range children {
-		switch strings.ToLower(strings.TrimSpace(c.Run.Status)) {
-		case "success", "done", "completed", "complete", "succeeded":
-			continue
-		case "error", "failed", "failure", "denied", "rejected", "cancelled", "canceled", "stopped":
-			failed = true
-		default:
-			return "running"
+func quietAgentWait(p toolPresentation) bool {
+	if p.Name != "WaitAgent" || p.Expanded {
+		return false
+	}
+	switch p.Status {
+	case "running", "queued", "pending", "starting":
+		return true
+	}
+	if !toolStatusComplete(p.Status) || p.Truncated {
+		return false
+	}
+	var result struct {
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal([]byte(p.Output), &result) != nil {
+		return false
+	}
+	switch result.Reason {
+	case "collaboration", "user_input", "no_pending_work":
+		return true
+	}
+	return false
+}
+
+func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, width int) string {
+	name := strings.TrimSpace(p.Name)
+	// Only SpawnAgent represents a live task. Other tools show invocation status.
+	spawn := name == "SpawnAgent"
+	status := p.Status
+	if spawn {
+		if child != nil {
+			status = child.Run.Status
+		} else if toolStatusComplete(status) {
+			status = "started"
 		}
 	}
-	if failed {
-		return "failed"
-	}
-	return "succeeded"
-}
-
-func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, notify bool, width int) string {
-	name := strings.TrimSpace(p.Name)
-	if name == "" {
-		name = "Task"
-	}
-	// For join the parent tool result is the freshest completion signal, so it
-	// drives the glyph. For notify the parent returns immediately as "accepted"
-	// while the child keeps running, so the child's own state is authoritative.
-	status := p.Status
-	if notify && child != nil {
-		status = child.Run.Status
-	}
 	glyph, stateStyle, label := agentMarkerStatus(status)
+	completed := label == "Done"
+	if completed && strings.EqualFold(name, "SpawnAgent") {
+		label = "运行结束"
+	} else if completed && strings.EqualFold(name, "WaitAgent") {
+		label = agentWaitSummary(p.Output)
+	} else if completed && strings.EqualFold(name, "FollowupAgent") {
+		label = "任务已接受"
+	} else if completed && strings.EqualFold(name, "StopAgent") {
+		label = "停止请求已处理"
+	}
 
 	head := stateStyle.Render(glyph) + " " + styleAssistant.Bold(true).Render(name)
 	var tail string
@@ -553,8 +606,8 @@ func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, notify 
 	if child != nil {
 		stats = agentChildStats(*child)
 	}
-	if label == "Done" && stats != "" {
-		tail = stateStyle.Render(" · Done (" + stats + ")")
+	if completed && stats != "" {
+		tail = stateStyle.Render(" · " + label + " (" + stats + ")")
 	} else {
 		tail = stateStyle.Render(" · " + label)
 		if stats != "" {
@@ -570,7 +623,7 @@ func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, notify 
 	rows := []string{head + tail}
 
 	switch label {
-	case "error", "stopped":
+	case "error", "stopped", "已中断":
 		detail := p.Output
 		if child != nil && strings.TrimSpace(child.Run.Error) != "" {
 			detail = child.Run.Error
@@ -578,10 +631,9 @@ func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, notify 
 		if msg := agentPreview(detail); msg != "" {
 			rows = append(rows, styleDivider.Render("  ⎿ ")+styleToolErr.Render(truncateDisplay(msg, max(1, width-6))))
 		}
-	case "Done":
-		// A notify parent's own output is just the "accepted" receipt; the real
-		// answer arrives later, so only a joined delegation previews it here.
-		if !notify {
+	case "Done", "运行结束":
+		// Read/List are inspections; Spawn receipts never contain the report.
+		if name == "ReadAgent" || name == "ListAgents" {
 			out := p.Output
 			if strings.TrimSpace(out) == "" && child != nil {
 				out = child.Run.Output
@@ -593,81 +645,4 @@ func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, notify 
 		}
 	}
 	return strings.Join(rows, "\n")
-}
-
-func renderAgentGroup(p toolPresentation, children []protocol.ChildSession, notify bool, width int) string {
-	name := strings.TrimSpace(p.Name)
-	if name == "" {
-		name = "Task"
-	}
-	overall := p.Status
-	if notify {
-		overall = aggregateChildStatus(children)
-	}
-	glyph, stateStyle, label := agentMarkerStatus(overall)
-	count := styleStatus.Render(fmt.Sprintf("  %d agents", len(children)))
-	head := stateStyle.Render(glyph) + " " + styleAssistant.Bold(true).Render(name) + count
-	if label == "Done" {
-		head += styleStatus.Render(" finished")
-		if stats := agentGroupUsageSummary(children); stats != "" {
-			head += stateStyle.Render(" (" + stats + ")")
-		}
-	} else {
-		head += stateStyle.Render(" · " + label)
-	}
-	rows := []string{head}
-	for i, c := range children {
-		rows = append(rows, renderAgentChildLine(c, i == len(children)-1, width))
-	}
-	return strings.Join(rows, "\n")
-}
-
-// agentGroupUsageSummary folds a batch into total tokens and the parallel wall
-// duration (earliest start to latest finish, or to now while one is active).
-func agentGroupUsageSummary(children []protocol.ChildSession) string {
-	tokens := 0
-	var earliest, latest time.Time
-	for _, c := range children {
-		tokens += c.Run.Usage.InputTokens + c.Run.Usage.OutputTokens
-		if !c.Run.StartedAt.IsZero() && (earliest.IsZero() || c.Run.StartedAt.Before(earliest)) {
-			earliest = c.Run.StartedAt
-		}
-		end := c.Run.FinishedAt
-		if end.IsZero() {
-			end = time.Now()
-		}
-		if end.After(latest) {
-			latest = end
-		}
-	}
-	var parts []string
-	if tokens > 0 {
-		parts = append(parts, formatContextTokens(tokens)+" tokens")
-	}
-	if !earliest.IsZero() && latest.After(earliest) {
-		parts = append(parts, formatElapsed(latest.Sub(earliest)))
-	}
-	return strings.Join(parts, " · ")
-}
-
-func renderAgentChildLine(c protocol.ChildSession, last bool, width int) string {
-	_, stateStyle, label := agentMarkerStatus(c.Run.Status)
-	branch := "├─"
-	if last {
-		branch = "└─"
-	}
-	line := "  " + styleDivider.Render(branch) + " "
-	if title := strings.TrimSpace(c.Title); title != "" {
-		line += truncateDisplay(title, max(1, width-8)) + " "
-	}
-	stats := agentChildStats(c)
-	if label == "Done" && stats != "" {
-		line += stateStyle.Render("· Done (" + stats + ")")
-	} else {
-		line += stateStyle.Render("· " + label)
-		if stats != "" {
-			line += styleStatus.Render(" · " + stats)
-		}
-	}
-	return line
 }
