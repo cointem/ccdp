@@ -13,7 +13,7 @@ import (
 
 func readAgentPage(t *testing.T, a *Agent, req protocol.AgentReadRequest, budget int) protocol.AgentReadPage {
 	t.Helper()
-	raw, err := a.supervisor.readAgent(context.Background(), req, budget)
+	raw, err := a.services.supervisor.readAgent(context.Background(), req, budget)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,10 +43,10 @@ func TestAgentResultPagingPinsCompletedTask(t *testing.T) {
 	}
 	var received strings.Builder
 	received.WriteString(page.Text)
-	if _, err := a.supervisor.Control(context.Background(), protocol.AgentControl{ID: "next-report", SessionID: id, Action: "continue", Text: "second"}); err != nil {
+	if _, err := a.services.supervisor.Control(context.Background(), protocol.AgentControl{ID: "next-report", SessionID: id, Action: "continue", Text: "second"}); err != nil {
 		t.Fatal(err)
 	}
-	next, _ := a.supervisor.lookup(id)
+	next, _ := a.services.supervisor.lookup(id)
 	waitManaged(t, next)
 	for page.More {
 		page = readAgentPage(t, a, protocol.AgentReadRequest{AgentID: id, Cursor: page.NextCursor}, 4096)

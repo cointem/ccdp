@@ -120,33 +120,74 @@ func Read(path string, limit int64) ([]byte, Version, error) {
 	return b, v, nil
 }
 
-// Publish requires the caller to hold LockPath through observation and records.
-// A nil expected version means create-only. Checks happen after preparing the
-// temporary file, immediately before publishing it.
-func Publish(path string, data []byte, mode os.FileMode, expected *Version) (Version, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return Version{}, err
-	}
-	if expected != nil {
-		i, err := os.Lstat(path)
-		if err != nil {
-			return Version{}, err
-		}
-		if !i.Mode().IsRegular() || MultipleLinks(i) {
-			return Version{}, fmt.Errorf("refusing to replace linked/nonregular file %s", path)
-		}
-		mode = i.Mode().Perm()
-	}
-	root, err := os.OpenRoot(filepath.Dir(path))
+// ObserveAt observes a regular file through a pinned filesystem root.
+func ObserveAt(root *os.Root, path string) (Version, error) {
+	f, err := OpenRegularAt(root, path)
 	if err != nil {
 		return Version{}, err
 	}
-	defer root.Close()
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Version{}, err
+	}
+	return FromInfo(info), nil
+}
+
+// ReadAt reads through the same pinned root used to publish an edit.
+func ReadAt(root *os.Root, path string, limit int64) ([]byte, Version, error) {
+	f, err := OpenRegularAt(root, path)
+	if err != nil {
+		return nil, Version{}, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, Version{}, err
+	}
+	version := FromInfo(info)
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, version, err
+	}
+	if int64(len(data)) > limit {
+		return nil, version, fmt.Errorf("file exceeds %d byte editing limit", limit)
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return nil, version, err
+	}
+	if FromInfo(after) != version {
+		return nil, version, fmt.Errorf("file changed during read: %s", path)
+	}
+	return data, version, nil
+}
+
+// PublishAt requires the caller to hold LockPath through observation and records.
+// root is an already opened authorized directory, never the target's parent.
+// A nil expected version means create-only.
+func PublishAt(ctx context.Context, root *os.Root, path string, data []byte, mode os.FileMode, expected *Version) (Version, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Version{}, err
+	}
+	if expected != nil {
+		info, err := root.Lstat(path)
+		if err != nil {
+			return Version{}, err
+		}
+		if !info.Mode().IsRegular() || MultipleLinks(info) {
+			return Version{}, fmt.Errorf("refusing to replace linked/nonregular file %s", path)
+		}
+		mode = info.Mode().Perm()
+	}
 	check := func() error {
 		if expected == nil {
 			return nil
 		}
-		current, err := Observe(path)
+		current, err := ObserveAt(root, path)
 		if err != nil {
 			return err
 		}
@@ -155,10 +196,10 @@ func Publish(path string, data []byte, mode os.FileMode, expected *Version) (Ver
 		}
 		return nil
 	}
-	if err = publishEntry(context.Background(), root, filepath.Base(path), "regular", mode, data, expected == nil, check); err != nil {
+	if err := publishEntry(ctx, root, path, "regular", mode, data, expected == nil, check); err != nil {
 		return Version{}, err
 	}
-	return Observe(path)
+	return ObserveAt(root, path)
 }
 
 func MultipleLinks(info os.FileInfo) bool {

@@ -79,7 +79,7 @@ func (m *Model) renderContextDetailPopover() string {
 	msgTokens := 0
 	if m.hasSnapshot {
 		toolsCount = len(m.snapshot.Catalog.Tools)
-		msgCount = len(m.snapshot.History)
+		msgCount = m.snapshot.HistoryLength
 		// The runtime splits used tokens into messages / tools / system
 		// (system = the whole system message, incl. repo layout and project
 		// instructions). The three always sum to ContextUsedTokens.

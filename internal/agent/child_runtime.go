@@ -19,32 +19,8 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
-	"ccdp/internal/session"
 	"ccdp/internal/tools"
 )
-
-// Options is the frozen input passed to the provider-owned child constructor.
-// The config must already include all parent effective/project settings;
-// child construction must not load settings again. ProviderRegistry and
-// Permissions are snapshots/copies, never mutable parent handles. An
-// AllowedTools nil map means the frozen registry may be used as-is, while a
-// non-nil map (including empty) is an exact hard allowlist.
-type Options struct {
-	Supervisor            *SessionSupervisor
-	RootContext           context.Context
-	EffectiveConfigFrozen bool
-	ProviderRegistry      *plugin.ModelRegistry
-	Permissions           *permissions.Manager
-	NonInteractive        bool
-	ReadOnlyWorkspace     bool
-	AllowedTools          map[string]bool
-	Purpose               string
-	ParentSessionID       string
-	InheritedCapabilities []protocol.CapabilityRequest
-	ExecutionGuard        *sandbox.ExecutionGuard
-	memoryResume          []session.Record
-	memoryBlobs           *memoryRequestArtifacts
-}
 
 const (
 	childPurposeTask     = "task"
@@ -107,6 +83,7 @@ type childRuntimeState struct {
 // rather than a later live config/reload. The owner stores it on Agent; this
 // type deliberately carries only frozen values and no parent pointer.
 type childStepSnapshot struct {
+	step          uint64
 	mcpLease      *mcp.StepLease
 	cfg           config.Config
 	binding       modelBinding
@@ -146,14 +123,14 @@ func slotsForParent(a *Agent) *childSlots {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.childSlots == nil {
+	if a.children.childSlots == nil {
 		limit := defaultChildWorkers
-		if a.cfg != nil && a.cfg.MaxParallelTools > 0 {
-			limit = a.cfg.MaxParallelTools
+		if a.services.cfg != nil && a.services.cfg.MaxParallelTools > 0 {
+			limit = a.services.cfg.MaxParallelTools
 		}
-		a.childSlots = newChildSlots(limit)
+		a.children.childSlots = newChildSlots(limit)
 	}
-	return a.childSlots
+	return a.children.childSlots
 }
 
 func (s *childSlots) acquire(ctx context.Context) error {
@@ -241,11 +218,11 @@ func pinChildProvider(source *plugin.ModelRegistry, cfg config.Config, binding m
 // should call it before normal Agent.executeTool admission. For non-child
 // Agents it returns an allow/no-op result. Approval requests in a
 // non-interactive child are denials, never implicit approvals.
-func ChildToolGate(a *Agent, tc messages.ToolCall) (bool, string) {
-	if a == nil || a.childState == nil {
+func ChildToolGate(a *Agent, tc messages.ToolCall, tool tools.Tool) (bool, string) {
+	if a == nil || a.children.childState == nil {
 		return false, ""
 	}
-	s := a.childState
+	s := a.children.childState
 	if (s.purpose == childPurposeGuardian || s.purpose == childPurposeReview || s.readOnlyWorkspace) && !childReadOnlyTools(s.purpose)[tc.Name] {
 		return true, fmt.Sprintf("guardian hard deny: tool %q is outside the read-only allowlist", tc.Name)
 	}
@@ -258,14 +235,13 @@ func ChildToolGate(a *Agent, tc messages.ToolCall) (bool, string) {
 		return true, "child hard deny: nested task is not available"
 	}
 	if s.purpose == childPurposeGuardian || s.purpose == childPurposeReview {
-		for _, effect := range permissions.InvocationEffects(tc.Name, tc.Arguments) {
-			if effect != permissions.EffectRead && !(s.purpose == childPurposeReview && effect == permissions.EffectNetwork) {
-				return true, fmt.Sprintf("guardian hard deny: tool %q is not read-only", tc.Name)
-			}
+		kind := toolKind(tool)
+		if kind != permissions.KindRead && !(s.purpose == childPurposeReview && kind == permissions.KindNetwork) {
+			return true, fmt.Sprintf("guardian hard deny: tool %q is not read-only", tc.Name)
 		}
 	}
 	if s.nonInteractive && s.perms != nil {
-		decision, reason := s.perms.Check(tc.Name, tc.Arguments)
+		decision, reason := s.perms.Check(tc.Name, tc.Arguments, toolKind(tool))
 		if decision == permissions.DecisionAsk {
 			if reason == "" {
 				reason = "permission requires approval"
@@ -279,10 +255,10 @@ func ChildToolGate(a *Agent, tc messages.ToolCall) (bool, string) {
 // ChildRuntime returns a read-only copy of child metadata for provider glue
 // and diagnostics. The returned allowlist is always independent.
 func ChildRuntime(a *Agent) (purpose string, nonInteractive bool, allowed map[string]bool, ok bool) {
-	if a == nil || a.childState == nil {
+	if a == nil || a.children.childState == nil {
 		return "", false, nil, false
 	}
-	s := a.childState
+	s := a.children.childState
 	return s.purpose, s.nonInteractive, cloneChildAllowed(s.allowed), true
 }
 
@@ -291,9 +267,9 @@ func parentTurnContext(a *Agent) context.Context {
 		return context.Background()
 	}
 	a.mu.Lock()
-	ctx := a.turnCtx
+	ctx := a.turn.turnCtx
 	if ctx == nil {
-		ctx = a.rootCtx
+		ctx = a.lifecycle.rootCtx
 	}
 	a.mu.Unlock()
 	if ctx == nil {
@@ -313,10 +289,10 @@ func childToolLeaseFromParent(a *Agent) *tools.Lease {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.busy || a.childStep == nil || a.childStep.turn != a.turnSeq {
+	if !a.turn.busy || a.children.childStep == nil || a.children.childStep.turn != a.sequences.turnSeq {
 		return nil
 	}
-	return a.childStep.toolLease
+	return a.children.childStep.toolLease
 }
 
 // childPreHooksFromParent snapshots only trusted in-process pre-tool
@@ -328,13 +304,13 @@ func childPreHooksFromParent(a *Agent) []plugin.PreToolHook {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.busy && a.childStep != nil && a.childStep.turn == a.turnSeq {
-		return append([]plugin.PreToolHook(nil), a.childStep.preHooks...)
+	if a.turn.busy && a.children.childStep != nil && a.children.childStep.turn == a.sequences.turnSeq {
+		return append([]plugin.PreToolHook(nil), a.children.childStep.preHooks...)
 	}
-	if a.gohooks == nil {
+	if a.services.gohooks == nil {
 		return nil
 	}
-	return a.gohooks.SnapshotPreTool()
+	return a.services.gohooks.SnapshotPreTool()
 }
 
 // inheritBorrowedPreHooks installs a frozen copy of parent pre-tool decisions
@@ -342,12 +318,12 @@ func childPreHooksFromParent(a *Agent) []plugin.PreToolHook {
 // callbacks, so an inherited callback can deny/ask but cannot relax guardian
 // or non-interactive hard policy.
 func (a *Agent) inheritBorrowedPreHooks(preHooks []plugin.PreToolHook) {
-	if a == nil || a.childState == nil || len(preHooks) == 0 || a.gohooks == nil {
+	if a == nil || a.children.childState == nil || len(preHooks) == 0 || a.services.gohooks == nil {
 		return
 	}
 	for _, hook := range preHooks {
 		if hook != nil {
-			a.gohooks.AddPreTool(hook)
+			a.services.gohooks.AddPreTool(hook)
 		}
 	}
 }
@@ -359,22 +335,22 @@ func (a *Agent) inheritBorrowedPreHooks(preHooks []plugin.PreToolHook) {
 // pointer; the borrowed implementations remain reachable through the parent
 // step lease until the child finishes.
 func (a *Agent) inheritBorrowedTools(lease *tools.Lease) {
-	if a == nil || lease == nil || a.registry == nil || a.childState == nil || a.childState.purpose != childPurposeTask {
+	if a == nil || lease == nil || a.services.registry == nil || a.children.childState == nil || a.children.childState.purpose != childPurposeTask {
 		return
 	}
 	for _, name := range lease.Names() {
-		if a.childState.allowed != nil && !a.childState.allowed[name] {
+		if a.children.childState.allowed != nil && !a.children.childState.allowed[name] {
 			continue
 		}
-		if _, exists := a.registry.Get(name); exists {
+		if _, exists := a.services.registry.Get(name); exists {
 			continue
 		}
 		tool, ok := lease.Get(name)
 		if !ok || tool == nil {
 			continue
 		}
-		a.registry.RegisterIn("inherited", tool)
-		a.deferTools[name] = true
+		a.services.registry.RegisterIn("inherited", tool)
+		a.discovery.deferTools[name] = true
 	}
 }
 
@@ -390,16 +366,16 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 	}
 	cfg, binding, sourceModels, parentID, registryNames, perms, parentCtx := a.childSourceSnapshot()
 	a.mu.Lock()
-	inheritedCapabilities := make([]protocol.CapabilityRequest, 0, len(a.capabilityGrants))
+	inheritedCapabilities := make([]protocol.CapabilityRequest, 0, len(a.capabilities.capabilityGrants))
 	var executionGuard *sandbox.ExecutionGuard
-	if a.sandbox != nil {
-		executionGuard = a.sandbox.ExecutionGuard()
+	if a.services.sandbox != nil {
+		executionGuard = a.services.sandbox.ExecutionGuard()
 	}
-	for _, grant := range a.capabilityGrants {
+	for _, grant := range a.capabilities.capabilityGrants {
 		inheritedCapabilities = append(inheritedCapabilities, grant)
 	}
-	revokingCapabilities := a.capabilityRevoking
-	readOnly := a.planMode || (a.childState != nil && a.childState.readOnlyWorkspace)
+	revokingCapabilities := a.capabilities.capabilityRevoking
+	readOnly := a.plan.planMode || (a.children.childState != nil && a.children.childState.readOnlyWorkspace)
 	a.mu.Unlock()
 	if revokingCapabilities {
 		return config.Config{}, Options{}, errors.New("agent: parent sandbox capabilities are being revoked")
@@ -456,15 +432,15 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 func (a *Agent) childSourceSnapshot() (cfg config.Config, binding modelBinding, sourceModels *plugin.ModelRegistry, parentID string, registryNames []string, perms *permissions.Manager, parentCtx context.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	cfg = cloneConfig(a.cfg)
-	binding = a.activeBinding
-	parentID = a.sessionID
+	cfg = cloneConfig(a.services.cfg)
+	binding = a.modelsState.activeBinding
+	parentID = a.conversation.sessionID
 	// A child launched by a tool inherits the exact step admission boundary,
 	// not whichever model/config/catalog happens to be live after a reload.
 	// The parent captures this snapshot in beginStep and clears it when the turn
 	// ends; the turn check prevents reuse by a later operation.
-	if a.busy && a.childStep != nil && a.childStep.turn == a.turnSeq {
-		step := a.childStep
+	if a.turn.busy && a.children.childStep != nil && a.children.childStep.turn == a.sequences.turnSeq {
+		step := a.children.childStep
 		cfg = cloneConfig(&step.cfg)
 		binding = step.binding
 		sourceModels = step.models
@@ -473,20 +449,20 @@ func (a *Agent) childSourceSnapshot() (cfg config.Config, binding modelBinding, 
 		if binding.model != "" {
 			cfg.Model = binding.model
 		}
-		if a.models != nil {
+		if a.services.models != nil {
 			// Direct constructor callers may not have gone through a running
 			// step; still freeze the catalog at this boundary.
-			sourceModels = a.models.Freeze()
+			sourceModels = a.services.models.Freeze()
 		}
-		if a.registry != nil {
-			registryNames = a.registry.Names()
+		if a.services.registry != nil {
+			registryNames = a.services.registry.Names()
 		}
 	}
-	parentCtx = a.turnCtx
+	parentCtx = a.turn.turnCtx
 	if parentCtx == nil {
-		parentCtx = a.rootCtx
+		parentCtx = a.lifecycle.rootCtx
 	}
-	perms = a.perms
+	perms = a.services.perms
 	return cfg, binding, sourceModels, parentID, registryNames, perms, parentCtx
 }
 

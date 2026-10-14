@@ -18,8 +18,7 @@ func newAgentWithCustomTool(t *testing.T) *Agent {
 	cfg.Tools = []config.ToolSpec{
 		{Name: "my-fmt", Description: "format files", Command: "gofmt"},
 	}
-	events := make(chan Event, 64)
-	ag, err := New(&cfg, events)
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -59,7 +58,7 @@ func TestDeferredToolNotInjected(t *testing.T) {
 	req, err := ag.buildRequestForStepChecked(step)
 	releaseStepLease(step)
 	ag.mu.Lock()
-	ag.childStep = nil
+	ag.children.childStep = nil
 	ag.mu.Unlock()
 	if err != nil {
 		t.Fatalf("buildRequestForStepChecked: %v", err)
@@ -93,7 +92,7 @@ func TestDeferredToolNotInjected(t *testing.T) {
 	req, err = ag.buildRequestForStepChecked(step)
 	releaseStepLease(step)
 	ag.mu.Lock()
-	ag.childStep = nil
+	ag.children.childStep = nil
 	ag.mu.Unlock()
 	if err != nil {
 		t.Fatalf("buildRequestForStepChecked after discovery: %v", err)
@@ -111,7 +110,7 @@ func TestToolSearchRun(t *testing.T) {
 	// Keyword search finds the custom tool by description.
 	ts := &toolSearchTool{ag: ag}
 	out, err := ts.Run(&tools.Context{
-		WorkingDir: ag.cfg.Workspace,
+		WorkingDir: ag.services.cfg.Workspace,
 		Args:       map[string]any{"query": "format files"},
 	})
 	if err != nil {
@@ -129,7 +128,7 @@ func TestToolSearchRun(t *testing.T) {
 	defer ag2.Close()
 	ts2 := &toolSearchTool{ag: ag2}
 	out2, err := ts2.Run(&tools.Context{
-		WorkingDir: ag2.cfg.Workspace,
+		WorkingDir: ag2.services.cfg.Workspace,
 		Args:       map[string]any{"name": "my-fmt"},
 	})
 	if err != nil || !strings.Contains(out2, "my-fmt") {
@@ -137,7 +136,7 @@ func TestToolSearchRun(t *testing.T) {
 	}
 
 	// Unknown name errors.
-	_, err = ts2.Run(&tools.Context{WorkingDir: ag2.cfg.Workspace, Args: map[string]any{"name": "nope"}})
+	_, err = ts2.Run(&tools.Context{WorkingDir: ag2.services.cfg.Workspace, Args: map[string]any{"name": "nope"}})
 	if err == nil {
 		t.Error("expected error for unknown tool")
 	}
@@ -157,7 +156,7 @@ func TestBuildRequestSections(t *testing.T) {
 		t.Fatalf("buildRequestForStepChecked: %v", err)
 	}
 	ag.mu.Lock()
-	ag.childStep = nil
+	ag.children.childStep = nil
 	ag.mu.Unlock()
 	if len(req.Messages) == 0 {
 		t.Fatal("no messages")

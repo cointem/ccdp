@@ -24,6 +24,7 @@ func ownReviewDirectory(dir string) (*os.File, error) {
 	}
 	return f, nil
 }
+
 func cleanAbandonedReviews() {
 	dirs, _ := filepath.Glob(filepath.Join(os.TempDir(), "ccdp-review-*"))
 	for _, dir := range dirs {

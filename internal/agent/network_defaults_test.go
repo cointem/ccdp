@@ -8,6 +8,7 @@ import (
 	"ccdp/internal/permissions"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
+	"ccdp/internal/tools"
 )
 
 func TestWorkerInheritsNetworkBaseline(t *testing.T) {
@@ -24,7 +25,7 @@ func TestWorkerInheritsNetworkBaseline(t *testing.T) {
 				models := plugin.NewModelRegistry()
 				models.Register(provider)
 				models.Route(cfg.Model, provider.Name())
-				parent, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+				parent, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -39,17 +40,17 @@ func TestWorkerInheritsNetworkBaseline(t *testing.T) {
 				}
 				bindChildWorkspace(&childCfg, &opts, workspace, root, cfg.Workspace)
 				applyChildRole(&childCfg, &opts, "worker", workspace)
-				child, err := NewWithOptions(&childCfg, nil, opts)
+				child, err := testNewWithOptions(t, &childCfg, opts)
 				if err != nil {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = child.CloseContext(context.Background()) })
 				for _, name := range []string{"WebSearch", "WebFetch"} {
 					call := messages.ToolCall{Name: name}
-					if denied, reason := ChildToolGate(child, call); denied {
+					if denied, reason := ChildToolGate(child, call, capabilityTestTool(t, child, call.Name)); denied {
 						t.Fatalf("%s unexpectedly requires tool approval: %s", name, reason)
 					}
-					policy, requested, _, err := child.toolCapabilityPolicy(call)
+					policy, requested, _, err := child.toolCapabilityPolicy(call, capabilityTestTool(t, child, call.Name))
 					if enabled {
 						if err != nil || len(requested) != 0 || !policy.NetworkAllowed() {
 							t.Fatalf("%s did not inherit network: requests=%v err=%v", name, requested, err)
@@ -70,7 +71,7 @@ func TestChildRoleAndWorkspacePreserveSessionNetworkGrant(t *testing.T) {
 				t.Run(role+"/"+workspace+"/"+scope, func(t *testing.T) {
 					parent := capabilityTestAgent(t)
 					call := messages.ToolCall{Name: "WebSearch"}
-					policy, requested, version, err := parent.toolCapabilityPolicy(call)
+					policy, requested, version, err := parent.toolCapabilityPolicy(call, capabilityTestTool(t, parent, call.Name))
 					if err != nil || len(requested) != 1 {
 						t.Fatalf("network request: %v %v", requested, err)
 					}
@@ -92,15 +93,15 @@ func TestChildRoleAndWorkspacePreserveSessionNetworkGrant(t *testing.T) {
 					}
 					bindChildWorkspace(&cfg, &opts, workspace, root, cfg.Workspace)
 					applyChildRole(&cfg, &opts, role, workspace)
-					child, err := NewWithOptions(&cfg, nil, opts)
+					child, err := testNewWithOptions(t, &cfg, opts)
 					if err != nil {
 						t.Fatal(err)
 					}
 					t.Cleanup(child.Close)
-					if denied, why := ChildToolGate(child, call); denied {
+					if denied, why := ChildToolGate(child, call, capabilityTestTool(t, child, call.Name)); denied {
 						t.Fatalf("role denied WebSearch: %s", why)
 					}
-					policy, requested, _, err = child.toolCapabilityPolicy(call)
+					policy, requested, _, err = child.toolCapabilityPolicy(call, capabilityTestTool(t, child, call.Name))
 					if scope == "session" {
 						if err != nil || len(requested) != 0 || !policy.NetworkAllowed() {
 							t.Fatalf("lost inherited network grant: %v %v", requested, err)
@@ -117,17 +118,17 @@ func TestChildRoleAndWorkspacePreserveSessionNetworkGrant(t *testing.T) {
 func TestInteractiveChildCanRequestMissingNetworkCapability(t *testing.T) {
 	parent := capabilityTestAgent(t)
 	parent.SetChildInteraction(true)
-	cfg, opts, lease, _, _, err := parent.supervisor.prepare(parent, childPurposeTask, "")
+	cfg, opts, lease, _, _, err := parent.services.supervisor.prepare(parent, childPurposeTask, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer lease.Close()
-	child, err := NewWithOptions(&cfg, nil, opts)
+	child, err := testNewWithOptions(t, &cfg, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(child.Close)
-	_, requested, _, err := child.toolCapabilityPolicy(messages.ToolCall{Name: "WebFetch"})
+	_, requested, _, err := child.toolCapabilityPolicy(messages.ToolCall{Name: "WebFetch"}, tools.NewWebFetchTool())
 	if err != nil || len(requested) != 1 || requested[0] != (protocol.CapabilityRequest{Kind: "network", Access: "outbound"}) {
 		t.Fatalf("child blocked before reaching approval channel: %v %v", requested, err)
 	}

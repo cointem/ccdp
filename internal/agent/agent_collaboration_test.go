@@ -64,7 +64,7 @@ func TestDelegatedResultsResumeSameParentTurnWithoutReadOrWait(t *testing.T) {
 		return llm.StreamResult{Text: text, FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	a.cfg.MaxTurns = 20
+	a.services.cfg.MaxTurns = 20
 	go a.Run()
 	submitChildRuntimeTestInput(t, a, "delegate-input", "parent-task")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -104,7 +104,7 @@ waitingForB:
 	}
 	finish("child-b")
 	view = waitChildRuntimeTestIdle(t, a)
-	records, _, err := a.supervisor.readSessionRecords(ctx, protocol.SessionID(a.sessionID))
+	records, _, err := a.services.supervisor.readSessionRecords(ctx, protocol.SessionID(a.conversation.sessionID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ waitingForB:
 		}
 	}
 	if turns != 1 {
-		t.Fatalf("completion started extra parent turns: %d", turns)
+		t.Fatalf("completion finished %d parent turns, want 1; last=%+v persistence=%v", turns, view.LastTurn, a.persistenceFailure())
 	}
 	finals, progress := 0, 0
 	for _, m := range view.History {
@@ -135,11 +135,11 @@ waitingForB:
 	if finals != 2 || progress != 2 || a.hasAgentMessage() {
 		t.Fatalf("delivery not exactly once: finals=%d progress=%d pending=%v", finals, progress, a.hasAgentMessage())
 	}
-	rows, _ := a.supervisor.ListChildren(ctx)
+	rows, _ := a.services.supervisor.ListChildren(ctx)
 	for _, row := range rows {
-		r, _ := a.supervisor.lookup(row.SessionID)
+		r, _ := a.services.supervisor.lookup(row.SessionID)
 		waitManaged(t, r)
-		a.supervisor.deliver(r) // retry must not queue another copy or start a turn
+		a.services.supervisor.deliver(r) // retry must not queue another copy or start a turn
 	}
 	if a.hasAgentMessage() {
 		t.Fatal("retry redelivered final result")
@@ -152,12 +152,12 @@ func TestAgentWaitMessageCancellationAndBusyFollowup(t *testing.T) {
 		return llm.StreamResult{}, ctx.Err()
 	}}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "hold", WaitPolicy: "notify"}, childPurposeTask, "blocked")
+	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "hold", WaitPolicy: "notify"}, childPurposeTask, "blocked")
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := r.fact.Child.SessionID
-	if _, err := a.supervisor.Control(context.Background(), protocol.AgentControl{ID: "busy-next", SessionID: id, Action: "continue", Text: "next"}); err == nil || !strings.Contains(err.Error(), "busy") {
+	if _, err := a.services.supervisor.Control(context.Background(), protocol.AgentControl{ID: "busy-next", SessionID: id, Action: "continue", Text: "next"}); err == nil || !strings.Contains(err.Error(), "busy") {
 		t.Fatalf("busy follow-up was not rejected: %v", err)
 	}
 	for i := 0; i < 10; i++ {
@@ -190,7 +190,7 @@ func TestAgentWaitMessageCancellationAndBusyFollowup(t *testing.T) {
 	if r.fact.Child.Run.Status != "cancelled" {
 		t.Fatalf("parent interruption left child running: %s", r.fact.Child.Run.Status)
 	}
-	if _, err := a.supervisor.Control(context.Background(), protocol.AgentControl{ID: "stop-idle", SessionID: id, Action: "cancel"}); err != nil {
+	if _, err := a.services.supervisor.Control(context.Background(), protocol.AgentControl{ID: "stop-idle", SessionID: id, Action: "cancel"}); err != nil {
 		t.Fatal(err)
 	}
 	finalCtx, finishWait := context.WithTimeout(context.Background(), 3*time.Second)
@@ -216,7 +216,7 @@ func TestPreviousRunCannotRepublishChildCard(t *testing.T) {
 	close(done)
 	old := &managedRun{parent: a, done: done, fact: session.ChildRunRecorded{Child: protocol.ChildSession{SessionID: id, Run: protocol.RunView{ID: "previous", Status: "succeeded"}}}}
 	current := &managedRun{parent: a, done: done, fact: session.ChildRunRecorded{Child: protocol.ChildSession{SessionID: id, Run: protocol.RunView{ID: "current", Status: "running"}}}}
-	s := &SessionSupervisor{root: a, children: map[protocol.SessionID]*managedRun{id: current}}
+	s := testSupervisor(a, current)
 	sub, err := a.Watch(context.Background(), protocol.Cursor{})
 	if err != nil {
 		t.Fatal(err)

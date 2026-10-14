@@ -2,18 +2,13 @@ package mcp
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,93 +136,6 @@ func TestMCPDiagnosticRedactsConfiguredSecretsAndLimitsTail(t *testing.T) {
 	if len(diagnostic) > 4*1024+32 { // suffix and marker overhead
 		t.Fatalf("diagnostic exceeded bounded tail: %d", len(diagnostic))
 	}
-}
-
-func TestResolveSSEEndpoint(t *testing.T) {
-	tests := []struct {
-		base, endpoint, want string
-	}{
-		{"http://example.test/sse", "/messages", "http://example.test/messages"},
-		{"https://example.test/mcp/sse", "../messages", "https://example.test/messages"},
-		{"http://example.test/mcp/", "messages", "http://example.test/mcp/messages"},
-	}
-	for _, tt := range tests {
-		got, err := resolveSSEEndpoint(tt.base, tt.endpoint)
-		if err != nil || got != tt.want {
-			t.Errorf("resolveSSEEndpoint(%q, %q) = %q, %v; want %q", tt.base, tt.endpoint, got, err, tt.want)
-		}
-	}
-	if _, err := resolveSSEEndpoint("file:///tmp/mcp", "/messages"); err == nil {
-		t.Fatal("accepted non-http base URL")
-	}
-	if _, err := resolveSSEEndpoint("https://example.test/sse", "//attacker.test/messages"); err == nil {
-		t.Fatal("accepted cross-origin protocol-relative SSE endpoint")
-	}
-}
-
-func TestToolsListChangedStormUsesOneRefreshWorkerAndCloses(t *testing.T) {
-	w := &refreshWriter{}
-	c := NewClient("storm", ServerConfig{})
-	c.stdin = nopWriteCloser{w}
-	var changes atomic.Int32
-	c.SetChangeListener(func() { changes.Add(1) })
-
-	// Hold the first refresh at its response boundary, then send a large burst
-	// of notifications. The coalescing worker should perform only one follow-up
-	// refresh after the first response, rather than one goroutine per event.
-	c.scheduleRefresh()
-	id := waitPendingRequest(t, c)
-	for i := 0; i < 1000; i++ {
-		c.dispatchRaw([]byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`))
-	}
-	respondPending(t, c, id)
-	id = waitPendingRequestAfter(t, c, id)
-	respondPending(t, c, id)
-	waitRefreshIdle(t, c)
-	w.mu.Lock()
-	calls := w.calls
-	w.mu.Unlock()
-	if calls != 2 || changes.Load() != 2 {
-		t.Fatalf("notification storm caused %d refresh writes and %d callbacks, want 2/2", calls, changes.Load())
-	}
-
-	// A refresh blocked in requestJSON must also terminate when the client is
-	// closed; this is the lifetime half of the storm bound.
-	c2 := NewClient("storm-close", ServerConfig{})
-	c2.stdin = nopWriteCloser{&refreshWriter{}}
-	c2.scheduleRefresh()
-	_ = waitPendingRequest(t, c2)
-	if err := c2.Close(); err != nil {
-		t.Fatal(err)
-	}
-	waitRefreshIdle(t, c2)
-}
-
-func waitPendingRequest(t *testing.T, c *Client) int {
-	return waitPendingRequestAfter(t, c, 0)
-}
-
-func waitPendingRequestAfter(t *testing.T, c *Client, previous int) int {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		c.mu.Lock()
-		for id := range c.pending {
-			if id != previous {
-				c.mu.Unlock()
-				return id
-			}
-		}
-		c.mu.Unlock()
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("refresh did not issue a pending tools/list request")
-	return 0
-}
-
-func respondPending(t *testing.T, c *Client, id int) {
-	t.Helper()
-	c.dispatchRaw([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"tools":[]}}`, id)))
 }
 
 func waitRefreshIdle(t *testing.T, c *Client) {
@@ -373,33 +281,7 @@ func TestManagerPrepareAbortDoesNotPublishCandidate(t *testing.T) {
 }
 
 func TestManagerStartsSSEWithoutCommand(t *testing.T) {
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprintf(w, "event: endpoint\ndata: %s/messages\n\n", srv.URL)
-			w.(http.Flusher).Flush()
-			<-r.Context().Done()
-			return
-		}
-		var req rpcMessage
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if len(req.ID) == 0 {
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-		var result any = map[string]any{}
-		if req.Method == "tools/list" {
-			result = map[string]any{"tools": []map[string]any{{
-				"name": "sse_echo", "description": "echo", "inputSchema": map[string]any{"type": "object"},
-			}}}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
-	}))
+	srv := newLegacyTestServer(t, nil, "sse_echo")
 	defer srv.Close()
 
 	// The in-process SSE transport connects only to this loopback test server.
@@ -449,83 +331,6 @@ func TestSSERedirectMustStayOnConfiguredOrigin(t *testing.T) {
 	}
 }
 
-// nopWriteCloser adapts an io.Writer to io.WriteCloser for stdin fakes.
-type nopWriteCloser struct{ io.Writer }
-
-func (nopWriteCloser) Close() error { return nil }
-
-type refreshWriter struct {
-	mu    sync.Mutex
-	calls int
-}
-
-func (w *refreshWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	w.calls++
-	w.mu.Unlock()
-	return len(p), nil
-}
-
-// TestFireClosedDispatchRace hammers dispatchRaw against fireClosed. dispatch
-// pops a pending channel under the lock and sends after unlocking, so a
-// fireClosed that closed those channels could race into "send on closed
-// channel" and kill the process; entries are deleted instead now. Run with
-// -race to verify.
-func TestFireClosedDispatchRace(t *testing.T) {
-	for i := 0; i < 200; i++ {
-		c := NewClient("fake", ServerConfig{})
-		id := c.allocID()
-		c.mu.Lock()
-		c.pending[id] = make(chan json.RawMessage, 1)
-		c.mu.Unlock()
-		var wg sync.WaitGroup
-		wg.Add(3)
-		go func() {
-			defer wg.Done()
-			c.dispatchRaw([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{}}`, id)))
-		}()
-		go func() {
-			defer wg.Done()
-			c.dispatchRaw([]byte(`{"jsonrpc":"2.0","id":99999,"result":{}}`))
-		}()
-		go func() {
-			defer wg.Done()
-			c.fireClosed()
-		}()
-		wg.Wait()
-	}
-}
-
-// TestRequestJSONReturnsOnServerExit: blocked requestJSON callers must return
-// promptly with a "server exited" error once fireClosed runs (previously they
-// waited on a channel that was closed — now deleted — and must not leak), and
-// a late response arriving after the delete must be dropped without panicking.
-func TestRequestJSONReturnsOnServerExit(t *testing.T) {
-	c := NewClient("fake", ServerConfig{})
-	c.stdin = nopWriteCloser{io.Discard} // stdio writes go nowhere
-	const n = 8
-	errs := make(chan error, n)
-	for i := 0; i < n; i++ {
-		go func() {
-			var out json.RawMessage
-			errs <- c.requestJSON(context.Background(), "tools/call", map[string]any{}, &out)
-		}()
-	}
-	time.Sleep(50 * time.Millisecond) // let the requests register and block
-	c.fireClosed()
-	for i := 0; i < n; i++ {
-		select {
-		case err := <-errs:
-			if err == nil || !strings.Contains(err.Error(), "server exited") {
-				t.Fatalf("requestJSON error = %v, want server exited", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("requestJSON still blocked after fireClosed")
-		}
-	}
-	c.dispatchRaw([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)) // late response: dropped
-}
-
 // TestCloseReapsSpontaneousExit: a server that exits on its own used to make
 // Close an early-return no-op, leaving a zombie child behind. Close must still
 // Kill+Wait so the child is reaped, and must not hang.
@@ -553,40 +358,5 @@ func TestCloseReapsSpontaneousExit(t *testing.T) {
 	case <-c.cmd.Done():
 	default:
 		t.Fatal("child was not reaped")
-	}
-}
-
-// TestDispatchRawEchoesServerRequestID: replies to server-initiated requests
-// must echo the original ID verbatim — servers using string IDs are valid
-// JSON-RPC and used to be silently dropped.
-func TestDispatchRawEchoesServerRequestID(t *testing.T) {
-	var buf bytes.Buffer
-	c := NewClient("fake", ServerConfig{})
-	c.stdin = nopWriteCloser{&buf}
-	c.dispatchRaw([]byte(`{"jsonrpc":"2.0","id":"srv-7","method":"sampling/createMessage","params":{}}`))
-	if buf.Len() == 0 {
-		t.Fatal("no reply written for server request with string ID")
-	}
-	var msg rpcMessage
-	if err := json.Unmarshal(buf.Bytes(), &msg); err != nil {
-		t.Fatalf("reply %q: %v", buf.String(), err)
-	}
-	if string(msg.ID) != `"srv-7"` {
-		t.Fatalf("reply id = %s, want \"srv-7\"", msg.ID)
-	}
-	if msg.Error == nil || msg.Error.Code != -32601 {
-		t.Fatalf("reply error = %+v, want -32601", msg.Error)
-	}
-}
-
-// TestDispatchRawStringIDResponseDropped: a response with a non-numeric ID can
-// never match one of our int pending entries; it must be dropped silently.
-func TestDispatchRawStringIDResponseDropped(t *testing.T) {
-	var buf bytes.Buffer
-	c := NewClient("fake", ServerConfig{})
-	c.stdin = nopWriteCloser{&buf}
-	c.dispatchRaw([]byte(`{"jsonrpc":"2.0","id":"str-id","result":{}}`))
-	if buf.Len() != 0 {
-		t.Fatalf("unexpected write: %q", buf.String())
 	}
 }

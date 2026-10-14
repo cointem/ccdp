@@ -2,12 +2,10 @@ package agent
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"time"
 
 	"ccdp/internal/mcp"
 	"ccdp/internal/permissions"
+	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 	"ccdp/internal/session"
@@ -33,7 +31,7 @@ type settingsMutator func(target *session.Settings) error
 // writing live state can never disturb the in-flight request or a decision already
 // made — it only governs the next one. The caller must not hold a.mu or
 // settingsCommitMu.
-func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutator) protocol.Receipt {
+func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutator, owned ...bool) protocol.Receipt {
 	// Serialize capture/commit/publish so a step boundary cannot interleave with a
 	// concurrent settings command. This may cover durable I/O; ordinary readers use
 	// the read side of the same lock.
@@ -41,15 +39,19 @@ func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutato
 	defer a.settingsCommitMu.Unlock()
 
 	a.mu.Lock()
-	if a.capabilityRevoking {
+	if a.capabilities.capabilityRevoking {
 		a.mu.Unlock()
 		return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox capability revocation is in progress")
 	}
 	target := a.sessionSettingsLocked()
-	active := a.activeBinding
-	sourceRevision := a.settingsRev
-	oldSandbox := a.sandbox
-	oldConfig := cloneConfig(a.cfg)
+	active := a.modelsState.activeBinding
+	sourceRevision := a.sequences.settingsRev
+	oldSandbox := a.services.sandbox
+	oldConfig := cloneConfig(a.services.cfg)
+	var frozenModels *plugin.ModelRegistry
+	if a.services.models != nil {
+		frozenModels = a.services.models.Freeze()
+	}
 	a.mu.Unlock()
 
 	if err := mutate(&target); err != nil {
@@ -61,10 +63,10 @@ func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutato
 	// widening changes can safely govern future calls without invalidating older,
 	// more restrictive children.
 	a.mu.Lock()
-	sandboxChanged := target.NetworkAccess != a.cfg.NetworkAccess ||
-		!equalStringSlice(target.AdditionalDirectories, a.cfg.AdditionalDirectories) ||
-		!equalStringSlice(target.AdditionalReadOnlyDirectories, a.cfg.AdditionalReadOnlyDirectories) ||
-		!equalStringSlice(target.DisallowedDirectories, a.cfg.DisallowedDirectories)
+	sandboxChanged := target.NetworkAccess != a.services.cfg.NetworkAccess ||
+		!equalStringSlice(target.AdditionalDirectories, a.services.cfg.AdditionalDirectories) ||
+		!equalStringSlice(target.AdditionalReadOnlyDirectories, a.services.cfg.AdditionalReadOnlyDirectories) ||
+		!equalStringSlice(target.DisallowedDirectories, a.services.cfg.DisallowedDirectories)
 	a.mu.Unlock()
 	sandboxTightened := false
 	if sandboxChanged && oldSandbox != nil {
@@ -76,32 +78,54 @@ func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutato
 		nextSandbox := buildSandbox(&nextConfig, nextConfig.Workspace)
 		sandboxTightened = sandbox.PolicyTightened(oldSandbox, nextSandbox)
 	}
-	quiesced := false
+	var scope *sandboxQuiescence
+	if sandboxTightened {
+		var err error
+		scope, err = a.beginSandboxQuiescence(nil, true)
+		if err != nil {
+			return a.rejectedReceipt(cmd, protocol.ErrorInternal, err.Error())
+		}
+	}
+	a.mu.Lock()
+	a.capabilities.settingsPreparing = true
+	a.mu.Unlock()
+	// Registered before unlock: no newly admitted turn can race the drain.
+	defer a.finishSettingsPreparation()
+	input := settingsPreparation{target: target, config: oldConfig, models: frozenModels, active: active, sourceRevision: sourceRevision, quiescence: scope}
+	a.settingsCommitMu.Unlock()
+	var prepared settingsPrepared
+	if len(owned) > 0 && owned[0] {
+		done := make(chan settingsPrepared, 1)
+		go func() { done <- prepareSettings(input) }()
+		prepared = a.awaitSettings(done)
+	} else {
+		prepared = prepareSettings(input)
+	}
+	a.settingsCommitMu.Lock()
 	committed := false
 	defer func() {
-		if quiesced && !committed {
+		if prepared.quiesced && !committed {
 			a.finishSandboxSettingsChange(false)
 		}
 	}()
-	if sandboxTightened {
-		if err := a.quiesceForSandboxSettingsChange(nil, true); err != nil {
-			return a.rejectedReceipt(cmd, protocol.ErrorInternal, "sandbox policy change is waiting for old executions to stop; dispatch remains blocked: "+err.Error())
+	if prepared.err != nil {
+		code := protocol.ErrorInvalidCommand
+		if scope != nil {
+			code = protocol.ErrorInternal
 		}
-		quiesced = true
+		return a.rejectedReceipt(cmd, code, prepared.err.Error())
 	}
-
-	// Resolve the model client only when the model dimension actually moves.
-	var binding *modelBinding
-	if target.Model != active.model || target.Provider != active.provider || target.Endpoint != active.endpoint {
-		resolved, err := a.makeBinding(target.Model)
-		if err != nil {
-			return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
-		}
-		binding = &resolved
-		target.Model = resolved.model
-		target.Provider = resolved.provider
-		target.Endpoint, _ = sanitizeRequestEndpoint(resolved.endpoint)
+	a.mu.Lock()
+	stale := a.sequences.settingsRev != prepared.sourceRevision
+	closing := a.lifecycle.closing || a.lifecycle.closed
+	a.mu.Unlock()
+	if closing {
+		return a.rejectedReceipt(cmd, protocol.ErrorClosed, "session closed during settings preparation")
 	}
+	if stale {
+		return a.rejectedReceipt(cmd, protocol.ErrorStaleRevision, "settings changed during preparation")
+	}
+	target, binding := prepared.target, prepared.binding
 
 	nextRevision := sourceRevision + 1
 	if nextRevision == 0 {
@@ -117,15 +141,15 @@ func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutato
 		committed = true
 	} else if sandboxChanged {
 		a.mu.Lock()
-		manager, policy := a.mcp, a.sandbox
+		manager, policy := a.services.mcp, a.services.sandbox
 		a.mu.Unlock()
 		if manager != nil && policy != nil {
 			manager.SetSandbox(policy.Snapshot())
 		}
 	}
-	if cmd.Type == protocol.CommandSetPermissionPolicy && a.childState == nil {
+	if cmd.Type == protocol.CommandSetPermissionPolicy && a.children.childState == nil {
 		a.mu.Lock()
-		cfg := cloneConfig(a.cfg)
+		cfg := cloneConfig(a.services.cfg)
 		a.mu.Unlock()
 		if err := cfg.SaveProjectPermission(target.PermissionPolicy); err != nil {
 			return a.rejectedReceipt(cmd, protocol.ErrorInternal, "session mode changed, but saving project permission failed: "+err.Error())
@@ -149,63 +173,14 @@ func sandboxQuiescenceOwner(name string) bool {
 // itself performing the transaction; it must not cancel or wait on itself.
 // closeMCP is false for candidate publication, which refreshes MCP atomically
 // after the old in-flight turn has drained.
-func (a *Agent) quiesceForSandboxSettingsChange(ownerCtx context.Context, closeMCP bool) error {
-	a.mu.Lock()
-	if a.capabilityRevoking {
-		a.mu.Unlock()
-		return errors.New("sandbox capability revocation is already pending")
-	}
-	a.capabilityRevoking = true
-	a.capabilityRevision++
-	ownerOperation := ownerCtx != nil && a.turnCtx == ownerCtx
-	turnCancel, compactCancel := a.turnCancel, a.compactCancel
-	if ownerOperation {
-		turnCancel = nil
-	}
-	resources, oldMCP, supervisor := a.resources, a.mcp, a.supervisor
-	activeSandbox := a.sandbox
-	a.mu.Unlock()
-
-	// beginStepChecked and supervisor.prepare also need this publication lock.
-	// With admission frozen, releasing it lets already-started callers observe
-	// the gate and return before this function joins their owning operations.
+func (a *Agent) quiesceForSandboxSettingsChange(ownerCtx context.Context, closeMCP bool) (uint64, error) {
 	a.settingsCommitMu.Unlock()
 	defer a.settingsCommitMu.Lock()
-
-	var stopErr error
-	if resources != nil && resources.Processes != nil {
-		if err := resources.Processes.StopAll(); err != nil {
-			stopErr = errors.Join(stopErr, fmt.Errorf("stop background processes: %w", err))
-		}
+	scope, err := a.requestQuiescence(ownerCtx, closeMCP)
+	if err != nil {
+		return 0, err
 	}
-	if turnCancel != nil {
-		turnCancel()
-	}
-	if compactCancel != nil {
-		compactCancel()
-	}
-	if closeMCP && oldMCP != nil {
-		if err := oldMCP.Close(); err != nil {
-			stopErr = errors.Join(stopErr, fmt.Errorf("close MCP connections: %w", err))
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if supervisor != nil {
-		if err := supervisor.revokeCapabilities(ctx); err != nil {
-			stopErr = errors.Join(stopErr, fmt.Errorf("stop descendant sessions: %w", err))
-		}
-	}
-	if err := waitGroupContext(ctx, &a.turnWG); err != nil {
-		stopErr = errors.Join(stopErr, fmt.Errorf("wait for active turn: %w", err))
-	}
-	if err := waitGroupContext(ctx, &a.sandboxOperationWG); err != nil {
-		stopErr = errors.Join(stopErr, fmt.Errorf("wait for active runtime operations: %w", err))
-	}
-	if activeSandbox != nil && activeSandbox.ExternalExecutionPossible() {
-		stopErr = errors.Join(stopErr, errors.New("a local process may have descendants retaining the previous Seatbelt policy; restart the session and independently stop possible descendants before retrying the change"))
-	}
-	return stopErr
+	return scope.revision, scope.drain()
 }
 
 // finishSandboxSettingsChange makes the next execution use a fresh manager
@@ -214,27 +189,27 @@ func (a *Agent) quiesceForSandboxSettingsChange(ownerCtx context.Context, closeM
 // user-visible authorization boundary changed.
 func (a *Agent) finishSandboxSettingsChange(clearGrants bool) {
 	a.mu.Lock()
-	if a.sandbox == nil {
-		a.capabilityRevoking = true
+	if a.services.sandbox == nil {
+		a.capabilities.capabilityRevoking = true
 		a.mu.Unlock()
 		return
 	}
 	replacement := mcp.NewManager()
-	replacement.SetSandbox(a.sandbox.Snapshot())
-	replacement.RegisterTools(a.registry)
-	a.mcp = replacement
-	for name := range a.deferTools {
+	replacement.SetSandbox(a.services.sandbox.Snapshot())
+	replacement.RegisterTools(a.services.registry)
+	a.services.mcp = replacement
+	for name := range a.discovery.deferTools {
 		if len(name) >= 5 && name[:5] == "mcp__" {
-			delete(a.deferTools, name)
-			delete(a.discovered, name)
+			delete(a.discovery.deferTools, name)
+			delete(a.discovery.discovered, name)
 		}
 	}
 	if clearGrants {
-		clear(a.capabilityGrants)
-		a.capabilityRevision++
+		clear(a.capabilities.capabilityGrants)
+		a.capabilities.capabilityRevision++
 	}
-	resources := a.resources
-	a.capabilityRevoking = false
+	resources := a.services.resources
+	a.capabilities.capabilityRevoking = false
 	a.mu.Unlock()
 	if resources != nil && resources.Processes != nil {
 		resources.Processes.ResumeAfterRevocation()
@@ -249,15 +224,15 @@ func (a *Agent) finishSandboxSettingsChange(clearGrants bool) {
 func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBinding, revision uint64) {
 	a.mu.Lock()
 	modelChanged := binding != nil
-	permModeChanged := target.PermissionPolicy != a.cfg.PermissionMode
-	allowChanged := !equalStringSlice(target.AlwaysAllow, a.cfg.AlwaysAllow)
-	denyChanged := !equalStringSlice(target.AlwaysDeny, a.cfg.AlwaysDeny)
-	sandboxChanged := target.NetworkAccess != a.cfg.NetworkAccess ||
-		!equalStringSlice(target.AdditionalDirectories, a.cfg.AdditionalDirectories) ||
-		!equalStringSlice(target.AdditionalReadOnlyDirectories, a.cfg.AdditionalReadOnlyDirectories) ||
-		!equalStringSlice(target.DisallowedDirectories, a.cfg.DisallowedDirectories)
+	permModeChanged := target.PermissionPolicy != a.services.cfg.PermissionMode
+	allowChanged := !equalStringSlice(target.AlwaysAllow, a.services.cfg.AlwaysAllow)
+	denyChanged := !equalStringSlice(target.AlwaysDeny, a.services.cfg.AlwaysDeny)
+	sandboxChanged := target.NetworkAccess != a.services.cfg.NetworkAccess ||
+		!equalStringSlice(target.AdditionalDirectories, a.services.cfg.AdditionalDirectories) ||
+		!equalStringSlice(target.AdditionalReadOnlyDirectories, a.services.cfg.AdditionalReadOnlyDirectories) ||
+		!equalStringSlice(target.DisallowedDirectories, a.services.cfg.DisallowedDirectories)
 	wantPlan := target.ExecutionMode == "plan"
-	planChanged := wantPlan != a.planMode
+	planChanged := wantPlan != a.plan.planMode
 	permChanged := permModeChanged || allowChanged || denyChanged
 
 	mode, modeErr := permissions.ParseMode(target.PermissionPolicy)
@@ -268,47 +243,47 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 	}
 
 	// generation
-	a.cfg.ReasoningEffort, a.baseCfg.ReasoningEffort = target.ReasoningEffort, target.ReasoningEffort
-	a.cfg.Verbosity, a.baseCfg.Verbosity = target.Verbosity, target.Verbosity
+	a.services.cfg.ReasoningEffort, a.services.baseCfg.ReasoningEffort = target.ReasoningEffort, target.ReasoningEffort
+	a.services.cfg.Verbosity, a.services.baseCfg.Verbosity = target.Verbosity, target.Verbosity
 
 	// permission
-	a.cfg.PermissionMode = string(mode)
-	a.baseCfg.PermissionMode = string(mode)
-	a.cfg.AlwaysAllow = cloneStringSlice(target.AlwaysAllow)
-	a.cfg.AlwaysDeny = cloneStringSlice(target.AlwaysDeny)
-	a.baseCfg.AlwaysAllow = cloneStringSlice(target.AlwaysAllow)
-	a.baseCfg.AlwaysDeny = cloneStringSlice(target.AlwaysDeny)
+	a.services.cfg.PermissionMode = string(mode)
+	a.services.baseCfg.PermissionMode = string(mode)
+	a.services.cfg.AlwaysAllow = cloneStringSlice(target.AlwaysAllow)
+	a.services.cfg.AlwaysDeny = cloneStringSlice(target.AlwaysDeny)
+	a.services.baseCfg.AlwaysAllow = cloneStringSlice(target.AlwaysAllow)
+	a.services.baseCfg.AlwaysDeny = cloneStringSlice(target.AlwaysDeny)
 
 	// execution mode / plan
-	a.planMode = wantPlan
-	a.planBaseMode = mode
+	a.plan.planMode = wantPlan
+	a.plan.planBaseMode = mode
 	if planChanged {
 		if wantPlan {
-			a.workflow = protocol.WorkflowDrafting
+			a.lifecycle.workflow = protocol.WorkflowDrafting
 		} else {
-			a.workflow = protocol.WorkflowOff
+			a.lifecycle.workflow = protocol.WorkflowOff
 		}
 	}
 
 	// sandbox
-	a.cfg.NetworkAccess = target.NetworkAccess
-	a.cfg.AdditionalDirectories = cloneStringSlice(target.AdditionalDirectories)
-	a.cfg.AdditionalReadOnlyDirectories = cloneStringSlice(target.AdditionalReadOnlyDirectories)
-	a.cfg.DisallowedDirectories = cloneStringSlice(target.DisallowedDirectories)
-	a.baseCfg.NetworkAccess = target.NetworkAccess
-	a.baseCfg.AdditionalDirectories = cloneStringSlice(target.AdditionalDirectories)
-	a.baseCfg.AdditionalReadOnlyDirectories = cloneStringSlice(target.AdditionalReadOnlyDirectories)
-	a.baseCfg.DisallowedDirectories = cloneStringSlice(target.DisallowedDirectories)
+	a.services.cfg.NetworkAccess = target.NetworkAccess
+	a.services.cfg.AdditionalDirectories = cloneStringSlice(target.AdditionalDirectories)
+	a.services.cfg.AdditionalReadOnlyDirectories = cloneStringSlice(target.AdditionalReadOnlyDirectories)
+	a.services.cfg.DisallowedDirectories = cloneStringSlice(target.DisallowedDirectories)
+	a.services.baseCfg.NetworkAccess = target.NetworkAccess
+	a.services.baseCfg.AdditionalDirectories = cloneStringSlice(target.AdditionalDirectories)
+	a.services.baseCfg.AdditionalReadOnlyDirectories = cloneStringSlice(target.AdditionalReadOnlyDirectories)
+	a.services.baseCfg.DisallowedDirectories = cloneStringSlice(target.DisallowedDirectories)
 	if sandboxChanged {
-		cfgCopy := cloneConfig(a.cfg)
-		newSandbox := buildSandbox(&cfgCopy, a.cfg.Workspace)
-		newSandbox.ShareExecutionGuard(a.sandbox)
-		a.sandbox = newSandbox
-		a.sandbox.Revision = revision
+		cfgCopy := cloneConfig(a.services.cfg)
+		newSandbox := buildSandbox(&cfgCopy, a.services.cfg.Workspace)
+		newSandbox.ShareExecutionGuard(a.services.sandbox)
+		a.services.sandbox = newSandbox
+		a.services.sandbox.Revision = revision
 		// This is the monotonic sandbox-approval epoch. Do not rely only on the
 		// backend snapshot Revision, which may start above settingsRev and later
 		// be replaced by it.
-		a.capabilityRevision++
+		a.capabilities.capabilityRevision++
 	}
 
 	// model
@@ -316,18 +291,18 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 		a.applyBindingLocked(*binding)
 	}
 
-	a.settingsRev = revision
-	routeCfg := cloneConfig(a.cfg)
+	a.sequences.settingsRev = revision
+	routeCfg := cloneConfig(a.services.cfg)
 	a.mu.Unlock()
 
 	if binding != nil {
 		a.registerBindingRoutes(*binding, routeCfg)
 	}
 	if permChanged || planChanged {
-		a.perms.SetMode(mode)
+		a.services.perms.SetMode(mode)
 	}
 	if permChanged {
-		a.perms.SetPolicy(permissions.Policy{
+		a.services.perms.SetPolicy(permissions.Policy{
 			AlwaysAllow: cloneStringSlice(target.AlwaysAllow),
 			AlwaysDeny:  cloneStringSlice(target.AlwaysDeny),
 		})

@@ -2,6 +2,8 @@ package fsops
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -90,7 +92,7 @@ func TestVersionWriterHelper(t *testing.T) {
 		return
 	}
 	defer lock.Close()
-	if _, err = Publish(path, []byte("new"), 0600, &v); err != nil {
+	if _, err = publishTestFile(context.Background(), filepath.Dir(path), path, []byte("new"), 0600, &v); err != nil {
 		fmt.Println("conflict")
 	} else {
 		fmt.Println("written")
@@ -132,11 +134,11 @@ func TestWorkspaceLeaseAllowsFileMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lock.Close()
-	v, err := Publish(path, []byte("created"), 0644, nil)
+	v, err := publishTestFile(context.Background(), dir, path, []byte("created"), 0644, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = Publish(path, []byte("updated"), 0644, &v); err != nil {
+	if _, err = publishTestFile(context.Background(), dir, path, []byte("updated"), 0644, &v); err != nil {
 		t.Fatal("own create invalidated version", err)
 	}
 }
@@ -166,4 +168,43 @@ func TestReadRejectsLargeContent(t *testing.T) {
 	if _, _, err := Read(p, 10); err == nil {
 		t.Fatal("limit ignored")
 	}
+}
+
+func TestPublishCancellationAfterVersionCheck(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "file")
+	if err := os.WriteFile(path, []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err = publishEntry(ctx, r, "file", "regular", 0600, []byte("changed"), false, func() error { cancel(); return nil })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "original" {
+		t.Fatalf("published after cancellation: %q", data)
+	}
+}
+
+func publishTestFile(ctx context.Context, rootPath, path string, data []byte, mode os.FileMode, expected *Version) (Version, error) {
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return Version{}, err
+	}
+	defer root.Close()
+	relative, err := filepath.Rel(rootPath, path)
+	if err != nil {
+		return Version{}, err
+	}
+	return PublishAt(ctx, root, relative, data, mode, expected)
 }

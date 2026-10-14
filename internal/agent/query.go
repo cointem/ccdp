@@ -53,6 +53,8 @@ func (a *Agent) Query(ctx context.Context, kind protocol.QueryKind) (protocol.Qu
 	var text string
 	var err error
 	switch kind {
+	case protocol.QueryGoal:
+		text = formatGoalReport(snapshot.view.Goal)
 	case protocol.QueryConfig:
 		text = formatQueryConfig(snapshot)
 	case protocol.QueryDoctor:
@@ -109,15 +111,15 @@ func (a *Agent) captureQuerySnapshot(ctx context.Context) *queryRuntimeSnapshot 
 	default:
 	}
 	view := a.snapshotLocked()
-	cfg := cloneConfig(a.cfg)
+	cfg := cloneConfig(a.services.cfg)
 	var sandboxReady bool
 	var sandboxDetail string
 	var sandboxRevision uint64
 	var limits bool
-	if a.sandbox != nil {
-		sandboxRevision = a.sandbox.Revision
-		limits = a.sandbox.Limits != nil
-		if err := a.sandbox.BackendError(); err != nil {
+	if a.services.sandbox != nil {
+		sandboxRevision = a.services.sandbox.Revision
+		limits = a.services.sandbox.Limits != nil
+		if err := a.services.sandbox.BackendError(); err != nil {
 			sandboxDetail = err.Error()
 		} else {
 			sandboxReady = true
@@ -127,25 +129,25 @@ func (a *Agent) captureQuerySnapshot(ctx context.Context) *queryRuntimeSnapshot 
 		sandboxDetail = "sandbox policy is unavailable"
 	}
 	var plugins, pending []string
-	if a.host != nil {
-		plugins = a.host.Names()
-		pending = a.host.Pending()
+	if a.services.host != nil {
+		plugins = a.services.host.Names()
+		pending = a.services.host.Pending()
 	}
 	var mcpNames []string
 	mcpTools := map[string][]string{}
-	if a.mcp != nil {
-		mcpNames = a.mcp.Names()
-		for name, names := range a.mcp.ToolNames() {
+	if a.services.mcp != nil {
+		mcpNames = a.services.mcp.Names()
+		for name, names := range a.services.mcp.ToolNames() {
 			mcpTools[name] = append([]string(nil), names...)
 		}
 	}
 	var loadedSkills []skills.Skill
-	if a.skills != nil {
-		loadedSkills = a.skills.All()
+	if a.services.skills != nil {
+		loadedSkills = a.services.skills.All()
 	}
 	var permissionSnapshot permissions.Snapshot
-	if a.perms != nil {
-		permissionSnapshot = a.perms.Snapshot()
+	if a.services.perms != nil {
+		permissionSnapshot = a.services.perms.Snapshot()
 	}
 	return &queryRuntimeSnapshot{view: view, cfg: cfg, sandboxReady: sandboxReady,
 		sandboxDetail: sandboxDetail, sandboxRev: sandboxRevision,
@@ -182,12 +184,9 @@ func formatQueryConfig(s *queryRuntimeSnapshot) string {
 	fmt.Fprintf(&b, "denied roots: %s\n", strings.Join(cfg.DisallowedDirectories, ", "))
 	fmt.Fprintf(&b, "plan mode:     %v\n", s.view.Settings.ExecutionMode == protocol.ExecutionModePlan)
 	fmt.Fprintf(&b, "workspace:     %s\n", cfg.Workspace)
-	fmt.Fprintf(&b, "context_window:%d\n", cfg.ContextWindowFor(cfg.Model))
+	fmt.Fprintf(&b, "context_window:%d\n", s.view.Settings.ContextWindow)
 	fmt.Fprintf(&b, "compact_thr:   %.0f%%\n", cfg.CompactThreshold*100)
 	fmt.Fprintf(&b, "max_turns:     %d\n", cfg.MaxTurns)
-	if cfg.MaxBudgetUSD > 0 {
-		fmt.Fprintf(&b, "max_budget:    $%.2f\n", cfg.MaxBudgetUSD)
-	}
 	fmt.Fprintf(&b, "tools:         %d\n", len(s.view.Catalog.Tools))
 	fmt.Fprintf(&b, "plugins:       %d\n", len(s.plugins))
 	fmt.Fprintf(&b, "mcp servers:   %d\n", len(s.mcpNames))

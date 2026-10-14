@@ -71,13 +71,13 @@ type inlinePrintedMsg struct {
 var renderGeneration atomic.Uint64
 
 type sessionDraft struct {
-	missingImages       bool
-	text, retry         string
-	images, retryImages []protocol.InputImage
-	retryID             protocol.CommandID
-	follow              bool
-	offset              int
-	paste               *pasteFoldState
+	missingImages bool
+	text          string
+	images        []protocol.InputImage
+	retry         *inputRetry
+	follow        bool
+	offset        int
+	paste         *pasteFoldState
 }
 
 func (m *Model) installSessionRouting(directory protocol.SessionDirectory) {
@@ -119,8 +119,8 @@ func (m *Model) agentPicker() tea.Cmd {
 	selected := 0
 	for _, row := range m.routing.rows {
 		mark := ""
-		if childAwaitingApproval(row) {
-			mark = " · approval required"
+		if childNeedsAttention(row) {
+			mark = " · " + childInteractionLabel(row)
 		}
 		if string(row.SessionID) == m.sessionID {
 			selected = len(options)
@@ -135,10 +135,10 @@ func (m *Model) agentPicker() tea.Cmd {
 }
 
 func childDisplayName(row protocol.ChildSession) string {
-	if name := strings.TrimSpace(row.Name); name != "" {
+	if name := displayLabel(row.Name); name != "" {
 		return name
 	}
-	return strings.TrimSpace(row.Title)
+	return displayLabel(row.Title)
 }
 
 func (m *Model) openAgentView(id string) tea.Cmd {
@@ -296,6 +296,7 @@ func (m *Model) applyChildUpdate(child protocol.ChildSession) {
 	// badge in the parent after the child has completed.
 	if !child.Run.Active() {
 		child.Approval = nil
+		child.Question, child.Plan = nil, nil
 	}
 	replaced := false
 	for i := range m.routing.rows {
@@ -313,8 +314,8 @@ func (m *Model) applyChildUpdate(child protocol.ChildSession) {
 	m.syncViewportHeight()
 }
 
-func childAwaitingApproval(child protocol.ChildSession) bool {
-	return child.Approval != nil && child.Run.Status == "waiting_approval"
+func childNeedsAttention(child protocol.ChildSession) bool {
+	return child.Run.Active() && (child.Approval != nil || child.Question != nil || child.Plan != nil)
 }
 
 func (m *Model) startAgentSwitch() tea.Cmd {
@@ -350,7 +351,7 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	saved.picker = nil
 	saved.approval = nil
 	r.views[m.sessionID] = saved
-	r.drafts[m.sessionID] = sessionDraft{text: m.textarea.Value(), retry: m.retryDraft, retryID: m.retryCommandID, images: cloneInputImages(m.inputImages), retryImages: cloneInputImages(m.retryImages), missingImages: m.missingHistoryImages, follow: m.followOutput, offset: m.viewport.YOffset, paste: clonePasteFold(m.pasteFold)}
+	r.drafts[m.sessionID] = sessionDraft{text: m.textarea.Value(), retry: m.inputRetry, images: cloneInputImages(m.inputImages), missingImages: m.missingHistoryImages, follow: m.followOutput, offset: m.viewport.YOffset, paste: clonePasteFold(m.pasteFold)}
 	for i, id := range r.order {
 		if id == m.sessionID {
 			r.order = append(r.order[:i], r.order[i+1:]...)
@@ -363,7 +364,7 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 		r.order = r.order[1:]
 		if old != r.rootID && old != m.sessionID && r.views[old].pendingSubmissionCount() == 0 && r.views[old].pasteRequest == "" {
 			view := r.views[old]
-			r.drafts[old] = sessionDraft{text: view.textarea.Value(), retry: view.retryDraft, retryID: view.retryCommandID, images: cloneInputImages(view.inputImages), retryImages: cloneInputImages(view.retryImages), missingImages: view.missingHistoryImages, follow: view.followOutput, offset: view.viewport.YOffset, paste: clonePasteFold(view.pasteFold)}
+			r.drafts[old] = sessionDraft{text: view.textarea.Value(), retry: view.inputRetry, images: cloneInputImages(view.inputImages), missingImages: view.missingHistoryImages, follow: view.followOutput, offset: view.viewport.YOffset, paste: clonePasteFold(view.pasteFold)}
 			delete(r.views, old)
 		}
 	}
@@ -402,8 +403,8 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	m.inlineMode = !toChild
 	if draft, ok := r.drafts[m.sessionID]; ok && !cached {
 		m.textarea.SetValue(draft.text)
-		m.retryDraft, m.retryCommandID = draft.retry, draft.retryID
-		m.inputImages, m.retryImages = cloneInputImages(draft.images), cloneInputImages(draft.retryImages)
+		m.inputRetry = draft.retry
+		m.inputImages = cloneInputImages(draft.images)
 		m.pasteFold = clonePasteFold(draft.paste)
 		m.missingHistoryImages = draft.missingImages
 		m.followOutput = draft.follow
@@ -624,4 +625,14 @@ func projectTranscriptCell(item protocol.TranscriptItem) historyCell {
 	return historyCell{kind: item.Kind, text: text, textOffset: int(item.TextOffset), messageID: item.ID, turnID: item.TurnID,
 		toolID: string(item.CallID), status: item.Status, toolName: item.Tool, toolArgs: args,
 		toolArgsRaw: string(item.Args), toolTruncated: item.Truncated}
+}
+
+func childInteractionLabel(child protocol.ChildSession) string {
+	if child.Question != nil {
+		return "answer required"
+	}
+	if child.Plan != nil {
+		return "plan decision required"
+	}
+	return "approval required"
 }

@@ -46,7 +46,7 @@ func TestPTYRearchitectureFixture(t *testing.T) {
 			protocol.TranscriptItem{ID: "dynamic-user", Kind: "user", Text: "LIVE_USER_MESSAGE"},
 			protocol.TranscriptItem{ID: "dynamic-answer", Kind: "assistant", Status: "running", Text: "LIVE_STREAM"})
 		live.Revision.LogSeq += 1
-		client.publish(protocol.Update{Type: protocol.UpdateState, Snapshot: &live})
+		client.publish(protocol.Update{Type: protocol.UpdateState, State: statePointer(live)})
 		time.Sleep(500 * time.Millisecond)
 		complete := live
 		complete.Transcript = append([]protocol.TranscriptItem(nil), live.Transcript...)
@@ -57,7 +57,7 @@ func TestPTYRearchitectureFixture(t *testing.T) {
 		client.mu.Lock()
 		client.snapshot = complete
 		client.mu.Unlock()
-		client.publish(protocol.Update{Type: protocol.UpdateState, Snapshot: &complete})
+		client.publish(protocol.Update{Type: protocol.UpdateState, State: statePointer(complete)})
 	}()
 	final, err := NewProgram(m).Run()
 	if err != nil {

@@ -18,6 +18,9 @@ func PublishEntry(ctx context.Context, r *os.Root, rel, kind string, mode os.Fil
 
 // Shared preparation/publication for file tools and snapshot application.
 func publishEntry(ctx context.Context, r *os.Root, rel, kind string, mode os.FileMode, b []byte, createOnly bool, check func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if e := ctx.Err(); e != nil {
 		return e
 	}
@@ -39,6 +42,9 @@ func publishEntry(ctx context.Context, r *os.Root, rel, kind string, mode os.Fil
 	parts := strings.Split(filepath.ToSlash(parent), "/")
 	prefix := ""
 	for _, part := range parts {
+		if e := ctx.Err(); e != nil {
+			return e
+		}
 		if part == "." {
 			continue
 		}
@@ -85,6 +91,9 @@ func publishEntry(ctx context.Context, r *os.Root, rel, kind string, mode os.Fil
 		if e := check(); e != nil {
 			return e
 		}
+	}
+	if e := ctx.Err(); e != nil {
+		return e
 	}
 	if createOnly {
 		if e := r.Link(tmp, rel); e != nil {

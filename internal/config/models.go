@@ -19,9 +19,8 @@ const DefaultReasoningEffort = "medium"
 
 // ModelConfig is the single configuration record for one provider's API model.
 type ModelConfig struct {
-	ContextWindow   int      `json:"context_window,omitempty"`
-	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
-	Pricing         *Pricing `json:"pricing,omitempty"`
+	ContextWindow   int `json:"context_window,omitempty"`
+	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
 }
 
 func (p *ProviderConfig) UnmarshalJSON(data []byte) error {
@@ -63,7 +62,7 @@ func (p *ProviderConfig) UnmarshalJSON(data []byte) error {
 }
 
 func rejectLegacyModelFields(raw map[string]json.RawMessage) error {
-	for _, key := range []string{"api_key", "base_url", "wire_api", "context_window", "context_windows", "pricing", "max_reply_tokens"} {
+	for _, key := range []string{"api_key", "base_url", "wire_api", "context_window", "context_windows", "max_reply_tokens"} {
 		if _, ok := raw[key]; ok {
 			return fmt.Errorf("config: top-level %s is obsolete; configure providers.<id> and providers.<id>.models.<model>; select model as provider/model", key)
 		}
@@ -99,19 +98,6 @@ func (c *Config) ReasoningEffortFor(model string) string {
 		return c.ReasoningEffort
 	}
 	return DefaultReasoningEffort
-}
-
-func (c *Config) PricingFor(model string) Pricing {
-	if p := c.ModelConfigFor(model).Pricing; p != nil {
-		return *p
-	}
-	if p, ok := c.Pricing[model]; ok {
-		return p
-	}
-	if p, ok := c.Pricing[c.APIModelFor(model)]; ok {
-		return p
-	}
-	return c.Pricing[c.Model]
 }
 
 // ValidateModelSelection is also applied to interactive model switches, where
@@ -171,9 +157,6 @@ func (c *Config) validateModelConfigs() error {
 			}
 			if m.MaxOutputTokens < 0 || effectiveOutput >= c.ContextWindowFor(id+"/"+name) {
 				return fmt.Errorf("providers.%s.models.%s: max_output_tokens must be below context_window (default is %d); set a smaller per-model limit", id, name, DefaultMaxOutputTokens)
-			}
-			if m.Pricing != nil && (m.Pricing.Input < 0 || m.Pricing.Output < 0) {
-				return fmt.Errorf("providers.%s.models.%s: negative pricing", id, name)
 			}
 		}
 	}

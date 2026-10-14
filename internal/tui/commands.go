@@ -17,7 +17,7 @@ import (
 // statuslineTokens are the valid /statusline items.
 var statuslineTokens = map[string]bool{
 	"version": true, "model": true, "mode": true,
-	"session": true, "workspace": true, "cost": true, "context": true,
+	"session": true, "workspace": true, "context": true,
 	"effort": true,
 }
 
@@ -30,6 +30,11 @@ var commandNames = commandCatalog.Names()
 // runCommand executes a slash command entered in the input box. Commands that
 // need the tea runtime (e.g. quitting) return a tea.Cmd alongside the model.
 func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
+	// Goal objectives are literal prose, including unmatched quotes and paths.
+	trimmed := strings.TrimSpace(text)
+	if prefix := strings.Fields(trimmed); len(prefix) > 0 && strings.EqualFold(prefix[0], "/goal") {
+		return m.runGoalCommand(strings.TrimSpace(trimmed[len(prefix[0]):]))
+	}
 	fields, err := commands.ParseLine(text)
 	if err != nil {
 		m.pushLog("error", "command parse failed: "+err.Error())
@@ -45,7 +50,7 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	}
 	if m.routing != nil && m.sessionID != m.routing.rootID {
 		switch cmd {
-		case "pending", "tasks", "next", "reconnect", "agents", "agent", "agent-history", "agent-output", "transcript", "parent", "root", "help", "cost", "context", "stop-tree", "quit":
+		case "pending", "tasks", "next", "reconnect", "agents", "agent", "agent-history", "agent-output", "transcript", "parent", "root", "help", "context", "stop-tree", "quit":
 		default:
 			m.pushStatus("this command belongs to the main session; use /root first")
 			return m, nil
@@ -130,9 +135,6 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 
 	case "compact":
 		return m, m.submitCommand(protocol.Command{Type: protocol.CommandCompact}, "compacting…")
-
-	case "cost":
-		m.pushLog("system", renderUsage(m.usage, m.modelName))
 
 	case "context":
 		if len(args) != 0 {
@@ -444,7 +446,7 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		var items []string
 		for _, a := range args {
 			if !statuslineTokens[a] {
-				m.pushLog("error", fmt.Sprintf("unknown statusline item %q (valid: version model mode session workspace cost context effort)", a))
+				m.pushLog("error", fmt.Sprintf("unknown statusline item %q (valid: version model mode session workspace context effort)", a))
 				return m, nil
 			}
 			items = append(items, a)
@@ -469,14 +471,6 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		}
 		m.pushStatus("running git…")
 		return m, m.runGit(args)
-
-	case "save":
-		if len(args) != 0 {
-			m.pushLog("error", "usage: /save")
-			return m, nil
-		}
-		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSaveSession,
-			SaveSession: &protocol.SaveSessionCommand{}}, "session save submitted")
 
 	case "resume":
 		// No argument → interactive picker over saved sessions.
@@ -750,21 +744,6 @@ func looksLikePatch(text string) bool {
 	return false
 }
 
-// renderUsage formats the session usage accounting for /cost.
-func renderUsage(u protocol.UsageSnapshot, model string) string {
-	var sb strings.Builder
-	sb.WriteString("Usage (model " + model + "):\n")
-	sb.WriteString(fmt.Sprintf("  input tokens:   %d\n", u.InputTokens))
-	sb.WriteString(fmt.Sprintf("  output tokens:  %d\n", u.OutputTokens))
-	if u.CachedTokens > 0 {
-		sb.WriteString(fmt.Sprintf("  cached tokens:  %d\n", u.CachedTokens))
-	}
-	sb.WriteString(fmt.Sprintf("  total tokens:   %d\n", u.InputTokens+u.OutputTokens))
-	sb.WriteString(fmt.Sprintf("  turns:          %d\n", u.TurnCount))
-	sb.WriteString(fmt.Sprintf("  estimated cost: $%.4f\n", u.Cost))
-	return sb.String()
-}
-
 // renderContext visualizes how much of the model's context window the session
 // currently occupies. It uses only authoritative numbers: the runtime's live
 // context estimate and window, plus cumulative request accounting. It never
@@ -800,7 +779,6 @@ func (m *Model) renderContext() string {
 		b.WriteString(fmt.Sprintf("    cached:  %d\n", usage.CachedTokens))
 	}
 	b.WriteString(fmt.Sprintf("    turns:   %d\n", usage.TurnCount))
-	b.WriteString(fmt.Sprintf("    cost:    $%.4f\n", usage.Cost))
 	return b.String()
 }
 

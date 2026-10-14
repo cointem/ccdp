@@ -1,12 +1,13 @@
 package agent
 
 import (
-	"ccdp/internal/llm"
-	"ccdp/internal/protocol"
-	"ccdp/internal/tools"
 	"context"
 	"encoding/json"
 	"testing"
+
+	"ccdp/internal/llm"
+	"ccdp/internal/protocol"
+	"ccdp/internal/tools"
 )
 
 func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
@@ -21,7 +22,7 @@ func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 		return llm.StreamResult{Text: text, FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "original"}, childPurposeTask, "call")
+	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "original"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +56,7 @@ func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 	if err != nil || receipt.Status != protocol.ReceiptScheduled {
 		t.Fatalf("continue: %+v %v", receipt, err)
 	}
-	next, err := a.supervisor.lookup(view.SessionID)
+	next, err := a.services.supervisor.lookup(view.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +68,7 @@ func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 	if err != nil || repeated.Status != protocol.ReceiptScheduled {
 		t.Fatalf("retry: %+v %v", repeated, err)
 	}
-	current, _ := a.supervisor.lookup(view.SessionID)
+	current, _ := a.services.supervisor.lookup(view.SessionID)
 	if current != next {
 		t.Fatal("retry created a second run")
 	}
@@ -87,7 +88,7 @@ func TestReasoningOnlyChildCompletesAndRestoresThinking(t *testing.T) {
 		return llm.StreamResult{Reasoning: "I need to implement the task", FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "write a file"}, childPurposeTask, "call")
+	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "write a file"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +114,7 @@ func TestReasoningOnlyChildCompletesAndRestoresThinking(t *testing.T) {
 		t.Fatal("settled child lost saved reasoning")
 	}
 	output, err := tools.NewAgentTool("ReadAgent").Run(&tools.Context{
-		Context: context.Background(), Sessions: a.Sessions(), ReadAgent: a.supervisor.readAgent,
+		Context: context.Background(), Sessions: a.Sessions(), ReadAgent: a.services.supervisor.readAgent,
 		Args: map[string]any{"view": "transcript", "agent_id": string(view.SessionID)},
 	})
 	if err != nil {

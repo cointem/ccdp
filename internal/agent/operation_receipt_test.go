@@ -32,15 +32,18 @@ func TestReviewScheduledCommandsReachTerminalReceipt(t *testing.T) {
 				t.Fatalf("admission = %+v, %v", r, err)
 			}
 			done := make(chan struct{})
-			go func() { a.operationWG.Wait(); close(done) }()
+			go func() { a.lifecycle.operationWG.Wait(); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):
 				t.Fatal("worker did not settle")
 			}
-			a.mu.Lock()
-			final := a.seenReceipts[cmd.ID]
-			a.mu.Unlock()
+			// Worker exit means its result was handed off. Query the public
+			// owner boundary to observe the durable terminal receipt.
+			final, err := a.Submit(context.Background(), cmd)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if final.Status == protocol.ReceiptScheduled {
 				t.Errorf("worker settled but receipt remained scheduled: %+v", final)
 			}
@@ -58,5 +61,40 @@ func TestReviewScheduledCommandsReachTerminalReceipt(t *testing.T) {
 				t.Fatal("worker settled without durable CommandCompleted")
 			}
 		})
+	}
+}
+
+func TestCompletedCommandRetainsBodyIdentityAfterReopen(t *testing.T) {
+	a, p, cfg := newJournalAgent(t, false)
+	cmd := protocol.Command{ID: "durable-body", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandFork, Fork: &protocol.Fork{Count: 1}}
+	var err error
+	cmd, err = cmd.Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.persistCommandScheduled(cmd, "fork", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.PersistCommandCompleted(session.CommandCompleted{CommandID: string(cmd.ID), Outcome: "applied"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := openSessionPersistence(cfg, a.SessionID(), a.conversation.createdAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	a.services.persistence = reopened
+	state, err := a.durableCommandState(cmd)
+	if err != nil || state.completed == nil || state.scheduled != nil || state.digestMismatch {
+		t.Fatalf("same body: %+v %v", state, err)
+	}
+	changed := cmd
+	changed.Fork = &protocol.Fork{Count: 2}
+	state, err = a.durableCommandState(changed)
+	if err != nil || !state.digestMismatch {
+		t.Fatalf("changed body accepted after completion/reopen: %+v %v", state, err)
 	}
 }

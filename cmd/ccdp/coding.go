@@ -89,9 +89,9 @@ func runCodingCLI(args []string, out, diagnostics io.Writer) int {
 		if err != nil {
 			return fail(err)
 		}
-		a, e = agent.Resume(&cfg, snap, nil)
+		a, e = agent.Resume(&cfg, snap)
 	} else {
-		a, e = agent.New(&cfg, nil)
+		a, e = agent.New(&cfg)
 	}
 	if e != nil {
 		return fail(e)

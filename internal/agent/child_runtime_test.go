@@ -21,6 +21,7 @@ import (
 	"ccdp/internal/permissions"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
+	"ccdp/internal/tools"
 )
 
 // childRuntimeTestProvider is intentionally a generic llm.Provider. These
@@ -51,13 +52,13 @@ func newChildRuntimeTestAgent(t *testing.T, p llm.Provider) (*Agent, config.Conf
 	registry := plugin.NewModelRegistry()
 	registry.Register(p)
 	registry.Route(cfg.Model, p.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Exercise the synchronous driver through a test-only tool; production
 	// SpawnAgent is asynchronous.
-	a.registry.Register(joinChildTestTool{parent: a})
+	a.services.registry.Register(joinChildTestTool{parent: a})
 	t.Cleanup(a.Close)
 	return a, cfg
 }
@@ -293,7 +294,7 @@ func TestIndependentChildrenShareBoundedSlots(t *testing.T) {
 	// The provider-owned constructor normally sizes this once from the frozen
 	// effective config. Install the same bounded parent slot set here without
 	// mutating a live config after construction.
-	a.childSlots = newChildSlots(2)
+	a.children.childSlots = newChildSlots(2)
 	a.mu.Unlock()
 	tasks := make([]childTask, 4)
 	for i := range tasks {
@@ -344,7 +345,7 @@ func TestConcurrentLaunchersShareParentChildSlots(t *testing.T) {
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
 	a.mu.Lock()
-	a.childSlots = newChildSlots(2)
+	a.children.childSlots = newChildSlots(2)
 	a.mu.Unlock()
 
 	const batchCount = 2
@@ -397,10 +398,10 @@ func TestChildHooksApplyToEachIndependentLaunch(t *testing.T) {
 	// one temporary directory to the parent session sandbox used by lifecycle
 	// hooks instead of relying on a nil/unrestricted policy.
 	a.AddDirectory(filepath.Dir(hookFile))
-	a.hooks = hooks.NewManager(hooks.Config{
+	a.services.hooks = hooks.NewManager(hooks.Config{
 		hooks.EventSubagentStart: {{Command: `printf 'start\n' >> "$CCDP_TEST_HOOK_FILE"`}},
 		hooks.EventSubagentStop:  {{Command: `printf 'stop\n' >> "$CCDP_TEST_HOOK_FILE"`}},
-	}, hooks.Options{SessionID: a.SessionID(), Workspace: a.cfg.Workspace, Env: []string{"CCDP_TEST_HOOK_FILE=" + hookFile}, Sandbox: a.sandbox})
+	}, hooks.Options{SessionID: a.SessionID(), Workspace: a.services.cfg.Workspace, Env: []string{"CCDP_TEST_HOOK_FILE=" + hookFile}, Sandbox: a.services.sandbox})
 	if _, err := runTestChild(a, "single-hook"); err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +450,7 @@ func TestTaskChildInheritsFrozenGoPreToolDecision(t *testing.T) {
 		}}}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	a.gohooks.AddPreTool(func(name string, _ map[string]any) (plugin.ToolDecision, string) {
+	a.services.gohooks.AddPreTool(func(name string, _ map[string]any) (plugin.ToolDecision, string) {
 		if name == "Write" {
 			return plugin.DecisionDeny, "parent policy denies child writes"
 		}
@@ -512,10 +513,10 @@ func TestTaskChildUsesStepProviderAndConfigSnapshot(t *testing.T) {
 			// Replace both the live route and effective endpoint while the
 			// original parent request is still streaming. The active binding and
 			// childStep must remain authoritative for the already-admitted Task.
-			parent.cfg.Model = "replacement-step-model"
-			parent.cfg.BaseURL = "http://replacement.invalid"
-			parent.models.Register(streamReplacement)
-			parent.models.Route("child-test-model", streamReplacement.Name())
+			parent.services.cfg.Model = "replacement-step-model"
+			parent.services.cfg.BaseURL = "http://replacement.invalid"
+			parent.services.models.Register(streamReplacement)
+			parent.services.models.Route("child-test-model", streamReplacement.Name())
 			parent.mu.Unlock()
 		})
 		return llm.StreamResult{FinishReason: "tool_calls", PromptTokens: 1, CompletionTok: 1,
@@ -529,8 +530,8 @@ func TestTaskChildUsesStepProviderAndConfigSnapshot(t *testing.T) {
 	// active binding still points at original, but the step's frozen registry
 	// therefore starts out pointing at preStepReplacement. pinChildProvider
 	// must reconcile that mismatch to the binding captured by the step.
-	a.models.Register(preStepReplacement)
-	a.models.Route("child-test-model", preStepReplacement.Name())
+	a.services.models.Register(preStepReplacement)
+	a.services.models.Route("child-test-model", preStepReplacement.Name())
 	submitChildRuntimeTestInput(t, a, "step-input", "step-parent")
 	view := waitChildRuntimeTestIdle(t, a)
 	if view.LastTurn.Status == protocol.TurnFailed {
@@ -587,29 +588,29 @@ func TestPreparedChildRequestRetainsFrozenWire(t *testing.T) {
 }
 
 func TestChildToolGateHardPolicies(t *testing.T) {
-	guardian := &Agent{childStateGroups: childStateGroups{childState: &childRuntimeState{
+	guardian := &Agent{children: childRuntimeBindings{childState: &childRuntimeState{
 		purpose:        childPurposeGuardian,
 		nonInteractive: true,
 		perms:          permissions.NewManager(permissions.ModeBypass, permissions.Policy{}),
 	}}}
 	for _, name := range []string{"Write", "Edit", "Bash", "WebSearch", "SpawnAgent", "EnterPlanMode", "ExitPlanMode", "unknown"} {
-		if denied, reason := ChildToolGate(guardian, messages.ToolCall{Name: name}); !denied || reason == "" {
+		if denied, reason := ChildToolGate(guardian, messages.ToolCall{Name: name}, nil); !denied || reason == "" {
 			t.Fatalf("guardian tool %q escaped hard gate: denied=%v reason=%q", name, denied, reason)
 		}
 	}
-	if denied, reason := ChildToolGate(guardian, messages.ToolCall{Name: "Read"}); denied {
+	if denied, reason := ChildToolGate(guardian, messages.ToolCall{Name: "Read"}, tools.NewReadTool()); denied {
 		t.Fatalf("guardian read unexpectedly denied: %q", reason)
 	}
 
-	task := &Agent{childStateGroups: childStateGroups{childState: &childRuntimeState{
+	task := &Agent{children: childRuntimeBindings{childState: &childRuntimeState{
 		purpose:        childPurposeTask,
 		nonInteractive: true,
 		perms:          permissions.NewManager(permissions.ModeDefault, permissions.Policy{}),
 	}}}
-	if denied, reason := ChildToolGate(task, messages.ToolCall{Name: "SpawnAgent"}); !denied || reason == "" {
+	if denied, reason := ChildToolGate(task, messages.ToolCall{Name: "SpawnAgent"}, tools.NewAgentTool("SpawnAgent")); !denied || reason == "" {
 		t.Fatalf("nested delegation escaped hard gate: denied=%v reason=%q", denied, reason)
 	}
-	if denied, reason := ChildToolGate(task, messages.ToolCall{Name: "Write", Arguments: map[string]any{"file_path": "x"}}); !denied || !strings.Contains(reason, "non-interactive") {
+	if denied, reason := ChildToolGate(task, messages.ToolCall{Name: "Write", Arguments: map[string]any{"file_path": "x"}}, tools.NewWriteTool()); !denied || !strings.Contains(reason, "non-interactive") {
 		t.Fatalf("approval Ask escaped non-interactive gate: denied=%v reason=%q", denied, reason)
 	}
 }

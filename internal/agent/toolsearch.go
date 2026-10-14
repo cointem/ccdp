@@ -54,9 +54,11 @@ func (t *toolSearchTool) Run(ctx *tools.Context) (string, error) {
 	if name == "" && query == "" {
 		return "", fmt.Errorf("ToolSearch: name or query required")
 	}
+	lease := t.ag.services.registry.Acquire()
+	defer lease.Close()
 	var matches []string
-	for _, n := range t.ag.registry.Names() {
-		if t.ag.childState != nil && t.ag.childState.allowed != nil && !t.ag.childState.allowed[n] {
+	for _, n := range lease.Names() {
+		if t.ag.children.childState != nil && t.ag.children.childState.allowed != nil && !t.ag.children.childState.allowed[n] {
 			continue
 		}
 		if name != "" {
@@ -66,8 +68,8 @@ func (t *toolSearchTool) Run(ctx *tools.Context) (string, error) {
 			}
 			continue
 		}
-		tool, _ := t.ag.registry.Get(n)
-		hay := strings.ToLower(n + " " + tool.Description())
+		definition, _ := lease.Definition(n)
+		hay := strings.ToLower(n + " " + definition.Description)
 		if strings.Contains(hay, query) {
 			matches = append(matches, n)
 		}
@@ -84,29 +86,33 @@ func (t *toolSearchTool) Run(ctx *tools.Context) (string, error) {
 		fmt.Fprintf(&sb, "Tools matching %q:\n\n", query)
 	}
 	for i, n := range matches {
-		tool, _ := t.ag.registry.Get(n)
-		schema, _ := json.MarshalIndent(tool.Parameters(), "  ", "  ")
+		definition, _ := lease.Definition(n)
+		description := definition.Description
 		if name == "" {
 			if i >= 5 {
 				break
 			}
-			fmt.Fprintf(&sb, "%s: %s\n", n, truncateRunes(tool.Description(), 240))
+			fmt.Fprintf(&sb, "%s: %s\n", n, truncateRunes(description, 240))
 			continue
+		}
+		parameters := definition.Parameters
+		schema, err := json.MarshalIndent(parameters, "  ", "  ")
+		if err != nil {
+			return "", fmt.Errorf("ToolSearch: encode %s schema: %w", n, err)
 		}
 		limit := 50 << 10
 		if ctx.OutputLimit > 0 {
 			limit = min(limit, ctx.OutputLimit)
 		}
-		if len(schema)+len(tool.Description())+sb.Len()+100 > limit {
+		if len(schema)+len(description)+sb.Len()+100 > limit {
 			return "", fmt.Errorf("ToolSearch: complete schema exceeds output budget; tool not loaded")
 		}
 		if i > 0 {
 			sb.WriteString("\n\n")
 		}
-		fmt.Fprintf(&sb, "Name: %s\nDescription: %s\nSchema:\n  %s", n, tool.Description(), schema)
+		fmt.Fprintf(&sb, "Name: %s\nDescription: %s\nSchema:\n  %s", n, description, schema)
 		// Make the discovered tool available for the rest of the session.
-		t.ag.markDiscovered(n)
-		if err := t.ag.persistToolDiscovery(n); err != nil {
+		if err := t.ag.persistToolDiscovery(lease.Version(), n, description, parameters); err != nil {
 			return "", err
 		}
 	}
@@ -123,7 +129,7 @@ func firstNonEmpty(a, b string) string {
 // markDiscovered records that a deferred tool was surfaced via ToolSearch.
 func (a *Agent) markDiscovered(name string) {
 	a.mu.Lock()
-	a.discovered[name] = true
+	a.discovery.discovered[name] = true
 	a.mu.Unlock()
 }
 
@@ -131,14 +137,14 @@ func (a *Agent) markDiscovered(name string) {
 func (a *Agent) isDiscovered(name string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.discovered[name]
+	return a.discovery.discovered[name]
 }
 
 // inlineToolNames returns the names of tools injected directly (all non-deferred).
 func (a *Agent) inlineToolNames() []string {
 	var names []string
-	for _, n := range a.registry.Names() {
-		if a.deferTools[n] && !a.isDiscovered(n) {
+	for _, n := range a.services.registry.Names() {
+		if a.discovery.deferTools[n] && !a.isDiscovered(n) {
 			continue
 		}
 		names = append(names, n)
@@ -149,10 +155,10 @@ func (a *Agent) inlineToolNames() []string {
 // toolSchemas returns the tool declarations to inject this request: all
 // non-deferred tools plus any discovered deferred tools.
 func (a *Agent) toolSchemas() []map[string]any {
-	return a.registry.SchemasFiltered(func(name string) bool {
-		if a.childState != nil && a.childState.allowed != nil && !a.childState.allowed[name] {
+	return a.services.registry.SchemasFiltered(func(name string) bool {
+		if a.children.childState != nil && a.children.childState.allowed != nil && !a.children.childState.allowed[name] {
 			return false
 		}
-		return !a.deferTools[name] || a.isDiscovered(name)
+		return !a.discovery.deferTools[name] || a.isDiscovered(name)
 	})
 }

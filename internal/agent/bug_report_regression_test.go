@@ -18,6 +18,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/replay"
 )
 
 // TestResumeRestoresRuntimeSequences exercises the durable boundary that was
@@ -40,7 +41,7 @@ func TestResumeRestoresRuntimeSequences(t *testing.T) {
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	b, err := newAgentWithOptions(&cfg, nil, snapshot, Options{
+	b, err := newAgentWithOptions(&cfg, snapshot, Options{
 		EffectiveConfigFrozen: true,
 		ProviderRegistry:      models,
 	})
@@ -63,14 +64,14 @@ func TestResumeRestoresRuntimeSequences(t *testing.T) {
 func TestConsecutiveModelChangesLeaveNoStaleCandidate(t *testing.T) {
 	provider := &formalCompletionProvider{}
 	a := newJournalRuntimeAgent(t, provider)
-	a.models.Route("bug-first-model", provider.Name())
-	a.models.Route("bug-second-model", provider.Name())
+	a.services.models.Route("bug-first-model", provider.Name())
+	a.services.models.Route("bug-second-model", provider.Name())
 	a.mu.Lock()
-	a.busy = true
+	a.turn.busy = true
 	a.mu.Unlock()
 	defer func() {
 		a.mu.Lock()
-		a.busy = false
+		a.turn.busy = false
 		a.mu.Unlock()
 	}()
 
@@ -83,12 +84,12 @@ func TestConsecutiveModelChangesLeaveNoStaleCandidate(t *testing.T) {
 		t.Fatalf("second model receipt=%+v, want applied", second)
 	}
 	a.mu.Lock()
-	activeModel := a.activeBinding.model
+	activeModel := a.modelsState.activeBinding.model
 	a.mu.Unlock()
 	if activeModel != "bug-second-model" {
 		t.Fatalf("last model did not win cleanly: active=%q", activeModel)
 	}
-	replayed, err := SessionSnapshotProjection(a.persistenceHandle().Store(), a.SessionID())
+	replayed, err := SessionSnapshotProjection(a.persistenceHandle(), a.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +103,7 @@ func TestToolProjectionUsesOccurrenceIdentityAndStablePrefix(t *testing.T) {
 		{Seq: 1, Event: &session.ToolResultsProjected{TurnID: "turn-1", StepID: "step-1", Results: []session.ProjectedToolResult{{CallID: "reused", Text: "same", Status: "success"}}}},
 		{Seq: 2, Event: &session.ToolResultsProjected{TurnID: "turn-1", StepID: "step-2", Results: []session.ProjectedToolResult{{CallID: "reused", Text: "same", Status: "success"}}}},
 	}
-	projection, err := projectRecordsRaw(records)
+	projection, err := replay.RecordsRaw(records)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +116,7 @@ func TestToolProjectionUsesOccurrenceIdentityAndStablePrefix(t *testing.T) {
 
 	provider := &formalToolFactProvider{}
 	a := newJournalRuntimeAgent(t, provider)
-	a.registry.Register(&formalAuditEffect{t: t, a: a})
+	a.services.registry.Register(&formalAuditEffect{t: t, a: a})
 	submitJournalRuntimeInput(t, a)
 	waitJournalRuntimeIdle(t, a)
 	actual, err := a.persistenceHandle().Read(session.Beginning)
@@ -180,9 +181,10 @@ func TestInputQueuedTooLargeIsRecoverable(t *testing.T) {
 	provider := &formalCompletionProvider{}
 	a := newJournalRuntimeAgent(t, provider)
 	p := a.persistenceHandle()
-	p.mu.Lock()
-	p.store = &inputTooLargeCommitStore{Store: p.store}
-	p.mu.Unlock()
+	backend := journalBackend(t, p)
+	backend.mu.Lock()
+	backend.store = &inputTooLargeCommitStore{Store: backend.store}
+	backend.mu.Unlock()
 	command := protocol.NewSubmitInput("bug-store-input-too-large", protocol.SessionID(a.SessionID()), "bug-store-input-too-large-id", "valid text", protocol.InputSteer)
 	receipt, err := a.Submit(context.Background(), command)
 	if err != nil {
@@ -200,12 +202,8 @@ func TestInputQueuedTooLargeIsRecoverable(t *testing.T) {
 	}
 }
 
-// TestMaximumEscapedInputDoesNotPoisonOnSnapshotOverflow covers the boundary
-// where a 1 MiB protocol input is valid, but the optional compatibility
-// snapshot becomes larger than the JSONL transaction limit after JSON
-// escaping. The typed event log must remain writable and sufficient for a
-// complete resume even when snapshot.json is skipped.
-func TestMaximumEscapedInputDoesNotPoisonOnSnapshotOverflow(t *testing.T) {
+// Maximum-size escaped input must remain recoverable directly from the log.
+func TestMaximumEscapedInputRemainsRecoverable(t *testing.T) {
 	provider := &formalCompletionProvider{}
 	a := newLargeContextJournalRuntimeAgent(t, provider)
 	text := strings.Repeat("\x01", protocol.MaxSubmitInputTextBytes)
@@ -222,9 +220,9 @@ func TestMaximumEscapedInputDoesNotPoisonOnSnapshotOverflow(t *testing.T) {
 		t.Fatalf("maximum escaped input turn=%+v", view.LastTurn)
 	}
 	if err := a.persistenceFailure(); err != nil {
-		t.Fatalf("snapshot overflow poisoned typed log: %v", err)
+		t.Fatalf("large input poisoned typed log: %v", err)
 	}
-	formalCompletionTurn(t, a, "bug-max-escaped-retry", "valid retry after snapshot overflow")
+	formalCompletionTurn(t, a, "bug-max-escaped-retry", "valid retry after large input")
 	if provider.requestsCount() != 2 {
 		t.Fatalf("post-overflow provider calls=%d, want 2", provider.requestsCount())
 	}
@@ -256,7 +254,7 @@ func TestMaximumEscapedInputDoesNotPoisonOnSnapshotOverflow(t *testing.T) {
 func TestApplyPlanTextLimitIsRecoverable(t *testing.T) {
 	provider := &formalCompletionProvider{}
 	a := newJournalRuntimeAgent(t, provider)
-	planPath := filepath.Join(a.cfg.Workspace, "large-plan.txt")
+	planPath := filepath.Join(a.services.cfg.Workspace, "large-plan.txt")
 	if err := os.WriteFile(planPath, []byte(strings.Repeat("plan ", 2<<20/len("plan "))), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -309,13 +307,13 @@ func TestIdempotencyIndexesRetainDigestsNotPayloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := a.seenCommands[normalized.ID]; got != commandDigest || len(got) != 64 {
+	if got := a.inbox.seenCommands[normalized.ID]; got != commandDigest || len(got) != 64 {
 		t.Fatalf("seen command index=%q, want canonical digest %q", got, commandDigest)
 	}
 
 	input := protocol.SubmitInput{ID: "bug-digest-input", Text: "payload that must not remain in the index", Strategy: protocol.InputFollowup}
 	a.mu.Lock()
-	a.busy = true
+	a.turn.busy = true
 	a.mu.Unlock()
 	inputCommand := protocol.Command{ID: "bug-digest-input-command", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandSubmitInput, Input: &input}
 	inputReceipt := a.applySubmitInput(inputCommand)
@@ -326,11 +324,11 @@ func TestIdempotencyIndexesRetainDigestsNotPayloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := a.seenInputBody[input.ID]; got != inputDigest || len(got) != 64 || strings.Contains(got, input.Text) {
+	if got := a.inbox.seenInputBody[input.ID]; got != inputDigest || len(got) != 64 || strings.Contains(got, input.Text) {
 		t.Fatalf("seen input index=%q, want canonical digest %q", got, inputDigest)
 	}
 	a.mu.Lock()
-	a.busy = false
+	a.turn.busy = false
 	a.mu.Unlock()
 }
 
@@ -348,7 +346,7 @@ func newLargeContextJournalRuntimeAgent(t *testing.T, provider llm.Provider) *Ag
 	registry := plugin.NewModelRegistry()
 	registry.Register(provider)
 	registry.Route(cfg.Model, provider.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +357,7 @@ func newLargeContextJournalRuntimeAgent(t *testing.T, provider llm.Provider) *Ag
 func TestAutomaticCompactionFailureIsSuppressedButManualRetries(t *testing.T) {
 	provider := &formalCompletionProvider{fail: true}
 	a := newJournalRuntimeAgent(t, provider)
-	a.cfg.KeepAfterCompact = 4
+	a.services.cfg.KeepAfterCompact = 4
 	for i := 0; i < 7; i++ {
 		if err := a.appendHistory(messages.Message{Role: messages.RoleUser, Content: fmt.Sprintf("compact entry %d", i)}); err != nil {
 			t.Fatal(err)
@@ -375,7 +373,7 @@ func TestAutomaticCompactionFailureIsSuppressedButManualRetries(t *testing.T) {
 		t.Fatalf("same-state automatic retry attempts=%d, want suppressed at 1", got)
 	}
 	a.mu.Lock()
-	failureRecorded := a.compactFailure != nil
+	failureRecorded := a.lifecycle.compactFailure != nil
 	a.mu.Unlock()
 	if !failureRecorded {
 		t.Fatal("automatic compaction failure was not recorded")
@@ -421,16 +419,17 @@ func TestApprovalTimeoutAndAllowCommitExactlyOneFact(t *testing.T) {
 	defer cancel()
 	p := a.persistenceHandle()
 	a.mu.Lock()
-	a.turnCtx = ctx
-	a.turnCancel = cancel
+	a.turn.turnCtx = ctx
+	a.turn.turnCancel = cancel
 	a.mu.Unlock()
 	if p == nil {
 		t.Fatal("session persistence missing")
 	}
-	barrier := &approvalResolutionBarrierStore{Store: p.Store(), entered: make(chan struct{}), release: make(chan struct{})}
-	p.mu.Lock()
-	p.store = barrier
-	p.mu.Unlock()
+	backend := journalBackend(t, p)
+	backend.mu.Lock()
+	barrier := &approvalResolutionBarrierStore{Store: backend.store, entered: make(chan struct{}), release: make(chan struct{})}
+	backend.store = barrier
+	backend.mu.Unlock()
 
 	tc := messages.ToolCall{ID: "approval-race-call", Name: "Bash", Arguments: map[string]any{"command": "echo safe"}}
 	resultCh := make(chan struct {
@@ -445,12 +444,12 @@ func TestApprovalTimeoutAndAllowCommitExactlyOneFact(t *testing.T) {
 		}{approved: approved, remember: remember}
 	}()
 
-	var approval *ApprovalRequest
+	var approval *protocol.ApprovalView
 	deadline := time.After(3 * time.Second)
 	for approval == nil {
 		select {
-		case event := <-a.events:
-			if event.Type == EventApproval && event.Approval != nil {
+		case event := <-watchTestEvents(t, a):
+			if event.Kind == protocol.EventApprovalRequest && event.Approval != nil {
 				approval = event.Approval
 			}
 		case <-deadline:
@@ -459,12 +458,16 @@ func TestApprovalTimeoutAndAllowCommitExactlyOneFact(t *testing.T) {
 	}
 	commandResult := make(chan protocol.Receipt, 1)
 	go func() {
-		commandResult <- a.applyApproveTool(protocol.Command{
+		receipt, err := a.Submit(context.Background(), protocol.Command{
 			ID:        "approval-race-command",
 			SessionID: protocol.SessionID(a.SessionID()),
 			Type:      protocol.CommandApproveTool,
 			Approval:  &protocol.ApproveTool{ApprovalID: approval.ID, Approve: true},
 		})
+		if err != nil {
+			t.Error(err)
+		}
+		commandResult <- receipt
 	}()
 	select {
 	case <-barrier.entered:
@@ -506,15 +509,15 @@ func TestApprovalTimeoutAndAllowCommitExactlyOneFact(t *testing.T) {
 	}
 }
 
-func TestMemoryCacheFailureDoesNotPoisonTypedMemory(t *testing.T) {
+func TestMemoryIgnoresLegacyCache(t *testing.T) {
 	a := newMemoryAgent(t)
 	defer a.Close()
-	if err := os.MkdirAll(a.memoryFile(), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(a.services.cfg.SessionDir, a.SessionID()+"-memory.md"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	a.mu.Lock()
-	a.turnUserMsg = "cache failure request"
-	a.turnSummary = "typed memory remains authoritative"
+	a.turnMemory.turnUserMsg = "cache failure request"
+	a.turnMemory.turnSummary = "typed memory remains authoritative"
 	a.mu.Unlock()
 	if err := a.recordMemory(); err != nil {
 		t.Fatalf("recordMemory returned cache failure: %v", err)

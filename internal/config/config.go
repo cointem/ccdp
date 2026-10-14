@@ -235,11 +235,6 @@ type Config struct {
 	// Claude Code's --max-turns.
 	MaxTurns int `json:"max_turns"`
 
-	// MaxBudgetUSD is the hard USD spending cap for the session (0 = unlimited).
-	// When cumulative cost exceeds it the agent stops, mirroring Claude Code's
-	// max budget.
-	MaxBudgetUSD float64 `json:"max_budget_usd"`
-
 	// Verbose prints extra progress diagnostics to stderr; Debug prints LLM
 	// request details as well. Both default false.
 	Verbose bool `json:"-"`
@@ -300,9 +295,6 @@ type Config struct {
 	// spawns a stdio server whose advertised tools become agent tools.
 	MCPServers map[string]mcp.ServerConfig `json:"mcp_servers"`
 
-	// Pricing per model: "model" → {input_per_million, output_per_million}.
-	Pricing map[string]Pricing `json:"pricing"`
-
 	SessionDir string `json:"session_dir"` // where sessions are persisted
 
 	// Runtime metadata is deliberately excluded from JSON.
@@ -314,13 +306,6 @@ type Config struct {
 	// where its own executable-settings authorization is stored. When nil,
 	// callers use DefaultTrustStore at the application boundary.
 	TrustStore *TrustStore `json:"-"`
-}
-
-// Pricing is per-model token cost, USD per million tokens.
-type Pricing struct {
-	Input         float64 `json:"input_per_million"`
-	Output        float64 `json:"output_per_million"`
-	ContextWindow int     `json:"context_window"`
 }
 
 // ProviderConfig describes one named model provider. An empty APIKey means the
@@ -485,16 +470,6 @@ type ToolSpec struct {
 	Permission string `json:"permission,omitempty"`
 }
 
-// DefaultPricing covers common models; users can override in config.json.
-func DefaultPricing() map[string]Pricing {
-	return map[string]Pricing{
-		"gpt-5.4-mini":             {Input: 0.15, Output: 0.60, ContextWindow: 400000},
-		"gpt-4o":                   {Input: 2.50, Output: 10.00, ContextWindow: 128000},
-		"gpt-4.1":                  {Input: 2.00, Output: 8.00, ContextWindow: 1000000},
-		"claude-sonnet-4-20250514": {Input: 3.00, Output: 15.00, ContextWindow: 200000},
-	}
-}
-
 func defaultConfig() Config {
 	home, _ := os.UserHomeDir()
 	return Config{
@@ -514,7 +489,6 @@ func defaultConfig() Config {
 		NetworkAccess:      true,
 		MCPServers:         map[string]mcp.ServerConfig{},
 		Providers:          map[string]ProviderConfig{},
-		Pricing:            DefaultPricing(),
 		SessionDir:         filepath.Join(home, ".ccdp", "sessions"),
 		sourcePath:         filepath.Join(home, ".ccdp", "config.json"),
 		provenance:         newProvenance(),
@@ -570,13 +544,6 @@ func applyEnvChecked(cfg *Config) error {
 		n, err := parseEnvInt("CCDP_MAX_TURNS", v)
 		if err == nil {
 			cfg.MaxTurns = n
-		}
-		return err
-	})
-	apply("CCDP_MAX_BUDGET_USD", func(v string) error {
-		n, err := parseEnvFloat("CCDP_MAX_BUDGET_USD", v)
-		if err == nil {
-			cfg.MaxBudgetUSD = n
 		}
 		return err
 	})
@@ -763,9 +730,6 @@ func (c *Config) Validate() error {
 	if c.Providers == nil {
 		c.Providers = map[string]ProviderConfig{}
 	}
-	if c.Pricing == nil {
-		c.Pricing = map[string]Pricing{}
-	}
 	return nil
 }
 
@@ -844,16 +808,6 @@ func (c *Config) SavePermissionRules() error {
 		return err
 	}
 	return atomicfile.WriteFile(path, data, 0o600)
-}
-
-// CostFor computes the USD cost of a token usage for the given model,
-// falling back to the configured model's pricing when unknown.
-func (c *Config) CostFor(model string, inputTokens, outputTokens int) float64 {
-	p := c.PricingFor(model)
-	if p.Input == 0 && p.Output == 0 {
-		return 0
-	}
-	return float64(inputTokens)/1e6*p.Input + float64(outputTokens)/1e6*p.Output
 }
 
 // Sandbox builds the fixed macOS Seatbelt policy for the configured workspace.
@@ -940,7 +894,6 @@ func loadProjectSettings(ws string, store *TrustStore) (Config, error) {
 	// entries and only fill values that are present in the files below.
 	proj.APIKey, proj.BaseURL, proj.Model, proj.Workspace = "", "", "", ""
 	proj.Providers = map[string]ProviderConfig{}
-	proj.Pricing = map[string]Pricing{}
 	proj.Hooks = hooks.Config{}
 	proj.MCPServers = map[string]mcp.ServerConfig{}
 	proj.EnableWebTools = nil

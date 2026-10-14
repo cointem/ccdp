@@ -51,14 +51,7 @@ func (*ReadTool) Run(ctx *Context) (string, error) {
 	if e != nil {
 		return "", e
 	}
-	canonical, e := filepath.EvalSymlinks(path)
-	if e != nil {
-		return "", e
-	}
-	if _, e = ctx.ResolveRead(canonical); e != nil {
-		return "", e
-	}
-	f, e := fsops.OpenRegular(ctx.ReadRoot, canonical)
+	f, e := fsops.OpenAuthorizedRegular(ctx.ReadRoot, path, ctx.ResolveRead)
 	if e != nil {
 		return "", e
 	}
@@ -77,6 +70,9 @@ func (*ReadTool) Run(ctx *Context) (string, error) {
 	r := bufio.NewReaderSize(f, budget)
 	line := 1
 	for line < offset {
+		if err := ctx.checkResources(); err != nil {
+			return "", err
+		}
 		_, e = r.ReadSlice('\n')
 		if e == bufio.ErrBufferFull {
 			continue
@@ -95,6 +91,9 @@ func (*ReadTool) Run(ctx *Context) (string, error) {
 	longLine := false
 	budgetStopped := false
 	for count < limit {
+		if err := ctx.checkResources(); err != nil {
+			return "", err
+		}
 		part, err := r.ReadSlice('\n')
 		if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
 			return "", err
@@ -138,6 +137,9 @@ func (*ReadTool) Run(ctx *Context) (string, error) {
 	}
 	if count == 0 && eof && offset > 1 {
 		return "", fmt.Errorf("Read: offset %d is beyond EOF", offset)
+	}
+	if err := ctx.checkResources(); err != nil {
+		return "", err
 	}
 	after, e := f.Stat()
 	if e != nil {
@@ -201,9 +203,14 @@ func (*WriteTool) Run(ctx *Context) (output string, runErr error) {
 		return "", e
 	}
 	defer lock.Close()
+	root, relative, e := ctx.openWriteRoot(path)
+	if e != nil {
+		return "", e
+	}
+	defer root.Close()
 	var expected *fsops.Version
 	if mode == "create" {
-		if _, e = os.Lstat(path); e == nil {
+		if _, e = root.Lstat(relative); e == nil {
 			return "", fmt.Errorf("Write: file exists; use mode=replace after Read, or Edit")
 		} else if !os.IsNotExist(e) {
 			return "", e
@@ -226,7 +233,7 @@ func (*WriteTool) Run(ctx *Context) (output string, runErr error) {
 			}
 		}()
 	}
-	version, e := fsops.Publish(path, []byte(content), 0644, expected)
+	version, e := fsops.PublishAt(ctx.Context, root, relative, []byte(content), 0644, expected)
 	if e != nil {
 		return "", e
 	}
@@ -269,7 +276,12 @@ func (*EditTool) Run(ctx *Context) (output string, runErr error) {
 		return "", e
 	}
 	defer lock.Close()
-	data, version, e := fsops.Read(path, 32<<20)
+	root, relative, e := ctx.openWriteRoot(path)
+	if e != nil {
+		return "", e
+	}
+	defer root.Close()
+	data, version, e := fsops.ReadAt(root, relative, 32<<20)
 	if e != nil {
 		return "", e
 	}
@@ -332,7 +344,7 @@ func (*EditTool) Run(ctx *Context) (output string, runErr error) {
 			}
 		}()
 	}
-	version, e = fsops.Publish(path, []byte(updated), 0644, &version)
+	version, e = fsops.PublishAt(ctx.Context, root, relative, []byte(updated), 0644, &version)
 	if e != nil {
 		return "", e
 	}
@@ -353,4 +365,49 @@ func appendBounded(sb *strings.Builder, value string, limit int) {
 }
 func diffSummary(old, next string) string {
 	return "Applied edit.\n- " + strings.ReplaceAll(strings.TrimSuffix(old, "\n"), "\n", "\n- ") + "\n+ " + strings.ReplaceAll(strings.TrimSuffix(next, "\n"), "\n", "\n+ ")
+}
+
+// Pin an admitted writable root before reading or recording a mutation. Every
+// later traversal stays within this handle even if a target ancestor changes.
+func (ctx *Context) openWriteRoot(path string) (*os.Root, string, error) {
+	// Resolve existing ancestors once, including harmless host aliases such as
+	// /var -> /private/var. Keep the final entry unresolved (writes reject links).
+	parent, tail := filepath.Dir(path), filepath.Base(path)
+	for {
+		canonical, err := filepath.EvalSymlinks(parent)
+		if err == nil {
+			path = filepath.Join(canonical, tail)
+			break
+		}
+		if !os.IsNotExist(err) {
+			return nil, "", err
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return nil, "", err
+		}
+		tail, parent = filepath.Join(filepath.Base(parent), tail), next
+	}
+	if _, err := ctx.ResolveWrite(path); err != nil {
+		return nil, "", err
+	}
+	policy := ctx.Sandbox.Snapshot()
+	roots := append([]string{policy.Workspace}, policy.AdditionalDirs...)
+	roots = append(roots, policy.ScratchDirs...)
+	for _, candidate := range roots {
+		canonical, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			continue
+		}
+		relative, err := filepath.Rel(canonical, path)
+		if err != nil || !filepath.IsLocal(relative) {
+			continue
+		}
+		handle, err := os.OpenRoot(canonical)
+		if err != nil {
+			return nil, "", err
+		}
+		return handle, relative, nil
+	}
+	return nil, "", fmt.Errorf("write has no authorized filesystem root: %s", path)
 }

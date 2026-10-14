@@ -477,3 +477,18 @@ func testRequest(t *testing.T, req Request) Request {
 	}
 	return req
 }
+
+func TestApprovedShellPreservesProjectPATH(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "project-query")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf project-output\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Run(Request{Context: context.Background(), Command: "project-query", Dir: root, Env: []string{"PATH=" + root + ":/usr/bin:/bin"}, Sandbox: sandbox.New(root)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 || res.Stdout != "project-output" {
+		t.Fatalf("project PATH changed: %+v", res)
+	}
+}

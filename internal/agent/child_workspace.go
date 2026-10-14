@@ -14,6 +14,7 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/execution"
 	"ccdp/internal/fsops"
+	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 )
 
@@ -152,14 +153,14 @@ func (a *Agent) prepareChildWorkspace(ctx context.Context, task childTask, cfg *
 	if head, headErr := a.resolveReviewRef(ctx, "", "HEAD"); headErr == nil && head != "" {
 		argv := []string{"git", "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", "--no-checkout", dir, "HEAD"}
 		args := map[string]any{"command": formatExternalCommand(argv)}
-		if e = a.precheckCommand("Bash", args); e != nil {
+		if e = a.precheckCommand("Bash", args, permissions.KindShell); e != nil {
 			return "", "", e
 		}
-		if e = a.authorizeCommand(ctx, protocol.CommandID(nextRuntimeID("worktree")), "Bash", args); e != nil {
+		if e = a.authorizeCommand(ctx, protocol.CommandID(nextRuntimeID("worktree")), "Bash", args, permissions.KindShell); e != nil {
 			return "", "", e
 		}
 		a.mu.Lock()
-		sb := a.sandbox.Snapshot()
+		sb := a.services.sandbox.Snapshot()
 		a.mu.Unlock()
 		sb.AddDir(dir)
 		r, e := execution.RunArgv(ctx, argv, execution.Request{Dir: parent, Sandbox: sb, Env: execution.ReadOnlyGitEnvironment(os.Environ()), OutputLimit: 1 << 20})
@@ -187,8 +188,8 @@ func (a *Agent) prepareChildWorkspace(ctx context.Context, task childTask, cfg *
 // be removed. Callers must have settled the run and hold its workspace lock.
 func (a *Agent) removeChildWorkspace(ctx context.Context, dir string) error {
 	a.mu.Lock()
-	cfg := a.cfg.Clone()
-	sb := a.sandbox.Snapshot()
+	cfg := a.services.cfg.Clone()
+	sb := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	base := os.TempDir()
 	if !cfg.NoSessionPersistence {
@@ -230,7 +231,7 @@ func (a *Agent) removeChildWorkspace(ctx context.Context, dir string) error {
 			return err
 		}
 		want := filepath.Join(parent, filepath.Base(dir))
-		listing, err := execution.RunArgv(ctx, []string{"git", "worktree", "list", "--porcelain", "-z"}, execution.Request{Dir: cfg.Workspace, Sandbox: sb, Env: execution.ReadOnlyGitEnvironment(os.Environ()), OutputLimit: 1 << 20, Timeout: 30 * time.Second})
+		listing, err := execution.RunReadOnlyGit(ctx, []string{"git", "worktree", "list", "--porcelain", "-z"}, execution.Request{Dir: cfg.Workspace, Sandbox: sb, OutputLimit: 1 << 20, Timeout: 30 * time.Second})
 		if err != nil {
 			return err
 		}
@@ -285,7 +286,7 @@ func (a *Agent) finishChildMerge(ctx context.Context, r *managedRun, binding chi
 		return "\nChild workspace retained: " + err.Error(), nil
 	}
 	a.mu.Lock()
-	policy := a.sandbox.Snapshot()
+	policy := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	policy.AddReadOnlyDir(row.Workspace)
 	current, err := store.CapturePaths(ctx, row.Workspace, nil, policy)
@@ -296,7 +297,7 @@ func (a *Agent) finishChildMerge(ctx context.Context, r *managedRun, binding chi
 		return "\nChild workspace has newer changes; retained.", nil
 	}
 	r.fact.Child.MergeStatus = "merged"
-	if err = a.supervisor.persist(r, "merged-"+id); err != nil {
+	if err = a.services.supervisor.persist(r, "merged-"+id); err != nil {
 		return "", err
 	}
 	return childCleanupResult("", a.removeChildWorkspace(ctx, row.Workspace))
@@ -312,9 +313,8 @@ func childCleanupResult(output string, err error) (string, error) {
 // Recovery is an execution-startup operation, never a side effect of opening
 // a session reader. Unmerged or interrupted work is deliberately retained.
 func (s *SessionSupervisor) cleanupMergedWorkspaces() {
-	s.mu.Lock()
 	var rows []protocol.ChildSession
-	for _, r := range s.children {
+	for _, r := range s.directory.Children() {
 		r.mu.Lock()
 		row := r.fact.Child
 		r.mu.Unlock()
@@ -322,13 +322,12 @@ func (s *SessionSupervisor) cleanupMergedWorkspaces() {
 			rows = append(rows, row)
 		}
 	}
-	s.mu.Unlock()
 	for _, row := range rows {
-		if s.root.rootCtx.Err() != nil {
+		if s.root.rootContext().Err() != nil {
 			return
 		}
 		if _, err := os.Lstat(row.Workspace); os.IsNotExist(err) {
-			if err = s.root.removeChildWorkspace(s.root.rootCtx, row.Workspace); err != nil {
+			if err = s.root.removeChildWorkspace(s.root.rootContext(), row.Workspace); err != nil {
 				s.root.emitStatus("child worktree registration cleanup deferred: %v", err)
 			}
 			continue
@@ -337,7 +336,7 @@ func (s *SessionSupervisor) cleanupMergedWorkspaces() {
 		if err != nil {
 			continue
 		}
-		if err = s.root.removeMergedWorkspace(s.root.rootCtx, row); err != nil {
+		if err = s.root.removeMergedWorkspace(s.root.rootContext(), row); err != nil {
 			s.root.emitStatus("merged child workspace cleanup deferred: %v", err)
 		}
 		lock.Close()
@@ -359,7 +358,7 @@ func (a *Agent) removeMergedWorkspace(ctx context.Context, row protocol.ChildSes
 			return err
 		}
 		a.mu.Lock()
-		policy := a.sandbox.Snapshot()
+		policy := a.services.sandbox.Snapshot()
 		a.mu.Unlock()
 		policy.AddReadOnlyDir(row.Workspace)
 		current, err := store.CapturePaths(ctx, row.Workspace, nil, policy)
@@ -419,7 +418,7 @@ func (a *Agent) runMergeChild(ctx context.Context, cmd protocol.Command) (string
 		return string(b), e
 	}
 	if w.Action == "prepare" {
-		r, e := a.supervisor.lookup(protocol.SessionID(w.ID))
+		r, e := a.services.supervisor.lookup(protocol.SessionID(w.ID))
 		if e != nil {
 			return "", e
 		}
@@ -468,7 +467,7 @@ func (a *Agent) runMergeChild(ctx context.Context, cmd protocol.Command) (string
 	if e := store.Value(w.ID, &binding); e != nil {
 		return "", e
 	}
-	r, e := a.supervisor.lookup(binding.Child)
+	r, e := a.services.supervisor.lookup(binding.Child)
 	if e != nil {
 		return "", e
 	}
@@ -500,7 +499,7 @@ func (a *Agent) runMergeChild(ctx context.Context, cmd protocol.Command) (string
 		return "", e
 	}
 	defer workspaceLock.Close()
-	current, e := a.supervisor.lookup(binding.Child)
+	current, e := a.services.supervisor.lookup(binding.Child)
 	if e != nil || current != r {
 		return "", errors.New("child changed since merge preparation")
 	}
@@ -511,7 +510,7 @@ func (a *Agent) runMergeChild(ctx context.Context, cmd protocol.Command) (string
 		if edit.Conflict != "" {
 			return "", changes.ErrConflict
 		}
-		if e := a.authorizeCommand(ctx, cmd.ID, "Write", map[string]any{"file_path": filepath.Join(binding.Plan.Root, edit.Path), "merge_plan": w.ID}); e != nil {
+		if e := a.authorizeCommand(ctx, cmd.ID, "Write", map[string]any{"file_path": filepath.Join(binding.Plan.Root, edit.Path), "merge_plan": w.ID}, permissions.KindWrite); e != nil {
 			return "", e
 		}
 	}
@@ -523,9 +522,9 @@ func (a *Agent) runMergeChild(ctx context.Context, cmd protocol.Command) (string
 	if e != nil {
 		return "", e
 	}
-	defer a.sealRecoveryPoint(checkpoint)
+	defer a.sealRecoveryPoint(ctx, checkpoint)
 	a.mu.Lock()
-	sb := a.sandbox.Snapshot()
+	sb := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	j, e := store.ApplyWithRecorder(ctx, binding.Plan, sb, a.recordCodingWrite)
 	if e != nil {
@@ -533,8 +532,8 @@ func (a *Agent) runMergeChild(ctx context.Context, cmd protocol.Command) (string
 		return string(b), e
 	}
 	note, e := a.finishChildMerge(ctx, r, binding, w.ID)
-	if a.resources != nil {
-		a.resources.Files.Clear()
+	if a.services.resources != nil {
+		a.services.resources.Files.Clear()
 	}
 	return "merged child " + string(binding.Child) + note, e
 }

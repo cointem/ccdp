@@ -111,10 +111,10 @@ func TestRefreshCmdSuggest(t *testing.T) {
 func TestCmdSuggestKeys(t *testing.T) {
 	m := sugModel()
 
-	// Open suggestions with "/g" → git, github.
-	typeKey(m, "/g")
+	// Open suggestions with "/gi" → git, github.
+	typeKey(m, "/gi")
 	if len(m.cmdSug) != 2 || m.cmdSug[0] != "git" || m.cmdSug[1] != "github" {
-		t.Fatalf("'/g' should suggest [git github], got %v", m.cmdSug)
+		t.Fatalf("'/gi' should suggest [git github], got %v", m.cmdSug)
 	}
 
 	// Down moves selection, wraps.

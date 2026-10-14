@@ -11,6 +11,7 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/llm"
 	"ccdp/internal/plugin"
+	"ccdp/internal/protocol"
 )
 
 type backgroundTestProvider struct {
@@ -64,12 +65,14 @@ func TestHeadlessWaitsForBackgroundDeliveryAndEmitsTypedChildEvents(t *testing.T
 			registry := plugin.NewModelRegistry()
 			registry.Register(p)
 			registry.Route(cfg.Model, p.Name())
-			a, err := agent.NewWithOptions(&cfg, nil, agent.Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
+			a, err := agent.NewWithOptions(&cfg, agent.Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer a.Close()
-			out, code := captureHeadlessStdout(t, func() int { return runHeadless(a, []string{"parent prompt"}, format, 10) })
+			out, code := captureHeadlessStdout(t, func() int {
+				return runHeadlessClient(protocolOnlyClient{SessionClient: a}, []string{"parent prompt"}, format, 10)
+			})
 			if code != 0 || !strings.Contains(out, "all finished") {
 				t.Fatalf("background task exited early: code=%d %s", code, out)
 			}
@@ -79,3 +82,6 @@ func TestHeadlessWaitsForBackgroundDeliveryAndEmitsTypedChildEvents(t *testing.T
 		})
 	}
 }
+
+// Embedding only the public interface deliberately hides Agent.Sessions.
+type protocolOnlyClient struct{ protocol.SessionClient }

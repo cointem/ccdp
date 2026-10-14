@@ -70,30 +70,35 @@ const (
 	DecisionAsk   Decision = "ask"
 )
 
-// Effect describes the observable capability required by a tool invocation.
-// Unknown is intentionally not treated as read-only; custom and MCP tools
-// must opt into a narrower capability through runtime registration.
-type Effect string
+// ToolKind is assigned by the runtime from the resolved implementation, never
+// from a model-controlled tool name. Unknown/custom implementations must ask.
+type ToolKind uint8
 
 const (
-	EffectRead     Effect = "read"
-	EffectWrite    Effect = "write"
-	EffectNetwork  Effect = "network"
-	EffectProcess  Effect = "process"
-	EffectDelegate Effect = "delegate"
-	EffectPlan     Effect = "plan"
-	EffectUnknown  Effect = "unknown"
+	KindUnknown ToolKind = iota
+	KindRead
+	KindState
+	KindWrite
+	KindShell
+	KindProcess
+	KindNetwork
+	KindDelegate
 )
 
-// ExecutionMode is the workflow dimension. It is separate from Mode (the
-// permission/approval policy) so plan cannot be accidentally implemented as a
-// second mutable permission mode.
-type ExecutionMode string
+func (k ToolKind) PlanAllowed() bool {
+	switch k {
+	case KindRead, KindState, KindNetwork, KindDelegate:
+		return true
+	default:
+		return false
+	}
+}
 
-const (
-	ExecutionModeExecute ExecutionMode = "execute"
-	ExecutionModePlan    ExecutionMode = "plan"
-)
+func (k ToolKind) Concurrent() bool { return k == KindRead }
+
+func (k ToolKind) NeedsReview() bool {
+	return k == KindUnknown || k == KindWrite || k == KindShell || k == KindProcess || k == KindNetwork
+}
 
 // Policy is the persistent, config-file-supplied rule set.
 type Policy struct {
@@ -236,14 +241,14 @@ func CommandKey(command string) string { return "command:" + command }
 
 // Check returns the decision for a tool invocation.
 //
-// toolName is e.g. "Bash", "Write". For Bash, args["command"] is inspected for
-// classification. For file tools, the mode drives the decision.
+// toolName is used to match user rules. kind comes from the runtime
+// implementation classifier; shell arguments are inspected only for KindShell.
 //
 // Decision order is: persistent deny rules → session denies → persistent allow
 // rules → session allows → per-tool classification. Persistent deny rules
 // outrank even a session-remembered allow, so a "remember for this session"
 // decision can never bypass always_deny.
-func (m *Manager) Check(toolName string, args map[string]any) (Decision, string) {
+func (m *Manager) Check(toolName string, args map[string]any, kind ToolKind) (Decision, string) {
 	if m == nil {
 		return DecisionDeny, "permission manager is nil"
 	}
@@ -259,20 +264,14 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 	// Rules are matched against the canonical invocation descriptor
 	// ("Bash:<cmd>", "Write:<path>"), not the session-rememberance key form.
 	invocation := describeInvocation(toolName, args)
-	// Plan is an execution capability cap, not an approval setting. Evaluate it
-	// before allow rules and bypass so an allow hook/rule cannot turn plan into
-	// execute mode. Existing ModePlan behavior is retained for compatibility;
-	// new runtimes should use ExecutionMode + PlanAllows.
-	if mode == ModePlan {
-		if ok, reason := PlanAllows(toolName, args); !ok {
-			return DecisionAsk, reason
-		}
+	if mode == ModePlan && !kind.PlanAllowed() {
+		return DecisionAsk, fmt.Sprintf("%s requires execute capability", toolName)
 	}
 	// Bash needs a command-aware gate: a whole-string glob rule can otherwise
 	// approve a chained command (`git status && <anything>`) whose tail the user
 	// never sanctioned. Handle Bash with the segment-aware path and return here;
 	// every non-Bash tool falls through to the generic rule/session/bypass chain.
-	if toolName == "Bash" {
+	if kind == KindShell {
 		command := StringArg(args, "command", "")
 		if commandAllowedByRules(command, policy.AlwaysAllow) {
 			return DecisionAllow, "allowed by always_allow rule"
@@ -297,47 +296,17 @@ func (m *Manager) Check(toolName string, args map[string]any) (Decision, string)
 		return DecisionAllow, "bypass mode"
 	}
 
-	// A namespaced MCP tool (`mcp__<server>__<tool>`) is remote-provided: its
-	// name is attacker-controlled text from a server, so it must never be
-	// auto-approved by the built-in name classification below. It can still be
-	// allowed via an explicit always_allow rule (checked above) or bypass mode,
-	// but its default is an ask — mirroring Claude Code (MCP tools are always
-	// passthrough) and Codex (never self-allowed). This gate is defense in
-	// depth: namespacing already keeps remote names out of the switch cases.
-	if isNamespacedMCPToolName(toolName) {
-		return DecisionAsk, fmt.Sprintf("MCP tool %q requires approval", toolName)
-	}
-
-	// Tool-specific classification. Bash is handled earlier via the
-	// segment-aware gate, so it is intentionally absent from this switch.
-	switch toolName {
-	case "Write", "Edit":
-		if mode == ModePlan {
-			return DecisionAsk, fmt.Sprintf("%s is not available in plan mode", toolName)
-		}
-		switch mode {
-		case ModeAcceptEdits:
+	switch kind {
+	case KindWrite:
+		if mode == ModeAcceptEdits {
 			return DecisionAllow, "edit accepted by acceptEdits mode"
-		case ModeDefault:
-			return DecisionAsk, fmt.Sprintf("%s requires approval in default mode", toolName)
-		default:
-			return DecisionAllow, "allowed by mode"
 		}
-	case "Read", "Glob", "Grep", "LS", "CodeNavigate", "TodoWrite",
-		"ToolSearch", "ReadSkill", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion":
-		return DecisionAllow, "read-only tool"
-	case "ReadAgent", "WaitAgent", "ListAgents":
-		return DecisionAllow, "child observation"
-	case "SpawnAgent", "SendMessage", "FollowupAgent", "StopAgent":
-		return DecisionAllow, "delegation remains subject to inherited policy"
-	case "WebFetch", "WebSearch":
-		// Built-in web lookup is a baseline capability. The runtime still
-		// enforces network policy, and explicit deny rules were checked above.
-		return DecisionAllow, "web lookup"
+		return DecisionAsk, fmt.Sprintf("%s requires approval", toolName)
+	case KindRead, KindState, KindNetwork, KindDelegate:
+		return DecisionAllow, "built-in capability"
+	default:
+		return DecisionAsk, fmt.Sprintf("tool %q requires approval", toolName)
 	}
-
-	// Unknown tool: ask to be safe.
-	return DecisionAsk, fmt.Sprintf("unknown tool %q", toolName)
 }
 
 // HardDeny reports a denial that no ordinary allow, bypass mode or approval
@@ -347,102 +316,54 @@ func (m *Manager) HardDeny(toolName string, args map[string]any) (bool, string) 
 	if m == nil {
 		return true, "permission manager is nil"
 	}
+	invocations := []string{describeInvocation(toolName, args)}
+	commands := []string{}
+	if toolName == "Bash" {
+		command := strings.TrimSpace(StringArg(args, "command", ""))
+		commands = append(commands, command)
+		// Static quoting/concatenation must not evade a deny, including the
+		// quoted argv representation used by typed external commands. Analyze
+		// individual segments so a denied tail cannot hide behind a safe head.
+		// Dynamic shell programs remain outside this deliberately narrow parser;
+		// this is not a claim to interpret arbitrary shell code.
+		if segments, ok := analyzeShell(command); ok {
+			for _, segment := range segments {
+				commands = append(commands, segment.text, strings.Join(segment.words, " "))
+			}
+		}
+		for _, command := range commands {
+			invocations = append(invocations, "Bash:"+command)
+		}
+	}
 	m.mu.RLock()
 	policy := m.Policy
-	_, deniedSession := m.denyMap[SessionKey(toolName, args)]
+	deniedSession := m.denyMap[SessionKey(toolName, args)]
+	for _, command := range commands {
+		deniedSession = deniedSession || m.denyMap[CommandKey(command)]
+	}
 	m.mu.RUnlock()
-	invocation := describeInvocation(toolName, args)
 	for _, deny := range policy.AlwaysDeny {
-		if ruleMatches(deny, toolName, invocation) {
-			return true, fmt.Sprintf("denied by always_deny rule %q", deny)
+		for _, invocation := range invocations {
+			if ruleMatches(deny, toolName, invocation) {
+				return true, fmt.Sprintf("denied by always_deny rule %q", deny)
+			}
 		}
 	}
 	if deniedSession {
 		return true, "denied by session rule"
 	}
 	if toolName == "Bash" {
-		command := strings.TrimSpace(StringArg(args, "command", ""))
-		for _, pat := range denyPatterns {
-			if pat.re.MatchString(command) {
-				return true, fmt.Sprintf("dangerous command pattern: %s", pat.desc)
-			}
+		if reason := dangerousShellCommand(StringArg(args, "command", ""), 0); reason != "" {
+			return true, "dangerous command pattern: " + reason
 		}
 	}
 	return false, ""
-}
-
-// CheckDenial is the decision-shaped form of HardDeny for runtimes that use
-// Decision values throughout their admission pipeline.
-func (m *Manager) CheckDenial(toolName string, args map[string]any) (Decision, string) {
-	if denied, reason := m.HardDeny(toolName, args); denied {
-		return DecisionDeny, reason
-	}
-	return DecisionAllow, "no hard deny"
 }
 
 // IsHardDenied is a compact bool-only helper for hooks and adapters.
 func (m *Manager) IsHardDenied(toolName string, args map[string]any) bool {
 	denied, _ := m.HardDeny(toolName, args)
 	return denied
-}
-
-// InvocationEffects returns the conservative effects of a built-in tool.
-// Custom/MCP tools should supply EffectUnknown unless their registration has
-// independently verified a narrower capability.
-func InvocationEffects(toolName string, args map[string]any) []Effect {
-	switch toolName {
-	case "ReadAgent", "WaitAgent", "ListAgents":
-		return []Effect{EffectRead}
-	case "SendMessage", "StopAgent":
-		return []Effect{EffectPlan}
-	case "SpawnAgent", "FollowupAgent":
-		return []Effect{EffectDelegate}
-	case "Read", "Glob", "Grep", "LS", "CodeNavigate", "ToolSearch", "ReadSkill":
-		return []Effect{EffectRead}
-	case "TodoWrite", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion":
-		return []Effect{EffectPlan}
-	case "Write", "Edit":
-		return []Effect{EffectWrite}
-	case "Bash", "Process":
-		return []Effect{EffectProcess}
-	case "WebFetch", "WebSearch":
-		return []Effect{EffectNetwork}
-	default:
-		return []Effect{EffectUnknown}
-	}
-}
-
-// PlanAllows enforces the default plan capability cap. It is deliberately
-// independent of allow/deny rules: a runtime may apply a narrower cap, but it
-// cannot widen this default for an unclassified/custom capability.
-func PlanAllows(toolName string, args map[string]any) (bool, string) {
-	effects := InvocationEffects(toolName, args)
-	for _, effect := range effects {
-		switch effect {
-		case EffectRead, EffectPlan:
-			continue
-		case EffectNetwork:
-			return false, fmt.Sprintf("%s is not available in plan mode without an explicit network workflow", toolName)
-		case EffectWrite, EffectProcess, EffectDelegate, EffectUnknown:
-			return false, fmt.Sprintf("%s requires execute capability and is not available in plan mode", toolName)
-		}
-	}
-	return true, "read-only/plan capability"
-}
-
-// CheckExecution applies an explicit workflow mode while retaining this
-// Manager's permission policy. Runtime should call HardDeny first (or rely on
-// this method's first step), then use the returned decision for approval.
-func (m *Manager) CheckExecution(mode ExecutionMode, toolName string, args map[string]any) (Decision, string) {
-	if denied, reason := m.HardDeny(toolName, args); denied {
-		return DecisionDeny, reason
-	}
-	if mode == ExecutionModePlan {
-		if ok, reason := PlanAllows(toolName, args); !ok {
-			return DecisionAsk, reason
-		}
-	}
-	return m.Check(toolName, args)
 }
 
 // ValidatePermissionRule reports whether a rule is worth storing. It refuses
@@ -473,12 +394,6 @@ func (m *Manager) checkBash(mode Mode, command string) (Decision, string) {
 		return DecisionDeny, "empty command"
 	}
 
-	// Dangerous patterns are always denied, regardless of mode.
-	for _, pat := range denyPatterns {
-		if pat.re.MatchString(command) {
-			return DecisionDeny, fmt.Sprintf("dangerous command pattern: %s", pat.desc)
-		}
-	}
 	if mode == ModeBypass {
 		return DecisionAllow, "bypass mode"
 	}
@@ -487,56 +402,16 @@ func (m *Manager) checkBash(mode Mode, command string) (Decision, string) {
 	// individually read-only. A chain like `git status && rm -rf x` no longer
 	// inherits the leading command's safety, and constructs we cannot tokenize
 	// (command substitution, subshells, unbalanced quotes) fail closed to ask.
-	segments, ok := splitCommandSegments(command)
+	segments, ok := analyzeShell(command)
 	if !ok || len(segments) == 0 {
 		return DecisionAsk, "command uses shell constructs that cannot be auto-approved"
 	}
 	for _, segment := range segments {
-		if !segmentReadOnly(segment) {
+		if !readOnlyArgv(segment.words) {
 			return DecisionAsk, "command is not in the safe allowlist"
 		}
 	}
 	return DecisionAllow, "read-only command"
-}
-
-// segmentReadOnly reports whether a single command segment (no control
-// operators) is safe to auto-allow: a read-only binary or a conservative git
-// subcommand, with no redirections or mutation primaries. Words are matched
-// after shell quoting is resolved so an argv-canonical invocation such as
-// `'git' 'diff'` (the form the runtime builds for typed external commands)
-// classifies identically to `git diff`.
-func segmentReadOnly(segment string) bool {
-	segment = strings.TrimSpace(segment)
-	if segment == "" {
-		return true
-	}
-	if hasDangerousOperator(segment) {
-		return false
-	}
-	words, ok := shellWords(segment)
-	if !ok || len(words) == 0 {
-		return false
-	}
-	// Leading `cd`/`env` prefixes do not change the safety of the wrapped
-	// command, so classification inspects the command behind them.
-	effective := stripCommandPrefix(words)
-	if len(effective) > 0 && effective[0] == "find" && hasFindMutation(effective[1:]) {
-		return false
-	}
-	if len(effective) > 0 && safeTokens[effective[0]] {
-		return true
-	}
-	return gitSafe(words)
-}
-
-// stripCommandPrefix drops leading `cd`/`env` words used purely to launch the
-// effective command.
-func stripCommandPrefix(words []string) []string {
-	i := 0
-	for i < len(words) && (words[i] == "cd" || words[i] == "env") {
-		i++
-	}
-	return words[i:]
 }
 
 // commandAllowedByRules reports whether an always_allow rule set covers a Bash
@@ -554,14 +429,14 @@ func commandAllowedByRules(command string, rules []string) bool {
 			return true
 		}
 	}
-	segments, ok := splitCommandSegments(command)
+	segments, ok := analyzeShell(command)
 	if !ok || len(segments) == 0 {
 		return false
 	}
 	for _, segment := range segments {
 		covered := false
 		for _, rule := range rules {
-			if bashRuleCoversSegment(rule, segment) {
+			if bashRuleCoversSegment(rule, segment.text) {
 				covered = true
 				break
 			}
@@ -602,18 +477,6 @@ func SessionKey(toolName string, args map[string]any) string {
 		return CommandKey(StringArg(args, "command", ""))
 	}
 	return describeInvocation(toolName, args)
-}
-
-// mcpToolNamePrefix is kept in lockstep with protocol.MCPToolNamePrefix. The
-// permissions package deliberately carries no internal dependencies, so the
-// prefix is restated here rather than imported; protocol.MCPToolName is the
-// single producer of qualified MCP names.
-const mcpToolNamePrefix = "mcp__"
-
-// isNamespacedMCPToolName reports whether a tool name was published by an MCP
-// server (it carries the `mcp__` qualification).
-func isNamespacedMCPToolName(name string) bool {
-	return strings.HasPrefix(name, mcpToolNamePrefix)
 }
 
 // ruleMatches supports rules like "Bash" (whole tool) or "Bash:git status*"
@@ -688,278 +551,6 @@ func StringArg(args map[string]any, key, fallback string) string {
 		}
 	}
 	return fallback
-}
-
-// shellWords splits a command segment into shell argument words, resolving
-// single quotes, double quotes and backslash escapes (adjacent quoted and
-// unquoted runs concatenate, as in the shell). Contents are treated as
-// literal: expansions such as `$HOME` or globs are not interpreted, which is
-// safe because callers only ever auto-allow exact literal words. It reports
-// ok=false on unbalanced quoting or a trailing backslash so callers fail
-// closed to the ask gate.
-func shellWords(s string) ([]string, bool) {
-	var (
-		words   []string
-		cur     strings.Builder
-		started bool
-	)
-	runes := []rune(s)
-	for i := 0; i < len(runes); i++ {
-		switch r := runes[i]; r {
-		case ' ', '\t':
-			if started {
-				words = append(words, cur.String())
-				cur.Reset()
-				started = false
-			}
-		case '\'':
-			started = true
-			i++
-			closed := false
-			for ; i < len(runes); i++ {
-				if runes[i] == '\'' {
-					closed = true
-					break
-				}
-				cur.WriteRune(runes[i])
-			}
-			if !closed {
-				return nil, false
-			}
-		case '"':
-			started = true
-			i++
-			closed := false
-			for ; i < len(runes); i++ {
-				switch runes[i] {
-				case '"':
-					closed = true
-					break
-				case '\\':
-					if i+1 >= len(runes) {
-						return nil, false
-					}
-					i++
-					cur.WriteRune(runes[i])
-				default:
-					cur.WriteRune(runes[i])
-				}
-			}
-			if !closed {
-				return nil, false
-			}
-		case '\\':
-			started = true
-			if i+1 >= len(runes) {
-				return nil, false
-			}
-			i++
-			cur.WriteRune(runes[i])
-		default:
-			started = true
-			cur.WriteRune(r)
-		}
-	}
-	if started {
-		words = append(words, cur.String())
-	}
-	return words, true
-}
-
-// hasDangerousOperator flags shell operators (including embedded newlines and
-// command substitutions) that make a command unsafe to auto-allow. The check
-// is deliberately quote-blind: an operator inside a quoted argument still
-// fails closed to the ask gate.
-func hasDangerousOperator(s string) bool {
-	for _, op := range []string{">", ">>", "|", ";", "&&", "||", "$(", "`", "\n"} {
-		if strings.Contains(s, op) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasFindMutation reports whether a find invocation carries a primary that
-// mutates the filesystem or executes a child command.
-func hasFindMutation(args []string) bool {
-	for _, arg := range args {
-		switch arg {
-		case "-delete", "-exec", "-execdir", "-ok", "-okdir",
-			"-fls", "-fprint", "-fprint0", "-fprintf":
-			return true
-		}
-	}
-	return false
-}
-
-// splitCommandSegments divides a shell command line into its sequential
-// command segments on the control operators `;`, `&&`, `||`, `|`, `&` and new
-// lines. It reports ok=false for anything it cannot tokenize conservatively —
-// command substitution `$(`/backticks, subshell parentheses, or an unbalanced
-// quote — so callers fail closed to an approval prompt rather than guessing.
-// Redirections (`<`, `>`) are kept inside a segment; hasDangerousOperator flags
-// them there.
-func splitCommandSegments(s string) ([]string, bool) {
-	var (
-		segments     []string
-		current      strings.Builder
-		inSingle     bool
-		inDouble     bool
-		runes        = []rune(s)
-		flushSegment = func() {
-			if t := strings.TrimSpace(current.String()); t != "" {
-				segments = append(segments, t)
-			}
-			current.Reset()
-		}
-	)
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
-		switch {
-		case r == '\'' && !inDouble:
-			inSingle = !inSingle
-			current.WriteRune(r)
-		case r == '"' && !inSingle:
-			inDouble = !inDouble
-			current.WriteRune(r)
-		case r == '\\' && !inSingle:
-			current.WriteRune(r)
-			if i+1 < len(runes) {
-				i++
-				current.WriteRune(runes[i])
-			}
-		case inSingle || inDouble:
-			current.WriteRune(r)
-		case r == '$' && i+1 < len(runes) && runes[i+1] == '(':
-			return nil, false // command substitution
-		case r == '`':
-			return nil, false // command substitution
-		case r == '(' || r == ')':
-			return nil, false // subshell / process substitution
-		case r == ';' || r == '\n':
-			flushSegment()
-		case r == '&':
-			if i+1 < len(runes) && runes[i+1] == '&' {
-				i++ // consume the second '&' of &&
-			}
-			flushSegment()
-		case r == '|':
-			if i+1 < len(runes) && runes[i+1] == '|' {
-				i++ // consume the second '|' of ||
-			}
-			flushSegment()
-		default:
-			current.WriteRune(r)
-		}
-	}
-	if inSingle || inDouble {
-		return nil, false // unbalanced quote
-	}
-	flushSegment()
-	return segments, true
-}
-
-// gitSafe allows a conservative, argv-aware subset of read-only git commands.
-// Matching is per-word so a mutating subcommand can never piggy-back on a safe
-// prefix (`git remote set-url`, `git branch -D`, `git tag v1` all fall through
-// to the ask gate) — the historic strings.HasPrefix check let them slip by.
-func gitSafe(words []string) bool {
-	if len(words) < 2 || words[0] != "git" {
-		return false
-	}
-	sub := words[1]
-	args := words[2:]
-	switch sub {
-	case "status", "log", "show", "blame", "rev-parse", "describe", "shortlog", "ls-files", "grep":
-		return true
-	case "diff":
-		// Diff can write --output and invoke configured helpers. Require the
-		// explicit read-only form; do not silently rewrite the command.
-		noExternal, noTextconv := false, false
-		for _, arg := range args {
-			if arg == "--" {
-				break
-			}
-			switch arg {
-			case "--no-ext-diff":
-				noExternal = true
-			case "--no-textconv":
-				noTextconv = true
-			case "--ext-diff", "--textconv", "--output":
-				return false
-			}
-			if strings.HasPrefix(arg, "--out") {
-				return false
-			}
-		}
-		return noExternal && noTextconv
-	case "branch":
-		return gitListOnlySubcommand(args, map[string]bool{
-			"-d": true, "-D": true, "--delete": true,
-			"-m": true, "-M": true, "--move": true,
-			"-c": true, "-C": true, "--copy": true,
-		})
-	case "tag":
-		return gitListOnlySubcommand(args, map[string]bool{"-d": true, "--delete": true, "-v": true})
-	case "remote":
-		return gitRemoteSafe(args)
-	case "config":
-		return len(args) > 0 && (args[0] == "--list" || args[0] == "-l")
-	case "stash":
-		return len(args) > 0 && args[0] == "list"
-	}
-	return false
-}
-
-// gitListOnlySubcommand permits only flag-form, non-mutating arguments (a bare
-// listing such as `git branch -a`); a positional argument or a delete/move flag
-// means the subcommand mutates, so it is rejected.
-func gitListOnlySubcommand(args []string, mutating map[string]bool) bool {
-	for _, arg := range args {
-		if mutating[arg] {
-			return false
-		}
-		if !strings.HasPrefix(arg, "-") {
-			return false // positional arg creates/deletes rather than lists
-		}
-	}
-	return true
-}
-
-// gitRemoteSafe allows only the read-only forms of `git remote`: the bare list,
-// its verbose variant, `show`, and `get-url`. Anything that mutates remotes
-// (add/remove/set-url/rename/prune/update/fetch) is rejected.
-func gitRemoteSafe(args []string) bool {
-	if len(args) == 0 {
-		return true
-	}
-	switch args[0] {
-	case "show", "get-url":
-		return true
-	}
-	if strings.HasPrefix(args[0], "-") {
-		for _, arg := range args {
-			switch arg {
-			case "-v", "--verbose", "--no-color", "-n":
-				continue
-			default:
-				return false
-			}
-		}
-		return true
-	}
-	return false
-}
-
-// safeTokens is the allowlist of read-only command names.
-var safeTokens = map[string]bool{
-	"ls": true, "pwd": true, "date": true, "echo": true, "cat": true,
-	"head": true, "tail": true, "wc": true, "grep": true, "rg": true,
-	"find": true, "which": true, "whoami": true, "env": true, "printenv": true,
-	"du": true, "df": true, "uname": true, "uptime": true, "true": true,
-	"false": true, "sleep": true, "less": true, "file": true, "stat": true,
-	"base64": true, "hexdump": true, "xxd": true, "tree": true,
-	"nl": true, "diff": true,
 }
 
 type denyPattern struct {

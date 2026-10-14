@@ -1,6 +1,12 @@
 package agent
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"ccdp/internal/permissions"
+)
 
 func TestExternalCommandReadOnlyChecksCompleteArgv(t *testing.T) {
 	cases := []struct {
@@ -34,5 +40,36 @@ func TestExternalCommandFailureExplainsGitStatus(t *testing.T) {
 	}
 	if got := externalCommandFailure("gh", 1, "").Error(); got != "gh exited with status 1" {
 		t.Fatalf("empty-output message = %q", got)
+	}
+}
+
+func TestTypedGitAuthorizationPreservesDenials(t *testing.T) {
+	a := &Agent{services: sessionServices{perms: permissions.NewManager(permissions.ModeDefault, permissions.Policy{})}}
+	argv := []string{"git", "status", "--short"}
+	if err := a.authorizeGitQuery(context.Background(), "query", argv); err != nil {
+		t.Fatal(err)
+	}
+	a.services.perms.SetPolicy(permissions.Policy{AlwaysDeny: []string{"Bash:git status*"}})
+	if err := a.authorizeGitQuery(context.Background(), "query", argv); err == nil {
+		t.Fatal("typed query bypassed deny")
+	}
+	a.services.perms.SetPolicy(permissions.Policy{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := a.authorizeGitQuery(ctx, "query", argv); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled query: %v", err)
+	}
+}
+
+func TestTypedMutatingGitCannotQuoteAwayHardDenials(t *testing.T) {
+	a := &Agent{services: sessionServices{perms: permissions.NewManager(permissions.ModeBypass, permissions.Policy{})}}
+	force := formatExternalCommand([]string{"git", "push", "-f", "origin"})
+	if err := a.precheckCommand("Bash", map[string]any{"command": force}, permissions.KindShell); err == nil {
+		t.Fatal("quoted force push bypassed hard deny")
+	}
+	a.services.perms.SetPolicy(permissions.Policy{AlwaysDeny: []string{"Bash:git push*"}})
+	push := formatExternalCommand([]string{"git", "push", "origin"})
+	if err := a.authorizeCommand(context.Background(), "push", "Bash", map[string]any{"command": push}, permissions.KindShell); err == nil {
+		t.Fatal("quoted push bypassed configured deny")
 	}
 }

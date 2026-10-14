@@ -118,12 +118,11 @@ type MessageEvent struct {
 	Content string `json:"content"`
 }
 
-// UsageEvent reports an update to the session's token/cost accounting.
+// UsageEvent reports an update to the session's token accounting.
 type UsageEvent struct {
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	TurnCount    int     `json:"turn_count"`
-	Cost         float64 `json:"cost"`
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	TurnCount    int `json:"turn_count"`
 }
 
 // SessionEvent reports a session lifecycle transition.

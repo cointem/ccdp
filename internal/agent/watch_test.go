@@ -30,7 +30,7 @@ func TestM1WatchInitialSnapshotIsAtomicWithStateUpdate(t *testing.T) {
 	ag.setPhase(protocol.PhaseStreaming)
 	select {
 	case update, ok := <-sub.Updates():
-		if !ok || update.Snapshot == nil || update.Snapshot.Phase != protocol.PhaseStreaming {
+		if !ok || update.State == nil || update.State.Phase != protocol.PhaseStreaming {
 			t.Fatalf("state update after initial snapshot = %#v, ok=%v", update, ok)
 		}
 	case <-time.After(2 * time.Second):
@@ -42,14 +42,14 @@ func TestM1WatchRegistrationAndPublishInterleave(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	defer ag.Close()
 
-	// Hold the publication lock while Watch and a state publisher rendezvous.
+	// Hold the state capture boundary while Watch and a publisher rendezvous.
 	// Both operations are then released together, forcing the implementation to
 	// make registration and the initial snapshot one atomic critical section.
-	ag.watchMu.Lock()
+	ag.mu.Lock()
 	released := false
 	defer func() {
 		if !released {
-			ag.watchMu.Unlock()
+			ag.mu.Unlock()
 		}
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -72,21 +72,8 @@ func TestM1WatchRegistrationAndPublishInterleave(t *testing.T) {
 		ag.setPhase(protocol.PhaseStreaming)
 		close(stateDone)
 	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		ag.mu.Lock()
-		phase := ag.phase
-		ag.mu.Unlock()
-		if phase == protocol.PhaseStreaming {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("state publisher did not reach the phase update barrier")
-		}
-		time.Sleep(time.Millisecond)
-	}
 
-	ag.watchMu.Unlock()
+	ag.mu.Unlock()
 	released = true
 	select {
 	case <-stateDone:
@@ -110,7 +97,7 @@ func TestM1WatchRegistrationAndPublishInterleave(t *testing.T) {
 	if first.Snapshot.Phase != protocol.PhaseStreaming {
 		select {
 		case update, ok := <-wr.sub.Updates():
-			if !ok || update.Snapshot == nil || update.Snapshot.Phase != protocol.PhaseStreaming {
+			if !ok || update.State == nil || update.State.Phase != protocol.PhaseStreaming {
 				t.Fatalf("interleaved state update = %#v, ok=%v", update, ok)
 			}
 		case <-time.After(2 * time.Second):
@@ -171,7 +158,7 @@ func TestM1WatchResyncSnapshotRetainsFailedTurn(t *testing.T) {
 	cfg.BaseURL = server.URL
 	cfg.APIKey = "test-key"
 	cfg.PermissionMode = string(permissions.ModeBypass)
-	ag, err := New(&cfg, make(chan Event, 1024))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +328,7 @@ func TestM1CommandAndInputIDConflictsReject(t *testing.T) {
 	}
 
 	ag.mu.Lock()
-	ag.busy = true
+	ag.turn.busy = true
 	ag.mu.Unlock()
 	input1 := protocol.NewSubmitInput("input-command-1", session, "same-input", "first", protocol.InputSteer)
 	if receipt := ag.applyCommand(input1); receipt.Rejected() {
@@ -351,5 +338,49 @@ func TestM1CommandAndInputIDConflictsReject(t *testing.T) {
 	receipt = ag.applyCommand(input2)
 	if !receipt.Rejected() || receipt.Error == nil || receipt.Error.Code != protocol.ErrorInvalidCommand {
 		t.Fatalf("conflicting input id = %+v", receipt)
+	}
+}
+
+func TestOwnerPublicationInboxOverflowRequiresResync(t *testing.T) {
+	a := newRuntimeAgent(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sub, err := a.Watch(ctx, protocol.Cursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	<-sub.Updates()
+	// Prevent consumption while producers reach the bounded inbox limit.
+	a.mu.Lock()
+	for i := 0; i < 1000; i++ {
+		a.enqueueViewsLocked(protocol.Update{Type: protocol.UpdateStream, Text: "pending"})
+	}
+	if len(a.publications.pendingViews) > 256 {
+		t.Error("publication inbox is unbounded")
+	}
+	a.mu.Unlock()
+	found := false
+	for {
+		select {
+		case update, ok := <-sub.Updates():
+			if !ok {
+				if !found {
+					t.Fatal("overflow silently closed observation")
+				}
+				fresh, err := a.Watch(ctx, protocol.Cursor{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer fresh.Close()
+				if update := <-fresh.Updates(); update.Snapshot == nil {
+					t.Fatal("fresh observation did not recover snapshot")
+				}
+				return
+			}
+			found = found || update.Type == protocol.UpdateResyncRequired
+		case <-ctx.Done():
+			t.Fatal("overflow did not terminate old observation")
+		}
 	}
 }

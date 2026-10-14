@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -17,8 +16,7 @@ func newMemoryAgent(t *testing.T) *Agent {
 	cfg.Workspace = dir
 	cfg.SessionDir = dir + "/sessions"
 	cfg.EnableMemory = config.BoolPtr(true)
-	events := make(chan Event, 64)
-	ag, err := New(&cfg, events)
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -31,33 +29,32 @@ func TestMemoryDisabledRecordsNothing(t *testing.T) {
 	cfg.Workspace = dir
 	cfg.SessionDir = dir + "/sessions"
 	cfg.EnableMemory = config.BoolPtr(false) // default: off
-	events := make(chan Event, 64)
-	ag, err := New(&cfg, events)
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer ag.Close()
 
 	ag.mu.Lock()
-	ag.turnUserMsg = "please add a feature"
-	ag.turnTouched = []string{"a.go"}
-	ag.turnSummary = "done"
+	ag.turnMemory.turnUserMsg = "please add a feature"
+	ag.turnMemory.turnTouched = []string{"a.go"}
+	ag.turnMemory.turnSummary = "done"
 	ag.mu.Unlock()
 	ag.recordMemory()
 
-	if _, err := os.Stat(ag.memoryFile()); !os.IsNotExist(err) {
-		t.Fatal("memory file should not exist when enable_memory is off")
+	if text := ag.MemoryText(); text != "" {
+		t.Fatalf("disabled memory recorded %q", text)
 	}
 }
 
-func TestRecordMemoryWritesFileAndInjects(t *testing.T) {
+func TestRecordMemoryCommitsAndInjects(t *testing.T) {
 	ag := newMemoryAgent(t)
 	defer ag.Close()
 
 	ag.mu.Lock()
-	ag.turnUserMsg = "refactor the http handler"
-	ag.turnTouched = []string{"server.go", "client.go"}
-	ag.turnSummary = "Split the handler into two routes and updated the client."
+	ag.turnMemory.turnUserMsg = "refactor the http handler"
+	ag.turnMemory.turnTouched = []string{"server.go", "client.go"}
+	ag.turnMemory.turnSummary = "Split the handler into two routes and updated the client."
 	ag.mu.Unlock()
 	ag.recordMemory()
 
@@ -84,7 +81,7 @@ func TestRecordMemoryWritesFileAndInjects(t *testing.T) {
 	// The direct test does not run the turn-finalizer that normally clears this
 	// borrow; release it explicitly so no frozen child view survives the test.
 	ag.mu.Lock()
-	ag.childStep = nil
+	ag.children.childStep = nil
 	ag.mu.Unlock()
 	// The memory section appears in the system prompt when enabled.
 	sys, _ := req.Messages[0].Content.(string)
@@ -99,9 +96,6 @@ func TestRecordMemoryWritesFileAndInjects(t *testing.T) {
 	if ag.MemoryText() != "" {
 		t.Error("memory text should be empty after clear")
 	}
-	if _, err := os.Stat(ag.memoryFile()); !os.IsNotExist(err) {
-		t.Error("memory file should be removed by clear")
-	}
 }
 
 func TestRecordMemoryBounded(t *testing.T) {
@@ -111,9 +105,9 @@ func TestRecordMemoryBounded(t *testing.T) {
 	// Simulate more turns than the cap allows.
 	for i := 0; i < maxMemoryEntries+5; i++ {
 		ag.mu.Lock()
-		ag.turnUserMsg = "turn " + string(rune('A'+i%26)) + string(rune('0'+i%10))
-		ag.turnTouched = nil
-		ag.turnSummary = "summary"
+		ag.turnMemory.turnUserMsg = "turn " + string(rune('A'+i%26)) + string(rune('0'+i%10))
+		ag.turnMemory.turnTouched = nil
+		ag.turnMemory.turnSummary = "summary"
 		ag.mu.Unlock()
 		ag.recordMemory()
 	}
@@ -135,7 +129,7 @@ func TestRecordTouchedDeduplicates(t *testing.T) {
 	ag.recordTouched("b.go")
 	ag.recordTouched("a.go")
 	ag.mu.Lock()
-	n := len(ag.turnTouched)
+	n := len(ag.turnMemory.turnTouched)
 	ag.mu.Unlock()
 	if n != 2 {
 		t.Errorf("expected 2 unique touched files, got %d", n)

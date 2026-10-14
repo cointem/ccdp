@@ -1,14 +1,15 @@
 package agent
 
 import (
-	"ccdp/internal/config"
-	"ccdp/internal/permissions"
-	"ccdp/internal/protocol"
 	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"ccdp/internal/config"
+	"ccdp/internal/permissions"
+	"ccdp/internal/protocol"
 )
 
 // TestModeChangeWhileBusyThroughRunLoop drives a genuinely running turn through
@@ -43,7 +44,7 @@ func TestModeChangeWhileBusyThroughRunLoop(t *testing.T) {
 	cfg.BaseURL = server.URL
 	cfg.APIKey = "k"
 	cfg.PermissionMode = string(permissions.ModeDefault)
-	ag, err := New(&cfg, make(chan Event, 256))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +91,7 @@ func TestModeChangeWhileBusyThroughRunLoop(t *testing.T) {
 	// its own config and the change governs the next gate evaluation.
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	if ag.cfg.PermissionMode != string(permissions.ModeBypass) {
-		t.Fatalf("permission mode did not apply immediately: %s", ag.cfg.PermissionMode)
+	if ag.services.cfg.PermissionMode != string(permissions.ModeBypass) {
+		t.Fatalf("permission mode did not apply immediately: %s", ag.services.cfg.PermissionMode)
 	}
 }

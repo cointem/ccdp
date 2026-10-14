@@ -4,6 +4,7 @@
 package sandbox
 
 import (
+	"ccdp/internal/shellsyntax"
 	"context"
 	"fmt"
 	"os"
@@ -526,6 +527,39 @@ func (s *Sandbox) ResolveWrite(path string) (string, error) {
 	return abs, nil
 }
 
+// ResolveWriteEntry authorizes replacing the directory entry itself. Unlike a
+// content write it must not follow the final symlink into its target.
+func (s *Sandbox) ResolveWriteEntry(path string) (string, error) {
+	abs, err := s.Resolve(path)
+	if err != nil {
+		return "", err
+	}
+	parent, err := s.ResolveWrite(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	parent, err = resolveExisting(parent)
+	if err != nil {
+		return "", err
+	}
+	entry := filepath.Join(parent, filepath.Base(abs))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, roots := range [][]string{s.DisallowedDirs, s.ReadOnlyDirs, s.ProtectedDirs} {
+		for _, root := range roots {
+			if pathWithin(root, abs) || pathWithin(root, entry) {
+				return "", fmt.Errorf("sandbox: directory entry %s is protected", path)
+			}
+		}
+	}
+	for _, protected := range s.ProtectedEntries {
+		if abs == protected || entry == protected {
+			return "", fmt.Errorf("sandbox: directory entry %s is protected", path)
+		}
+	}
+	return entry, nil
+}
+
 func (s *Sandbox) InWorkspace(path string) bool {
 	if s == nil || s.blockedByDisallowed(path) {
 		return false
@@ -724,6 +758,20 @@ func (s *Sandbox) BackendError() error {
 }
 
 func (s *Sandbox) Profile() (string, error) {
+	return s.profile("")
+}
+
+// ReadOnlyCommandProfile permits only the selected executable, host reads and
+// invocation scratch writes. Repository helpers cannot inherit workspace writes
+// or network access from the session that admitted the query.
+func (s *Sandbox) ReadOnlyCommandProfile(executable string) (string, error) {
+	if !filepath.IsAbs(executable) {
+		return "", fmt.Errorf("sandbox: read-only executable must be absolute")
+	}
+	return s.profile(canonicalRoot(executable))
+}
+
+func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	if err := s.BackendError(); err != nil {
 		return "", err
 	}
@@ -740,6 +788,9 @@ func (s *Sandbox) Profile() (string, error) {
 	allowNetwork := s.AllowNetwork
 	localServices := append([]LocalService(nil), s.LocalServices...)
 	s.mu.RUnlock()
+	if readOnlyExecutable != "" {
+		allowNetwork, localServices = false, nil
+	}
 	if workspace == "" {
 		return "", fmt.Errorf("sandbox: profile has no workspace root")
 	}
@@ -800,7 +851,9 @@ func (s *Sandbox) Profile() (string, error) {
 	}
 	for _, root := range append([]string{workspace}, additional...) {
 		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
-		fmt.Fprintf(&b, "(allow file-write* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(writeDenied))
+		if readOnlyExecutable == "" {
+			fmt.Fprintf(&b, "(allow file-write* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(writeDenied))
+		}
 	}
 	for _, root := range readOnly {
 		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
@@ -809,7 +862,14 @@ func (s *Sandbox) Profile() (string, error) {
 		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
 		fmt.Fprintf(&b, "(allow file-write* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(writeDenied))
 	}
-	b.WriteString("(allow process-fork)\n(allow process-exec)\n")
+	b.WriteString("(allow process-fork)\n")
+	if readOnlyExecutable == "" {
+		b.WriteString("(allow process-exec)\n")
+	} else {
+		fmt.Fprintf(&b, "(allow process-exec (literal %s))\n", sbplQuote(readOnlyExecutable))
+		fmt.Fprintf(&b, "(deny process-exec (require-not (literal %s)))\n", sbplQuote(readOnlyExecutable))
+		b.WriteString("(deny network*)\n")
+	}
 	if allowNetwork {
 		// External networking excludes host-local services. Unix-domain sockets
 		// and named endpoints remain denied because these rules match IP-based
@@ -993,10 +1053,85 @@ var interactivePatterns = []*regexp.Regexp{
 
 func CheckInteractive(command string) error {
 	command = strings.TrimSpace(command)
+	if segments, ok := shellsyntax.Analyze(command); ok {
+		for _, segment := range segments {
+			if err := CheckInteractiveArgv(segment.Words); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return checkInteractivePatterns(command)
+}
+
+func checkInteractivePatterns(command string) error {
 	for _, pattern := range interactivePatterns {
 		if pattern.MatchString(command) {
 			return fmt.Errorf("sandbox: command %q needs an interactive terminal; run it yourself instead", command)
 		}
+	}
+	return nil
+}
+
+// CheckInteractiveArgv classifies executable and supported interactive flags,
+// keeping search patterns and file paths as data rather than shell programs.
+func CheckInteractiveArgv(argv []string) error {
+	return checkInteractiveArgv(argv, 0)
+}
+
+func checkInteractiveArgv(argv []string, depth int) error {
+	words, supported := shellsyntax.Executable(argv)
+	if !supported || depth >= 8 {
+		return checkInteractivePatterns(strings.Join(argv, " "))
+	}
+	if len(words) == 0 {
+		return nil
+	}
+	if nested, shell := shellsyntax.ShellProgram(words); shell {
+		if segments, ok := shellsyntax.Analyze(nested); ok {
+			for _, segment := range segments {
+				if err := checkInteractiveArgv(segment.Words, depth+1); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return checkInteractivePatterns(nested)
+	}
+	interactive := false
+	switch strings.ToLower(filepath.Base(words[0])) {
+	case "vim", "vimdiff", "nvim", "vi", "nano", "emacs", "pico", "less", "read", "top", "htop", "btop":
+		interactive = true
+	case "git":
+		if len(words) > 2 {
+			amend := false
+			for _, arg := range words[2:] {
+				if arg == "--" {
+					break
+				}
+				amend = amend || arg == "--amend"
+			}
+			for _, arg := range words[2:] {
+				if arg == "--" {
+					break
+				}
+				if words[1] == "rebase" && (arg == "-i" || arg == "--interactive") || words[1] == "add" && (arg == "-p" || arg == "--patch" || arg == "-i" || arg == "--interactive") || words[1] == "clean" && (arg == "-i" || arg == "--interactive") || words[1] == "commit" && amend && arg == "-i" {
+					interactive = true
+				}
+			}
+		}
+	case "ssh":
+		for _, arg := range words[1:] {
+			if arg == "--" {
+				break
+			}
+			if arg == "-t" || arg == "-tt" {
+				interactive = true
+			}
+		}
+	}
+	if interactive {
+		return fmt.Errorf("sandbox: command %q needs an interactive terminal; run it yourself instead", strings.Join(argv, " "))
 	}
 	return nil
 }

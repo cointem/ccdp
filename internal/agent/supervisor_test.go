@@ -11,6 +11,7 @@ import (
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/sessionview"
 )
 
 func waitManaged(t *testing.T, r *managedRun) {
@@ -38,7 +39,7 @@ func TestSupervisorObservationDoesNotOwnExecution(t *testing.T) {
 		return llm.StreamResult{Text: "finished", FinishReason: "stop", PromptTokens: 3, CompletionTok: 2}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "observe me"}, childPurposeTask, "call")
+	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "observe me"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func TestSupervisorObservationDoesNotOwnExecution(t *testing.T) {
 		t.Fatalf("usage not accounted: %+v", a.Usage())
 	}
 	r.mu.Lock()
-	err = a.supervisor.recordOutcome(r)
+	err = a.services.supervisor.recordOutcome(r)
 	r.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -101,13 +102,13 @@ func TestSupervisorRegistersQueuedChildrenAndCancelsOnlyTarget(t *testing.T) {
 		return llm.StreamResult{Text: "first", FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	a.childSlots = newChildSlots(1)
-	r1, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "first"}, childPurposeTask, nextRuntimeID("test-call"))
+	a.children.childSlots = newChildSlots(1)
+	r1, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "first"}, childPurposeTask, nextRuntimeID("test-call"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-started
-	r2, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "second"}, childPurposeTask, nextRuntimeID("test-call"))
+	r2, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "second"}, childPurposeTask, nextRuntimeID("test-call"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +150,7 @@ func TestSupervisorAcceptedFollowupIsJoined(t *testing.T) {
 		return llm.StreamResult{Text: "followup answer", FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "initial"}, childPurposeTask, "call")
+	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "initial"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +182,7 @@ func TestSupervisorContinueKeepsOriginalOutcomeAndRejectsStaleControl(t *testing
 		return llm.StreamResult{Text: text, FinishReason: "stop", PromptTokens: 2, CompletionTok: 1}, nil
 	}
 	a, cfg := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "original"}, childPurposeTask, "call")
+	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "original"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +192,7 @@ func TestSupervisorContinueKeepsOriginalOutcomeAndRejectsStaleControl(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	nextRun, err := a.supervisor.lookup(r.fact.Child.SessionID)
+	nextRun, err := a.services.supervisor.lookup(r.fact.Child.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,18 +228,16 @@ func TestSupervisorContinueKeepsOriginalOutcomeAndRejectsStaleControl(t *testing
 }
 
 func TestTranscriptSnapshotIsBoundedAndIndependent(t *testing.T) {
-	tx := &transcriptState{}
-	for i := 0; i < transcriptWindow+5; i++ {
-		tx.mu.Lock()
-		tx.put(protocol.TranscriptItem{ID: nextRuntimeID("item"), Kind: "tool", Text: strings.Repeat("x", transcriptTextLimit+100), Args: []byte(`{"a":1}`)})
-		tx.mu.Unlock()
+	tx := &sessionview.Transcript{}
+	for i := 0; i < sessionview.Window+5; i++ {
+		tx.Put(protocol.TranscriptItem{ID: nextRuntimeID("item"), Kind: "tool", Text: strings.Repeat("x", sessionview.TextLimit+100), Args: []byte(`{"a":1}`)})
 	}
-	items, more := tx.snapshot()
-	if !more || len(items) != transcriptWindow || !items[0].Truncated {
+	items, more := tx.Snapshot()
+	if !more || len(items) != sessionview.Window || !items[0].Truncated {
 		t.Fatal("transcript is not bounded")
 	}
 	items[0].Args[0] = 'x'
-	again, _ := tx.snapshot()
+	again, _ := tx.Snapshot()
 	if again[0].Args[0] == 'x' {
 		t.Fatal("snapshot shares mutable arguments")
 	}

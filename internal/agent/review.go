@@ -3,7 +3,6 @@ package agent
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +16,7 @@ import (
 	"ccdp/internal/changes"
 	"ccdp/internal/config"
 	"ccdp/internal/execution"
+	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 )
@@ -50,10 +50,10 @@ type ReviewReport struct {
 func (a *Agent) codingGit(ctx context.Context, id protocol.CommandID, args ...string) ([]byte, error) {
 	argv := append([]string{"git"}, args...)
 	parameters := map[string]any{"command": formatExternalCommand(argv)}
-	if e := a.precheckCommand("Bash", parameters); e != nil {
+	if e := a.precheckCommand("Bash", parameters, permissions.KindShell); e != nil {
 		return nil, e
 	}
-	authorize := func() error { return a.authorizeCommand(ctx, id, "Bash", parameters) }
+	authorize := func() error { return a.authorizeCommand(ctx, id, "Bash", parameters, permissions.KindShell) }
 	if reviewAuthorize, ok := ctx.Value(reviewGitAuthorizationKey{}).(func(context.Context, map[string]any) error); ok {
 		authorize = func() error { return reviewAuthorize(ctx, parameters) }
 	}
@@ -61,17 +61,13 @@ func (a *Agent) codingGit(ctx context.Context, id protocol.CommandID, args ...st
 		return nil, e
 	}
 	a.mu.Lock()
-	dir := a.cfg.Workspace
-	sb := a.sandbox.Snapshot()
+	dir := a.services.cfg.Workspace
+	sb := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	if source, ok := ctx.Value(reviewSourceKey{}).(reviewSource); ok {
 		dir, sb = source.root, source.policy
 	}
-	argv, e := execution.ReadOnlyGitArgv(argv)
-	if e != nil {
-		return nil, e
-	}
-	r, e := execution.RunArgv(ctx, argv, execution.Request{Dir: dir, Sandbox: sb, Env: execution.ReadOnlyGitEnvironment(os.Environ()), OutputLimit: 64 << 20})
+	r, e := execution.RunReadOnlyGit(ctx, argv, execution.Request{Dir: dir, Sandbox: sb, OutputLimit: 64 << 20})
 	if e != nil {
 		return nil, e
 	}
@@ -95,8 +91,8 @@ func (a *Agent) resolveReviewRef(ctx context.Context, id protocol.CommandID, ref
 func (a *Agent) gitSnapshot(ctx context.Context, id protocol.CommandID, tree string) (changes.Snapshot, error) {
 	store := a.codingState().store
 	a.mu.Lock()
-	root := a.cfg.Workspace
-	policy := a.sandbox.Snapshot()
+	root := a.services.cfg.Workspace
+	policy := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	out := changes.Snapshot{Root: root, Files: map[string]changes.File{}}
 	if tree == "" {
@@ -133,14 +129,13 @@ func (a *Agent) gitSnapshot(ctx context.Context, id protocol.CommandID, tree str
 	}
 	argv := []string{"git", "cat-file", "--batch"}
 	params := map[string]any{"command": formatExternalCommand(argv)}
-	if e = a.precheckCommand("Bash", params); e != nil {
+	if e = a.precheckCommand("Bash", params, permissions.KindShell); e != nil {
 		return out, e
 	}
-	if e = a.authorizeCommand(ctx, id, "Bash", params); e != nil {
+	if e = a.authorizeCommand(ctx, id, "Bash", params, permissions.KindShell); e != nil {
 		return out, e
 	}
-	argv, _ = execution.ReadOnlyGitArgv(argv)
-	r, e := execution.RunArgv(ctx, argv, execution.Request{Dir: root, Sandbox: policy, Input: strings.NewReader(input.String()), Env: execution.ReadOnlyGitEnvironment(os.Environ()), OutputLimit: 128 << 20})
+	r, e := execution.RunReadOnlyGit(ctx, argv, execution.Request{Dir: root, Sandbox: policy, Input: strings.NewReader(input.String()), OutputLimit: 128 << 20})
 	if e != nil {
 		return out, e
 	}
@@ -240,8 +235,8 @@ func (a *Agent) reviewSnapshots(ctx context.Context, cmd protocol.Command) (chan
 	switch w.Scope {
 	case "uncommitted":
 		a.mu.Lock()
-		sb := a.sandbox.Snapshot()
-		root := a.cfg.Workspace
+		sb := a.services.sandbox.Snapshot()
+		root := a.services.cfg.Workspace
 		a.mu.Unlock()
 		paths, err := a.gitWorktreePaths(ctx, cmd, root)
 		if err != nil {
@@ -278,8 +273,8 @@ func (a *Agent) stagedTree(ctx context.Context, id protocol.CommandID) ([]byte, 
 		return nil, e
 	}
 	a.mu.Lock()
-	root := a.cfg.Workspace
-	sb := a.sandbox.Snapshot()
+	root := a.services.cfg.Workspace
+	sb := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	index := strings.TrimSpace(string(path))
 	if !filepath.IsAbs(index) {
@@ -353,7 +348,7 @@ func (a *Agent) readReviews(w *protocol.WorkflowCommand) (string, error) {
 					return "", errors.New("invalid report filename")
 				}
 				a.mu.Lock()
-				dir := filepath.Join(a.cfg.SessionDir, a.sessionID, "reviews")
+				dir := filepath.Join(a.services.cfg.SessionDir, a.conversation.sessionID, "reviews")
 				a.mu.Unlock()
 				data, err := os.ReadFile(filepath.Join(dir, row.ReportPath))
 				return string(data), err
@@ -367,12 +362,6 @@ func (a *Agent) readReviews(w *protocol.WorkflowCommand) (string, error) {
 		}
 	}
 	if w.Action == "report" {
-		a.mu.Lock()
-		dir := filepath.Join(a.cfg.SessionDir, a.sessionID, "reviews")
-		a.mu.Unlock()
-		if b, err := os.ReadFile(filepath.Join(dir, base64.RawURLEncoding.EncodeToString([]byte(w.ID))+".md")); err == nil {
-			return "结果已保存，结束记录不完整。\n\n" + string(b), nil
-		}
 		return "", errors.New("review report not found")
 	}
 	b, e := json.MarshalIndent(rows, "", "  ")

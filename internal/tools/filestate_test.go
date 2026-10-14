@@ -3,6 +3,7 @@ package tools
 import (
 	"ccdp/internal/fsops"
 	"ccdp/internal/sandbox"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,8 +80,13 @@ func TestWriteFileNoFollowRejectsHardlinkDescriptor(t *testing.T) {
 	if err := os.Link(target, alias); err != nil {
 		t.Fatal(err)
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
 	v, _ := fsops.Observe(alias)
-	if _, err := fsops.Publish(alias, []byte("attacker\n"), 0o644, &v); err == nil {
+	if _, err := fsops.PublishAt(context.Background(), root, filepath.Base(alias), []byte("attacker\n"), 0o644, &v); err == nil {
 		t.Fatal("write through a multiply-linked alias was accepted")
 	}
 	got, err := os.ReadFile(target)

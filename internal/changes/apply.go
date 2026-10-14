@@ -248,7 +248,7 @@ func (s *Store) ApplyWithRecorder(ctx context.Context, p Plan, policy *sandbox.S
 		if e != nil {
 			return j, e
 		}
-		if _, e = policy.ResolveWrite(path); e != nil {
+		if _, e = policy.ResolveWriteEntry(path); e != nil {
 			return j, e
 		}
 		err = func() error {

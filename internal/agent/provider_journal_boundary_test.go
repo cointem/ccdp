@@ -16,14 +16,11 @@ import (
 func TestCompactJournalAdmissionFailureLeavesHistoryUntouched(t *testing.T) {
 	provider := &requestJournalGateProvider{}
 	a := newJournalRuntimeAgent(t, provider)
-	a.cfg.KeepAfterCompact = 4
+	a.services.cfg.KeepAfterCompact = 4
 	for i := 0; i < 7; i++ {
 		if err := a.appendHistory(messages.Message{Role: messages.RoleUser, Content: "history entry"}); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := a.Save(); err != nil {
-		t.Fatal(err)
 	}
 	before := a.History()
 
@@ -50,10 +47,7 @@ func TestForkJournalAdmissionFailureDoesNotCreateChild(t *testing.T) {
 	if err := a.appendHistory(messages.Message{Role: messages.RoleAssistant, Content: "abandoned"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Save(); err != nil {
-		t.Fatal(err)
-	}
-	before, _, err := ListSessions(a.cfg.SessionDir)
+	before, _, err := ListSessions(a.services.cfg.SessionDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +58,7 @@ func TestForkJournalAdmissionFailureDoesNotCreateChild(t *testing.T) {
 	if err == nil || !errors.As(err, &journalErr) {
 		t.Fatalf("fork error = %v, want request journal failure", err)
 	}
-	after, _, err := ListSessions(a.cfg.SessionDir)
+	after, _, err := ListSessions(a.services.cfg.SessionDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +76,8 @@ func installRequestPreparedFailure(t *testing.T, a *Agent) {
 	if p == nil {
 		t.Fatal("agent persistence is unavailable")
 	}
-	p.mu.Lock()
-	p.store = requestJournalFailEventStore{Store: p.store, event: session.EventTypeRequestPrepared}
-	p.mu.Unlock()
+	backend := journalBackend(t, p)
+	backend.mu.Lock()
+	backend.store = requestJournalFailEventStore{Store: backend.store, event: session.EventTypeRequestPrepared}
+	backend.mu.Unlock()
 }

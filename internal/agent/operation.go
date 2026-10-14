@@ -1,11 +1,12 @@
 package agent
 
 import (
-	"ccdp/internal/protocol"
-	"ccdp/internal/session"
 	"context"
 	"fmt"
 	"time"
+
+	"ccdp/internal/protocol"
+	"ccdp/internal/session"
 )
 
 type operationMode uint8
@@ -27,8 +28,8 @@ func (a *Agent) scheduleCommandOperation(cmd protocol.Command, name string, oper
 func (a *Agent) scheduleOperation(cmd protocol.Command, name string, operation commandOperation, mode operationMode) protocol.Receipt {
 	requireIdle := mode == operationExclusive
 	a.mu.Lock()
-	revoking := a.capabilityRevoking
-	if (requireIdle && (a.busy || a.settling)) || a.closing || a.closed ||
+	revoking := a.capabilities.capabilityRevoking
+	if (requireIdle && (a.turn.busy || a.lifecycle.settling)) || a.lifecycle.closing || a.lifecycle.closed ||
 		revoking && name != "query:doctor" && name != "query:status" {
 		a.mu.Unlock()
 		if revoking {
@@ -39,41 +40,46 @@ func (a *Agent) scheduleOperation(cmd protocol.Command, name string, operation c
 		}
 		return a.rejectedReceipt(cmd, protocol.ErrorClosed, "session is closing")
 	}
-	ctx, cancel := context.WithCancel(a.rootCtx)
+	ctx, cancel := context.WithCancel(a.lifecycle.rootCtx)
 	if requireIdle {
-		a.busy = true
-		a.workStartedAt = time.Now()
-		a.workLabel = name
-		a.interruptFlag = false
-		a.stop = false
-		a.phase = protocol.PhaseExecutingTools
+		a.turn.busy = true
+		a.turn.workStartedAt = time.Now()
+		a.turn.workLabel = name
+		a.turn.interruptFlag = false
+		a.lifecycle.phase = protocol.PhaseExecutingTools
 		if cmd.Type == protocol.CommandCompact {
-			a.phase = protocol.PhaseCompacting
+			a.lifecycle.phase = protocol.PhaseCompacting
 		}
-		a.turnCancel = cancel
-		a.turnCtx = ctx
+		a.turn.turnCancel = cancel
+		a.turn.turnCtx = ctx
 	}
-	a.operationWG.Add(1)
+	if sandboxQuiescenceOwner(name) {
+		a.capabilities.settingsPreparing = true
+	}
+	a.lifecycle.operationWG.Add(1)
 	trackForSandboxQuiescence := !sandboxQuiescenceOwner(name) && name != "query:doctor" && name != "query:status"
 	if trackForSandboxQuiescence {
-		a.sandboxOperationWG.Add(1)
+		a.lifecycle.sandboxOperationWG.Add(1)
 	}
 	a.mu.Unlock()
 	if err := a.persistCommandScheduled(cmd, name, a.revision().LogSeq); err != nil {
 		if requireIdle {
 			a.mu.Lock()
-			if a.turnCtx == ctx {
-				a.turnCancel = nil
-				a.turnCtx = nil
-				a.busy = false
-				a.phase = protocol.PhaseIdle
+			if a.turn.turnCtx == ctx {
+				a.turn.turnCancel = nil
+				a.turn.turnCtx = nil
+				a.turn.busy = false
+				a.lifecycle.phase = protocol.PhaseIdle
 			}
 			a.mu.Unlock()
 		}
 		cancel()
-		a.operationWG.Done()
+		if sandboxQuiescenceOwner(name) {
+			a.finishSettingsPreparation()
+		}
+		a.lifecycle.operationWG.Done()
 		if trackForSandboxQuiescence {
-			a.sandboxOperationWG.Done()
+			a.lifecycle.sandboxOperationWG.Done()
 		}
 		return a.rejectedReceipt(cmd, protocol.ErrorInternal, err.Error())
 	}
@@ -89,13 +95,28 @@ func (a *Agent) scheduleOperation(cmd protocol.Command, name string, operation c
 // busy reservation, and persists the terminal CommandCompleted admission ahead
 // of the final receipt so a restart cannot observe a success without it.
 func (a *Agent) completeScheduledOperation(ctx context.Context, cancel context.CancelFunc, cmd protocol.Command, name string, operation func(context.Context) (string, error), requireIdle, trackForSandboxQuiescence bool) {
-	defer a.operationWG.Done()
+	defer a.lifecycle.operationWG.Done()
 	if trackForSandboxQuiescence {
-		defer a.sandboxOperationWG.Done()
+		defer a.lifecycle.sandboxOperationWG.Done()
 	}
 	output, err := operation(ctx)
 	if err == nil {
 		err = ctx.Err()
+	}
+	// Queue the immutable result before releasing either worker reservation.
+	// The wakeup is coalesced; a saturated control lane cannot strand a worker
+	// that settings revocation or Close is waiting to join.
+	a.postOperationCompleted(operationCompleted{ctx: ctx, cancel: cancel, command: cmd, name: name, output: output, err: err, exclusive: requireIdle})
+}
+
+// settleOperation runs on the owner after the worker's execution has ended.
+func (a *Agent) settleOperation(result operationCompleted) {
+	ctx, cancel, cmd, name := result.ctx, result.cancel, result.command, result.name
+	output, err, requireIdle := result.output, result.err, result.exclusive
+	if sandboxQuiescenceOwner(name) {
+		a.mu.Lock()
+		a.capabilities.settingsPreparing = false
+		a.mu.Unlock()
 	}
 	status := "success"
 	if err != nil {
@@ -153,6 +174,7 @@ func (a *Agent) scheduleCompact(cmd protocol.Command) protocol.Receipt {
 		return "compaction complete", nil
 	})
 }
+
 func (a *Agent) scheduleFork(cmd protocol.Command) protocol.Receipt {
 	return a.scheduleOperation(cmd, "fork", func(ctx context.Context) (string, error) {
 		if err := ctx.Err(); err != nil {

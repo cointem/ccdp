@@ -110,7 +110,7 @@ func (m *Model) agentShelfLines() []agentShelfLine {
 		if string(r.SessionID) == m.sessionID {
 			return 0
 		}
-		if childAwaitingApproval(r) {
+		if childNeedsAttention(r) {
 			return 1
 		}
 		if r.Run.Active() {
@@ -126,7 +126,7 @@ func (m *Model) agentShelfLines() []agentShelfLine {
 	}
 	lines := []agentShelfLine{{text: main, target: m.routing.rootID}}
 	for _, row := range rows[:min(limit, len(rows))] {
-		status := map[string]string{"queued": "排队中", "starting": "准备中", "running": "运行中", "waiting_approval": "等待确认", "settling": "正在保存", "partial": "部分完成", "succeeded": "运行结束", "failed": "失败", "cancelled": "已取消", "interrupted": "已中断"}[row.Run.Status]
+		status := map[string]string{"queued": "排队中", "starting": "准备中", "running": "运行中", "waiting_approval": "等待确认", "waiting_question": "等待回答", "waiting_plan": "等待计划确认", "settling": "正在保存", "partial": "部分完成", "succeeded": "运行结束", "failed": "失败", "cancelled": "已取消", "interrupted": "已中断"}[row.Run.Status]
 		if status == "" {
 			status = row.Run.Status
 		}
@@ -159,7 +159,7 @@ func (m *Model) renderAgentShelf() string {
 		if line.canDismiss {
 			width -= 4
 		}
-		text := truncateDisplay(line.text, width)
+		text := truncateDisplay(displayLabel(line.text), width)
 		if line.canDismiss {
 			text += strings.Repeat(" ", max(0, width-lipgloss.Width(text))) + " [×]"
 		}

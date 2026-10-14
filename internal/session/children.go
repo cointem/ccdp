@@ -1,14 +1,17 @@
 package session
 
 import (
-	"ccdp/internal/protocol"
 	"errors"
+
+	"ccdp/internal/protocol"
 )
 
 // ChildRunRecorded is log-only metadata, never part of model history. Each
 // change is written by the owning session; terminal copies may also be kept
 // by the child as a durable outbox entry for recovery.
 type ChildRunRecorded struct {
+	GoalSessionID   string                 `json:"goal_session_id,omitempty"`
+	GoalID          string                 `json:"goal_id,omitempty"`
 	PendingMessages []protocol.InputView   `json:"pending_messages,omitempty"`
 	Version         int                    `json:"version"`
 	Child           protocol.ChildSession  `json:"child"`
@@ -24,8 +27,21 @@ type ChildRunRecorded struct {
 const EventTypeChildRunRecorded EventType = "ChildRunRecorded"
 
 func (ChildRunRecorded) Type() EventType { return EventTypeChildRunRecorded }
-func (ChildRunRecorded) seal()           {}
+
+func (ChildRunRecorded) seal() {}
+
 func (e ChildRunRecorded) validate() error {
+	if (e.GoalSessionID == "") != (e.GoalID == "") {
+		return errors.New("child goal binding requires session id and goal id")
+	}
+	if e.GoalID != "" {
+		if err := validateSessionID(e.GoalSessionID); err != nil {
+			return err
+		}
+		if err := requireID("goal_id", e.GoalID); err != nil {
+			return err
+		}
+	}
 	if e.Version != 1 {
 		return errors.New("unsupported child run version")
 	}
@@ -50,7 +66,7 @@ func (e ChildRunRecorded) validate() error {
 		return errors.New("invalid child purpose")
 	}
 	switch e.Child.Run.Status {
-	case "queued", "starting", "running", "waiting_approval", "stopping", "settling", "succeeded", "partial", "failed", "cancelled", "interrupted", "unknown":
+	case "queued", "starting", "running", "waiting_approval", "waiting_question", "waiting_plan", "stopping", "settling", "succeeded", "partial", "failed", "cancelled", "interrupted", "unknown":
 	default:
 		return errors.New("invalid child run status")
 	}

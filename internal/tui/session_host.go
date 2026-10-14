@@ -299,15 +299,13 @@ func (m *Model) handleResumeOpened(msg resumeOpenedMsg) (tea.Model, tea.Cmd) {
 	m.reportGeneration++
 	m.operations = nil
 	m.inputImages = nil
-	m.retryImages = nil
+	m.inputRetry = nil
 	m.historyImages = nil
 	m.expiredHistoryImages = nil
 	m.missingHistoryImages = false
 	m.pasteRequest = ""
 	m.receiptKeys = nil
 	m.receiptOrder = nil
-	m.retryCommandID = ""
-	m.retryDraft = ""
 	m.pendingApprovalCommand = ""
 	m.pendingApprovalKey = ""
 	m.watchDisconnected = false

@@ -8,6 +8,7 @@
 package workspace
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -84,6 +85,17 @@ func langOf(name string) string {
 // Scan walks the workspace and returns a model of it. maxFiles caps the
 // inventory (cheap guard against enormous trees).
 func Scan(root string, maxFiles int) (*Info, error) {
+	return ScanContext(context.Background(), root, maxFiles)
+}
+
+// ScanContext walks until the inventory bound or invocation cancellation.
+func ScanContext(ctx context.Context, root string, maxFiles int) (*Info, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
@@ -105,7 +117,10 @@ func Scan(root string, maxFiles int) (*Info, error) {
 		return nil, err
 	}
 	if isRepo {
-		if err := ignore.LoadGitignores(gitRoot); err != nil {
+		if err := ignore.LoadGitignoresContext(ctx, gitRoot); err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			ignore = NewMatcherSafe()
 		}
 	}
@@ -119,7 +134,10 @@ func Scan(root string, maxFiles int) (*Info, error) {
 		"derived_data": true, ".gradle": true, "go.sum": false,
 	}
 
-	_ = filepath.WalkDir(abs, func(path string, d os.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(abs, func(path string, d os.DirEntry, err error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil {
 			return nil
 		}
@@ -152,7 +170,8 @@ func Scan(root string, maxFiles int) (*Info, error) {
 			return nil
 		}
 
-		if ignored, ok := ignore.Match(rel, d.IsDir()); ok && ignored {
+		ignoreRel, _ := filepath.Rel(gitRoot, path)
+		if ignored, ok := ignore.Match(ignoreRel, d.IsDir()); ok && ignored {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -180,6 +199,12 @@ func Scan(root string, maxFiles int) (*Info, error) {
 		return nil
 	})
 
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	sort.Slice(info.Files, func(i, j int) bool {
 		a, b := info.Files[i], info.Files[j]
 		if a.IsDir != b.IsDir {

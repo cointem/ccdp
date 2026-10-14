@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -82,6 +83,13 @@ func (m *Manager) Start(ctx context.Context, servers map[string]ServerConfig) {
 			log.Printf("mcp: %s", err)
 			continue
 		}
+		m.mu.Lock()
+		if m.generation == 0 {
+			m.generation = 1
+		}
+		generation := m.generation
+		m.mu.Unlock()
+		m.configureClient(c, name, generation)
 		m.registryMu.Lock()
 		m.mu.Lock()
 		if m.closed {
@@ -90,16 +98,16 @@ func (m *Manager) Start(ctx context.Context, servers map[string]ServerConfig) {
 			_ = c.Close()
 			return
 		}
-		m.clients[name] = c
-		m.names = append(m.names, name)
-		if m.generation == 0 {
-			m.generation = 1
+		if !c.isClosed() {
+			m.clients[name] = c
+			m.names = append(m.names, name)
 		}
-		generation := m.generation
 		m.replaceRegistryLocked()
 		m.mu.Unlock()
 		m.registryMu.Unlock()
-		m.configureClient(c, name, generation)
+		if c.isClosed() {
+			_ = c.Close()
+		}
 	}
 }
 
@@ -146,6 +154,15 @@ func (m *Manager) StartChecked(ctx context.Context, servers map[string]ServerCon
 		}
 		candidates = append(candidates, candidate{name: name, client: client})
 	}
+	m.mu.Lock()
+	if m.generation == 0 {
+		m.generation = 1
+	}
+	generation := m.generation
+	m.mu.Unlock()
+	for _, c := range candidates {
+		m.configureClient(c.client, c.name, generation)
+	}
 	m.registryMu.Lock()
 	m.mu.Lock()
 	if m.closed {
@@ -154,19 +171,19 @@ func (m *Manager) StartChecked(ctx context.Context, servers map[string]ServerCon
 		cleanup()
 		return fmt.Errorf("mcp: manager is closed")
 	}
-	if m.generation == 0 {
-		m.generation = 1
-	}
-	generation := m.generation
 	for _, c := range candidates {
-		m.clients[c.name] = c.client
-		m.names = append(m.names, c.name)
+		if !c.client.isClosed() {
+			m.clients[c.name] = c.client
+			m.names = append(m.names, c.name)
+		}
 	}
 	m.replaceRegistryLocked()
 	m.mu.Unlock()
 	m.registryMu.Unlock()
 	for _, c := range candidates {
-		m.configureClient(c.client, c.name, generation)
+		if c.client.isClosed() {
+			_ = c.client.Close()
+		}
 	}
 	return nil
 }
@@ -204,11 +221,12 @@ type refreshClient struct {
 // Agent persist the corresponding SettingsChanged fact before exposing a new
 // executable extension generation.
 type RefreshCandidate struct {
-	manager   *Manager
-	clients   []refreshClient
-	mu        sync.Mutex
-	finished  bool
-	committed bool
+	manager    *Manager
+	clients    []refreshClient
+	mu         sync.Mutex
+	finished   bool
+	committed  bool
+	retirement []*Client
 }
 
 // PrepareRefresh starts and handshakes every configured server without
@@ -270,6 +288,17 @@ func (m *Manager) PrepareRefresh(ctx context.Context, servers map[string]ServerC
 // this path non-fallible except for a concurrent shutdown, which is serialized
 // by refreshMu and therefore cannot occur until Commit returns.
 func (c *RefreshCandidate) Commit() error {
+	if err := c.Publish(); err != nil {
+		return err
+	}
+	c.FinishRetirement()
+	return nil
+}
+
+// Publish installs a prepared generation without joining retired transports.
+// Its caller must call FinishRetirement outside the session owner, including
+// when later publication steps fail. Commit provides the synchronous variant.
+func (c *RefreshCandidate) Publish() error {
 	if c == nil || c.manager == nil {
 		return fmt.Errorf("mcp: nil refresh candidate")
 	}
@@ -289,6 +318,19 @@ func (c *RefreshCandidate) Commit() error {
 	c.clients = nil
 	c.mu.Unlock()
 
+	// Install death observers before publishing. A candidate that died while
+	// settings were being persisted is omitted; a later death unregisters the
+	// exact published client. refreshMu keeps this generation reservation stable.
+	manager.mu.Lock()
+	oldGen := manager.generation
+	if oldGen == 0 {
+		oldGen = 1
+	}
+	newGen := oldGen + 1
+	manager.mu.Unlock()
+	for _, item := range clients {
+		manager.configureClient(item.client, item.name, newGen)
+	}
 	manager.registryMu.Lock()
 	manager.mu.Lock()
 	if manager.closed {
@@ -300,21 +342,18 @@ func (c *RefreshCandidate) Commit() error {
 		manager.refreshMu.Unlock()
 		return fmt.Errorf("mcp: manager is closed")
 	}
-	oldGen := manager.generation
-	if oldGen == 0 {
-		oldGen = 1
-	}
 	oldClients := make([]*Client, 0, len(manager.clients))
 	for _, client := range manager.clients {
 		oldClients = append(oldClients, client)
 	}
-	manager.generation = oldGen + 1
-	newGen := manager.generation
+	manager.generation = newGen
 	manager.clients = make(map[string]*Client, len(clients))
 	manager.names = make([]string, 0, len(clients))
 	for _, item := range clients {
-		manager.clients[item.name] = item.client
-		manager.names = append(manager.names, item.name)
+		if !item.client.isClosed() {
+			manager.clients[item.name] = item.client
+			manager.names = append(manager.names, item.name)
+		}
 	}
 	if len(oldClients) > 0 {
 		manager.retired[oldGen] = oldClients
@@ -324,10 +363,15 @@ func (c *RefreshCandidate) Commit() error {
 	manager.replaceRegistryLocked()
 	manager.mu.Unlock()
 	manager.registryMu.Unlock()
+	retirement := manager.detachRetiredGeneration(oldGen)
 	for _, item := range clients {
-		manager.configureClient(item.client, item.name, newGen)
+		if item.client.isClosed() {
+			retirement = append(retirement, item.client)
+		}
 	}
-	manager.releaseGeneration(oldGen)
+	c.mu.Lock()
+	c.retirement = retirement
+	c.mu.Unlock()
 	manager.refreshMu.Unlock()
 	return nil
 }
@@ -521,17 +565,34 @@ func (m *Manager) releaseGenerationRef(generation uint64) {
 	}
 }
 
-func (m *Manager) releaseGeneration(generation uint64) {
+func (m *Manager) detachRetiredGeneration(generation uint64) []*Client {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.refs[generation] != 0 {
-		m.mu.Unlock()
+		return nil
+	}
+	clients := m.retired[generation]
+	delete(m.retired, generation)
+	return clients
+}
+func (m *Manager) releaseGeneration(generation uint64) {
+	for _, client := range m.detachRetiredGeneration(generation) {
+		_ = client.Close()
+	}
+}
+
+// FinishRetirement joins resources transferred by Publish. It is idempotent;
+// generation leases retain clients that are still in use by active steps.
+func (c *RefreshCandidate) FinishRetirement() {
+	if c == nil {
 		return
 	}
-	clients := append([]*Client(nil), m.retired[generation]...)
-	delete(m.retired, generation)
-	m.mu.Unlock()
-	for _, c := range clients {
-		_ = c.Close()
+	c.mu.Lock()
+	clients := c.retirement
+	c.retirement = nil
+	c.mu.Unlock()
+	for _, client := range clients {
+		_ = client.Close()
 	}
 }
 
@@ -567,6 +628,30 @@ func (m *Manager) replaceRegistryLocked() {
 }
 
 // Names returns the connected server names.
+// Matches checks the actual live generation, rather than desired agent config.
+func (m *Manager) Matches(servers map[string]ServerConfig) bool {
+	if m == nil {
+		return len(servers) == 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed || len(m.clients) != len(servers) {
+		return false
+	}
+	for name, cfg := range servers {
+		client := m.clients[name]
+		if client == nil || !reflect.DeepEqual(client.cfg, cfg) {
+			return false
+		}
+		select {
+		case <-client.closed:
+			return false
+		default:
+		}
+	}
+	return true
+}
+
 func (m *Manager) Names() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -597,30 +682,11 @@ func (m *Manager) ToolNames() map[string][]string {
 	return out
 }
 
-// RequiresHostNetwork reports whether the qualified tool is backed by a
-// remote HTTP MCP server. Local stdio MCP remains governed by its Seatbelt
-// process policy and does not consume the host-network capability.
-func (m *Manager) RequiresHostNetwork(toolName string) bool {
-	if m == nil {
-		return false
-	}
-	m.mu.Lock()
-	clients := make([]*Client, 0, len(m.clients))
-	for _, client := range m.clients {
-		clients = append(clients, client)
-	}
-	m.mu.Unlock()
-	for _, client := range clients {
-		if !client.RequiresHostNetwork() {
-			continue
-		}
-		for _, def := range client.Tools() {
-			if protocol.MCPToolName(client.Name(), def.Name) == toolName {
-				return true
-			}
-		}
-	}
-	return false
+// ToolRequiresHostNetwork checks the resolved tool's actual transport. A
+// same-named replacement never inherits an MCP connection's capabilities.
+func ToolRequiresHostNetwork(tool tools.Tool) bool {
+	mcpTool, ok := tool.(*mcpTool)
+	return ok && mcpTool.client.RequiresHostNetwork()
 }
 
 // RegisterTools wraps every advertised tool as a tools.Tool and registers it

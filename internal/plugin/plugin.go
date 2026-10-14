@@ -684,7 +684,7 @@ func (g *GoHooks) AddPostTool(h PostToolHook) func() {
 	}
 }
 
-// RunPreTool invokes all pre-tool hooks; the first non-none verdict wins. The
+// RunPreTool combines pre-tool hooks with deny > ask > allow. The
 // hook list is copied under the lock so concurrent disposers (which move
 // elements in place) never race with the iteration.
 func (g *GoHooks) RunPreTool(toolName string, args map[string]any) (ToolDecision, string) {
@@ -692,13 +692,17 @@ func (g *GoHooks) RunPreTool(toolName string, args map[string]any) (ToolDecision
 	hooks := make([]*preHookNode, len(g.pre))
 	copy(hooks, g.pre)
 	g.mu.RUnlock()
+	decision, reason := DecisionNone, ""
 	for _, node := range hooks {
-		dec, reason := node.h(toolName, args)
-		if dec != DecisionNone {
-			return dec, reason
+		next, nextReason := node.h(toolName, args)
+		if next == DecisionDeny {
+			return next, nextReason
+		}
+		if next == DecisionAsk || next == DecisionAllow && decision == DecisionNone {
+			decision, reason = next, nextReason
 		}
 	}
-	return DecisionNone, ""
+	return decision, reason
 }
 
 // RunPostTool invokes all post-tool hooks and concatenates their additions.

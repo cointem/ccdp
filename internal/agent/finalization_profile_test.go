@@ -24,7 +24,7 @@ func TestProfileFinalization(t *testing.T) {
 	cfg.EnableGuardian = config.BoolPtr(false)
 	cfg.EnableMemory = config.BoolPtr(true)
 	cfg.MCPServers = nil
-	a, err := New(&cfg, nil)
+	a, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestProfileFinalization(t *testing.T) {
 		t.Logf("%s: %s", name, time.Since(start))
 	}
 	measure("inventory", func() error {
-		paths, err := workspace.Inventory(context.Background(), root, a.sandbox.Snapshot())
+		paths, err := workspace.Inventory(context.Background(), root, a.services.sandbox.Snapshot())
 		t.Logf("inventory files: %d", len(paths))
 		return err
 	})
@@ -47,9 +47,8 @@ func TestProfileFinalization(t *testing.T) {
 		point, err = a.captureRecoveryPoint(context.Background(), "profile-turn", "profile")
 		return err
 	})
-	measure("checkpoint_after_unchanged", func() error { return a.sealRecoveryPoint(point) })
+	measure("checkpoint_after_unchanged", func() error { return a.sealRecoveryPoint(context.Background(), point) })
 	measure("turn_finished_fact", func() error { return a.persistTurnFinished("profile-turn", "success", "", time.Second) })
-	a.turnUserMsg, a.turnSummary = "profile", "profile completed"
+	a.turnMemory.turnUserMsg, a.turnMemory.turnSummary = "profile", "profile completed"
 	measure("memory", a.recordMemory)
-	measure("session_save", a.Save)
 }

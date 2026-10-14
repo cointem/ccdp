@@ -45,11 +45,10 @@ func (m *Model) renderHeader() string {
 
 	ws := truncateDisplay(sanitizeANSI(m.workspace), 24)
 
-	hasCost := usage.TurnCount > 0 || usage.InputTokens > 0 || usage.OutputTokens > 0
 	parts := make([]string, 0, len(m.statusItems))
 	items := m.statusItems
 	if sameStatusItems(items, defaultStatusItems) {
-		// The persistent footer owns model/effort/context/cost. Keep the header
+		// The persistent footer owns model/effort/context. Keep the header
 		// empty after the welcome item, so a normal conversation does not repeat
 		// launch identity or settings above and below the transcript.
 		items = nil
@@ -66,13 +65,6 @@ func (m *Model) renderHeader() string {
 			parts = append(parts, "session:"+shortID(sanitizeANSI(sessionID)))
 		case "workspace":
 			parts = append(parts, ws)
-		case "cost":
-			if hasCost {
-				parts = append(parts, fmt.Sprintf("%.1fk→%.1fk · $%.3f",
-					float64(usage.InputTokens)/1000,
-					float64(usage.OutputTokens)/1000,
-					usage.Cost))
-			}
 		case "context":
 			// Keep the runtime's authoritative context estimate visible. The
 			// usage counters are request accounting, not the live context

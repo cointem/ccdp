@@ -7,12 +7,26 @@ import "encoding/json"
 // of content parts (for tool-bearing messages we always use strings for the
 // tool role, matching the OpenAI convention).
 type ChatMessage struct {
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	Role             string     `json:"role"`
-	Content          any        `json:"content,omitempty"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
-	Name             string     `json:"name,omitempty"`
+	ProviderOrigin   string            `json:"provider_origin,omitempty"`
+	ProviderWire     string            `json:"provider_wire,omitempty"`
+	ProviderContent  []json.RawMessage `json:"provider_content,omitempty"`
+	ReasoningContent string            `json:"reasoning_content,omitempty"`
+	Role             string            `json:"role"`
+	Content          any               `json:"content,omitempty"`
+	ToolCalls        []ToolCall        `json:"tool_calls,omitempty"`
+	ToolCallID       string            `json:"tool_call_id,omitempty"`
+	Name             string            `json:"name,omitempty"`
+}
+
+func cloneRawBlocks(src []json.RawMessage) []json.RawMessage {
+	if src == nil {
+		return nil
+	}
+	dst := make([]json.RawMessage, len(src))
+	for i := range src {
+		dst[i] = append(json.RawMessage(nil), src[i]...)
+	}
+	return dst
 }
 
 // ToolCall is a streaming-assembled tool call.
@@ -107,11 +121,32 @@ type Delta struct {
 
 // Usage reports token accounting when the provider includes it.
 type Usage struct {
-	PromptTokens     int                 `json:"prompt_tokens"`
-	CompletionTokens int                 `json:"completion_tokens"`
-	TotalTokens      int                 `json:"total_tokens"`
-	PromptDetails    *PromptTokensDetail `json:"prompt_tokens_details,omitempty"`
+	PromptReported     bool                `json:"-"`
+	CompletionReported bool                `json:"-"`
+	PromptTokens       int                 `json:"prompt_tokens"`
+	CompletionTokens   int                 `json:"completion_tokens"`
+	TotalTokens        int                 `json:"total_tokens"`
+	PromptDetails      *PromptTokensDetail `json:"prompt_tokens_details,omitempty"`
 }
+
+// UnmarshalJSON preserves usage field presence, including an explicit zero.
+func (u *Usage) UnmarshalJSON(data []byte) error {
+	type wire Usage
+	var value wire
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*u = Usage(value)
+	u.PromptReported = reportedCounter(fields["prompt_tokens"])
+	u.CompletionReported = reportedCounter(fields["completion_tokens"])
+	return nil
+}
+
+func reportedCounter(raw json.RawMessage) bool { return len(raw) > 0 && string(raw) != "null" }
 
 // PromptTokensDetail carries cache-hit accounting (OpenAI-style
 // prompt_tokens_details.cached_tokens).
@@ -135,11 +170,13 @@ type SystemBlock struct {
 	Cacheable bool
 }
 
-// CompletionRequest is the full request body for Chat Completions.
+// ThinkingConfig carries the requested reasoning mode for compatible providers.
 type ThinkingConfig struct {
 	Type string `json:"type"`
 }
 
+// CompletionRequest is the provider-neutral prepared request, including internal
+// prompt metadata. Each adapter projects it into its own API request body.
 type CompletionRequest struct {
 	Thinking        *ThinkingConfig `json:"thinking,omitempty"`
 	ReasoningEffort string          `json:"reasoning_effort,omitempty"`

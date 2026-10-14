@@ -444,6 +444,10 @@ func agentMarkerStatus(status string) (string, lipgloss.Style, string) {
 		return "✗", styleToolErr, "error"
 	case "cancelled", "canceled", "stopped":
 		return "■", styleStatus, "stopped"
+	case "waiting_question":
+		return "◆", styleAgentRun, "needs answer"
+	case "waiting_plan":
+		return "◆", styleAgentRun, "needs plan decision"
 	case "waiting_approval":
 		return "◆", styleAgentRun, "needs approval"
 	case "started":

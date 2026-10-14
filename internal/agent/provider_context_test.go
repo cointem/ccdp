@@ -1,12 +1,13 @@
 package agent
 
 import (
+	"fmt"
+	"testing"
+
 	"ccdp/internal/config"
 	"ccdp/internal/llm"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
-	"fmt"
-	"testing"
 )
 
 func TestProviderContextBudgetAndAdapterRefresh(t *testing.T) {
@@ -39,10 +40,12 @@ func TestProviderContextBudgetAndAdapterRefresh(t *testing.T) {
 
 func TestModelSwitchUpdatesContextDisplayWithoutChangingFallback(t *testing.T) {
 	a := newRuntimeAgent(t)
-	a.cfg.Providers = map[string]config.ProviderConfig{"other": {Models: []string{"step-5-preview", "small-model"}, ContextWindow: 800000, ContextWindows: map[string]int{"step-5-preview": 1000000, "small-model": 128000}}}
-	a.baseCfg.Providers = a.cfg.Providers
-	fallback := a.cfg.ContextWindow
-	original := a.cfg.Model
+	a.mu.Lock()
+	a.services.cfg.Providers = map[string]config.ProviderConfig{"other": {Models: []string{"step-5-preview", "small-model"}, ContextWindow: 800000, ContextWindows: map[string]int{"step-5-preview": 1000000, "small-model": 128000}}}
+	a.services.baseCfg.Providers = a.services.cfg.Providers
+	fallback := a.services.cfg.ContextWindow
+	original := a.services.cfg.Model
+	a.mu.Unlock()
 	for i, model := range []string{"step-5-preview", original} {
 		cmd := protocol.NewSetModel(protocol.CommandID([]string{"large", "back"}[i]), protocol.SessionID(a.SessionID()), model)
 		if r := a.applyCommand(cmd); r.Rejected() {
@@ -64,9 +67,11 @@ func TestModelSwitchUpdatesContextDisplayWithoutChangingFallback(t *testing.T) {
 
 func TestConfiguredModelRemainsInCatalogAfterSwitch(t *testing.T) {
 	a := newRuntimeAgent(t)
-	original := a.cfg.Model
-	a.cfg.Providers = map[string]config.ProviderConfig{"other": {Models: []string{"other-model"}}}
-	a.baseCfg.Providers = a.cfg.Providers
+	a.mu.Lock()
+	original := a.services.cfg.Model
+	a.services.cfg.Providers = map[string]config.ProviderConfig{"other": {Models: []string{"other-model"}}}
+	a.services.baseCfg.Providers = a.services.cfg.Providers
+	a.mu.Unlock()
 	for i, model := range []string{"other-model", original, "other-model"} {
 		cmd := protocol.NewSetModel(protocol.CommandID(fmt.Sprintf("catalog-switch-%d", i)), protocol.SessionID(a.SessionID()), model)
 		if r := a.applyCommand(cmd); r.Rejected() {
@@ -91,7 +96,7 @@ func TestQualifiedProviderSwitchKeepsDistinctModels(t *testing.T) {
 		"first":  {BaseURL: "https://first.example/v1", WireAPI: "responses", ModelConfigs: map[string]config.ModelConfig{"same": {ContextWindow: 1000000}}},
 		"second": {BaseURL: "https://second.example/v1", WireAPI: "chat", ModelConfigs: map[string]config.ModelConfig{"same": {ContextWindow: 128000}}},
 	}
-	a, err := New(&cfg, make(chan Event, 64))
+	a, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,10 +106,10 @@ func TestQualifiedProviderSwitchKeepsDistinctModels(t *testing.T) {
 		if r.Rejected() {
 			t.Fatal(r.Error)
 		}
-		if a.activeBinding.client.Name() != model {
+		if a.modelsState.activeBinding.client.Name() != model {
 			t.Fatal("registry alias collision")
 		}
-		caps, _ := llm.ProviderCapabilitiesOf(a.activeBinding.client)
+		caps, _ := llm.ProviderCapabilitiesOf(a.modelsState.activeBinding.client)
 		if caps.ContextWindow != cfg.ContextWindowFor(model) {
 			t.Fatal("wrong context")
 		}

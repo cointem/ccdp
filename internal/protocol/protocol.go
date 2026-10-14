@@ -110,7 +110,7 @@ const (
 	CommandReloadSettings      CommandType = "reload_settings"
 	CommandTrustProject        CommandType = "trust_project"
 	CommandClearMemory         CommandType = "clear_memory"
-	CommandSaveSession         CommandType = "save_session"
+	CommandGoal                CommandType = "goal"
 )
 
 type InputStrategy string
@@ -274,7 +274,7 @@ type Command struct {
 	Reload             *ReloadCommand       `json:"reload,omitempty"`
 	TrustProject       *TrustProjectCommand `json:"trust_project,omitempty"`
 	ClearMemory        *ClearMemoryCommand  `json:"clear_memory,omitempty"`
-	SaveSession        *SaveSessionCommand  `json:"save_session,omitempty"`
+	Goal               *GoalCommand         `json:"goal,omitempty"`
 }
 
 // Normalize validates the discriminant/payload relationship and returns a
@@ -363,7 +363,7 @@ func (c Command) Normalize() (Command, error) {
 	if c.ClearMemory != nil {
 		payloads++
 	}
-	if c.SaveSession != nil {
+	if c.Goal != nil {
 		payloads++
 	}
 
@@ -572,7 +572,7 @@ func (c Command) Normalize() (Command, error) {
 		query := *c.Query
 		c.Query = &query
 		switch query.Kind {
-		case QueryConfig, QueryDoctor, QueryPermissions, QueryMemory, QueryMCP, QueryPlugins, QuerySkills, QueryStatus, QueryGitHub:
+		case QueryConfig, QueryDoctor, QueryPermissions, QueryMemory, QueryMCP, QueryPlugins, QuerySkills, QueryStatus, QueryGitHub, QueryGoal:
 		default:
 			return Command{}, fmt.Errorf("protocol: unknown query kind %q", query.Kind)
 		}
@@ -600,10 +600,15 @@ func (c Command) Normalize() (Command, error) {
 		if err := requirePayload(c.ClearMemory != nil); err != nil {
 			return Command{}, err
 		}
-	case CommandSaveSession:
-		if err := requirePayload(c.SaveSession != nil); err != nil {
+	case CommandGoal:
+		if err := requirePayload(c.Goal != nil); err != nil {
 			return Command{}, err
 		}
+		goal, err := c.Goal.normalize()
+		if err != nil {
+			return Command{}, err
+		}
+		c.Goal = &goal
 	case CommandInterrupt, CommandStop, CommandClearConversation, CommandCompact:
 		if payloads != 0 {
 			return Command{}, errors.New("protocol: command does not accept a payload")
@@ -725,6 +730,7 @@ type ModelBinding struct {
 }
 
 type SettingsSnapshot struct {
+	Workspace        string           `json:"workspace"`
 	ReasoningEffort  string           `json:"reasoning_effort,omitempty"`
 	Verbosity        string           `json:"verbosity,omitempty"`
 	Revision         uint64           `json:"revision"`
@@ -736,7 +742,6 @@ type SettingsSnapshot struct {
 	CompactThreshold float64          `json:"compact_threshold,omitempty"`
 	MaxOutputTokens  int              `json:"max_output_tokens"`
 	MaxTurns         int              `json:"max_turns"`
-	MaxBudgetUSD     float64          `json:"max_budget_usd"`
 }
 
 type ProviderSnapshot struct {
@@ -782,7 +787,6 @@ type UsageSnapshot struct {
 	InputTokens  int        `json:"input_tokens"`
 	OutputTokens int        `json:"output_tokens"`
 	CachedTokens int        `json:"cached_tokens,omitempty"`
-	Cost         float64    `json:"cost"`
 	TurnCount    int        `json:"turn_count"`
 }
 
@@ -814,6 +818,7 @@ type MessageViewToolCall struct {
 // snapshot deliberately omits tool-call arguments (they may embed secrets); the
 // context-usage breakdown estimates their cost with a fixed allowance instead.
 type MessageView struct {
+	InternalSource   string                `json:"internal_source,omitempty"`
 	ID               string                `json:"id,omitempty"`
 	Role             string                `json:"role"`
 	Content          string                `json:"content,omitempty"`
@@ -868,6 +873,7 @@ const (
 	EventTurnDone          EventKind = "turn_done"
 	EventUsage             EventKind = "usage"
 	EventStateChanged      EventKind = "state_changed"
+	EventGoalChanged       EventKind = "goal_changed"
 )
 
 type ToolView struct {
@@ -882,6 +888,7 @@ type ToolView struct {
 // provider credentials or mutable runtime pointers and is safe to retain
 // after the update has been delivered.
 type EventView struct {
+	Goal           *Goal            `json:"goal,omitempty"`
 	Question       *QuestionRequest `json:"question,omitempty"`
 	Transcript     *TranscriptItem  `json:"transcript,omitempty"`
 	Kind           EventKind        `json:"kind"`
@@ -923,15 +930,18 @@ type SandboxRuntimeView struct {
 // SessionView is a read-only projection. Agent returns copies of all slices
 // and nested values so a client cannot mutate or race runtime state.
 type SessionView struct {
-	Question       *QuestionRequest `json:"question,omitempty"`
-	RunID          RunID            `json:"run_id,omitempty"`
-	Transcript     []TranscriptItem `json:"transcript,omitempty"`
-	TranscriptMore bool             `json:"transcript_more,omitempty"`
-	SessionID      SessionID        `json:"session_id"`
-	Revision       Revision         `json:"revision"`
-	Phase          RuntimePhase     `json:"phase"`
-	Workflow       WorkflowState    `json:"workflow"`
-	Busy           bool             `json:"busy"`
+	HistoryLength   int              `json:"history_length"`
+	OutstandingWork int              `json:"outstanding_work"`
+	Goal            *Goal            `json:"goal,omitempty"`
+	Question        *QuestionRequest `json:"question,omitempty"`
+	RunID           RunID            `json:"run_id,omitempty"`
+	Transcript      []TranscriptItem `json:"transcript,omitempty"`
+	TranscriptMore  bool             `json:"transcript_more,omitempty"`
+	SessionID       SessionID        `json:"session_id"`
+	Revision        Revision         `json:"revision"`
+	Phase           RuntimePhase     `json:"phase"`
+	Workflow        WorkflowState    `json:"workflow"`
+	Busy            bool             `json:"busy"`
 	// WorkStartedAt is the runtime start of the current turn or exclusive operation.
 	WorkLabel         string             `json:"work_label,omitempty"`
 	WorkStartedAt     time.Time          `json:"work_started_at,omitempty"`
@@ -966,15 +976,17 @@ const (
 )
 
 type Update struct {
-	Child       *ChildUpdate `json:"child,omitempty"`
-	Type        UpdateType   `json:"type"`
-	Cursor      Cursor       `json:"cursor"`
-	Revision    Revision     `json:"revision"`
-	Snapshot    *SessionView `json:"snapshot,omitempty"`
-	Receipt     *Receipt     `json:"receipt,omitempty"`
-	Event       *EventView   `json:"event,omitempty"`
-	Text        string       `json:"text,omitempty"`
-	OperationID OperationID  `json:"operation_id,omitempty"`
+	Child       *ChildUpdate     `json:"child,omitempty"`
+	Type        UpdateType       `json:"type"`
+	Cursor      Cursor           `json:"cursor"`
+	Revision    Revision         `json:"revision"`
+	Snapshot    *SessionView     `json:"snapshot,omitempty"`
+	State       *SessionState    `json:"state,omitempty"`
+	Catalog     *CatalogSnapshot `json:"catalog,omitempty"`
+	Receipt     *Receipt         `json:"receipt,omitempty"`
+	Event       *EventView       `json:"event,omitempty"`
+	Text        string           `json:"text,omitempty"`
+	OperationID OperationID      `json:"operation_id,omitempty"`
 }
 
 // Subscription is deliberately tiny: the runtime owns delivery and the

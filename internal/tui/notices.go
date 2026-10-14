@@ -259,7 +259,7 @@ type Operation struct {
 	// intentionally has no second applied receipt, so the TUI closes that
 	// operation when the associated turn reaches its terminal boundary.
 	InputID          protocol.InputID
-	InputImages      []protocol.InputImage
+	InputCommand     *protocol.Command
 	Recoverable      bool
 	InputText        string
 	TurnID           protocol.TurnID
@@ -306,7 +306,8 @@ func (m *operationStore) register(cmd protocol.Command, purpose string) {
 		Purpose: purpose, State: OperationPending, StartedAt: when, UpdatedAt: when, Order: m.operationSeq}
 	if cmd.Input != nil {
 		op.InputID, op.InputText = cmd.Input.ID, cmd.Input.Text
-		op.InputImages = cloneInputImages(cmd.Input.Images)
+		frozen := cloneInputCommand(cmd)
+		op.InputCommand = &frozen
 		op.Recoverable = true
 	}
 	m.operations[cmd.ID] = op
@@ -411,7 +412,10 @@ func (m Model) Notices() []Notice { return m.visibleNotices() }
 func (m operationStore) Operations() []Operation {
 	out := make([]Operation, 0, len(m.operations))
 	for _, op := range m.operations {
-		op.InputImages = cloneInputImages(op.InputImages)
+		if op.InputCommand != nil {
+			frozen := cloneInputCommand(*op.InputCommand)
+			op.InputCommand = &frozen
+		}
 		out = append(out, op)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Order < out[j].Order })
@@ -431,7 +435,7 @@ func (m operationStore) pendingSubmissionCount() int {
 func (m *operationStore) consumeSubmission(id protocol.CommandID) {
 	if op, ok := m.operations[id]; ok {
 		op.Recoverable = false
-		op.InputImages = nil
+		op.InputCommand = nil
 		m.operations[id] = op
 	}
 }

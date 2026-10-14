@@ -31,6 +31,12 @@ func sanitizeANSI(s string) string {
 	}, s)
 }
 
+// displayLabel is for untrusted, single-line metadata. Decode structured data
+// before calling it, and add terminal styling only afterwards.
+func displayLabel(s string) string {
+	return strings.Join(strings.Fields(sanitizeANSI(s)), " ")
+}
+
 func stringsContainsTerminalSequence(s string) bool {
 	for i := 0; i < len(s); i++ {
 		// Some UTF-8 continuation bytes also match this range. The parser

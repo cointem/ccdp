@@ -29,22 +29,22 @@ const (
 	EventModeChanged                      // permission mode changed
 	EventHistoryCleared                   // /clear happened
 	EventCompacted                        // context was compacted
-	EventUsage                            // token/cost accounting updated
+	EventUsage                            // token accounting updated
 	EventHistoryChanged                   // history edited via /remove or /rewind
 	EventSandboxChanged                   // sandbox mode changed
 	EventPlan                             // a plan is ready for approval (Plan Mode)
 	EventPlanModeChanged                  // plan mode was toggled
 	EventQuestion
+	EventGoalChanged
 	EventSessionChanged // the agent switched to another session (fork/resume)
 )
 
-// Usage is the accumulated token and cost accounting for the session.
+// Usage is the accumulated token accounting for the session.
 type Usage struct {
 	Cache        protocol.CacheStats `json:"cache,omitempty"`
 	InputTokens  int                 `json:"input_tokens"`
 	OutputTokens int                 `json:"output_tokens"`
 	CachedTokens int                 `json:"cached_tokens"` // prompt tokens served from provider cache
-	Cost         float64             `json:"cost"`
 	TurnCount    int                 `json:"turn_count"`
 }
 
@@ -59,10 +59,10 @@ type ToolEvent struct {
 
 // ApprovalRequest is issued when a tool needs the user to decide.
 type ApprovalRequest struct {
-	ID      string
-	Tool    string
-	Command string
-	Reason  string
+	ID           string
+	Tool         string
+	Command      string
+	Reason       string
 	Capabilities []protocol.CapabilityRequest
 	// journalID is the occurrence-scoped durable identity. ID remains the
 	// compatibility/UI call ID so older control clients can answer a prompt;
@@ -77,8 +77,9 @@ type PlanRequest struct {
 	Plan string
 }
 
-// Event is everything the agent emits to the UI.
+// Event is an internal runtime event projected into the Watch protocol and trace.
 type Event struct {
+	Goal      *protocol.Goal
 	Question  *protocol.QuestionRequest
 	Type      EventType
 	Text      string

@@ -29,7 +29,7 @@ func TestModePickerKeepsRevisionAfterCommandCompletion(t *testing.T) {
 			cfg.NoSessionPersistence = !persistent
 			cfg.APIKey = "test-key"
 			cfg.BaseURL = "http://127.0.0.1:1"
-			ag, err := agent.New(&cfg, nil)
+			ag, err := agent.New(&cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -60,7 +60,7 @@ func TestModePickerKeepsRevisionAfterCommandCompletion(t *testing.T) {
 				}
 			}
 			drain()
-			for _, line := range []string{"/mode", "/mode", "/mode plan", "/mode default", "/plan on", "/plan off", "/sandbox", "/clear", "/save", "/mode"} {
+			for _, line := range []string{"/mode", "/mode", "/mode plan", "/mode default", "/plan on", "/plan off", "/sandbox", "/clear", "/mode"} {
 				next, cmd := m.runCommand(line)
 				m = modelValue(t, next)
 				if line == "/mode" {

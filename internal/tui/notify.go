@@ -57,7 +57,7 @@ func sanitizeNotification(s string) string {
 		switch {
 		case r == '\x1b' || r == '\a' || r == 0 || r == '\n' || r == '\r':
 			b.WriteRune(' ')
-		case r < 0x20:
+		case r < 0x20 || (r >= 0x7f && r <= 0x9f):
 			// Drop remaining C0 control characters.
 		default:
 			b.WriteRune(r)

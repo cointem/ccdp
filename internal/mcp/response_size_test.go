@@ -2,54 +2,31 @@ package mcp
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 )
-
-type largeResponseTransport struct{}
-
-type bodyResponseTransport struct{ body string }
-
-func (r bodyResponseTransport) RoundTrip(*http.Request) (*http.Response, error) {
-	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(r.body))}, nil
-}
 
 func TestInvalidOrOversizedJSONReturnsImmediately(t *testing.T) {
 	for _, body := range []string{"{invalid", strings.Repeat("x", maxLineLen+1)} {
-		c := NewClient("test", ServerConfig{Transport: "sse"})
-		c.sseTransport = true
-		c.messagesURL = "http://example.test/messages"
-		c.sseCtx = context.Background()
-		c.sseClient = &http.Client{Transport: bodyResponseTransport{body}}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		var out map[string]any
-		err := c.requestJSON(ctx, "tools/call", map[string]any{}, &out)
-		cancel()
-		if err == nil || strings.Contains(err.Error(), "deadline") {
-			t.Fatalf("expected immediate protocol error: %v", err)
+		c := newHTTPTestClient(t, func(w http.ResponseWriter, r *http.Request, req rpcMessage) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		})
+		done := make(chan error, 1)
+		go func() { _, err := c.Call(context.Background(), "echo", nil); done <- err }()
+		if err := receiveError(t, done); err == nil {
+			t.Fatal("expected protocol/size error")
 		}
 	}
 }
-
-func (largeResponseTransport) RoundTrip(*http.Request) (*http.Response, error) {
-	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"result":{"content":"%s"}}`, strings.Repeat("x", 1<<20))
-	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
-}
-
 func TestReviewLargePlainJSONResponse(t *testing.T) {
-	c := NewClient("test", ServerConfig{Transport: "sse"})
-	c.sseTransport = true
-	c.messagesURL = "http://example.test/messages"
-	c.sseClient = &http.Client{Transport: largeResponseTransport{}}
-	c.sseCtx = context.Background()
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-	defer cancel()
-	var out map[string]any
-	if err := c.requestJSON(ctx, "tools/call", map[string]any{}, &out); err != nil {
-		t.Fatalf("valid response failed: %v", err)
+	text := strings.Repeat("x", 1<<20)
+	c := newHTTPTestClient(t, func(w http.ResponseWriter, r *http.Request, req rpcMessage) {
+		writeRPC(w, req.ID, map[string]any{"content": []any{map[string]any{"type": "text", "text": text}}})
+	})
+	out, err := c.Call(context.Background(), "echo", nil)
+	if err != nil || out != text {
+		t.Fatalf("response len=%d err=%v", len(out), err)
 	}
 }

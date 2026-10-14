@@ -8,8 +8,8 @@
 //     "additionalContext" is injected as a system message.
 //   - PreToolUse: runs before a tool executes. Returning
 //     {"decision":"block"|"deny"} vetoes the call, {"decision":"allow"}
-//     short-circuits the permission gate, and an "ask" decision escalates to
-//     the user.
+//     permits ordinary approval unless another hook asks or denies. An "ask"
+//     decision escalates to the user after all non-denying hooks have run.
 //   - PostToolUse / PostToolUseFailure: run after a tool succeeds or fails.
 //     Their JSON "hookSpecificOutput" is appended to the tool result.
 //   - PreCompact / PostCompact: run around context compaction.
@@ -357,7 +357,11 @@ func (m *Manager) Run(ctx context.Context, event string, mutate func(*Input)) Ou
 		res, blocked, err := m.runOne(ctx, spec.Command, hookTimeout, in, opts)
 		if err != nil {
 			if hookFailClosed(opts, event) {
-				return Output{Decision: DecisionDeny, Reason: fmt.Sprintf("hook %q failed closed: %v", spec.Command, err)}
+				out.Decision = DecisionDeny
+				if out.Continue == nil || *out.Continue {
+					out.Reason = fmt.Sprintf("hook %q failed closed: %v", spec.Command, err)
+				}
+				return out
 			}
 			// Observer hooks retain best-effort behavior. Decision-affecting
 			// hooks are fail-closed when the runtime opts into safety mode.
@@ -368,13 +372,32 @@ func (m *Manager) Run(ctx context.Context, event string, mutate func(*Input)) Ou
 		}
 		if blocked {
 			// Exit code 2: veto with stderr as the reason.
-			return Output{Decision: DecisionBlock, Reason: res.Reason}
+			out.Decision = DecisionBlock
+			if out.Continue == nil || *out.Continue {
+				out.Reason = res.Reason
+			}
+			return out
 		}
-		if res.Decision != DecisionNone {
+		if res.Continue != nil {
+			if out.Continue == nil || !*res.Continue {
+				value := *res.Continue
+				out.Continue = &value
+			}
+			if !*res.Continue {
+				out.Reason = res.Reason
+			}
+		}
+		if res.Decision == DecisionDeny || res.Decision == DecisionBlock {
 			out.Decision = res.Decision
-			out.Reason = res.Reason
-			if res.Decision != DecisionAllow {
-				return out // vetoing decision stops the chain
+			if out.Continue == nil || *out.Continue {
+				out.Reason = res.Reason
+			}
+			return out
+		}
+		if res.Decision == DecisionAsk || res.Decision == DecisionAllow && out.Decision == DecisionNone {
+			out.Decision = res.Decision
+			if out.Continue == nil || *out.Continue {
+				out.Reason = res.Reason
 			}
 		}
 		if res.HookSpecificOutput != "" {

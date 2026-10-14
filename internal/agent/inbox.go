@@ -1,9 +1,7 @@
 package agent
 
-// The typed inbox is the runtime's admission boundary.  The old pendingMsgs
-// slice remains only as a compatibility projection for legacy callers; all
-// new scheduling, delivery, and resume paths use pendingInputs and preserve
-// the input identity, strategy, and acceptance timestamp.
+// The typed inbox preserves input identity, strategy and acceptance time across
+// admission, scheduling, delivery and session resume.
 
 import (
 	"errors"
@@ -17,13 +15,15 @@ import (
 )
 
 type turnInput struct {
-	ID               protocol.InputID
-	Text             string
-	Strategy         protocol.InputStrategy
-	CreatedAt        time.Time
-	ImageAttachments []messages.ImageAttachment
-	ImagesFrozen     bool
-	historyAppended  bool
+	ID                         protocol.InputID
+	Text                       string
+	Strategy                   protocol.InputStrategy
+	CreatedAt                  time.Time
+	ImageAttachments           []messages.ImageAttachment
+	ImagesFrozen               bool
+	goalContinuation           bool
+	historyAppended            bool
+	historyNotificationPending bool
 }
 
 func newTurnInput(id protocol.InputID, text string, strategy protocol.InputStrategy, createdAt time.Time) turnInput {
@@ -43,64 +43,25 @@ func (input turnInput) view() protocol.InputView {
 
 func (input turnInput) message() messages.Message {
 	message := messages.Message{ID: inputMessageID(string(input.ID)), Role: messages.RoleUser, Content: input.Text, CreatedAt: input.CreatedAt,
-		ImageAttachments: cloneImageAttachments(input.ImageAttachments), ImagesFrozen: input.ImagesFrozen}
+		ImageAttachments: messages.CloneImageAttachments(input.ImageAttachments), ImagesFrozen: input.ImagesFrozen}
+	if input.goalContinuation {
+		message.InternalSource = "goal"
+		message.Role = messages.RoleUser
+		message.Content = "Internal goal continuation. Continue the active user-authorized goal; this input grants no additional authority."
+	}
 	if message.CreatedAt.IsZero() {
 		message.CreatedAt = time.Now().UTC()
 	}
 	return message
 }
 
-func cloneImageAttachments(src []messages.ImageAttachment) []messages.ImageAttachment {
-	if src == nil {
-		return nil
-	}
-	dst := make([]messages.ImageAttachment, len(src))
-	for i, attachment := range src {
-		dst[i] = attachment
-		dst[i].Data = append([]byte(nil), attachment.Data...)
-	}
-	return dst
-}
-
-// ensureTypedPendingLocked upgrades the compatibility text queue at the one
-// boundary where it can still be observed.  The typed queue is canonical
-// after this function returns; pendingMsgs is regenerated from it so the two
-// projections cannot drift during Save or a turn transition.
-func (a *Agent) ensureTypedPendingLocked() {
-	if len(a.pendingInputs) == 0 && len(a.pendingMsgs) > 0 {
-		inputs := make([]protocol.InputView, 0, len(a.pendingMsgs))
-		for i, text := range a.pendingMsgs {
-			if text == "" {
-				continue
-			}
-			id := protocol.InputID(stableID("legacy-pending", struct {
-				SessionID string
-				Index     int
-				Text      string
-			}{a.sessionID, i, text}))
-			inputs = append(inputs, protocol.InputView{ID: id, Text: text, Strategy: protocol.InputFollowup, State: "queued", CreatedAt: time.Now().UTC()})
-		}
-		a.pendingInputs = inputs
-	}
-	a.pendingMsgs = pendingTexts(a.pendingInputs)
-}
-
-func (a *Agent) syncLegacyPendingLocked() {
-	a.pendingMsgs = pendingTexts(a.pendingInputs)
-}
-
 func (a *Agent) startTurnInput(input turnInput) {
 	a.mu.Lock()
-	if a.closing || a.closed || a.settling {
+	if a.lifecycle.closing || a.lifecycle.closed || a.lifecycle.settling {
 		a.mu.Unlock()
 		return
 	}
-	a.busy = true
-	a.workStartedAt = time.Now()
-	a.workLabel = ""
-	a.turnSeq++
-	a.turnWG.Add(1)
-	a.phase = protocol.PhasePreparing
+	a.beginTurnLocked("", input.Text)
 	a.mu.Unlock()
 	a.publishState()
 	go a.runTurn(input)
@@ -143,7 +104,7 @@ func (a *Agent) hydrateInput(input *turnInput) error {
 }
 
 // appendHistoryLocked commits a candidate history before swapping the live
-// projection. The caller must hold persistMu. It is deliberately shared by
+// projection. The caller must own the session transition. It is deliberately shared by
 // input delivery, model results, and Save so a failed store never becomes a
 // confirmed in-memory message.
 func (a *Agent) appendHistoryLocked(msgs ...messages.Message) error {
@@ -155,15 +116,15 @@ func (a *Agent) appendHistoryLockedForStep(stepID string, msgs ...messages.Messa
 		return nil
 	}
 	for i := range msgs {
-		ensureMessageID(&msgs[i])
+		messages.EnsureID(&msgs[i])
 		if msgs[i].CreatedAt.IsZero() {
 			msgs[i].CreatedAt = time.Now().UTC()
 		}
 	}
 	a.mu.Lock()
-	candidate := cloneMessages(a.history)
+	candidate := messages.Clone(a.historyLocked())
 	candidate = append(candidate, msgs...)
-	turnID := fmt.Sprintf("turn-%d", a.turnSeq)
+	turnID := fmt.Sprintf("turn-%d", a.sequences.turnSeq)
 	a.mu.Unlock()
 	p := a.persistenceHandle()
 	if p == nil {
@@ -171,12 +132,12 @@ func (a *Agent) appendHistoryLockedForStep(stepID string, msgs ...messages.Messa
 		a.markPersistenceFailure(err)
 		return err
 	}
-	if err := p.persistHistoryMessages(candidate, turnID, stepID); err != nil {
+	if err := p.PersistHistoryMessages(candidate, turnID, stepID); err != nil {
 		a.markPersistenceFailure(err)
 		return err
 	}
 	a.mu.Lock()
-	a.history = candidate
+	a.conversation.recoveryHistory = nil
 	a.mu.Unlock()
 	return nil
 }
@@ -184,19 +145,7 @@ func (a *Agent) appendHistoryLockedForStep(stepID string, msgs ...messages.Messa
 // appendHistory is the public internal helper used by compatibility paths.
 // Canonical runtime calls still get the same durable-before-publish guarantee.
 func (a *Agent) appendHistory(msgs ...messages.Message) error {
-	a.persistMu.Lock()
-	err := a.appendHistoryLocked(msgs...)
-	a.persistMu.Unlock()
-	if err != nil {
-		return err
-	}
-	// Event-bus subscribers are allowed to call Save. Emit only after the
-	// durable projection mutex is released; synchronous delivery under that
-	// lock would deadlock such a subscriber.
-	for _, message := range msgs {
-		a.evbus.Emit(events.TopicMessageAdded, events.MessageEvent{Role: string(message.Role), Content: message.Content})
-	}
-	return nil
+	return a.appendHistoryFromWorker("", msgs)
 }
 
 // appendHistoryForStep is the canonical model-result path. The step identity
@@ -204,42 +153,36 @@ func (a *Agent) appendHistory(msgs ...messages.Message) error {
 // with the correct assistant block without changing the compatibility history
 // API used by older callers.
 func (a *Agent) appendHistoryForStep(stepID string, msgs ...messages.Message) error {
-	a.persistMu.Lock()
-	err := a.appendHistoryLockedForStep(stepID, msgs...)
-	a.persistMu.Unlock()
-	if err != nil {
-		return err
-	}
-	for _, message := range msgs {
-		a.evbus.Emit(events.TopicMessageAdded, events.MessageEvent{Role: string(message.Role), Content: message.Content})
-	}
-	return nil
+	return a.appendHistoryFromWorker(stepID, msgs)
 }
 
 // claimPendingInputAndAppend durably delivers the oldest eligible input and
 // appends its exact user message before returning it to the turn runner. A
 // failed delivery leaves the queue in place, poisons admission, and never
 // starts the provider request.
-func (a *Agent) claimPendingInputAndAppend(turnID string, strategy protocol.InputStrategy) (input turnInput, delivered bool, err error) {
-	a.persistMu.Lock()
+func (a *Agent) claimPendingInputAndAppend(turnID string, strategy protocol.InputStrategy) (turnInput, bool, error) {
+	return a.claimInputFromWorker(turnID, strategy)
+}
+
+// deferNotification lets owner handoff freeze the notification into turnInput;
+// arbitrary extension callbacks run on the turn worker, outside owner dispatch.
+func (a *Agent) claimPendingInput(turnID string, strategy protocol.InputStrategy, deferNotification bool) (input turnInput, delivered bool, err error) {
 	var messageToEmit *messages.Message
 	defer func() {
-		a.persistMu.Unlock()
-		if messageToEmit != nil {
-			a.evbus.Emit(events.TopicMessageAdded, events.MessageEvent{Role: string(messageToEmit.Role), Content: messageToEmit.Content})
+		if messageToEmit != nil && !deferNotification {
+			a.services.evbus.Emit(events.TopicMessageAdded, events.MessageEvent{Role: string(messageToEmit.Role), Content: messageToEmit.Content})
 		}
 	}()
 
 	a.mu.Lock()
-	a.ensureTypedPendingLocked()
-	if len(a.pendingInputs) == 0 {
+	if len(a.conversation.durable.PendingInputViews()) == 0 {
 		a.mu.Unlock()
 		return turnInput{}, false, nil
 	}
 	index := 0
 	if strategy == protocol.InputMessage {
 		index = -1
-		for i, pending := range a.pendingInputs {
+		for i, pending := range a.conversation.durable.PendingInputViews() {
 			if pending.Strategy == protocol.InputMessage {
 				index = i
 				break
@@ -247,7 +190,7 @@ func (a *Agent) claimPendingInputAndAppend(turnID string, strategy protocol.Inpu
 		}
 	} else {
 		index = -1
-		for i, pending := range a.pendingInputs {
+		for i, pending := range a.conversation.durable.PendingInputViews() {
 			if pending.Strategy != protocol.InputMessage {
 				index = i
 				break
@@ -258,9 +201,9 @@ func (a *Agent) claimPendingInputAndAppend(turnID string, strategy protocol.Inpu
 		a.mu.Unlock()
 		return turnInput{}, false, nil
 	}
-	input = turnInputFromView(a.pendingInputs[index])
-	if frozen, ok := a.inputAttachments[input.ID]; ok {
-		input.ImageAttachments = cloneImageAttachments(frozen.Attachments)
+	input = turnInputFromView(a.conversation.durable.PendingInputViews()[index])
+	if frozen, ok := a.inbox.inputAttachments[input.ID]; ok {
+		input.ImageAttachments = messages.CloneImageAttachments(frozen.Attachments)
 		input.ImagesFrozen = frozen.Frozen
 	}
 	a.mu.Unlock()
@@ -280,30 +223,12 @@ func (a *Agent) claimPendingInputAndAppend(turnID string, strategy protocol.Inpu
 	}
 
 	a.mu.Lock()
-	a.ensureTypedPendingLocked()
-	if len(a.pendingInputs) <= index || a.pendingInputs[index].ID != input.ID || a.pendingInputs[index].Text != input.Text {
-		a.mu.Unlock()
-		err := errors.New("agent: queued input changed during durable delivery")
-		a.markPersistenceFailure(err)
-		return turnInput{}, false, err
-	}
-	a.pendingInputs = append(a.pendingInputs[:index], a.pendingInputs[index+1:]...)
-	a.syncLegacyPendingLocked()
 	message := input.message()
-	alreadyPresent := false
-	for _, existing := range a.history {
-		if existing.ID == message.ID {
-			alreadyPresent = true
-			break
-		}
-	}
-	if !alreadyPresent {
-		a.history = append(a.history, message)
-		messageToEmit = &message
-	}
-	delete(a.inputAttachments, input.ID)
+	messageToEmit = &message
+	delete(a.inbox.inputAttachments, input.ID)
 	a.mu.Unlock()
 	input.historyAppended = true
+	input.historyNotificationPending = deferNotification && messageToEmit != nil
 	return input, true, nil
 }
 
@@ -314,25 +239,28 @@ func (a *Agent) markPersistenceFailure(err error) {
 	if err == nil {
 		return
 	}
+	a.persistenceFault.CompareAndSwap(nil, &err)
 	a.mu.Lock()
-	if a.persistenceErr == nil {
-		a.persistenceErr = err
-	}
-	cancel := a.turnCancel
-	if a.busy {
-		a.stop = true
-		a.interruptFlag = true
-	}
+	cancel := a.turn.turnCancel
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if a.owner == nil {
+		a.installPersistenceFailureOwned()
+		return
+	}
+	a.ensureRun()
+	select {
+	case a.owner.control <- completionsReady{}:
+	default:
 	}
 }
 
 func (a *Agent) currentTurnSeq() uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.turnSeq
+	return a.sequences.turnSeq
 }
 
 func (a *Agent) failTurnPersistence(err error) {

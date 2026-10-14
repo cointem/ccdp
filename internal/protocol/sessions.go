@@ -41,6 +41,8 @@ type ChildSession struct {
 	Run              RunView           `json:"run"`
 	Capabilities     AgentCapabilities `json:"capabilities"`
 	Approval         *ApprovalView     `json:"approval,omitempty"`
+	Question         *QuestionRequest  `json:"question,omitempty"`
+	Plan             *PlanView         `json:"plan,omitempty"`
 	DeliveryPending  bool              `json:"delivery_pending,omitempty"`
 }
 
@@ -59,7 +61,7 @@ type RunView struct {
 
 func (r RunView) Active() bool {
 	switch r.Status {
-	case "queued", "starting", "running", "waiting_approval", "stopping", "settling":
+	case "queued", "starting", "running", "waiting_approval", "waiting_question", "waiting_plan", "stopping", "settling":
 		return true
 	}
 	return false

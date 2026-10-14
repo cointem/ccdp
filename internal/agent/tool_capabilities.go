@@ -1,33 +1,38 @@
 package agent
 
-import "ccdp/internal/tools"
+import (
+	"ccdp/internal/permissions"
+	"ccdp/internal/tools"
+)
 
-// planAllowedImplementation classifies the concrete implementation, not its
-// advertised name. A plugin or project command named "Read" must not inherit
-// the built-in Read capability in plan mode (and likewise for every other
-// allowlisted name).
-func planAllowedImplementation(tool tools.Tool) bool {
-	switch tool.(type) {
-	case *tools.ReadTool, *tools.GlobTool, *tools.GrepTool, *tools.LSTool,
-		*tools.ReadSkillTool, *tools.CodeNavigateTool, *toolSearchTool,
-		*tools.TodoWriteTool, *tools.AgentTool,
-		*tools.WebFetchTool, *tools.WebSearchTool,
-		*enterPlanModeTool, *exitPlanModeTool, *askUserQuestionTool:
-		return true
-	default:
-		return false
-	}
-}
-
-// readOnlyImplementation is the stricter classification used by the
-// concurrent dispatch pool. TodoWrite, Task and web tools remain barriers
-// even though the historical plan workflow permits their real built-ins.
-func readOnlyImplementation(tool tools.Tool) bool {
+// toolKind is the sole built-in implementation classification. Names remain
+// labels for user rules; a plugin shadowing Read never inherits its capability.
+func toolKind(tool tools.Tool) permissions.ToolKind {
 	switch tool.(type) {
 	case *tools.ReadTool, *tools.GlobTool, *tools.GrepTool, *tools.LSTool,
 		*tools.ReadSkillTool, *tools.CodeNavigateTool, *toolSearchTool:
-		return true
+		return permissions.KindRead
+	case *tools.TodoWriteTool, *tools.CreateGoalTool, *tools.GetGoalTool, *tools.UpdateGoalTool,
+		*enterPlanModeTool, *exitPlanModeTool, *askUserQuestionTool:
+		return permissions.KindState
+	case *tools.WriteTool, *tools.EditTool:
+		return permissions.KindWrite
+	case *tools.BashTool:
+		return permissions.KindShell
+	case *tools.ProcessTool:
+		return permissions.KindProcess
+	case *tools.AgentTool:
+		return permissions.KindDelegate
+	case *tools.WebFetchTool, *tools.WebSearchTool:
+		return permissions.KindNetwork
 	default:
-		return false
+		return permissions.KindUnknown
 	}
+}
+
+func planAllowedImplementation(tool tools.Tool) bool { return toolKind(tool).PlanAllowed() }
+
+func readOnlyImplementation(tool tools.Tool) bool {
+	kind := toolKind(tool)
+	return kind == permissions.KindRead || kind == permissions.KindNetwork
 }

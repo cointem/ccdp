@@ -238,7 +238,16 @@ var blockedHostnames = map[string]bool{
 
 // validateExternalURL rejects URLs that point at loopback, private or
 // link-local addresses (or unrouteable internal hostnames).
-func validateExternalURL(raw string) error {
+func validateExternalURL(ctx context.Context, raw string) error {
+	return validateExternalURLWithLookup(ctx, raw, resolveHostIPs)
+}
+
+// Lookup is explicit so policy tests do not depend on public DNS or host proxy
+// configuration. The production entry point always uses bounded DNS resolution.
+func validateExternalURLWithLookup(ctx context.Context, raw string, lookup func(context.Context, string) ([]net.IP, error)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return err
@@ -250,7 +259,11 @@ func validateExternalURL(raw string) error {
 	if host == "" || blockedHostnames[strings.ToLower(host)] {
 		return errBlockedPrivate
 	}
-	for _, ip := range resolveHostIPs(host) {
+	ips, err := lookup(ctx, host)
+	if err != nil {
+		return err
+	}
+	for _, ip := range ips {
 		if isPrivateIP(ip) {
 			return errBlockedPrivate
 		}
@@ -261,21 +274,27 @@ func validateExternalURL(raw string) error {
 // resolveHostIPs returns the IPs a URL host refers to: IP literals directly,
 // DNS names via a bounded lookup. An unresolvable name yields nothing — the
 // request itself will fail with a DNS error anyway.
-func resolveHostIPs(host string) []net.IP {
-	if ip := net.ParseIP(host); ip != nil {
-		return []net.IP{ip}
+func resolveHostIPs(ctx context.Context, host string) ([]net.IP, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{ip}, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return nil
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, nil
 	}
 	ips := make([]net.IP, 0, len(addrs))
 	for _, a := range addrs {
 		ips = append(ips, a.IP)
 	}
-	return ips
+	return ips, nil
 }
 
 // isPrivateIP reports whether ip is unspecified (0.0.0.0/::), loopback
@@ -294,7 +313,7 @@ func checkExternalRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errors.New("stopped after 10 redirects")
 	}
-	return validateExternalURL(req.URL.String())
+	return validateExternalURL(req.Context(), req.URL.String())
 }
 
 // httpGet performs a GET with a timeout, an SSRF address check (initial URL
@@ -307,7 +326,7 @@ func httpGetDetails(ctx context.Context, u string) (body []byte, finalURL, conte
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := validateExternalURL(u); err != nil {
+	if err := validateExternalURL(ctx, u); err != nil {
 		return nil, "", "", 0, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)

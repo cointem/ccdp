@@ -4,18 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"ccdp/internal/mcp"
 	"ccdp/internal/messages"
+	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
+	"ccdp/internal/tools"
 )
 
 const maxRequestedCapabilities = 8
@@ -25,21 +25,20 @@ type capabilityPolicyVersion struct {
 	capabilityRevision uint64
 }
 
-func (a *Agent) toolCapabilityPolicy(tc messages.ToolCall) (*sandbox.Sandbox, []protocol.CapabilityRequest, capabilityPolicyVersion, error) {
+func (a *Agent) toolCapabilityPolicy(tc messages.ToolCall, tool tools.Tool) (*sandbox.Sandbox, []protocol.CapabilityRequest, capabilityPolicyVersion, error) {
 	a.mu.Lock()
-	base := a.sandbox
-	version := capabilityPolicyVersion{capabilityRevision: a.capabilityRevision}
+	base := a.services.sandbox
+	version := capabilityPolicyVersion{capabilityRevision: a.capabilities.capabilityRevision}
 	if base != nil {
 		version.sandboxRevision = base.Revision
 		base = base.Snapshot()
 	}
-	grants := make([]protocol.CapabilityRequest, 0, len(a.capabilityGrants))
-	for _, grant := range a.capabilityGrants {
+	grants := make([]protocol.CapabilityRequest, 0, len(a.capabilities.capabilityGrants))
+	for _, grant := range a.capabilities.capabilityGrants {
 		grants = append(grants, grant)
 	}
-	revoking := a.capabilityRevoking
-	workspace := a.cfg.Workspace
-	remoteMCP := a.mcp
+	revoking := a.capabilities.capabilityRevoking
+	workspace := a.services.cfg.Workspace
 	a.mu.Unlock()
 	if revoking {
 		return nil, nil, version, fmt.Errorf("sandbox capability revocation is pending; inspect /sandbox before requesting further tool work")
@@ -57,8 +56,21 @@ func (a *Agent) toolCapabilityPolicy(tc messages.ToolCall) (*sandbox.Sandbox, []
 	if err != nil {
 		return nil, nil, version, err
 	}
-	requested = append(requested, inferredFileCapability(tc, workspace, base)...)
-	needsHostNetwork := tc.Name == "WebFetch" || tc.Name == "WebSearch" || remoteMCP != nil && remoteMCP.RequiresHostNetwork(tc.Name)
+	// Use explicitly requested grants only to determine whether an inferred
+	// file grant is needed. Approval still uses the original base policy.
+	requestedPolicy := base.Snapshot()
+	for i, req := range requested {
+		canonical, err := canonicalizeCapability(base, req)
+		if err != nil {
+			return nil, nil, version, err
+		}
+		requested[i] = canonical
+		if err := applyCapability(requestedPolicy, canonical); err != nil {
+			return nil, nil, version, err
+		}
+	}
+	requested = append(requested, inferredFileCapability(tc, tool, workspace, requestedPolicy)...)
+	needsHostNetwork := toolKind(tool) == permissions.KindNetwork || mcp.ToolRequiresHostNetwork(tool)
 	if needsHostNetwork && !base.NetworkAllowed() {
 		requested = append(requested, protocol.CapabilityRequest{Kind: "network", Access: "outbound"})
 	}
@@ -80,7 +92,7 @@ func (a *Agent) toolCapabilityPolicy(tc messages.ToolCall) (*sandbox.Sandbox, []
 		if capabilityGranted(base, canonical) {
 			continue
 		}
-		if a.childState != nil && (a.childState.purpose != childPurposeTask || a.childState.nonInteractive) {
+		if a.children.childState != nil && (a.children.childState.purpose != childPurposeTask || a.children.childState.nonInteractive) {
 			return nil, nil, version, fmt.Errorf("child sandbox capability ceiling does not allow requesting %s", describeCapability(canonical))
 		}
 		unique = append(unique, canonical)
@@ -110,14 +122,11 @@ func explicitToolCapabilities(args map[string]any) ([]protocol.CapabilityRequest
 	return requests, nil
 }
 
-func inferredFileCapability(tc messages.ToolCall, workspace string, policy *sandbox.Sandbox) []protocol.CapabilityRequest {
-	var rawPath string
-	switch tc.Name {
-	case "Write", "Edit":
-		rawPath = stringArgument(tc.Arguments, "file_path")
-	default:
+func inferredFileCapability(tc messages.ToolCall, tool tools.Tool, workspace string, policy *sandbox.Sandbox) []protocol.CapabilityRequest {
+	if toolKind(tool) != permissions.KindWrite {
 		return nil
 	}
+	rawPath := stringArgument(tc.Arguments, "file_path")
 	if rawPath == "" {
 		return nil
 	}
@@ -130,6 +139,18 @@ func inferredFileCapability(tc messages.ToolCall, workspace string, policy *sand
 		return nil
 	}
 	dir := filepath.Dir(path)
+	// A new output subtree cannot itself be granted before it exists. Ask for
+	// its nearest existing ancestor, subject to the same protected-path checks.
+	for {
+		if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
 	return []protocol.CapabilityRequest{{Kind: "directory", Path: dir, Access: "write"}}
 }
 
@@ -256,20 +277,20 @@ func capabilityKey(req protocol.CapabilityRequest) string {
 	return string(data)
 }
 
-func (a *Agent) addSessionCapabilities(version capabilityPolicyVersion, requested []protocol.CapabilityRequest) (*sandbox.Sandbox, capabilityPolicyVersion, error) {
+func (a *Agent) addSessionCapabilitiesOwned(version capabilityPolicyVersion, requested []protocol.CapabilityRequest) (*sandbox.Sandbox, capabilityPolicyVersion, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.capabilityRevoking {
+	if a.capabilities.capabilityRevoking {
 		return nil, version, fmt.Errorf("sandbox capabilities are being revoked")
 	}
-	if a.sandbox == nil || a.sandbox.Revision != version.sandboxRevision || a.capabilityRevision != version.capabilityRevision {
+	if a.services.sandbox == nil || a.services.sandbox.Revision != version.sandboxRevision || a.capabilities.capabilityRevision != version.capabilityRevision {
 		return nil, version, fmt.Errorf("sandbox policy changed while capability approval was pending; retry the tool under the current policy")
 	}
-	if a.turnCtx != nil && a.turnCtx.Err() != nil || a.interruptFlag || a.stop {
+	if a.turn.turnCtx != nil && a.turn.turnCtx.Err() != nil || a.turn.interruptFlag {
 		return nil, version, fmt.Errorf("capability approval expired because the operation was interrupted")
 	}
-	candidate := a.sandbox.Snapshot()
-	for _, grant := range a.capabilityGrants {
+	candidate := a.services.sandbox.Snapshot()
+	for _, grant := range a.capabilities.capabilityGrants {
 		if err := applyCapability(candidate, grant); err != nil {
 			return nil, version, err
 		}
@@ -279,14 +300,14 @@ func (a *Agent) addSessionCapabilities(version capabilityPolicyVersion, requeste
 			return nil, version, err
 		}
 	}
-	if a.capabilityGrants == nil {
-		a.capabilityGrants = map[string]protocol.CapabilityRequest{}
+	if a.capabilities.capabilityGrants == nil {
+		a.capabilities.capabilityGrants = map[string]protocol.CapabilityRequest{}
 	}
 	for _, grant := range requested {
-		a.capabilityGrants[capabilityKey(grant)] = grant
+		a.capabilities.capabilityGrants[capabilityKey(grant)] = grant
 	}
-	a.capabilityRevision++
-	version.capabilityRevision = a.capabilityRevision
+	a.capabilities.capabilityRevision++
+	version.capabilityRevision = a.capabilities.capabilityRevision
 	return candidate, version, nil
 }
 
@@ -327,24 +348,24 @@ func (a *Agent) approveToolWithCapabilities(tc messages.ToolCall, reason string,
 func (a *Agent) capabilityApprovalCurrent(version capabilityPolicyVersion) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.capabilityRevoking || a.sandbox == nil || a.sandbox.Revision != version.sandboxRevision || a.capabilityRevision != version.capabilityRevision {
+	if a.capabilities.capabilityRevoking || a.services.sandbox == nil || a.services.sandbox.Revision != version.sandboxRevision || a.capabilities.capabilityRevision != version.capabilityRevision {
 		return false
 	}
-	if a.turnCtx != nil && a.turnCtx.Err() != nil {
+	if a.turn.turnCtx != nil && a.turn.turnCtx.Err() != nil {
 		return false
 	}
-	return !a.interruptFlag && !a.stop && !a.closing && !a.closed
+	return !a.turn.interruptFlag && !a.lifecycle.closing && !a.lifecycle.closed
 }
 
-func (a *Agent) applyRevokeCapabilities(cmd protocol.Command) protocol.Receipt {
+func (a *Agent) applyRevokeCapabilities(cmd protocol.Command, owned ...bool) protocol.Receipt {
 	a.mu.Lock()
-	wasRevoking := a.capabilityRevoking
-	base := a.sandbox
+	wasRevoking := a.capabilities.capabilityRevoking
+	base := a.services.sandbox
 	if base != nil {
 		base = base.Snapshot()
 	}
-	grants := make(map[string]protocol.CapabilityRequest, len(a.capabilityGrants))
-	for key, grant := range a.capabilityGrants {
+	grants := make(map[string]protocol.CapabilityRequest, len(a.capabilities.capabilityGrants))
+	for key, grant := range a.capabilities.capabilityGrants {
 		grants[key] = grant
 	}
 	if len(grants) == 0 && !wasRevoking {
@@ -352,13 +373,13 @@ func (a *Agent) applyRevokeCapabilities(cmd protocol.Command) protocol.Receipt {
 		return a.receipt(cmd, protocol.ReceiptApplied, "", nil)
 	}
 	if !wasRevoking {
-		a.capabilityRevoking = true
+		a.capabilities.capabilityRevoking = true
 		// Invalidate all outstanding approval prompts at the same moment that
 		// dispatch is frozen. The revoking bit stays set if any cleanup fails.
-		a.capabilityRevision++
+		a.capabilities.capabilityRevision++
 	}
-	turnCancel, compactCancel := a.turnCancel, a.compactCancel
-	resources, oldMCP, supervisor := a.resources, a.mcp, a.supervisor
+	turnCancel := a.turn.turnCancel
+	resources, oldMCP, supervisor := a.services.resources, a.services.mcp, a.services.supervisor
 	a.mu.Unlock()
 
 	targets := map[string]bool{}
@@ -404,39 +425,16 @@ func (a *Agent) applyRevokeCapabilities(cmd protocol.Command) protocol.Receipt {
 	// Close every admission gate before interrupting work. ProcessManager keeps
 	// starts blocked until every old process has exited; the MCP manager is
 	// closed and replaced only after the active turn has released its leases.
+	scope := &sandboxQuiescence{turnCancel: turnCancel, resources: resources, mcp: oldMCP, supervisor: supervisor, policy: base, turn: &a.lifecycle.turnWG, operations: &a.lifecycle.operationWG}
 	var revokeErr error
-	if resources != nil && resources.Processes != nil {
-		if err := resources.Processes.StopAll(); err != nil {
-			revokeErr = fmt.Errorf("stop background processes: %w", err)
-		}
+	if len(owned) > 0 && owned[0] {
+		done := make(chan settingsPrepared, 1)
+		go func() { done <- settingsPrepared{err: scope.drain()} }()
+		revokeErr = a.awaitSettings(done).err
+	} else {
+		revokeErr = scope.drain()
 	}
-	if turnCancel != nil {
-		turnCancel()
-	}
-	if compactCancel != nil {
-		compactCancel()
-	}
-	if oldMCP != nil {
-		if err := oldMCP.Close(); err != nil {
-			revokeErr = errors.Join(revokeErr, fmt.Errorf("close MCP connections: %w", err))
-		}
-	}
-	waitCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if supervisor != nil {
-		if err := supervisor.revokeCapabilities(waitCtx); err != nil {
-			revokeErr = errors.Join(revokeErr, fmt.Errorf("stop descendant sessions: %w", err))
-		}
-	}
-	if err := waitGroupContext(waitCtx, &a.turnWG); err != nil {
-		revokeErr = errors.Join(revokeErr, fmt.Errorf("wait for active turn: %w", err))
-	}
-	if err := waitGroupContext(waitCtx, &a.operationWG); err != nil {
-		revokeErr = errors.Join(revokeErr, fmt.Errorf("wait for active runtime operation: %w", err))
-	}
-	if base != nil && base.ExternalExecutionPossible() {
-		revokeErr = errors.Join(revokeErr, errors.New("a local process may have descendants retaining the previous Seatbelt policy; revocation cannot be confirmed until the session is restarted and those processes are independently terminated"))
-	}
+
 	if revokeErr != nil {
 		// Fail closed. Dispatch remains disabled and process starts remain gated.
 		// Rejoining managed resources cannot clear the session-sticky witness for
@@ -448,27 +446,27 @@ func (a *Agent) applyRevokeCapabilities(cmd protocol.Command) protocol.Receipt {
 
 	a.settingsCommitMu.Lock()
 	a.mu.Lock()
-	if a.sandbox == nil {
+	if a.services.sandbox == nil {
 		a.mu.Unlock()
 		a.settingsCommitMu.Unlock()
 		return a.rejectedReceipt(cmd, protocol.ErrorInternal, "sandbox policy disappeared during revocation; new tool dispatch remains blocked")
 	}
 	replacement := mcp.NewManager()
-	replacement.SetSandbox(a.sandbox.Snapshot())
-	replacement.RegisterTools(a.registry)
-	a.mcp = replacement
-	for name := range a.deferTools {
+	replacement.SetSandbox(a.services.sandbox.Snapshot())
+	replacement.RegisterTools(a.services.registry)
+	a.services.mcp = replacement
+	for name := range a.discovery.deferTools {
 		if strings.HasPrefix(name, "mcp__") {
-			delete(a.deferTools, name)
-			delete(a.discovered, name)
+			delete(a.discovery.deferTools, name)
+			delete(a.discovery.discovered, name)
 		}
 	}
 	for key := range targets {
-		delete(a.capabilityGrants, key)
+		delete(a.capabilities.capabilityGrants, key)
 	}
-	a.capabilityRevision++
-	a.capabilityRevoking = false
-	a.catalogVersion++
+	a.capabilities.capabilityRevision++
+	a.capabilities.capabilityRevoking = false
+	a.sequences.catalogVersion++
 	a.mu.Unlock()
 	a.settingsCommitMu.Unlock()
 	if resources != nil && resources.Processes != nil {
@@ -481,7 +479,7 @@ func (a *Agent) applyRevokeCapabilities(cmd protocol.Command) protocol.Receipt {
 
 func (a *Agent) resetCapabilityRevoking() {
 	a.mu.Lock()
-	a.capabilityRevoking = false
+	a.capabilities.capabilityRevoking = false
 	a.mu.Unlock()
 }
 

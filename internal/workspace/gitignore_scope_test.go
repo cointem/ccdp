@@ -22,3 +22,17 @@ func TestIgnoreRulesUseTheirOwnDirectory(t *testing.T) {
 		}
 	}
 }
+
+func TestTrailingDoubleStarAllowsReincludedLeaf(t *testing.T) {
+	m := NewMatcherSafe()
+	m.AddGitignore([]byte("dir/**\n!dir/keep.txt\n"), "")
+	for _, test := range []struct {
+		path         string
+		dir, ignored bool
+	}{{"dir", true, false}, {"dir/keep.txt", false, false}, {"dir/drop.txt", false, true}} {
+		ignored, _ := m.Match(test.path, test.dir)
+		if ignored != test.ignored {
+			t.Errorf("%s ignored=%v, want %v", test.path, ignored, test.ignored)
+		}
+	}
+}

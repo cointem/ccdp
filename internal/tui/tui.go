@@ -65,8 +65,6 @@ type Model struct {
 	// tool-result event. It is deliberately UI-owned; the runtime remains the
 	// source of command execution and receipts.
 	operationReports map[protocol.CommandID]struct{}
-	retryCommandID   protocol.CommandID
-	retryDraft       string
 
 	modelName    string
 	mode         permissions.Mode
@@ -75,7 +73,7 @@ type Model struct {
 	sessionID    string
 	workspace    string
 
-	usage protocol.UsageSnapshot // token/cost accounting, updated on EventUsage
+	usage protocol.UsageSnapshot // token accounting, updated on EventUsage
 
 	showContextDetail bool
 	detail            *readerState
@@ -133,7 +131,7 @@ type Model struct {
 	followOutput bool
 
 	// statusItems configures which items render in the header statusline
-	// (/statusline). Valid tokens: version model mode session workspace cost.
+	// (/statusline). Valid tokens: version model mode session workspace context effort.
 	statusItems []string
 
 	// autoResume opens the session picker on first render (ccdp -c).
@@ -166,7 +164,7 @@ type selectorAction struct {
 }
 
 // defaultStatusItems is what the header shows unless /statusline changes it.
-var defaultStatusItems = []string{"version", "model", "workspace", "mode", "cost", "context"}
+var defaultStatusItems = []string{"version", "model", "workspace", "mode", "context"}
 
 type watchOpenedMsg struct {
 	sub        protocol.Subscription
@@ -261,14 +259,14 @@ func NewWithClient(client protocol.SessionClient, workspace string, autoResume b
 			m.pushStatus("session snapshot unavailable: " + err.Error())
 		}
 	}
-	if workspace != "" {
-		m.customCmds = loadCustomCommands(workspace)
+	if m.workspace != "" {
+		m.customCmds = loadCustomCommands(m.workspace)
 	}
 
 	// Greet only a fresh protocol session (and only after a successful
 	// snapshot).
 	if client != nil && !autoResume && (!m.hasSnapshot || len(m.snapshot.History) == 0 && len(m.snapshot.Transcript) == 0) {
-		m.addReport(welcomeItem(workspace))
+		m.addReport(welcomeItem(m.workspace))
 	}
 	// The initial frame owns the baseline history. It should not be emitted a
 	// second time when the first live turn is flushed to native scrollback.
@@ -444,6 +442,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.WindowSizeMsg:
+		m.selActive, m.selAnchor, m.selFocus, m.selPressValid = false, nil, nil, false
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
 		// The first real size is the earliest point at which wrapping is
@@ -825,7 +824,7 @@ func (m *Model) selPointAt(screenY, screenX int) selPoint {
 	headerH := presentationHeight(m.headerPresentation(), m.width)
 	row := m.viewport.YOffset + (screenY - headerH)
 	col := screenX - m.viewport.Style.GetHorizontalFrameSize()/2
-	return selPoint{Row: row, Col: max(0, col)}
+	return clampSelectionPoint(m.selGrid, selPoint{Row: row, Col: col})
 }
 
 // doMouseClick executes the immediate action bound to a left click: footer

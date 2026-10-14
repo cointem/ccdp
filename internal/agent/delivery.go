@@ -18,6 +18,7 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/execution"
 	"ccdp/internal/fsops"
+	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 	"ccdp/internal/session"
@@ -49,10 +50,10 @@ func hashBytes(b []byte) string { v := sha256.Sum256(b); return hex.EncodeToStri
 
 func (a *Agent) deliveryExec(ctx context.Context, id protocol.CommandID, dir string, sb *sandbox.Sandbox, argv []string, input io.Reader, env []string) (execution.Result, error) {
 	args := map[string]any{"command": formatExternalCommand(argv), "working_directory": dir}
-	if e := a.precheckCommand("Bash", args); e != nil {
+	if e := a.precheckCommand("Bash", args, permissions.KindShell); e != nil {
 		return execution.Result{}, e
 	}
-	if e := a.authorizeCommand(ctx, id, "Bash", args); e != nil {
+	if e := a.authorizeCommand(ctx, id, "Bash", args, permissions.KindShell); e != nil {
 		return execution.Result{}, e
 	}
 	if len(env) == 0 {
@@ -98,9 +99,10 @@ func (a *Agent) deliveryStatus(id string) (session.DeliveryRecorded, error) {
 	}
 	return state, nil
 }
+
 func (a *Agent) recordDelivery(state session.DeliveryRecorded) error {
 	raw, _ := json.Marshal(state)
-	_, e := a.persistenceHandle().commitEvents("delivery-"+state.PlanID+"-"+state.Stage+"-"+hashBytes(raw), state)
+	_, e := a.commitAuxiliary("delivery-"+state.PlanID+"-"+state.Stage+"-"+hashBytes(raw), state)
 	return e
 }
 
@@ -182,9 +184,9 @@ func (a *Agent) prepareDelivery(ctx context.Context, cmd protocol.Command) (stri
 		return "", errors.New("delivery requires a local branch")
 	}
 	a.mu.Lock()
-	cfg := a.cfg.Clone()
+	cfg := a.services.cfg.Clone()
 	root := cfg.Workspace
-	sb := a.sandbox.Snapshot()
+	sb := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	repoRoot, err := a.codingGit(ctx, cmd.ID, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -304,7 +306,7 @@ func (a *Agent) applyDelivery(ctx context.Context, cmd protocol.Command) (string
 		return "", err
 	}
 	a.mu.Lock()
-	root, policy := a.cfg.Workspace, a.sandbox.Snapshot()
+	root, policy := a.services.cfg.Workspace, a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	if plan.Root != root {
 		return "", errors.New("delivery belongs to another workspace")
@@ -334,6 +336,7 @@ func (a *Agent) applyDelivery(ctx context.Context, cmd protocol.Command) (string
 }
 
 func bytesReader(b []byte) io.Reader { return strings.NewReader(string(b)) }
+
 func githubRepository(remote string) (string, error) {
 	if strings.HasPrefix(remote, "git@") {
 		v := strings.TrimPrefix(remote, "git@")

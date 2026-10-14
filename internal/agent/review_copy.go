@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"ccdp/internal/execution"
+	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 )
 
@@ -38,20 +39,19 @@ type reviewJob struct {
 func (a *Agent) openReviewBlobs(ctx context.Context, cmd protocol.Command, r *reviewCopy) (*reviewBlobReader, error) {
 	argv := []string{"git", "cat-file", "--batch"}
 	params := map[string]any{"command": formatExternalCommand(argv)}
-	if err := a.precheckCommand("Bash", params); err != nil {
+	if err := a.precheckCommand("Bash", params, permissions.KindShell); err != nil {
 		return nil, err
 	}
 	var err error
 	if authorize, ok := ctx.Value(reviewGitAuthorizationKey{}).(func(context.Context, map[string]any) error); ok {
 		err = authorize(ctx, params)
 	} else {
-		err = a.authorizeCommand(ctx, cmd.ID, "Bash", params)
+		err = a.authorizeCommand(ctx, cmd.ID, "Bash", params, permissions.KindShell)
 	}
 	if err != nil {
 		return nil, err
 	}
-	argv, _ = execution.ReadOnlyGitArgv(argv)
-	p, err := execution.StartArgv(execution.StartRequest{Context: ctx, Argv: argv, Dir: r.root, Sandbox: r.policy, Env: execution.ReadOnlyGitEnvironment(os.Environ())})
+	p, err := execution.StartReadOnlyGit(execution.StartRequest{Context: ctx, Argv: argv, Dir: r.root, Sandbox: r.policy})
 	if err != nil {
 		return nil, err
 	}

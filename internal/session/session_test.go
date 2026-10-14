@@ -129,17 +129,6 @@ func TestStoreConformanceMemoryAndJSONL(t *testing.T) {
 				t.Fatalf("unexpected decoded event %#v", records[0].Event)
 			}
 
-			snapshot := Snapshot{LastSeq: 2, Data: []byte("projection")}
-			if err := store.SaveSnapshot(snapshot); err != nil {
-				t.Fatal(err)
-			}
-			gotSnapshot, err := store.Snapshot()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if gotSnapshot.LastSeq != 2 || string(gotSnapshot.Data) != "projection" {
-				t.Fatalf("unexpected snapshot %+v", gotSnapshot)
-			}
 		})
 	}
 }

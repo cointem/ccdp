@@ -32,7 +32,7 @@ func (a *Agent) runHookWithJournal(ctx context.Context, stage string, run func(c
 	if run == nil {
 		return hooks.Output{Decision: hooks.DecisionDeny, Reason: "hook runner is unavailable"}
 	}
-	if a == nil || a.hooks == nil || !a.hooks.Has(stage) {
+	if a == nil || a.services.hooks == nil || !a.services.hooks.Has(stage) {
 		return run(ctx)
 	}
 	invocation := hookInvocation{HookID: nextRuntimeID("hook"), EffectID: nextRuntimeID("hook-effect"), Stage: stage}
@@ -45,6 +45,20 @@ func (a *Agent) runHookWithJournal(ctx context.Context, stage string, run func(c
 		a.markPersistenceFailure(err)
 		return hooks.Output{Decision: hooks.DecisionDeny, Reason: "hook result was not durably recorded: " + err.Error()}
 	}
+	// A false continuation is a sticky stop verdict, separate from the tool's
+	// approval decision. Stop the live turn only after its hook fact is durable.
+	if out.Continue != nil && !*out.Continue && stage != hooks.EventUserPromptSubmit {
+		a.mu.Lock()
+		liveTurn := a.turn.busy && a.turn.turnCtx != nil
+		a.mu.Unlock()
+		if liveTurn {
+			reason := out.Reason
+			if reason == "" {
+				reason = "stopped by " + stage + " hook"
+			}
+			a.cancelWorkFromWorker(reason)
+		}
+	}
 	return out
 }
 
@@ -52,22 +66,7 @@ func (a *Agent) persistHookStarted(invocation hookInvocation) error {
 	if invocation.HookID == "" || invocation.EffectID == "" || invocation.Stage == "" {
 		return errors.New("agent: hook journal start identity is required")
 	}
-	p := a.persistenceHandle()
-	if p == nil {
-		return errors.New("agent: session persistence is unavailable")
-	}
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
-	if err := a.persistenceFailure(); err != nil {
-		return err
-	}
-	if _, err := p.Commit(session.Batch{
-		TransactionID: stableID("hook-started", invocation),
-		Events:        []session.Event{session.HookStarted{HookID: invocation.HookID, EffectID: invocation.EffectID, Stage: invocation.Stage}},
-	}); err != nil {
-		return fmt.Errorf("agent: persist HookStarted: %w", err)
-	}
-	return nil
+	return a.admitHook(invocation)
 }
 
 func (a *Agent) persistHookFinished(ctx context.Context, invocation hookInvocation, out hooks.Output) error {
@@ -91,7 +90,7 @@ func (a *Agent) persistHookFinished(ctx context.Context, invocation hookInvocati
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ref, err := p.putBlob(context.Background(), data, "application/json")
+	ref, err := p.PutBlob(context.Background(), data, "application/json")
 	if err != nil {
 		return fmt.Errorf("agent: persist hook output: %w", err)
 	}
@@ -105,16 +104,5 @@ func (a *Agent) persistHookFinished(ctx context.Context, invocation hookInvocati
 	if status == "denied" {
 		event.Error = out.Reason
 	}
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
-	if err := a.persistenceFailure(); err != nil {
-		return err
-	}
-	if _, err := p.Commit(session.Batch{
-		TransactionID: stableID("hook-finished", invocation),
-		Events:        []session.Event{event},
-	}); err != nil {
-		return fmt.Errorf("agent: persist HookFinished: %w", err)
-	}
-	return nil
+	return a.settleHook(invocation, event)
 }

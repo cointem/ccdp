@@ -1,10 +1,11 @@
 package agent
 
 import (
+	"testing"
+
 	"ccdp/internal/config"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
-	"testing"
 )
 
 func TestPermissionChangePersistsProjectAndChildInherits(t *testing.T) {
@@ -14,8 +15,8 @@ func TestPermissionChangePersistsProjectAndChildInherits(t *testing.T) {
 		t.Fatal(receipt.Error)
 	}
 	fresh := config.Default()
-	fresh.Workspace = a.cfg.Workspace
-	fresh.SessionDir = a.cfg.SessionDir
+	fresh.Workspace = a.services.cfg.Workspace
+	fresh.SessionDir = a.services.cfg.SessionDir
 	effective, err := buildEffectiveConfig(fresh, nil, false, Options{})
 	if err != nil || effective.PermissionMode != "default" {
 		t.Fatalf("project reload: %s %v", effective.PermissionMode, err)
@@ -36,7 +37,7 @@ func TestPermissionChangePersistsProjectAndChildInherits(t *testing.T) {
 	if cfg.PermissionMode != "acceptEdits" {
 		t.Fatal(cfg.PermissionMode)
 	}
-	decision, _ := opts.Permissions.Check("Write", map[string]any{"file_path": a.cfg.Workspace + "/test.txt"})
+	decision, _ := opts.Permissions.Check("Write", map[string]any{"file_path": a.services.cfg.Workspace + "/test.txt"}, permissions.KindWrite)
 	if decision != permissions.DecisionAllow {
 		t.Fatalf("child write asks for approval: %s", decision)
 	}

@@ -1,10 +1,11 @@
 package agent
 
 import (
-	"ccdp/internal/protocol"
-	"ccdp/internal/session"
 	"context"
 	"errors"
+
+	"ccdp/internal/protocol"
+	"ccdp/internal/session"
 )
 
 type OperationResult struct {
@@ -43,7 +44,7 @@ func (a *Agent) ReadOperation(ctx context.Context, id protocol.CommandID) (Opera
 		out.Status = done.Outcome
 		out.Error = done.Report
 		if done.Output != nil {
-			blobs, e := p.requestArtifacts()
+			blobs, e := p.RequestArtifacts()
 			if e != nil {
 				return out, e
 			}

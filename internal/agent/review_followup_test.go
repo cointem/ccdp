@@ -1,14 +1,15 @@
 package agent
 
 import (
-	"ccdp/internal/config"
-	"ccdp/internal/protocol"
-	"ccdp/internal/tools"
 	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ccdp/internal/config"
+	"ccdp/internal/protocol"
+	"ccdp/internal/tools"
 )
 
 func TestRegressionCleanSymlinkReview(t *testing.T) {
@@ -32,7 +33,7 @@ func TestRegressionSelectedReviewContextQuota(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "chosen.txt"), []byte("changed\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	a.cfg.Review = config.ReviewConfig{FileBytes: 1024, TotalBytes: 1024, MaxPaths: 1}
+	a.services.cfg.Review = config.ReviewConfig{FileBytes: 1024, TotalBytes: 1024, MaxPaths: 1}
 	out, outcome, err := a.runReviewWith(context.Background(), protocol.Command{ID: "audit-quota", Workflow: &protocol.WorkflowCommand{Scope: "uncommitted", Paths: []string{"chosen.txt"}}}, func(context.Context, config.Config, Options, string) (string, error) {
 		return "selected file reviewed", nil
 	})
@@ -49,7 +50,7 @@ func TestRegressionCheckCannotExpandDelivery(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "chosen.txt"), []byte("chosen\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	a.cfg.Delivery.Checks = []config.DeliveryCheck{{Name: "stage-generated", Argv: []string{"/bin/sh", "-c", "printf 'generated\\n' > generated.txt && git add generated.txt"}}}
+	a.services.cfg.Delivery.Checks = []config.DeliveryCheck{{Name: "stage-generated", Argv: []string{"/bin/sh", "-c", "printf 'generated\\n' > generated.txt && git add generated.txt"}}}
 	head := git(t, root, "rev-parse", "HEAD")
 	out, err := runCoding(t, a, protocol.WorkflowCommand{Kind: protocol.WorkflowCommitPushPR, Action: "prepare", Message: "chosen only", Mode: "commit", Paths: []string{"chosen.txt"}})
 	if err != nil {
@@ -74,7 +75,7 @@ func TestRegressionNoopWriteDoesNotBlockRewind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolCtx := a.resources.Context(ctx, root, a.sandbox)
+	toolCtx := a.services.resources.Context(ctx, root, a.services.sandbox)
 	toolCtx.BeforeWrite = a.beforeCodingWrite
 	toolCtx.Args = map[string]any{"file_path": "chosen.txt"}
 	if _, err = tools.NewReadTool().Run(toolCtx); err != nil {
@@ -84,7 +85,7 @@ func TestRegressionNoopWriteDoesNotBlockRewind(t *testing.T) {
 	if _, err = tools.NewWriteTool().Run(toolCtx); err != nil {
 		t.Fatal(err)
 	}
-	if err = a.sealRecoveryPoint(point); err != nil {
+	if err = a.sealRecoveryPoint(context.Background(), point); err != nil {
 		t.Fatal(err)
 	}
 	current, err := a.captureCoding(ctx)

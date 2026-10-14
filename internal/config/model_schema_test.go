@@ -11,7 +11,7 @@ import (
 func TestModelObjectSchema(t *testing.T) {
 	t.Setenv("TEST_ROUTER_KEY", "test-secret")
 	path := filepath.Join(t.TempDir(), "config.json")
-	data := `{"model":"first/same","reasoning_effort":"high","providers":{"first":{"base_url":"https://first.example/v1","api_key_env":"TEST_ROUTER_KEY","wire_api":"responses","models":{"same":{"context_window":1000000,"max_output_tokens":16000,"pricing":{"input_per_million":2,"output_per_million":4}}}},"second":{"base_url":"https://second.example/v1","wire_api":"chat","models":{"same":{"context_window":128000},"org/model":{}}}}}`
+	data := `{"model":"first/same","reasoning_effort":"high","providers":{"first":{"base_url":"https://first.example/v1","api_key_env":"TEST_ROUTER_KEY","wire_api":"responses","models":{"same":{"context_window":1000000,"max_output_tokens":16000}}},"second":{"base_url":"https://second.example/v1","wire_api":"chat","models":{"same":{"context_window":128000},"org/model":{}}}}}`
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -31,9 +31,6 @@ func TestModelObjectSchema(t *testing.T) {
 	if cfg.MaxOutputTokensFor("first/same") != 16000 || cfg.ReasoningEffortFor("first/same") != "high" {
 		t.Fatal("model options lost")
 	}
-	if cfg.CostFor("first/same", 1000000, 1000000) != 6 {
-		t.Fatal("model pricing lost")
-	}
 	for _, model := range []string{"same", "missing/same", "first/missing"} {
 		if cfg.ValidateModelSelection(model) == nil {
 			t.Fatalf("accepted %s", model)
@@ -41,9 +38,10 @@ func TestModelObjectSchema(t *testing.T) {
 	}
 	clone := cfg.Clone()
 	v := clone.Providers["first"].ModelConfigs["same"]
-	v.Pricing.Input = 99
-	if cfg.ModelConfigFor("first/same").Pricing.Input != 2 {
-		t.Fatal("mutable pricing shared")
+	v.MaxOutputTokens = 99
+	clone.Providers["first"].ModelConfigs["same"] = v
+	if cfg.MaxOutputTokensFor("first/same") != 16000 {
+		t.Fatal("mutable model config shared")
 	}
 	encoded, _ := json.Marshal(cfg.Providers)
 	if strings.Contains(string(encoded), "test-secret") {
@@ -53,7 +51,7 @@ func TestModelObjectSchema(t *testing.T) {
 
 func TestRejectOldModelConfiguration(t *testing.T) {
 	for _, data := range []string{
-		`{"max_reply_tokens":8192}`, `{"api_key":"old"}`, `{"base_url":"https://example.com"}`, `{"context_window":1000000}`, `{"pricing":{}}`,
+		`{"max_reply_tokens":8192}`, `{"api_key":"old"}`, `{"base_url":"https://example.com"}`, `{"context_window":1000000}`,
 		`{"providers":{"p":{"models":["m"]}}}`,
 		`{"providers":{"p":{"models":{"m":{}},"context_windows":{"m":1000000}}}}`,
 		`{"providers":{"p":{"base_url":"https://example.com","wire_api":"chat","models":{"m":{"reasoning_effort":"low"}}}}}`,

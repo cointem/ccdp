@@ -1,9 +1,10 @@
 package mcp
 
 import (
-	"ccdp/internal/tools"
 	"sync"
 	"testing"
+
+	"ccdp/internal/tools"
 )
 
 func TestRetainedLeasePinsExactGenerationAfterReload(t *testing.T) {

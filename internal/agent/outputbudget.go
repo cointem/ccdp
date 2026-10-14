@@ -7,19 +7,12 @@ import (
 	"ccdp/internal/messages"
 )
 
-// resetOutputBudget clears the per-turn aggregate budget.
-func (a *Agent) resetOutputBudget() {
-	a.mu.Lock()
-	a.outputBudget = 0
-	a.mu.Unlock()
-}
-
 // maybePersistResult writes very large tool results to disk and replaces them
 // with a preview + path, so the model can re-read them (Claude Code's
 // toolResultStorage). Small results pass through truncated as before.
 func (a *Agent) maybePersistResult(tc messages.ToolCall, out string) string {
 	a.mu.Lock()
-	maxChars := a.cfg.MaxResultSizeChars
+	maxChars := a.services.cfg.MaxResultSizeChars
 	a.mu.Unlock()
 	if maxChars <= 0 {
 		maxChars = toolJournalMaxText
@@ -34,7 +27,7 @@ func (a *Agent) maybePersistResult(tc messages.ToolCall, out string) string {
 	if p == nil {
 		return truncateResult(out, maxChars)
 	}
-	ref, err := p.putBlob(context.Background(), []byte(out), "text/plain; charset=utf-8")
+	ref, err := p.PutBlob(context.Background(), []byte(out), "text/plain; charset=utf-8")
 	if err != nil || ref == nil {
 		return truncateResult(out, maxChars)
 	}
@@ -46,19 +39,19 @@ func (a *Agent) maybePersistResult(tc messages.ToolCall, out string) string {
 // clipAggregate enforces the per-turn aggregate tool-result budget: once the
 // combined delivered characters exceed the cap, remaining results are clipped
 // to a short preview.
-func (a *Agent) clipAggregate(out string) string {
+func (a *Agent) clipAggregateOwned(out string) string {
 	a.mu.Lock()
-	cap := a.cfg.MaxToolOutputCharsPerTurn
+	cap := a.services.cfg.MaxToolOutputCharsPerTurn
 	a.mu.Unlock()
 	if cap <= 0 {
 		return out
 	}
 	a.mu.Lock()
-	used := a.outputBudget
+	used := a.budget.outputBudget
 	remaining := cap - used
 	if remaining > 0 {
 		clipped := truncateResult(out, remaining)
-		a.outputBudget += len(clipped)
+		a.budget.outputBudget += len(clipped)
 		a.mu.Unlock()
 		return clipped
 	}

@@ -40,6 +40,8 @@ type responsesTool struct {
 
 // responsesBodyRequest is the Responses Create body we send.
 type responsesBodyRequest struct {
+	Include     []string          `json:"include,omitempty"`
+	Text        *responsesText    `json:"text,omitempty"`
 	Model       string            `json:"model"`
 	Input       []json.RawMessage `json:"input"`
 	Tools       []responsesTool   `json:"tools,omitempty"`
@@ -48,6 +50,10 @@ type responsesBodyRequest struct {
 	MaxOutput   *int              `json:"max_output_tokens,omitempty"`
 	Temperature *float64          `json:"temperature,omitempty"`
 	TopP        *float64          `json:"top_p,omitempty"`
+}
+
+type responsesText struct {
+	Verbosity string `json:"verbosity"`
 }
 
 type responsesReason struct {
@@ -135,6 +141,25 @@ func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
 			input = append(input, item)
 			continue
 		}
+		// Replay completed output items verbatim on the same wire. Reasoning
+		// items carry opaque state required for stateless tool continuations.
+		replayedText := false
+		replayedCalls := map[string]bool{}
+		if m.Role == "assistant" && m.ProviderWire == "responses" && m.ProviderOrigin != "" && m.ProviderOrigin == c.providerOrigin {
+			for _, raw := range m.ProviderContent {
+				var item responsesItem
+				if err := json.Unmarshal(raw, &item); err != nil {
+					return nil, fmt.Errorf("llm: invalid Responses output item: %w", err)
+				}
+				input = append(input, append(json.RawMessage(nil), raw...))
+				if item.Type == "message" {
+					replayedText = true
+				}
+				if item.Type == "function_call" {
+					replayedCalls[item.CallID] = true
+				}
+			}
+		}
 		content, err := responsesContent(m.Content)
 		if err != nil {
 			return nil, err
@@ -143,10 +168,15 @@ func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		input = append(input, item)
+		if !replayedText && (m.Role != "assistant" || content != nil && contentString(content) != "") {
+			input = append(input, item)
+		}
 		// Emit an assistant's historical tool calls as function_call items so a
 		// resumed conversation re-pairs calls with their outputs.
 		for _, tc := range m.ToolCalls {
+			if replayedCalls[tc.ID] {
+				continue
+			}
 			fc, ferr := marshalItem(responsesItem{
 				Type:      "function_call",
 				CallID:    tc.ID,
@@ -160,9 +190,10 @@ func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
 		}
 	}
 	br := responsesBodyRequest{
-		Model:  req.Model,
-		Input:  input,
-		Stream: true,
+		Include: []string{"reasoning.encrypted_content"},
+		Model:   req.Model,
+		Input:   input,
+		Stream:  true,
 	}
 	if len(req.Tools) > 0 {
 		for _, t := range req.Tools {
@@ -173,6 +204,9 @@ func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
 				Parameters:  t.Function.Parameters,
 			})
 		}
+	}
+	if req.Verbosity != "" {
+		br.Text = &responsesText{Verbosity: req.Verbosity}
 	}
 	if req.ReasoningEffort != "" {
 		br.Reasoning = &responsesReason{Effort: req.ReasoningEffort}
@@ -188,8 +222,8 @@ func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
 // --- SSE event shapes ---------------------------------------------------
 
 type responsesUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens  *int `json:"input_tokens"`
+	OutputTokens *int `json:"output_tokens"`
 	InputDetails *struct {
 		CachedTokens *int `json:"cached_tokens"`
 	} `json:"input_tokens_details"`
@@ -201,7 +235,7 @@ type responsesEvent struct {
 	Delta       string              `json:"delta"`
 	OutputIndex int                 `json:"output_index"`
 	Arguments   string              `json:"arguments"`
-	Item        *responsesItem      `json:"item"`
+	Item        json.RawMessage     `json:"item"`
 	Response    *responsesEventResp `json:"response"`
 	Error       *struct {
 		Message string `json:"message"`
@@ -244,11 +278,22 @@ func (c *Client) responsesStreamOnce(ctx context.Context, body []byte, onDelta f
 		args     strings.Builder
 	}
 	toolSlots := map[int]*slot{}
+	providerItems := map[int]json.RawMessage{}
 	thinking := &reasoningPhase{onDelta: onDelta}
 	var textBuffer, reasoningBuffer strings.Builder
 	defer func() {
 		result.Text = textBuffer.String()
 		result.Reasoning = reasoningBuffer.String()
+		result.ProviderWire = "responses"
+		result.ProviderOrigin = c.providerOrigin
+		indexes := make([]int, 0, len(providerItems))
+		for index := range providerItems {
+			indexes = append(indexes, index)
+		}
+		sort.Ints(indexes)
+		for _, index := range indexes {
+			result.ProviderContent = append(result.ProviderContent, providerItems[index])
+		}
 	}()
 	emitDelta := func(s string) {
 		if s == "" {
@@ -295,6 +340,28 @@ loop:
 		if json.Unmarshal([]byte(payload), &ev) != nil {
 			continue
 		}
+		if ev.Response != nil && ev.Response.Usage != nil {
+			u := ev.Response.Usage
+			if u.InputTokens != nil {
+				result.PromptTokens = *u.InputTokens
+				result.PromptReported = true
+			}
+			if u.OutputTokens != nil {
+				result.CompletionTok = *u.OutputTokens
+				result.CompletionReported = true
+			}
+			if u.InputDetails != nil && u.InputDetails.CachedTokens != nil {
+				result.CacheReported = true
+				result.CachedTokens = *u.InputDetails.CachedTokens
+			}
+		}
+		var item *responsesItem
+		if len(ev.Item) > 0 && string(ev.Item) != "null" {
+			var value responsesItem
+			if json.Unmarshal(ev.Item, &value) == nil {
+				item = &value
+			}
+		}
 		switch ev.Type {
 		case "error":
 			result.FinishReason = "error"
@@ -318,22 +385,24 @@ loop:
 				s.args.WriteString(ev.Arguments)
 			}
 		case "response.output_item.added":
-			if ev.Item == nil {
+			if item == nil {
 				continue
 			}
-			switch ev.Item.Type {
+			switch item.Type {
 			case "function_call":
 				// The call's arguments stream for a long time: thinking is over.
 				thinking.end()
-				toolSlots[ev.OutputIndex] = &slot{id: ev.Item.CallID, name: ev.Item.Name}
+				toolSlots[ev.OutputIndex] = &slot{id: item.CallID, name: item.Name}
 			case "message":
 				thinking.end()
 			}
 		case "response.output_item.done":
-			if ev.Item == nil {
+			if item == nil {
 				continue
 			}
-			switch ev.Item.Type {
+			emitted = true
+			providerItems[ev.OutputIndex] = append(json.RawMessage(nil), ev.Item...)
+			switch item.Type {
 			case "reasoning":
 				thinking.end()
 			case "function_call":
@@ -342,26 +411,21 @@ loop:
 					s = &slot{}
 					toolSlots[ev.OutputIndex] = s
 				}
-				if s.name == "" {
-					s.name = ev.Item.Name
+				if s.id == "" {
+					s.id = item.CallID
 				}
-				if ev.Item.Arguments != "" {
+				if s.name == "" {
+					s.name = item.Name
+				}
+				if item.Arguments != "" {
 					s.args.Reset()
-					s.args.WriteString(ev.Item.Arguments)
+					s.args.WriteString(item.Arguments)
 				}
 			}
 		case "response.completed", "response.incomplete", "response.failed":
 			terminal = true
 			if ev.Response != nil {
-				if u := ev.Response.Usage; u != nil {
-					result.PromptTokens = u.InputTokens
-					result.CompletionTok = u.OutputTokens
-					result.CacheReported = u.InputDetails != nil && u.InputDetails.CachedTokens != nil
-					result.CachedTokens = 0
-					if result.CacheReported {
-						result.CachedTokens = *u.InputDetails.CachedTokens
-					}
-				}
+
 				result.FinishReason = responsesFinishReason(ev.Response.Status)
 			}
 			if ev.Type == "response.failed" || result.FinishReason == "error" || (ev.Response != nil && ev.Response.Error != nil) {
@@ -414,7 +478,7 @@ loop:
 	}
 	if !terminal {
 		result.ToolCalls = nil
-		return result, !emitted, emitted, 0, fmt.Errorf("llm: incomplete responses stream: %w", io.ErrUnexpectedEOF)
+		return result, !emitted, emitted, 0, &RetryableError{Err: fmt.Errorf("llm: incomplete responses stream: %w", io.ErrUnexpectedEOF)}
 	}
 	return result, false, emitted, 0, nil
 }

@@ -1,9 +1,10 @@
 package agent
 
 import (
-	"ccdp/internal/messages"
 	"strings"
 	"testing"
+
+	"ccdp/internal/messages"
 )
 
 func TestSessionTitle(t *testing.T) {

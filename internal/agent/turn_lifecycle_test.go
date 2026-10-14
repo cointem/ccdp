@@ -4,12 +4,16 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"ccdp/internal/hooks"
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session"
 )
 
 // TestTurnDoneIsAnIdleBoundary uses the typed terminal update itself as the
@@ -44,12 +48,12 @@ func TestTurnDoneIsAnIdleBoundary(t *testing.T) {
 			if !ok {
 				t.Fatal("watch closed before TurnDone")
 			}
-			if update.Snapshot != nil {
-				if update.Snapshot.Phase == protocol.PhaseFinalizing {
+			if update.State != nil {
+				if update.State.Phase == protocol.PhaseFinalizing {
 					sawFinalizing = true
 				}
-				for _, item := range update.Snapshot.Transcript {
-					if item.Kind == "turn_summary" && update.Snapshot.Phase == protocol.PhaseStreaming {
+				for _, item := range update.State.Transcript {
+					if item.Kind == "turn_summary" && update.State.Phase == protocol.PhaseStreaming {
 						t.Fatal("completed turn still advertises streaming")
 					}
 				}
@@ -119,14 +123,13 @@ func TestTurnAdmissionCancellationIsNotClearedByRunTurn(t *testing.T) {
 			}
 			ag.mu.Lock()
 			binding := modelBinding{model: "cancel-model", provider: client.Name(), endpoint: server.URL, client: client, version: 1}
-			ag.client = client
-			ag.primaryBinding = binding
-			ag.activeModel = "cancel-model"
+			ag.services.client = client
+			ag.modelsState.primaryBinding = binding
+			ag.modelsState.activeModel = "cancel-model"
 			// This locked state is the deterministic barrier between input
 			// admission and the new goroutine's first cancellation check.
-			ag.activeBinding = binding
-			ag.interruptFlag = !tc.stop
-			ag.stop = tc.stop
+			ag.modelsState.activeBinding = binding
+			ag.turn.interruptFlag = true
 			ag.mu.Unlock()
 
 			input := newTurnInput(protocol.InputID("cancel-"+tc.name), "cancel immediately", protocol.InputSteer, time.Now().UTC())
@@ -135,8 +138,8 @@ func TestTurnAdmissionCancellationIsNotClearedByRunTurn(t *testing.T) {
 			deadline := time.After(5 * time.Second)
 			for {
 				select {
-				case ev := <-ag.events:
-					if ev.Type != EventTurnDone {
+				case ev := <-watchTestEvents(t, ag):
+					if ev.Kind != protocol.EventTurnDone {
 						continue
 					}
 					if got := requests.Load(); got != 0 {
@@ -158,26 +161,49 @@ func TestTurnAdmissionCancellationIsNotClearedByRunTurn(t *testing.T) {
 	}
 }
 
-func TestSaveFailurePublishesFailedTerminalOutcome(t *testing.T) {
-	ag := newRuntimeAgent(t)
-	if err := ag.closePersistence(); err != nil {
-		t.Fatalf("close persistence: %v", err)
-	}
-	ag.mu.Lock()
-	ag.busy = true
-	ag.turnSeq = 1
-	ag.lastTurn = &protocol.TurnOutcome{TurnID: "1", Status: protocol.TurnRunning}
-	ag.mu.Unlock()
-
-	// Closing persistence makes the terminal Save fail deterministically. The
-	// terminal projection must remain failed; TurnDone must not turn it into a
-	// success merely because the turn body returned.
-	ag.turnFinished()
-	view, err := ag.Snapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestTurnCommitFailurePublishesFailedTerminalOutcome(t *testing.T) {
+	ag := newJournalRuntimeAgent(t, &formalCompletionProvider{})
+	p := ag.persistenceHandle()
+	backend := journalBackend(t, p)
+	backend.mu.Lock()
+	backend.store = requestJournalFailEventStore{Store: backend.store, event: session.EventTypeTurnFinished}
+	backend.mu.Unlock()
+	submitJournalRuntimeInput(t, ag)
+	view := waitJournalRuntimeIdle(t, ag)
 	if view.Busy || view.LastTurn == nil || view.LastTurn.Status != protocol.TurnFailed || view.LastTurn.Error == "" {
-		t.Fatalf("Save failure terminal outcome = %+v", view)
+		t.Fatalf("TurnFinished commit failure outcome = %+v", view.LastTurn)
+	}
+}
+
+func TestCancellationReachesPreparationHook(t *testing.T) {
+	for _, kind := range []protocol.CommandType{protocol.CommandInterrupt, protocol.CommandStop} {
+		t.Run(string(kind), func(t *testing.T) {
+			provider := &formalCompletionProvider{}
+			ag := formalHookAgent(t, provider, hooks.HookSpec{Command: "printf ready > hook-started; exec sleep 60"})
+			events := watchTestEvents(t, ag)
+			submitJournalRuntimeInput(t, ag)
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				if _, err := os.Stat(filepath.Join(ag.services.cfg.Workspace, "hook-started")); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("preparation hook did not start")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			receipt, err := ag.Submit(context.Background(), protocol.Command{ID: "cancel-preparation", SessionID: protocol.SessionID(ag.SessionID()), Type: kind})
+			if err != nil || receipt.Rejected() {
+				t.Fatalf("cancel: %+v, %v", receipt, err)
+			}
+			drainUntil(t, events, 5*time.Second, func(e protocol.EventView) bool { return e.Kind == protocol.EventTurnDone })
+			view, err := ag.Snapshot(context.Background())
+			if err != nil || view.LastTurn == nil || view.LastTurn.Status != protocol.TurnCancelled {
+				t.Fatalf("preparation cancellation: %+v, %v", view.LastTurn, err)
+			}
+			if got := provider.requestsCount(); got != 0 {
+				t.Fatalf("cancelled hook still reached model: %d", got)
+			}
+		})
 	}
 }

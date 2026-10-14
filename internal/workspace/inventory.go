@@ -16,17 +16,19 @@ import (
 // Inventory covers tracked files (including hidden/ignored tracked files) and
 // visible untracked files. Git's NUL protocol preserves unusual file names.
 func Inventory(ctx context.Context, root string, policy *sandbox.Sandbox) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if policy == nil {
 		return nil, fmt.Errorf("inventory requires path policy")
 	}
 	_, isGit, _ := detectGit(root)
 	paths := []string{}
 	if isGit {
-		argv, e := execution.ReadOnlyGitArgv([]string{"git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"})
-		if e != nil {
-			return nil, e
-		}
-		r, e := execution.RunArgv(ctx, argv, execution.Request{Dir: root, Sandbox: policy, Env: execution.ReadOnlyGitEnvironment(os.Environ()), Timeout: 30 * time.Second, OutputLimit: 32 << 20})
+		r, e := execution.RunReadOnlyGit(ctx, []string{"git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"}, execution.Request{Dir: root, Sandbox: policy, Timeout: 30 * time.Second, OutputLimit: 32 << 20})
 		if e != nil {
 			return nil, e
 		}
@@ -35,7 +37,7 @@ func Inventory(ctx context.Context, root string, policy *sandbox.Sandbox) ([]str
 		}
 		paths = strings.Split(r.Stdout, "\x00")
 	} else {
-		info, e := Scan(root, int(^uint(0)>>1))
+		info, e := ScanContext(ctx, root, int(^uint(0)>>1))
 		if e != nil {
 			return nil, e
 		}
@@ -48,6 +50,9 @@ func Inventory(ctx context.Context, root string, policy *sandbox.Sandbox) ([]str
 	seen := map[string]bool{}
 	out := []string{}
 	for _, rel := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		rel = filepath.ToSlash(filepath.Clean(rel))
 		if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
 			continue

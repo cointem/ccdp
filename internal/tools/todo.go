@@ -2,6 +2,9 @@ package tools
 
 import (
 	"encoding/json"
+	"errors"
+
+	"ccdp/internal/atomicfile"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,10 +28,11 @@ type TodoStore struct {
 	owner      string
 	sessionDir string
 
-	mu     sync.Mutex
-	state  map[string]TodoState
-	loaded bool
-	closed bool
+	mu         sync.Mutex
+	state      map[string]TodoState
+	loaded     bool
+	closed     bool
+	persistErr error
 }
 
 // NewTodoStore creates a task-list store. The owner is only an identity used
@@ -88,27 +92,34 @@ func (s *TodoStore) Close() {
 	s.mu.Unlock()
 }
 
-func (s *TodoStore) loadLocked() map[string]TodoState {
-	if s.state == nil {
-		s.state = map[string]TodoState{}
+func (s *TodoStore) loadLocked() (map[string]TodoState, error) {
+	if s.persistErr != nil {
+		return nil, s.persistErr
 	}
 	if s.loaded {
-		return s.state
+		return s.state, nil
 	}
-	s.loaded = true
-	if s.sessionDir == "" {
-		return s.state
-	}
-	data, err := os.ReadFile(filepath.Join(s.sessionDir, "todos.json"))
-	if err == nil {
-		// Decode into a temporary map so malformed data cannot partially replace
-		// the current in-memory list.
-		var loaded map[string]TodoState
-		if json.Unmarshal(data, &loaded) == nil && loaded != nil {
+	if s.sessionDir != "" {
+		data, err := os.ReadFile(filepath.Join(s.sessionDir, "todos.json"))
+		if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("todo: read state: %w", err)
+		}
+		if err == nil {
+			var loaded map[string]TodoState
+			if err := json.Unmarshal(data, &loaded); err != nil {
+				return nil, fmt.Errorf("todo: decode state: %w", err)
+			}
+			if loaded == nil {
+				return nil, fmt.Errorf("todo: persisted state must be an object")
+			}
 			s.state = loaded
 		}
 	}
-	return s.state
+	if s.state == nil {
+		s.state = map[string]TodoState{}
+	}
+	s.loaded = true
+	return s.state, nil
 }
 
 func cloneTodoMap(in map[string]TodoState) map[string]TodoState {
@@ -129,7 +140,11 @@ func (s *TodoStore) Load() (map[string]TodoState, error) {
 	if err := s.checkOpenLocked(); err != nil {
 		return nil, err
 	}
-	return cloneTodoMap(s.loadLocked()), nil
+	state, err := s.loadLocked()
+	if err != nil {
+		return nil, err
+	}
+	return cloneTodoMap(state), nil
 }
 
 // Store replaces the task map and durably persists it before returning. The
@@ -143,38 +158,37 @@ func (s *TodoStore) Store(m map[string]TodoState) error {
 	if err := s.checkOpenLocked(); err != nil {
 		return err
 	}
-	s.state = cloneTodoMap(m)
+	if _, err := s.loadLocked(); err != nil {
+		return err
+	}
+	next := cloneTodoMap(m)
+	if s.sessionDir != "" {
+		data, err := json.MarshalIndent(next, "", "  ")
+		if err != nil {
+			return fmt.Errorf("todo: encode state: %w", err)
+		}
+		if err := atomicfile.WriteFile(filepath.Join(s.sessionDir, "todos.json"), data, 0o600); err != nil {
+			var published *atomicfile.PublishedError
+			if errors.As(err, &published) {
+				s.persistErr = fmt.Errorf("todo: publication durability failed; reopen store: %w", err)
+			}
+			return fmt.Errorf("todo: persist state: %w", err)
+		}
+	}
+	s.state = next
 	s.loaded = true
-	if s.sessionDir == "" {
-		return nil
-	}
-	if err := os.MkdirAll(s.sessionDir, 0o755); err != nil {
-		return fmt.Errorf("todo: create session directory: %w", err)
-	}
-	data, err := json.MarshalIndent(s.state, "", "  ")
-	if err != nil {
-		return fmt.Errorf("todo: encode state: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(s.sessionDir, "todos.json"), data, 0o600); err != nil {
-		return fmt.Errorf("todo: persist state: %w", err)
-	}
 	return nil
 }
 
 // Section renders the current task list for system-prompt injection. Empty
 // when there are no todos (so the prompt stays stable and cheap).
-func (s *TodoStore) Section() string {
-	if s == nil {
-		return ""
+func (s *TodoStore) Section() (string, error) {
+	m, err := s.Load()
+	if err != nil {
+		return "", err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.checkOpenLocked() != nil {
-		return ""
-	}
-	m := s.loadLocked()
 	if len(m) == 0 {
-		return ""
+		return "", nil
 	}
 	states := sortedStates(m)
 	var sb strings.Builder
@@ -182,20 +196,16 @@ func (s *TodoStore) Section() string {
 	for _, st := range states {
 		fmt.Fprintf(&sb, "- %s (%s) %s\n", todoMark(st.Status), st.Priority, st.Content)
 	}
-	return sb.String()
+	return sb.String(), nil
 }
 
 // Snapshot returns a copy of the current task list for rendering.
-func (s *TodoStore) Snapshot() []TodoState {
-	if s == nil {
-		return nil
+func (s *TodoStore) Snapshot() ([]TodoState, error) {
+	m, err := s.Load()
+	if err != nil {
+		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.checkOpenLocked() != nil {
-		return nil
-	}
-	return sortedStates(s.loadLocked())
+	return sortedStates(m), nil
 }
 
 func sortedStates(m map[string]TodoState) []TodoState {

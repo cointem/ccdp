@@ -59,24 +59,22 @@ func TestReadBoundedFile(t *testing.T) {
 func TestApplyCLIOverridesUsesFlagPresenceForZeroFalseAndEmpty(t *testing.T) {
 	fs := flag.NewFlagSet("ccdp-test", flag.ContinueOnError)
 	maxTurns := fs.Int("max-turns", 0, "")
-	maxBudget := fs.Float64("max-budget", 0, "")
 	debug := fs.Bool("debug", false, "")
 	noPersist := fs.Bool("no-session-persistence", false, "")
 	allowed := fs.String("allowedTools", "", "")
 	prompt := fs.String("system-prompt", "", "")
-	if err := fs.Parse([]string{"--max-turns=0", "--max-budget=0", "--debug=false", "--no-session-persistence=false", "--allowedTools=", "--system-prompt="}); err != nil {
+	if err := fs.Parse([]string{"--max-turns=0", "--debug=false", "--no-session-persistence=false", "--allowedTools=", "--system-prompt="}); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
 	cfg.MaxTurns = 7
-	cfg.MaxBudgetUSD = 2.5
+
 	cfg.Debug = true
 	cfg.NoSessionPersistence = true
 	cfg.AlwaysAllow = []string{"Bash:git status"}
 	cfg.SystemPrompt = "from file"
 	visited, err := applyCLIOverrides(&cfg, fs, map[string]any{
 		"max-turns":              *maxTurns,
-		"max-budget":             *maxBudget,
 		"debug":                  *debug,
 		"no-session-persistence": *noPersist,
 		"allowedTools":           *allowed,
@@ -85,15 +83,15 @@ func TestApplyCLIOverridesUsesFlagPresenceForZeroFalseAndEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"max-turns", "max-budget", "debug", "no-session-persistence", "allowedTools", "system-prompt"} {
+	for _, name := range []string{"max-turns", "debug", "no-session-persistence", "allowedTools", "system-prompt"} {
 		if !visited[name] {
 			t.Fatalf("flag %q was not recorded as visited", name)
 		}
 	}
-	if cfg.MaxTurns != 0 || cfg.MaxBudgetUSD != 0 || cfg.Debug || cfg.NoSessionPersistence || len(cfg.AlwaysAllow) != 0 || cfg.SystemPrompt != "" {
+	if cfg.MaxTurns != 0 || cfg.Debug || cfg.NoSessionPersistence || len(cfg.AlwaysAllow) != 0 || cfg.SystemPrompt != "" {
 		t.Fatalf("explicit zero/false/empty values were not applied: %+v", cfg)
 	}
-	for _, field := range []string{"max_turns", "max_budget_usd", "debug", "no_session_persistence", "always_allow", "system_prompt"} {
+	for _, field := range []string{"max_turns", "debug", "no_session_persistence", "always_allow", "system_prompt"} {
 		if cfg.SourceOf(field) != config.SourceCLI || !cfg.IsExplicit(field) {
 			t.Fatalf("field %q provenance = %+v", field, cfg.SourceReport().Fields[field])
 		}
@@ -119,7 +117,7 @@ func newMainLifecycleAgent(t *testing.T, root string) *agent.Agent {
 	cfg.SessionDir = filepath.Join(root, "sessions")
 	cfg.APIKey = "test-key"
 	cfg.BaseURL = "http://127.0.0.1:1"
-	ag, err := agent.New(&cfg, nil)
+	ag, err := agent.New(&cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,9 +143,6 @@ func TestResumeThenQuitShutsDownCurrentAgent(t *testing.T) {
 	defer source.Close()
 	target := newMainLifecycleAgent(t, root)
 	targetID := target.SessionID()
-	if err := target.Save(); err != nil {
-		t.Fatal(err)
-	}
 	if err := target.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}

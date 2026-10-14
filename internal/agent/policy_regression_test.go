@@ -49,9 +49,9 @@ func TestPolicyCommandsPersistCandidateValues(t *testing.T) {
 			if kind == "sandbox" {
 				cmd = protocol.Command{Type: protocol.CommandSetSandboxPolicy,
 					SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{
-						NetworkAccess:         !a.cfg.NetworkAccess,
-						AdditionalDirectories: []string{filepath.Join(a.cfg.Workspace, "extra")},
-						DisallowedDirectories: []string{filepath.Join(a.cfg.Workspace, "blocked")},
+						NetworkAccess:         !a.services.cfg.NetworkAccess,
+						AdditionalDirectories: []string{filepath.Join(a.services.cfg.Workspace, "extra")},
+						DisallowedDirectories: []string{filepath.Join(a.services.cfg.Workspace, "blocked")},
 					}}}
 			}
 			r, err := a.Submit(context.Background(), cmd)

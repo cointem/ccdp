@@ -1,11 +1,12 @@
 package agent
 
 import (
-	"ccdp/internal/protocol"
-	"ccdp/internal/session"
 	"context"
 	"testing"
 	"time"
+
+	"ccdp/internal/protocol"
+	"ccdp/internal/session"
 )
 
 func TestClosedRuntimeSnapshotKeepsDurableRevision(t *testing.T) {
@@ -35,11 +36,11 @@ func TestClosedRuntimeSnapshotKeepsDurableRevision(t *testing.T) {
 func TestChildWatchPublishesIdleOnRuntimeDetach(t *testing.T) {
 	a := newRuntimeAgent(t)
 	a.mu.Lock()
-	a.phase = protocol.PhaseStopping
+	a.lifecycle.phase = protocol.PhaseStopping
 	a.mu.Unlock()
-	id := protocol.SessionID(a.sessionID)
+	id := protocol.SessionID(a.conversation.sessionID)
 	r := &managedRun{agent: a, fact: session.ChildRunRecorded{Child: protocol.ChildSession{SessionID: id, Run: protocol.RunView{ID: "run", Status: "succeeded"}}}}
-	s := &SessionSupervisor{root: a, children: map[protocol.SessionID]*managedRun{id: r}}
+	s := testSupervisor(a, r)
 	c := &managedClient{supervisor: s, run: r, id: id}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -49,12 +50,12 @@ func TestChildWatchPublishesIdleOnRuntimeDetach(t *testing.T) {
 	}
 	defer sub.Close()
 	// The initial snapshot precedes observer attachment. Wait for its own
-	// state snapshot so it has recorded the terminal run status and instance.
+	// full snapshot so it has recorded the terminal run status and instance.
 	count := 0
 	for count < 2 {
 		select {
 		case u := <-sub.Updates():
-			if u.Snapshot != nil && u.Snapshot.Phase == protocol.PhaseStopping {
+			if u.Type == protocol.UpdateSnapshot && u.Snapshot != nil && u.Snapshot.Phase == protocol.PhaseStopping {
 				count++
 			}
 		case <-ctx.Done():
@@ -68,7 +69,7 @@ func TestChildWatchPublishesIdleOnRuntimeDetach(t *testing.T) {
 	for {
 		select {
 		case u := <-sub.Updates():
-			if u.Snapshot != nil && u.Snapshot.Phase == protocol.PhaseIdle && !u.Snapshot.Closing && !u.Snapshot.Busy {
+			if u.Type == protocol.UpdateSnapshot && u.Snapshot != nil && u.Snapshot.Phase == protocol.PhaseIdle && !u.Snapshot.Closing && !u.Snapshot.Busy {
 				return
 			}
 		case <-ctx.Done():

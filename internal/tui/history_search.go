@@ -74,17 +74,17 @@ func (m *Model) moveHistorySearch(delta int) {
 // closes the prompt. It deliberately does not submit: reverse search is a recall
 // aid, and the sibling CLIs let the user revise the recalled text first.
 func (m *Model) acceptHistorySearch() {
-	text := m.historySearchSelected()
-	m.histSearch = nil
-	if text == "" {
+	s := m.histSearch
+	if s == nil || s.sel < 0 || s.sel >= len(s.matches) {
+		m.histSearch = nil
 		return
 	}
-	m.pasteFold = nil
-	m.textarea.SetValue(text)
-	m.recallHistoryImages()
-	m.textarea.CursorEnd()
-	m.syncInputHeight()
-	m.refreshCmdSuggest()
+	index := s.matches[s.sel]
+	m.histSearch = nil
+	if m.historyIdx >= len(m.history) {
+		m.historyDraft = &composerDraft{text: m.textarea.Value(), images: cloneInputImages(m.inputImages), paste: clonePasteFold(m.pasteFold), missingImages: m.missingHistoryImages}
+	}
+	m.recallHistory(index)
 }
 
 func (m *Model) cancelHistorySearch() {
@@ -144,6 +144,12 @@ func (m *Model) renderHistorySearch() string {
 	width := max(1, m.width-2)
 	prompt := styleModalTitle.Render("(reverse-i-search)`") + styleAssistant.Render(s.query) + styleModalTitle.Render("': ")
 	match := m.historySearchSelected()
+	if match == "" && s.sel >= 0 && s.sel < len(s.matches) {
+		index := s.matches[s.sel]
+		if len(m.historyImages[index]) > 0 || m.expiredHistoryImages[index] {
+			match = "[image input]"
+		}
+	}
 	if match == "" {
 		prompt += styleHints.Render("(no match)")
 	} else {

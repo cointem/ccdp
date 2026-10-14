@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"ccdp/internal/config"
+	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 	"ccdp/internal/workspace"
@@ -35,10 +36,10 @@ func (a *Agent) semanticNavigate(ctx context.Context, cfg config.Config, sb *san
 			continue
 		}
 		args := map[string]any{"command": formatExternalCommand(server.Argv), "language_server": key}
-		if e := a.precheckCommand("Bash", args); e != nil {
+		if e := a.precheckCommand("Bash", args, permissions.KindShell); e != nil {
 			return "", e
 		}
-		if e := a.authorizeCommand(ctx, protocol.CommandID(nextRuntimeID("lsp")), "Bash", args); e != nil {
+		if e := a.authorizeCommand(ctx, protocol.CommandID(nextRuntimeID("lsp")), "Bash", args, permissions.KindShell); e != nil {
 			return "", e
 		}
 		locations, e := workspace.LanguageQuery(ctx, cfg.Workspace, path, op, line, character, server, sb)

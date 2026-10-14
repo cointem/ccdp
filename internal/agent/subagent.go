@@ -47,11 +47,11 @@ Reporting rules:
 - Never claim to have performed actions you did not perform.`
 
 func (a *Agent) spawnAgent(request tools.SpawnAgentRequest, callID string) (protocol.AgentReceipt, error) {
-	if a.childState != nil {
+	if a.children.childState != nil {
 		return protocol.AgentReceipt{}, errors.New("nested delegation is not available")
 	}
 	task := childTask{Description: request.Task, Name: request.Name, Role: request.Role, WorkspaceMode: request.Workspace, ContextMode: request.Context, WaitPolicy: "notify"}
-	r, err := a.supervisor.launch(a, parentTurnContext(a), task, childPurposeTask, callID)
+	r, err := a.services.supervisor.launch(a, parentTurnContext(a), task, childPurposeTask, callID)
 	if err != nil {
 		return protocol.AgentReceipt{}, err
 	}
@@ -62,27 +62,30 @@ func (a *Agent) spawnAgent(request tools.SpawnAgentRequest, callID string) (prot
 
 // Guardian is an internal synchronous inspection, driven by the same supervisor.
 func (a *Agent) runGuardianChild(description string) (string, error) {
-	if a.childState != nil {
+	if a.children.childState != nil {
 		return "", errors.New("nested guardian is not available")
 	}
-	r, err := a.supervisor.launch(a, parentTurnContext(a), childTask{Description: description, SystemPrompt: GuardianSystem}, childPurposeGuardian, "")
+	r, err := a.services.supervisor.launch(a, parentTurnContext(a), childTask{Description: description, SystemPrompt: GuardianSystem}, childPurposeGuardian, "")
 	if err != nil {
 		return "", err
 	}
 	<-r.done
+	if err := a.persistenceFailure(); err != nil {
+		return "", &guardianBoundaryError{fmt.Errorf("guardian outcome persistence failed: %w", err)}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.executionBoundaryErr != nil {
+		return "", &guardianBoundaryError{r.executionBoundaryErr}
+	}
 	return r.fact.Child.Run.Output, r.err
 }
 
-func childBudgetError(child *Agent, view protocol.SessionView) error {
+func (child *Agent) RunBudgetError() error {
 	child.mu.Lock()
-	cfg := cloneConfig(child.cfg)
+	cfg := cloneConfig(child.services.cfg)
 	child.mu.Unlock()
 	history := child.History()
-	if cfg.MaxBudgetUSD > 0 && view.Usage.Cost >= cfg.MaxBudgetUSD {
-		return fmt.Errorf("child exceeded budget ($%.2f of $%.2f)", view.Usage.Cost, cfg.MaxBudgetUSD)
-	}
 	if cfg.MaxTurns > 0 && len(history) > 0 {
 		modelCalls := 0
 		latestAssistantHasTools := false

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"testing"
 )
@@ -28,7 +29,7 @@ func TestValidateExternalURLBlocksInternalAddresses(t *testing.T) {
 		"file:///etc/passwd",
 	}
 	for _, raw := range blocked {
-		if err := validateExternalURL(raw); err == nil {
+		if err := validateExternalURL(context.Background(), raw); err == nil {
 			t.Errorf("expected block for %q", raw)
 		}
 	}
@@ -38,7 +39,12 @@ func TestValidateExternalURLBlocksInternalAddresses(t *testing.T) {
 		"https://100.64.0.1/x", // shared address space, not RFC1918
 	}
 	for _, raw := range allowed {
-		if err := validateExternalURL(raw); err != nil {
+		if err := validateExternalURLWithLookup(context.Background(), raw, func(ctx context.Context, host string) ([]net.IP, error) {
+			if host == "example.com" {
+				return []net.IP{net.ParseIP("93.184.216.34")}, nil
+			}
+			return resolveHostIPs(ctx, host)
+		}); err != nil {
 			t.Errorf("unexpected block for %q: %v", raw, err)
 		}
 	}
@@ -65,8 +71,17 @@ func TestCheckExternalRedirectBlocksPrivateHop(t *testing.T) {
 	if err := checkExternalRedirect(target, nil); err == nil {
 		t.Error("redirect hop to loopback must be blocked")
 	}
-	ok, _ := http.NewRequest(http.MethodGet, "https://example.com/x", nil)
+	ok, _ := http.NewRequest(http.MethodGet, "https://8.8.8.8/x", nil)
 	if err := checkExternalRedirect(ok, nil); err != nil {
 		t.Errorf("public redirect hop should pass: %v", err)
+	}
+}
+
+func TestExternalURLRejectsMixedPublicPrivateDNSAnswers(t *testing.T) {
+	err := validateExternalURLWithLookup(context.Background(), "https://public-name.example/x", func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("93.184.216.34"), net.ParseIP("127.0.0.1")}, nil
+	})
+	if err == nil {
+		t.Fatal("public host name bypassed private DNS address check")
 	}
 }

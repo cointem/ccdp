@@ -5,8 +5,11 @@ import "testing"
 func TestDefaultCatalogHasStableCommandSurface(t *testing.T) {
 	catalog := Default()
 	names := catalog.Names()
-	if len(names) != 61 {
-		t.Fatalf("default command surface has %d spellings, want 61", len(names))
+	if len(names) != 60 {
+		t.Fatalf("default command surface has %d spellings, want 60", len(names))
+	}
+	if _, ok := catalog.Lookup("/cost"); ok {
+		t.Fatal("removed cost command is still registered")
 	}
 	if canonical, ok := catalog.Canonical("/exit"); !ok || canonical != "quit" {
 		t.Fatalf("exit alias resolved to %q, %v; want quit", canonical, ok)

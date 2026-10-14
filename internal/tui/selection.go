@@ -49,6 +49,10 @@ func normalizeSel(anchor, focus selPoint) selRect {
 // rows (each entry is the ANSI-stripped, width-measured text of one content
 // row, aligned with the content row numbering used by clickTargets).
 func selectionText(rows []string, anchor, focus selPoint) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	anchor, focus = clampSelectionPoint(rows, anchor), clampSelectionPoint(rows, focus)
 	if anchor == focus {
 		return ""
 	}
@@ -92,6 +96,20 @@ func selectionText(rows []string, anchor, focus selPoint) string {
 		b.WriteString(cutWidth(line, start, end))
 	}
 	return b.String()
+}
+
+func clampSelectionPoint(rows []string, point selPoint) selPoint {
+	if len(rows) == 0 {
+		return selPoint{}
+	}
+	if point.Row < 0 {
+		return selPoint{} // dragging above the body selects from its beginning
+	}
+	if point.Row >= len(rows) {
+		return selPoint{Row: len(rows) - 1, Col: lipgloss.Width(rows[len(rows)-1])}
+	}
+	point.Col = min(max(0, point.Col), lipgloss.Width(rows[point.Row]))
+	return point
 }
 
 // cutWidth returns the substring of s that occupies display cells [from, to).

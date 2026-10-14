@@ -1,9 +1,10 @@
 package agent
 
 import (
+	"testing"
+
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
-	"testing"
 )
 
 // TestGenerationSettingsApplyWhileBusy covers the reasoning effort/verbosity
@@ -12,7 +13,7 @@ import (
 func TestGenerationSettingsApplyWhileBusy(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	ag.mu.Lock()
-	ag.busy = true
+	ag.turn.busy = true
 	ag.mu.Unlock()
 
 	effort, verbosity := "max", "low"
@@ -26,8 +27,8 @@ func TestGenerationSettingsApplyWhileBusy(t *testing.T) {
 	}
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	if ag.cfg.ReasoningEffort != "max" || ag.cfg.Verbosity != "low" {
-		t.Fatalf("generation did not apply immediately: effort=%q verbosity=%q", ag.cfg.ReasoningEffort, ag.cfg.Verbosity)
+	if ag.services.cfg.ReasoningEffort != "max" || ag.services.cfg.Verbosity != "low" {
+		t.Fatalf("generation did not apply immediately: effort=%q verbosity=%q", ag.services.cfg.ReasoningEffort, ag.services.cfg.Verbosity)
 	}
 }
 
@@ -37,7 +38,7 @@ func TestGenerationSettingsApplyWhileBusy(t *testing.T) {
 func TestPermissionAppliesImmediatelyWhileBusy(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	ag.mu.Lock()
-	ag.busy = true
+	ag.turn.busy = true
 	ag.mu.Unlock()
 	sid := protocol.SessionID(ag.SessionID())
 
@@ -56,11 +57,11 @@ func TestPermissionAppliesImmediatelyWhileBusy(t *testing.T) {
 
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	if ag.cfg.PermissionMode != string(permissions.ModeBypass) {
-		t.Fatalf("live mode did not track the last change: %s", ag.cfg.PermissionMode)
+	if ag.services.cfg.PermissionMode != string(permissions.ModeBypass) {
+		t.Fatalf("live mode did not track the last change: %s", ag.services.cfg.PermissionMode)
 	}
-	if ag.perms.CurrentMode() != permissions.ModeBypass {
-		t.Fatalf("permission manager not synced to live mode: %s", ag.perms.CurrentMode())
+	if ag.services.perms.CurrentMode() != permissions.ModeBypass {
+		t.Fatalf("permission manager not synced to live mode: %s", ag.services.perms.CurrentMode())
 	}
 }
 
@@ -75,11 +76,11 @@ func TestPermissionIdleApply(t *testing.T) {
 	}
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	if ag.cfg.PermissionMode != string(permissions.ModeAcceptEdits) {
-		t.Fatalf("idle mode did not apply immediately: %s", ag.cfg.PermissionMode)
+	if ag.services.cfg.PermissionMode != string(permissions.ModeAcceptEdits) {
+		t.Fatalf("idle mode did not apply immediately: %s", ag.services.cfg.PermissionMode)
 	}
-	if ag.perms.CurrentMode() != permissions.ModeAcceptEdits {
-		t.Fatalf("perms manager did not update: %s", ag.perms.CurrentMode())
+	if ag.services.perms.CurrentMode() != permissions.ModeAcceptEdits {
+		t.Fatalf("perms manager did not update: %s", ag.services.perms.CurrentMode())
 	}
 }
 
@@ -98,9 +99,9 @@ func TestSettingsPreservePendingPlanWorkflow(t *testing.T) {
 			pending := &PlanRequest{ID: "pending-plan", Plan: "Review this plan"}
 			resp := make(chan bool, 1)
 			a.mu.Lock()
-			a.workflow = protocol.WorkflowAwaitingDecision
-			a.pendingPlan = pending
-			a.planResp = resp
+			a.lifecycle.workflow = protocol.WorkflowAwaitingDecision
+			a.plan.pendingPlan = pending
+			a.plan.planResp = resp
 			a.mu.Unlock()
 			cmd.SessionID = protocol.SessionID(a.SessionID())
 			if r := a.applyCommand(cmd); r.Rejected() {
@@ -108,8 +109,8 @@ func TestSettingsPreservePendingPlanWorkflow(t *testing.T) {
 			}
 			a.mu.Lock()
 			defer a.mu.Unlock()
-			if a.workflow != protocol.WorkflowAwaitingDecision || a.pendingPlan != pending || a.planResp != resp || !a.planMode {
-				t.Fatalf("pending approval changed: workflow=%s plan=%+v", a.workflow, a.pendingPlan)
+			if a.lifecycle.workflow != protocol.WorkflowAwaitingDecision || a.plan.pendingPlan != pending || a.plan.planResp != resp || !a.plan.planMode {
+				t.Fatalf("pending approval changed: workflow=%s plan=%+v", a.lifecycle.workflow, a.plan.pendingPlan)
 			}
 		})
 	}

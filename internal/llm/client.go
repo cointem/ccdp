@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -49,6 +51,19 @@ type Config struct {
 type RetryableError struct {
 	Err        error
 	RetryAfter time.Duration
+}
+
+// HTTPRejection identifies a response rejected before a completion stream.
+type HTTPRejection struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *HTTPRejection) Error() string { return e.Message }
+
+func RejectedBeforeExecution(err error) bool {
+	var response *HTTPRejection
+	return errors.As(err, &response) && response.StatusCode >= 400 && response.StatusCode < 500 && response.StatusCode != 408
 }
 
 func (e *RetryableError) Error() string {
@@ -94,6 +109,8 @@ type Client struct {
 	baseURL    string
 	maxRetries int
 	retryDelay time.Duration
+	// Opaque state belongs to one endpoint/account, independently of wire type.
+	providerOrigin string
 }
 
 // NewClient validates the config and returns a client.
@@ -116,7 +133,11 @@ func NewClient(cfg Config) (*Client, error) {
 	if retryDelay <= 0 {
 		retryDelay = 500 * time.Millisecond
 	}
-	return &Client{cfg: cfg, httpc: httpc, baseURL: baseURL, maxRetries: maxRetries, retryDelay: retryDelay}, nil
+	// The source namespace includes credentials without persisting them in
+	// history. An endpoint or account switch falls back to portable text/tools.
+	originMaterial, _ := json.Marshal([]string{baseURL, cfg.APIKey})
+	origin := sha256.Sum256(originMaterial)
+	return &Client{cfg: cfg, httpc: httpc, baseURL: baseURL, maxRetries: maxRetries, retryDelay: retryDelay, providerOrigin: fmt.Sprintf("http-%x", origin)}, nil
 }
 
 // DebugLog prints a request summary to stderr when debug mode is enabled.
@@ -151,14 +172,20 @@ func (c *Client) Capabilities() Capabilities {
 
 // StreamResult is the final outcome of a streaming call.
 type StreamResult struct {
-	CacheReported bool
-	Text          string
-	Reasoning     string // chain-of-thought deltas, when the provider sends them
-	ToolCalls     []ToolCall
-	FinishReason  string
-	PromptTokens  int
-	CompletionTok int
-	CachedTokens  int // prompt tokens served from a provider cache (if reported)
+	ProviderOrigin  string            `json:"provider_origin,omitempty"`
+	ProviderWire    string            `json:"provider_wire,omitempty"`
+	ProviderContent []json.RawMessage `json:"provider_content,omitempty"`
+	CacheReported   bool
+	// Reported flags distinguish an explicit zero from absent provider usage.
+	PromptReported     bool
+	CompletionReported bool
+	Text               string
+	Reasoning          string // chain-of-thought deltas, when the provider sends them
+	ToolCalls          []ToolCall
+	FinishReason       string
+	PromptTokens       int
+	CompletionTok      int
+	CachedTokens       int // prompt tokens served from a provider cache (if reported)
 }
 
 // Stream performs a streaming chat completion and calls onDelta for each text
@@ -182,7 +209,7 @@ func (c *Client) stream(ctx context.Context, req CompletionRequest, onDelta func
 	}
 
 	for attempt := 0; ; attempt++ {
-		result, retryable, emitted, retryAfter, rerr := c.streamOnce(ctx, body, onDelta, onReasoning)
+		result, _, emitted, _, rerr := c.streamOnce(ctx, body, onDelta, onReasoning)
 		if rerr == nil {
 			return result, nil
 		}
@@ -191,6 +218,7 @@ func (c *Client) stream(ctx context.Context, req CompletionRequest, onDelta func
 		}
 		// Retrying replays the stream from the start: if any delta already
 		// reached the caller (UI + history), a retry would duplicate it.
+		retryAfter, retryable := RetryAfter(rerr)
 		if !retryable || emitted || attempt >= c.maxRetries {
 			return result, rerr
 		}
@@ -232,16 +260,11 @@ func (c *Client) isAnthropic() bool {
 // pin the exact endpoint by writing it out.
 func normalizeBaseURL(raw string) string {
 	b := strings.TrimRight(strings.TrimSpace(raw), "/")
-	if i := strings.Index(b, "://"); i >= 0 {
-		rest := b[i+3:]
-		if strings.Contains(rest, "/") {
+	if parsed, err := url.Parse(b); err == nil && parsed.Host != "" {
+		if parsed.Path != "" {
 			return b // concrete path already present
 		}
-		host := rest
-		if colon := strings.IndexByte(host, ':'); colon >= 0 {
-			host = host[:colon]
-		}
-		if isLoopbackHost(host) {
+		if isLoopbackHost(parsed.Hostname()) {
 			return b
 		}
 	}
@@ -267,7 +290,7 @@ func (c *Client) marshalRequestBody(req CompletionRequest) ([]byte, error) {
 	if c.isAnthropic() {
 		return c.anthropicBody(req)
 	}
-	return json.Marshal(req)
+	return c.chatBody(req)
 }
 
 // postStream sends one streaming POST attempt and surfaces transient failures.
@@ -317,7 +340,7 @@ func (c *Client) postStream(ctx context.Context, url string, body []byte) (resp 
 				}
 			}
 		}
-		statusErr := errors.New(msg)
+		var statusErr error = &HTTPRejection{StatusCode: resp.StatusCode, Message: msg}
 		if retryable {
 			statusErr = &RetryableError{Err: statusErr, RetryAfter: after}
 		}
@@ -447,17 +470,23 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 			// Some providers emit non-JSON keep-alive lines; ignore them.
 			continue
 		}
-		if chunk.Error != nil {
-			return StreamResult{}, false, emitted, 0, fmt.Errorf("llm: provider error: %s", chunk.Error.Message)
-		}
 		if chunk.Usage != nil {
-			result.PromptTokens = chunk.Usage.PromptTokens
-			result.CompletionTok = chunk.Usage.CompletionTokens
-			result.CacheReported = chunk.Usage.PromptDetails != nil && chunk.Usage.PromptDetails.CachedTokens != nil
-			result.CachedTokens = 0
-			if result.CacheReported {
+			if chunk.Usage.PromptReported {
+				result.PromptTokens = chunk.Usage.PromptTokens
+				result.PromptReported = true
+			}
+			if chunk.Usage.CompletionReported {
+				result.CompletionTok = chunk.Usage.CompletionTokens
+				result.CompletionReported = true
+			}
+			if chunk.Usage.PromptDetails != nil && chunk.Usage.PromptDetails.CachedTokens != nil {
+				result.CacheReported = true
 				result.CachedTokens = *chunk.Usage.PromptDetails.CachedTokens
 			}
+		}
+		if chunk.Error != nil {
+			result.FinishReason = "error"
+			return result, false, emitted, 0, fmt.Errorf("llm: provider error: %s", chunk.Error.Message)
 		}
 		if len(chunk.Choices) == 0 {
 			continue

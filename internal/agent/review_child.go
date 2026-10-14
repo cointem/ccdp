@@ -67,7 +67,7 @@ func (a *Agent) launchReview(cmd protocol.Command) (string, error) {
 	w := *cmd.Workflow
 	w.Paths = append([]string(nil), w.Paths...)
 	cmd.Workflow = &w
-	r, err := a.supervisor.launchWithReview(a, a.rootCtx, childTask{
+	r, err := a.services.supervisor.launchWithReview(a, a.lifecycle.rootCtx, childTask{
 		Description: "代码审查 · " + w.Scope, Role: "explorer", WaitPolicy: "observe",
 	}, childPurposeReview, "", &cmd)
 	if err != nil {
@@ -82,9 +82,7 @@ func (a *Agent) launchReview(cmd protocol.Command) (string, error) {
 
 func (s *SessionSupervisor) executeReview(r *managedRun, ctx context.Context) (*Agent, string, error) {
 	var child *Agent
-	r.parent.mu.Lock()
-	policy := r.parent.sandbox.Snapshot()
-	r.parent.mu.Unlock()
+	policy := r.parent.childPolicy()
 	ctx = context.WithValue(ctx, reviewSourceKey{}, reviewSource{r.cfg.Workspace, policy})
 	preparationCtx := context.WithValue(ctx, reviewGitAuthorizationKey{}, func(ctx context.Context, args map[string]any) error {
 		return s.authorizeReviewGit(r, ctx, args)
@@ -97,7 +95,7 @@ func (s *SessionSupervisor) executeReview(r *managedRun, ctx context.Context) (*
 		opts.Supervisor = s
 		opts.RootContext = runCtx
 		var err error
-		child, err = newAgentWithOptions(&cfg, nil, nil, opts)
+		child, err = newAgentWithOptions(&cfg, nil, opts)
 		if err != nil {
 			return "", err
 		}
@@ -129,7 +127,7 @@ func (s *SessionSupervisor) executeReview(r *managedRun, ctx context.Context) (*
 		bindReportOnly(&cfg, &opts)
 		opts.RootContext = ctx
 		var createErr error
-		child, createErr = newAgentWithOptions(&cfg, nil, nil, opts)
+		child, createErr = newAgentWithOptions(&cfg, nil, opts)
 		err = errors.Join(err, createErr)
 		if child != nil {
 			r.mu.Lock()
@@ -157,7 +155,7 @@ func (s *SessionSupervisor) authorizeReviewGit(r *managedRun, ctx context.Contex
 	if denied, reason := p.HardDeny("Bash", args); denied {
 		return errors.New(reason)
 	}
-	decision, reason := p.Check("Bash", args)
+	decision, reason := p.Check("Bash", args, permissions.KindShell)
 	if decision == permissions.DecisionDeny {
 		return errors.New(reason)
 	}
@@ -206,7 +204,7 @@ func (a *Agent) ReadReviewOperation(ctx context.Context, id protocol.CommandID) 
 	if json.Unmarshal([]byte(result.Output), &launch) != nil || launch.SessionID == "" {
 		return result, nil
 	}
-	r, err := a.supervisor.lookup(launch.SessionID)
+	r, err := a.services.supervisor.lookup(launch.SessionID)
 	if err != nil {
 		return result, err
 	}
@@ -235,12 +233,8 @@ func canFinalizeReview(child *Agent, ctx context.Context) bool {
 		return false
 	}
 	child.mu.Lock()
-	cfg := *child.cfg
-	usage := child.usage
+	cfg := *child.services.cfg
 	child.mu.Unlock()
-	if cfg.MaxBudgetUSD > 0 && usage.Cost >= cfg.MaxBudgetUSD {
-		return false
-	}
 	calls := 0
 	for _, m := range child.History() {
 		if m.Role == messages.RoleAssistant {

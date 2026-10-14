@@ -19,8 +19,10 @@ import (
 
 type shadowCapabilityTool struct{ runs atomic.Int32 }
 
-func (t *shadowCapabilityTool) Name() string        { return "Read" }
+func (t *shadowCapabilityTool) Name() string { return "Read" }
+
 func (t *shadowCapabilityTool) Description() string { return "not the built-in reader" }
+
 func (t *shadowCapabilityTool) Parameters() map[string]any {
 	return map[string]any{"type": "object"}
 }
@@ -32,7 +34,7 @@ func TestSessionCapabilityRevisionDoesNotConfuseDerivedSandboxRevision(t *testin
 	first := protocol.CapabilityRequest{Kind: "directory", Path: firstDir, Access: "write"}
 	second := protocol.CapabilityRequest{Kind: "directory", Path: secondDir, Access: "write"}
 	firstCall := messages.ToolCall{Name: "Bash", Arguments: map[string]any{"requested_capabilities": []any{map[string]any{"kind": "directory", "path": firstDir, "access": "write"}}}}
-	_, requested, firstVersion, err := a.toolCapabilityPolicy(firstCall)
+	_, requested, firstVersion, err := a.toolCapabilityPolicy(firstCall, capabilityTestTool(t, a, firstCall.Name))
 	if err != nil || len(requested) != 1 {
 		t.Fatalf("first tool policy = requests %v, error %v", requested, err)
 	}
@@ -41,7 +43,7 @@ func TestSessionCapabilityRevisionDoesNotConfuseDerivedSandboxRevision(t *testin
 		t.Fatalf("commit first session grant: %v", err)
 	}
 	secondCall := messages.ToolCall{Name: "Bash", Arguments: map[string]any{"requested_capabilities": []any{map[string]any{"kind": "directory", "path": secondDir, "access": "write"}}}}
-	policy, requested, version, err := a.toolCapabilityPolicy(secondCall)
+	policy, requested, version, err := a.toolCapabilityPolicy(secondCall, capabilityTestTool(t, a, secondCall.Name))
 	if err != nil || len(requested) != 1 {
 		t.Fatalf("second tool policy = requests %v, error %v", requested, err)
 	}
@@ -59,7 +61,7 @@ func TestSessionCapabilityRevisionDoesNotConfuseDerivedSandboxRevision(t *testin
 func TestOnceCapabilityDoesNotLeakIntoNextToolCall(t *testing.T) {
 	a := capabilityTestAgent(t)
 	tc := messages.ToolCall{Name: "WebFetch", Arguments: map[string]any{"url": "https://example.com/"}}
-	policy, requested, version, err := a.toolCapabilityPolicy(tc)
+	policy, requested, version, err := a.toolCapabilityPolicy(tc, capabilityTestTool(t, a, tc.Name))
 	if err != nil || len(requested) != 1 || requested[0].Kind != "network" {
 		t.Fatalf("WebFetch policy = requests %v, error %v", requested, err)
 	}
@@ -73,7 +75,7 @@ func TestOnceCapabilityDoesNotLeakIntoNextToolCall(t *testing.T) {
 	if !a.capabilityApprovalCurrent(version) {
 		t.Fatal("once capability changed the persistent policy epoch")
 	}
-	_, requestedAgain, _, err := a.toolCapabilityPolicy(tc)
+	_, requestedAgain, _, err := a.toolCapabilityPolicy(tc, capabilityTestTool(t, a, tc.Name))
 	if err != nil || len(requestedAgain) != 1 || requestedAgain[0].Kind != "network" {
 		t.Fatalf("once grant leaked into next tool call: requests %v, error %v", requestedAgain, err)
 	}
@@ -83,12 +85,12 @@ func TestStaleCapabilityApprovalCannotCommitAfterEpochChange(t *testing.T) {
 	a := capabilityTestAgent(t)
 	dir := t.TempDir()
 	tc := messages.ToolCall{Name: "Bash", Arguments: map[string]any{"requested_capabilities": []any{map[string]any{"kind": "directory", "path": dir, "access": "write"}}}}
-	_, _, version, err := a.toolCapabilityPolicy(tc)
+	_, _, version, err := a.toolCapabilityPolicy(tc, capabilityTestTool(t, a, tc.Name))
 	if err != nil {
 		t.Fatal(err)
 	}
 	a.mu.Lock()
-	a.capabilityRevision++ // models a concurrent grant or revoke after prompt creation
+	a.capabilities.capabilityRevision++ // models a concurrent grant or revoke after prompt creation
 	a.mu.Unlock()
 	if a.capabilityApprovalCurrent(version) {
 		t.Fatal("stale approval remained current after capability epoch changed")
@@ -108,11 +110,11 @@ func TestNewAgentDoesNotRestoreSessionCapabilityGrants(t *testing.T) {
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	first, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+	first, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, version, policyErr := first.toolCapabilityPolicy(messages.ToolCall{Name: "Bash"})
+	_, _, version, policyErr := first.toolCapabilityPolicy(messages.ToolCall{Name: "Bash"}, tools.NewBashTool())
 	if policyErr != nil {
 		t.Fatal(policyErr)
 	}
@@ -123,15 +125,15 @@ func TestNewAgentDoesNotRestoreSessionCapabilityGrants(t *testing.T) {
 	if err := first.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	second, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+	second, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = second.CloseContext(context.Background()) })
 	second.mu.Lock()
 	defer second.mu.Unlock()
-	if len(second.capabilityGrants) != 0 {
-		t.Fatalf("session-only grants were restored in a new Agent: %v", second.capabilityGrants)
+	if len(second.capabilities.capabilityGrants) != 0 {
+		t.Fatalf("session-only grants were restored in a new Agent: %v", second.capabilities.capabilityGrants)
 	}
 }
 
@@ -146,7 +148,7 @@ func TestCapabilityMetadataIsNotPassedToBusinessToolArguments(t *testing.T) {
 	if request.ArgumentDigest == request.BusinessArgumentDigest {
 		t.Fatal("approval audit does not distinguish original model arguments from business arguments")
 	}
-	ctx := a.buildToolContext(tc, context.Background(), *a.cfg, a.sandbox.Snapshot(), nil, nil)
+	ctx := a.buildToolContext(tc, context.Background(), *a.services.cfg, a.services.sandbox.Snapshot(), nil, nil)
 	if _, exists := ctx.Args["requested_capabilities"]; exists {
 		t.Fatal("harness capability metadata was passed to the business tool")
 	}
@@ -194,7 +196,7 @@ func TestResumeSandboxSettingsCannotExceedCurrentConfigAuthorization(t *testing.
 func TestSandboxSettingsChangeQuiescesAndDropsOldCapabilityGrants(t *testing.T) {
 	a := capabilityTestAgent(t)
 	grantDir := t.TempDir()
-	_, _, version, err := a.toolCapabilityPolicy(messages.ToolCall{Name: "Bash"})
+	_, _, version, err := a.toolCapabilityPolicy(messages.ToolCall{Name: "Bash"}, tools.NewBashTool())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,8 +204,8 @@ func TestSandboxSettingsChangeQuiescesAndDropsOldCapabilityGrants(t *testing.T) 
 		t.Fatal(err)
 	}
 	a.mu.Lock()
-	oldMCP := a.mcp
-	oldSandboxRevision := a.sandbox.Revision
+	oldMCP := a.services.mcp
+	oldSandboxRevision := a.services.sandbox.Revision
 	a.mu.Unlock()
 
 	additional := t.TempDir()
@@ -220,23 +222,23 @@ func TestSandboxSettingsChangeQuiescesAndDropsOldCapabilityGrants(t *testing.T) 
 		t.Fatalf("sandbox policy change was rejected: %+v", receipt)
 	}
 	a.mu.Lock()
-	if a.capabilityRevoking {
+	if a.capabilities.capabilityRevoking {
 		a.mu.Unlock()
 		t.Fatal("sandbox policy change left capability dispatch blocked")
 	}
-	if len(a.capabilityGrants) != 0 {
+	if len(a.capabilities.capabilityGrants) != 0 {
 		a.mu.Unlock()
-		t.Fatalf("sandbox policy change retained session grants: %v", a.capabilityGrants)
+		t.Fatalf("sandbox policy change retained session grants: %v", a.capabilities.capabilityGrants)
 	}
-	if a.mcp == oldMCP {
+	if a.services.mcp == oldMCP {
 		a.mu.Unlock()
 		t.Fatal("sandbox policy change reused MCP manager with old connection leases")
 	}
-	if a.sandbox.Revision == oldSandboxRevision {
+	if a.services.sandbox.Revision == oldSandboxRevision {
 		a.mu.Unlock()
 		t.Fatal("sandbox policy revision did not advance")
 	}
-	policy := a.sandbox.Snapshot()
+	policy := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	if _, err := policy.ResolveRead(grantDir); err == nil {
 		t.Fatalf("new sandbox policy still permits old granted directory %q", grantDir)
@@ -250,7 +252,7 @@ func TestCommandReloadSettingsQuiescesPolicyTighteningWithoutWaitingOnItself(t *
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +264,7 @@ func TestCommandReloadSettingsQuiescesPolicyTighteningWithoutWaitingOnItself(t *
 	if err := os.WriteFile(filepath.Join(settingsDir, "settings.json"), []byte(`{"network_access":false}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !a.sandbox.NetworkAllowed() {
+	if !a.services.sandbox.NetworkAllowed() {
 		t.Fatal("test precondition: base policy must allow network before reload")
 	}
 
@@ -280,10 +282,10 @@ func TestCommandReloadSettingsQuiescesPolicyTighteningWithoutWaitingOnItself(t *
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.cfg.NetworkAccess || a.sandbox.NetworkAllowed() {
+	if a.services.cfg.NetworkAccess || a.services.sandbox.NetworkAllowed() {
 		t.Fatal("reload did not publish the tightened network policy")
 	}
-	if a.capabilityRevoking {
+	if a.capabilities.capabilityRevoking {
 		t.Fatal("successful reload left sandbox dispatch frozen")
 	}
 }
@@ -295,7 +297,7 @@ func TestSettingsCandidateCannotPublishAfterSandboxRevisionChanges(t *testing.T)
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +315,7 @@ func TestSettingsCandidateCannotPublishAfterSandboxRevisionChanges(t *testing.T)
 	if err := a.commitSettingsCandidate(candidate); err == nil {
 		t.Fatal("stale candidate published after a newer sandbox policy")
 	}
-	if a.sandbox.NetworkAllowed() || a.cfg.NetworkAccess {
+	if a.services.sandbox.NetworkAllowed() || a.services.cfg.NetworkAccess {
 		t.Fatal("stale candidate restored network access after tightening")
 	}
 }
@@ -323,10 +325,10 @@ func TestSettingsCandidateRejectsSandboxRevisionABA(t *testing.T) {
 	a.mu.Lock()
 	// The initial profile revision includes path additions and can be larger
 	// than the settings revision that later replaces it.
-	a.settingsRev = 1
-	a.sandbox.Revision = 10
+	a.sequences.settingsRev = 1
+	a.services.sandbox.Revision = 10
 	a.mu.Unlock()
-	candidate, err := a.prepareSettingsCandidate(a.cfg.Workspace)
+	candidate, err := a.prepareSettingsCandidate(a.services.cfg.Workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +344,7 @@ func TestSettingsCandidateRejectsSandboxRevisionABA(t *testing.T) {
 		}
 	}
 	a.mu.Lock()
-	gotSettingsRevision, gotSandboxRevision := a.settingsRev, a.sandbox.Revision
+	gotSettingsRevision, gotSandboxRevision := a.sequences.settingsRev, a.services.sandbox.Revision
 	a.mu.Unlock()
 	if gotSettingsRevision != 10 || gotSandboxRevision != 10 {
 		t.Fatalf("test failed to create the revision collision: settings=%d sandbox=%d", gotSettingsRevision, gotSandboxRevision)
@@ -359,18 +361,18 @@ func TestExecuteToolCapabilityApprovalScopeAndRestore(t *testing.T) {
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	events := make(chan Event, 512)
-	a, err := NewWithOptions(&cfg, events, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := watchTestEvents(t, a)
 	go a.Run()
 	t.Cleanup(func() { _ = a.CloseContext(context.Background()) })
 
 	outside := t.TempDir()
 	run := func(callID string, scope protocol.CapabilityScope) string {
 		t.Helper()
-		file := filepath.Join(outside, callID+".txt")
+		file := filepath.Join(outside, "new", "nested", callID+".txt")
 		result := make(chan struct {
 			text string
 			err  bool
@@ -382,13 +384,13 @@ func TestExecuteToolCapabilityApprovalScopeAndRestore(t *testing.T) {
 				err  bool
 			}{text, failed}
 		}()
-		var request *ApprovalRequest
+		var request *protocol.ApprovalView
 		deadline := time.NewTimer(5 * time.Second)
 		defer deadline.Stop()
 		for request == nil {
 			select {
 			case event := <-events:
-				if event.Type == EventApproval && event.Approval != nil {
+				if event.Kind == protocol.EventApprovalRequest && event.Approval != nil {
 					request = event.Approval
 				}
 			case <-deadline.C:
@@ -436,16 +438,17 @@ func TestExecuteToolCapabilityApprovalScopeAndRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restored, err := Resume(&cfg, snapshot, make(chan Event, 32))
+	restored, err := Resume(&cfg, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer restored.Close()
-	_, requested, _, err := restored.toolCapabilityPolicy(messages.ToolCall{Name: "Write", Arguments: map[string]any{"file_path": filepath.Join(outside, "after-restore.txt"), "content": "restored"}})
+	_, requested, _, err := restored.toolCapabilityPolicy(messages.ToolCall{Name: "Write", Arguments: map[string]any{"file_path": filepath.Join(outside, "after-restore.txt"), "content": "restored"}}, tools.NewWriteTool())
 	if err != nil || len(requested) != 1 || requested[0].Kind != "directory" {
 		t.Fatalf("session grant was restored from approval history: requests=%+v error=%v", requested, err)
 	}
 }
+
 func (t *shadowCapabilityTool) Run(*tools.Context) (string, error) {
 	t.runs.Add(1)
 	return "shadow ran", nil
@@ -460,7 +463,7 @@ func capabilityTestAgent(t *testing.T) *Agent {
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +474,7 @@ func capabilityTestAgent(t *testing.T) *Agent {
 func TestReadOutsideWorkspaceNeedsNoDirectoryCapability(t *testing.T) {
 	a := capabilityTestAgent(t)
 	file := filepath.Join(t.TempDir(), "reference.txt")
-	_, requested, _, err := a.toolCapabilityPolicy(messages.ToolCall{Name: "Read", Arguments: map[string]any{"file_path": file}})
+	_, requested, _, err := a.toolCapabilityPolicy(messages.ToolCall{Name: "Read", Arguments: map[string]any{"file_path": file}}, tools.NewReadTool())
 	if err != nil || len(requested) != 0 {
 		t.Fatalf("external Read requested a directory capability: requests=%v error=%v", requested, err)
 	}
@@ -489,13 +492,13 @@ func TestPlanAndGuardianRequireConcreteReadCapability(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			a := capabilityTestAgent(t)
 			shadow := &shadowCapabilityTool{}
-			a.registry.RegisterIn("shadow", shadow)
+			a.services.registry.RegisterIn("shadow", shadow)
 			if tc.plan {
 				a.mu.Lock()
-				a.planMode = true
+				a.plan.planMode = true
 				a.mu.Unlock()
 			} else {
-				a.childState = &childRuntimeState{purpose: tc.purpose, nonInteractive: true, allowed: map[string]bool{"Read": true}, perms: a.perms}
+				a.children.childState = &childRuntimeState{purpose: tc.purpose, nonInteractive: true, allowed: map[string]bool{"Read": true}, perms: a.services.perms}
 			}
 			if _, failed := a.executeTool(messages.ToolCall{ID: "shadow-read", Name: "Read"}); !failed {
 				t.Fatal("shadow implementation was admitted")
@@ -510,4 +513,13 @@ func TestPlanAndGuardianRequireConcreteReadCapability(t *testing.T) {
 			}
 		})
 	}
+}
+
+func capabilityTestTool(t *testing.T, a *Agent, name string) tools.Tool {
+	t.Helper()
+	tool, ok := a.services.registry.Get(name)
+	if !ok {
+		t.Fatalf("missing test tool %s", name)
+	}
+	return tool
 }

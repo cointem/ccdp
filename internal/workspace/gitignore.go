@@ -1,8 +1,10 @@
 package workspace
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -33,11 +35,18 @@ func NewMatcherSafe() *Matcher { return &Matcher{} }
 // LoadGitignores loads every .gitignore from repoRoot downward, deepest last
 // (mirroring git precedence: deeper files override shallower ones).
 func (m *Matcher) LoadGitignores(repoRoot string) error {
+	return m.LoadGitignoresContext(context.Background(), repoRoot)
+}
+
+func (m *Matcher) LoadGitignoresContext(ctx context.Context, repoRoot string) error {
 	if m == nil {
 		m = &Matcher{}
 	}
 	var files []string
-	_ = filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil {
 			return nil
 		}
@@ -49,8 +58,14 @@ func (m *Matcher) LoadGitignores(repoRoot string) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
 	sortDepthAsc(files)
 	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		base, err := filepath.Rel(repoRoot, filepath.Dir(f))
 		if err != nil {
 			continue
@@ -67,35 +82,36 @@ func (m *Matcher) LoadGitignores(repoRoot string) error {
 }
 
 func sortDepthAsc(paths []string) {
-	for i := 1; i < len(paths); i++ {
-		for j := i; j > 0; j-- {
-			depth := func(p string) int { return strings.Count(filepath.ToSlash(p), "/") }
-			if depth(paths[j-1]) > depth(paths[j]) {
-				paths[j-1], paths[j] = paths[j], paths[j-1]
-			} else {
-				break
-			}
+	depths := make(map[string]int, len(paths))
+	for _, path := range paths {
+		depths[path] = strings.Count(filepath.ToSlash(path), "/")
+	}
+	sort.SliceStable(paths, func(i, j int) bool { return depths[paths[i]] < depths[paths[j]] })
+}
+
+// AddGitignore adds bounded, already-authorized file contents relative to baseDir.
+func (m *Matcher) AddGitignore(data []byte, baseDir string) {
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(strings.TrimRight(raw, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
+		rule := parseIgnoreLine(line)
+		rule.baseDir = filepath.ToSlash(baseDir)
+		m.patterns = append(m.patterns, rule)
 	}
 }
 
 // loadFile parses one .gitignore file whose patterns apply under baseDir.
 func (m *Matcher) loadFile(path, baseDir string) error {
-	data, err := os.ReadFile(path)
+	data, truncated, err := readBounded(path, 256<<10)
+	if truncated {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimRight(raw, "\r")
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		rule := parseIgnoreLine(line)
-		// Patterns from a nested .gitignore are relative to that directory.
-		rule.baseDir = baseDir
-		m.patterns = append(m.patterns, rule)
-	}
+	m.AddGitignore(data, baseDir)
 	return nil
 }
 
@@ -212,6 +228,11 @@ func simpleGlob(pattern, s string) bool {
 
 // doubleStarMatch matches patterns that may contain ** across segments.
 func doubleStarMatch(pattern, s string) bool {
+	// A trailing /** matches entries inside a directory, not the directory
+	// itself. Keeping that parent traversable allows subsequent ! rules.
+	if strings.HasSuffix(pattern, "/**") && strings.TrimSuffix(pattern, "/**") == s {
+		return false
+	}
 	// Split both into segments and do a DP match.
 	psegs := strings.Split(pattern, "/")
 	ssegs := strings.Split(s, "/")

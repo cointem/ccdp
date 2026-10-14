@@ -24,6 +24,7 @@ import (
 type policyTestProvider struct{ name string }
 
 func (p *policyTestProvider) Name() string { return p.name }
+
 func (p *policyTestProvider) Stream(context.Context, llm.CompletionRequest, func(string)) (llm.StreamResult, error) {
 	return llm.StreamResult{Text: "ok"}, nil
 }
@@ -104,7 +105,7 @@ func TestStreamPreparedRetriesAtJournalBoundary(t *testing.T) {
 	if result.Text != "ok" || provider.calls.Load() != 2 {
 		t.Fatalf("retry result=%+v calls=%d, want ok/2", result, provider.calls.Load())
 	}
-	records, err := a.persistence.store.Read(0)
+	records, err := a.services.persistence.Read(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +149,7 @@ func TestReloadRefreshesActiveProviderOperatorCaps(t *testing.T) {
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,8 +158,8 @@ func TestReloadRefreshesActiveProviderOperatorCaps(t *testing.T) {
 	// limits. Reload must rebuild the binding wrapper even though model/provider
 	// identity remains unchanged.
 	a.mu.Lock()
-	a.baseCfg.ContextWindow = 4096
-	a.baseCfg.Providers["test"].ModelConfigs["reload-caps-model"] = config.ModelConfig{ContextWindow: 4096, MaxOutputTokens: 128}
+	a.services.baseCfg.ContextWindow = 4096
+	a.services.baseCfg.Providers["test"].ModelConfigs["reload-caps-model"] = config.ModelConfig{ContextWindow: 4096, MaxOutputTokens: 128}
 	a.mu.Unlock()
 	candidate, err := a.prepareSettingsCandidate(cfg.Workspace)
 	if err != nil {
@@ -167,12 +168,12 @@ func TestReloadRefreshesActiveProviderOperatorCaps(t *testing.T) {
 	if err := a.commitSettingsCandidate(candidate); err != nil {
 		t.Fatal(err)
 	}
-	caps, ok := llm.ProviderCapabilitiesOf(a.activeBinding.client)
+	caps, ok := llm.ProviderCapabilitiesOf(a.modelsState.activeBinding.client)
 	if !ok || caps.ContextWindow != 4096 || caps.MaxOutputTokens != 128 {
 		t.Fatalf("active binding capabilities = %+v (described=%v), want 4096/128", caps, ok)
 	}
-	if a.activeBinding.model != cfg.Model || a.activeBinding.provider != provider.Name() {
-		t.Fatalf("reload changed provider identity: %+v", a.activeBinding)
+	if a.modelsState.activeBinding.model != cfg.Model || a.modelsState.activeBinding.provider != provider.Name() {
+		t.Fatalf("reload changed provider identity: %+v", a.modelsState.activeBinding)
 	}
 }
 
@@ -181,7 +182,7 @@ func TestNewWithOptionsChildPoliciesAreHardGates(t *testing.T) {
 		t.Run("purpose-"+purpose, func(t *testing.T) {
 			cfg := isolatedTestConfig(t, "policy-model")
 			registry := frozenProviderRegistry(cfg.Model)
-			a, err := NewWithOptions(&cfg, nil, Options{
+			a, err := testNewWithOptions(t, &cfg, Options{
 				EffectiveConfigFrozen: true,
 				ProviderRegistry:      registry,
 				Purpose:               purpose,
@@ -211,7 +212,7 @@ func TestGuardianOptionsDisableLifecycleSideEffects(t *testing.T) {
 	cfg.Hooks = hooks.Config{
 		hooks.EventSessionStart: {{Command: "touch " + sentinel}},
 	}
-	a, err := NewWithOptions(&cfg, nil, Options{
+	a, err := testNewWithOptions(t, &cfg, Options{
 		EffectiveConfigFrozen: true,
 		ProviderRegistry:      frozenProviderRegistry(cfg.Model),
 		Purpose:               childPurposeGuardian,
@@ -270,7 +271,7 @@ func TestGuardianCannotShadowReadWithConfiguredCommand(t *testing.T) {
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	parent, err := NewWithOptions(&cfg, nil, Options{
+	parent, err := testNewWithOptions(t, &cfg, Options{
 		EffectiveConfigFrozen: true,
 		ProviderRegistry:      models,
 	})
@@ -297,7 +298,7 @@ func TestTaskRetainsConfiguredCustomTool(t *testing.T) {
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	task, err := NewWithOptions(&cfg, nil, Options{
+	task, err := testNewWithOptions(t, &cfg, Options{
 		EffectiveConfigFrozen: true,
 		ProviderRegistry:      models,
 		Purpose:               childPurposeTask,
@@ -317,7 +318,7 @@ func TestTaskRetainsConfiguredCustomTool(t *testing.T) {
 func TestNewWithOptionsRejectsUnknownPurposeAndCancelledRoot(t *testing.T) {
 	cfg := isolatedTestConfig(t, "validation-model")
 	registry := frozenProviderRegistry(cfg.Model)
-	if _, err := NewWithOptions(&cfg, nil, Options{
+	if _, err := testNewWithOptions(t, &cfg, Options{
 		EffectiveConfigFrozen: true,
 		ProviderRegistry:      registry,
 		Purpose:               "unknown",
@@ -326,7 +327,7 @@ func TestNewWithOptionsRejectsUnknownPurposeAndCancelledRoot(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := NewWithOptions(&cfg, nil, Options{
+	if _, err := testNewWithOptions(t, &cfg, Options{
 		RootContext:           ctx,
 		EffectiveConfigFrozen: true,
 		ProviderRegistry:      registry,
@@ -441,7 +442,7 @@ func TestCatalogPublishesModelsForEachProvider(t *testing.T) {
 		"zeta":  {BaseURL: "https://zeta.example/v1", APIKey: "k", Models: []string{"zeta-2", "zeta-1", "zeta-1"}},
 		"alpha": {BaseURL: "https://alpha.example/v1", APIKey: "k", Models: []string{"alpha-1"}},
 	}
-	ag, err := New(&cfg, make(chan Event, 64))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

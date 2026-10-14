@@ -168,6 +168,9 @@ func globPatternAnchor(pattern string) (string, []string, error) {
 // denied matches are discarded before they can be returned or traversed.
 // A complete ** component matches zero or more descendant path components.
 func scopedGlob(ctx *Context, anchor string, parts []string) ([]string, error) {
+	if err := ctx.checkResources(); err != nil {
+		return nil, err
+	}
 	if len(parts) == 0 {
 		if _, err := ctx.ResolveRead(anchor); err != nil {
 			return nil, err
@@ -185,6 +188,9 @@ func scopedGlob(ctx *Context, anchor string, parts []string) ([]string, error) {
 	var matches []string
 	var expand func(string, int, bool) error
 	expand = func(current string, index int, initial bool) error {
+		if err := ctx.checkResources(); err != nil {
+			return err
+		}
 		if _, err := ctx.ResolveRead(current); err != nil {
 			return nil
 		}
@@ -210,6 +216,9 @@ func scopedGlob(ctx *Context, anchor string, parts []string) ([]string, error) {
 				return nil
 			}
 			for _, entry := range entries {
+				if err := ctx.checkResources(); err != nil {
+					return err
+				}
 				child := filepath.Join(current, entry.Name())
 				if _, err := ctx.ResolveRead(child); err != nil {
 					continue
@@ -236,6 +245,9 @@ func scopedGlob(ctx *Context, anchor string, parts []string) ([]string, error) {
 			return nil
 		}
 		for _, entry := range entries {
+			if err := ctx.checkResources(); err != nil {
+				return err
+			}
 			matched, err := filepath.Match(part, entry.Name())
 			if err != nil {
 				return err
@@ -281,11 +293,11 @@ func NewGrepTool() *GrepTool { return &GrepTool{} }
 func (t *GrepTool) Name() string { return "Grep" }
 
 func (t *GrepTool) Description() string {
-	return `Search file contents with a regular expression (ripgrep syntax).
+	return `Search file contents with Go/RE2 regular expressions. \w, \d and \b use ASCII classes; use \p{L} and \p{N} for Unicode letters and numbers.
 Files ignored by .gitignore and VCS/dependency/cache directories are skipped.
 Output modes: "content" (default) prints matching lines with line numbers,
 "files" prints only paths, "count" prints matches per file.
-Use context for surrounding lines and limit for result entries (default 100, maximum 1000). literal=true searches exact text.`
+Use context for surrounding lines and limit for result entries (default 100, maximum 1000). literal=true searches exact text. Ordinary searches stream files; oversized individual lines or bounded multiline reads report incomplete results.`
 }
 
 func (t *GrepTool) Parameters() map[string]any {
@@ -437,6 +449,9 @@ func (t *LSTool) Run(ctx *Context) (string, error) {
 	}
 	visible := entries[:0]
 	for _, entry := range entries {
+		if err := ctx.checkResources(); err != nil {
+			return "", err
+		}
 		if _, err := ctx.ResolveRead(filepath.Join(dir, entry.Name())); err == nil {
 			visible = append(visible, entry)
 		}
@@ -458,6 +473,9 @@ func (t *LSTool) Run(ctx *Context) (string, error) {
 	}
 	shown := 0
 	for _, e := range entries {
+		if err := ctx.checkResources(); err != nil {
+			return "", err
+		}
 		if shown >= limit || sb.Len() > min(50<<10, ctx.outputLimit())-400 {
 			break
 		}

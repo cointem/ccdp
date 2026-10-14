@@ -28,7 +28,7 @@ func runTestChildren(a *Agent, tasks []childTask, callID string) ([]testChildRes
 	runs := make([]*managedRun, len(tasks))
 	for i, task := range tasks {
 		results[i] = testChildResult{Index: i, Description: task.Description}
-		r, err := a.supervisor.launch(a, parentTurnContext(a), task, childPurposeTask, fmt.Sprintf("%s-%d", callID, i))
+		r, err := a.services.supervisor.launch(a, parentTurnContext(a), task, childPurposeTask, fmt.Sprintf("%s-%d", callID, i))
 		if err != nil {
 			results[i].Error = err.Error()
 			continue
@@ -68,11 +68,14 @@ func runTestChild(a *Agent, description string) (string, error) {
 // retaining a synchronous model-facing delegation API in production.
 type joinChildTestTool struct{ parent *Agent }
 
-func (joinChildTestTool) Name() string        { return "JoinChildTest" }
+func (joinChildTestTool) Name() string { return "JoinChildTest" }
+
 func (joinChildTestTool) Description() string { return "Join one test child" }
+
 func (joinChildTestTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{"description": map[string]any{"type": "string"}}}
 }
+
 func (t joinChildTestTool) Run(ctx *tools.Context) (string, error) {
 	return runTestChild(t.parent, tools.StringArg(ctx.Args, "description", ""))
 }

@@ -55,6 +55,12 @@ func (m *Model) renderStatus() string {
 			break
 		}
 	}
+	if goal := goalStatus(m.snapshot.Goal); goal != "" {
+		if status != "" {
+			status += " · "
+		}
+		status += goal
+	}
 	if m.busy || activity != "" {
 		if status == "" {
 			if m.streaming {

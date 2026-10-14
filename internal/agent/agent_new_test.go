@@ -18,8 +18,7 @@ func newAgentForTest(t *testing.T) *Agent {
 	cfg.Workspace = dir
 	cfg.SessionDir = filepath.Join(dir, "sessions")
 
-	events := make(chan Event, 64)
-	ag, err := New(&cfg, events)
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -39,7 +38,7 @@ func TestImageContentParts(t *testing.T) {
 		0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
 		0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 	}
-	if err := os.WriteFile(filepath.Join(ag.cfg.Workspace, "pic.png"), png, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(ag.services.cfg.Workspace, "pic.png"), png, 0o644); err != nil {
 		t.Fatal(err)
 	}
 

@@ -1,14 +1,15 @@
 package agent
 
 import (
-	"ccdp/internal/config"
-	"ccdp/internal/protocol"
 	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ccdp/internal/config"
+	"ccdp/internal/protocol"
 )
 
 func TestReviewSelectionAdmittedBeforeContextQuota(t *testing.T) {
@@ -16,7 +17,7 @@ func TestReviewSelectionAdmittedBeforeContextQuota(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(root, "chosen.txt"), []byte("changed\n"), 0644)
 	_ = os.WriteFile(filepath.Join(root, "aaa-unselected"), []byte(strings.Repeat("x", 4096)), 0644)
 	a.mu.Lock()
-	a.cfg.Review = config.ReviewConfig{FileBytes: 1024, TotalBytes: 1024, MaxPaths: 1}
+	a.services.cfg.Review = config.ReviewConfig{FileBytes: 1024, TotalBytes: 1024, MaxPaths: 1}
 	a.mu.Unlock()
 	cmd := protocol.Command{ID: "quota", Workflow: &protocol.WorkflowCommand{Scope: "uncommitted", Paths: []string{"chosen.txt"}}}
 	r, err := a.prepareReviewCopy(context.Background(), cmd)
@@ -60,7 +61,7 @@ func TestReviewFilterExclusionDoesNotConsumeContextQuota(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a.cfg.Review = config.ReviewConfig{FileBytes: 1024, TotalBytes: 1024, MaxPaths: 2}
+	a.services.cfg.Review = config.ReviewConfig{FileBytes: 1024, TotalBytes: 1024, MaxPaths: 2}
 	r, err := a.prepareReviewCopy(context.Background(), protocol.Command{ID: "filter-quota", Workflow: &protocol.WorkflowCommand{Scope: "uncommitted", Paths: []string{"chosen.txt"}}})
 	if err != nil {
 		t.Fatal(err)
@@ -87,7 +88,7 @@ func TestReportOnlyDoesNotHaveTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindReportOnly(&cfg, &opts)
-	child, err := newAgentWithOptions(&cfg, nil, nil, opts)
+	child, err := newAgentWithOptions(&cfg, nil, opts)
 	if err != nil {
 		t.Fatal(err)
 	}

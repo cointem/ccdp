@@ -28,7 +28,7 @@ func (a *Agent) ghCmd(args ...string) (string, error) {
 
 func (a *Agent) localCommand(argv []string, network bool) (string, error) {
 	a.mu.Lock()
-	ctx := a.rootCtx
+	ctx := a.lifecycle.rootCtx
 	a.mu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
@@ -44,9 +44,9 @@ func (a *Agent) localCommandContext(ctx context.Context, argv []string, network 
 		ctx = context.Background()
 	}
 	a.mu.Lock()
-	workspace := a.cfg.Workspace
-	sb := a.sandbox
-	perms := a.perms
+	workspace := a.services.cfg.Workspace
+	sb := a.services.sandbox
+	perms := a.services.perms
 	a.mu.Unlock()
 	if !externalCommandReadOnly(argv) {
 		return "", fmt.Errorf("legacy GitHub helper only permits an explicitly read-only command")
@@ -56,22 +56,16 @@ func (a *Agent) localCommandContext(ctx context.Context, argv []string, network 
 		if denied, reason := perms.HardDeny("Bash", map[string]any{"command": command}); denied {
 			return "", fmt.Errorf("command denied: %s", reason)
 		}
-		decision, reason := perms.Check("Bash", map[string]any{"command": command})
+		decision, reason := perms.Check("Bash", map[string]any{"command": command}, permissions.KindShell)
+		if argv[0] == "git" {
+			decision, reason = perms.CheckReadOnlyGit(argv)
+		}
 		if decision != permissions.DecisionAllow {
 			return "", fmt.Errorf("command requires the typed runtime approval gate: %s", reason)
 		}
 	}
 	if network && (sb == nil || !sb.NetworkAllowed()) {
 		return "", fmt.Errorf("network command denied: no network capability is authorized")
-	}
-	actualArgv := argv
-	readOnly := externalCommandReadOnly(argv)
-	if readOnly && argv[0] == "git" {
-		hardened, err := execution.ReadOnlyGitArgv(argv)
-		if err != nil {
-			return "", err
-		}
-		actualArgv = hardened
 	}
 	envPurpose := execution.EnvironmentGit
 	if argv[0] == "gh" {
@@ -82,11 +76,14 @@ func (a *Agent) localCommandContext(ctx context.Context, argv []string, network 
 		envPurpose = execution.EnvironmentGitHub
 	}
 	env := execution.SanitizedEnvironmentFor(envPurpose, os.Environ())
-	if readOnly && actualArgv[0] == "git" {
-		env = execution.ReadOnlyGitEnvironment(env)
+	request := execution.Request{Context: ctx, Dir: workspace, Sandbox: sb, Env: env, OutputLimit: 512 * 1024}
+	var res execution.Result
+	var err error
+	if argv[0] == "git" {
+		res, err = execution.RunReadOnlyGit(ctx, argv, request)
+	} else {
+		res, err = execution.RunArgv(ctx, argv, request)
 	}
-	res, err := execution.RunArgv(ctx, actualArgv, execution.Request{Context: ctx, Dir: workspace,
-		Sandbox: sb, Env: env, OutputLimit: 512 * 1024})
 	if err != nil {
 		return strings.TrimSpace(res.Output), err
 	}

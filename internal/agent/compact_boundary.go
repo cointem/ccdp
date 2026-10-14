@@ -1,6 +1,8 @@
 package agent
 
-import "ccdp/internal/messages"
+import (
+	"ccdp/internal/messages"
+)
 
 func estimateHistoryTokens(history []messages.Message) int {
 	total := 0
@@ -42,6 +44,26 @@ func compactCut(history []messages.Message, keep, budget int) int {
 	for _, boundary := range boundaries {
 		if boundary >= cut && suffix[cut] > budget {
 			cut = boundary
+		}
+	}
+	return cut
+}
+
+// compactAttachmentCut advances only across complete tool groups.
+func compactAttachmentCut(history []messages.Message, cut int, budget int64) int {
+	pending := map[string]bool{}
+	for i, message := range history {
+		for _, call := range message.ToolCalls {
+			pending[call.ID] = true
+		}
+		if message.Role == messages.RoleTool {
+			delete(pending, message.ToolCallID)
+		}
+		if i+1 >= cut && len(pending) == 0 {
+			cut = i + 1
+			if historyAttachmentBytes(history[cut:]) <= budget {
+				return cut
+			}
 		}
 	}
 	return cut

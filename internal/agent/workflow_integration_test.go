@@ -55,13 +55,10 @@ func newWorkflowTestSetupAt(t *testing.T, workspace string, permission permissio
 		t.Setenv("CCDP_WORKFLOW_READY", ready)
 	}
 
-	events := make(chan Event, 256)
-	ag, err := New(&cfg, events)
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	// Cleanup is LIFO: close the runtime before its legacy event channel.
-	t.Cleanup(func() { close(events) })
 	t.Cleanup(func() { _ = ag.CloseContext(context.Background()) })
 	return workflowTestSetup{ag: ag, log: logPath}
 }
@@ -165,7 +162,10 @@ func readWorkflowOutput(t *testing.T, setup workflowTestSetup, completed session
 	if completed.Output == nil {
 		t.Fatal("workflow completion has no output artifact")
 	}
-	artifacts := setup.ag.persistenceHandle().Artifacts()
+	artifacts, err := setup.ag.persistenceHandle().RequestArtifacts()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if artifacts == nil {
 		t.Fatal("workflow completion has no artifact store")
 	}

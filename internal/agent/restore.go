@@ -1,13 +1,15 @@
 package agent
 
-import "ccdp/internal/session"
+import (
+	"ccdp/internal/session"
+)
 
 // restoreDiscoveredFromStore rebuilds deferred-tool discovery from typed
 // ToolsDiscovered facts.  The diagnostics stream is intentionally ignored:
 // text matching a trace line cannot prove that a schema was admitted.
 func (a *Agent) restoreDiscoveredFromStore() {
 	a.mu.Lock()
-	p := a.persistence
+	p := a.services.persistence
 	a.mu.Unlock()
 	if p == nil {
 		return

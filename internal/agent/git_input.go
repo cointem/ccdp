@@ -2,7 +2,6 @@ package agent
 
 import (
 	"bytes"
-	"ccdp/internal/protocol"
 	"context"
 	"errors"
 	"os"
@@ -10,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"ccdp/internal/protocol"
 )
 
 // reviewObjects discovers metadata only; selection and quotas precede blob I/O.

@@ -13,7 +13,7 @@ type composerState struct {
 	pasteRequest         protocol.CommandID
 	inputImages          []protocol.InputImage
 	selectedImage        int
-	retryImages          []protocol.InputImage
+	inputRetry           *inputRetry
 	historyImages        map[int][]protocol.InputImage
 	expiredHistoryImages map[int]bool
 	missingHistoryImages bool
@@ -41,7 +41,15 @@ type composerState struct {
 
 // composerDraft preserves the unsent input while browsing submitted history.
 type composerDraft struct {
-	text   string
-	images []protocol.InputImage
-	paste  *pasteFoldState
+	text          string
+	images        []protocol.InputImage
+	paste         *pasteFoldState
+	missingImages bool
+}
+
+// replay distinguishes an unknown transport outcome from a confirmed refusal.
+// The retained command is immutable and contains the complete submitted input.
+type inputRetry struct {
+	command protocol.Command
+	replay  bool
 }

@@ -4,9 +4,11 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"ccdp/internal/protocol"
+	"ccdp/internal/sessionview"
 )
 
 func TestStreamPublicationCoalescesAndFlushesFinalTail(t *testing.T) {
@@ -25,10 +27,14 @@ func TestStreamPublicationCoalescesAndFlushesFinalTail(t *testing.T) {
 	a.publishEvent(Event{Type: EventStatus, Text: "finished reasoning"})
 	count := 0
 	var latest *protocol.TranscriptItem
+	deadline := time.After(2 * time.Second)
 drain:
 	for {
 		select {
-		case update := <-sub.Updates():
+		case update, ok := <-sub.Updates():
+			if !ok {
+				t.Fatal("observation ended before final status")
+			}
 			if update.Type == protocol.UpdateResyncRequired {
 				t.Fatal("stream flooded subscriber")
 			}
@@ -36,8 +42,11 @@ drain:
 				count++
 				latest = update.Event.Transcript
 			}
-		default:
-			break drain
+			if update.Event != nil && update.Event.Kind == protocol.EventStatus && update.Event.Text == "finished reasoning" {
+				break drain
+			}
+		case <-deadline:
+			t.Fatal("owner did not flush final stream before status")
 		}
 	}
 	if count > 20 {
@@ -49,9 +58,9 @@ drain:
 }
 
 func BenchmarkLongReasoningWindow(b *testing.B) {
-	tr := &transcriptState{}
+	tr := &sessionview.Transcript{}
 	ev := protocol.EventView{Kind: protocol.EventReasoning, TurnID: "1", Text: strings.Repeat("x", 32)}
 	for i := 0; i < b.N; i++ {
-		tr.event(ev)
+		tr.Event(ev)
 	}
 }

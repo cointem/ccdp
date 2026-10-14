@@ -16,6 +16,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session"
 	"ccdp/internal/tools"
 )
 
@@ -48,15 +49,15 @@ func TestQuestionRoundTripAndReasoningWire(t *testing.T) {
 	cfg.Workspace, cfg.SessionDir = t.TempDir(), t.TempDir()
 	cfg.BaseURL, cfg.Model = server.URL, "deepseek-test"
 	cfg.ReasoningEffort, cfg.Verbosity = "high", "low"
-	events := make(chan Event, 128)
-	ag, err := New(&cfg, events)
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ag.Close()
+	events := watchTestEvents(t, ag)
 	go ag.Run()
 	submitTestInput(t, ag, "Build a database app")
-	seen := drainUntil(t, events, 5*time.Second, func(ev Event) bool { return ev.Type == EventQuestion })
+	seen := drainUntil(t, events, 5*time.Second, func(ev protocol.EventView) bool { return ev.Kind == protocol.EventQuestionRequest })
 	request := seen[len(seen)-1].Question
 	if request == nil {
 		t.Fatal("missing question")
@@ -83,7 +84,7 @@ func TestQuestionRoundTripAndReasoningWire(t *testing.T) {
 	if !submitAnswer("duplicate", answer).Rejected() {
 		t.Fatal("duplicate answer accepted")
 	}
-	drainUntil(t, events, 5*time.Second, func(ev Event) bool { return ev.Type == EventTurnDone })
+	drainUntil(t, events, 5*time.Second, func(ev protocol.EventView) bool { return ev.Kind == protocol.EventTurnDone })
 	first, second := <-requests, <-requests
 	if first.ReasoningEffort != "high" || first.Verbosity != "low" || first.Thinking == nil || first.Thinking.Type != "enabled" {
 		t.Fatalf("missing generation controls: %+v", first)
@@ -102,7 +103,7 @@ func TestQuestionRoundTripAndReasoningWire(t *testing.T) {
 		t.Fatalf("second request lost reasoning/answer: %+v", second.Messages)
 	}
 	// The durable message round trip also preserves provider reasoning.
-	for _, msg := range ag.history {
+	for _, msg := range ag.conversation.durable.History {
 		if msg.ReasoningContent == "" {
 			continue
 		}
@@ -110,7 +111,7 @@ func TestQuestionRoundTripAndReasoningWire(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		restored, err := messageFromSession(typed)
+		restored, err := session.DecodeMessage(typed)
 		if err != nil || restored.ReasoningContent != msg.ReasoningContent {
 			t.Fatalf("reasoning replay: %+v %v", restored, err)
 		}
@@ -124,7 +125,7 @@ func TestQuestionPlanCapabilityAndCancellation(t *testing.T) {
 	if !planAllowedImplementation(tool) || readOnlyImplementation(tool) {
 		t.Fatal("question must be a plan-allowed serial barrier")
 	}
-	if decision, _ := ag.perms.CheckExecution(permissions.ExecutionModePlan, tool.Name(), nil); decision != permissions.DecisionAllow {
+	if decision, _ := ag.services.perms.Check(tool.Name(), nil, toolKind(tool)); decision != permissions.DecisionAllow {
 		t.Fatal("plan mode denied clarification")
 	}
 	raw, _ := json.Marshal(map[string]any{"questions": clarificationQuestions()})
@@ -176,7 +177,7 @@ func TestGenerationSettingsPersistResetAndFreeze(t *testing.T) {
 	if snapshot.Settings.ReasoningEffort != "max" || snapshot.Settings.Verbosity != "low" {
 		t.Fatal("settings not published")
 	}
-	frozen := cloneConfig(ag.cfg)
+	frozen := cloneConfig(ag.services.cfg)
 	req := ag.buildRequestFromConfig(frozen, "openai-test", "test", nil, false, nil)
 	if req.ReasoningEffort != "max" || req.Verbosity != "low" {
 		t.Fatal("request lost settings")

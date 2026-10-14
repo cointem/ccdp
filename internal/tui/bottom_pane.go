@@ -144,7 +144,7 @@ func (m *Model) pendingDecisionSummary() string {
 	}
 	if m.routing != nil {
 		for _, child := range m.routing.rows {
-			if childAwaitingApproval(child) && string(child.SessionID) != m.sessionID {
+			if childNeedsAttention(child) && string(child.SessionID) != m.sessionID {
 				n++
 			}
 		}
@@ -165,7 +165,7 @@ func (m *Model) openPendingDecision() tea.Cmd {
 		m.approvalSelected = false
 		return nil
 	}
-	if child := m.pendingChildApproval(); child != nil {
+	if child := m.pendingChildInteraction(); child != nil {
 		return m.openAgentView(string(child.SessionID))
 	}
 	m.pushStatus("no pending decisions")

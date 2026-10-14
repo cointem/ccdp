@@ -75,7 +75,7 @@ func TestNewConcurrentAgentsHaveUniqueSessionIDs(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			a, err := NewWithOptions(&cfg, nil, Options{
+			a, err := testNewWithOptions(t, &cfg, Options{
 				EffectiveConfigFrozen: true,
 				ProviderRegistry:      models,
 			})

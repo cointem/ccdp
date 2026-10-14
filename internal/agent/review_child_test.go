@@ -72,7 +72,7 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 			cfg.APIKey, cfg.Model, cfg.PermissionMode = "test", "fake", "bypass"
 			cfg.EnableGuardian, cfg.EnableMemory, cfg.AutomaticCheckpoints = config.BoolPtr(false), config.BoolPtr(false), config.BoolPtr(false)
 			cfg.MCPServers = nil
-			a, err := New(&cfg, nil)
+			a, err := testNew(t, &cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -203,13 +203,13 @@ func TestReviewChildReportSurvivesRestart(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("children: %v %v", rows, err)
 	}
-	cfg, id := cloneConfig(a.cfg), a.SessionID()
+	cfg, id := cloneConfig(a.services.cfg), a.SessionID()
 	a.Close()
 	snap, err := LoadSession(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := Resume(&cfg, snap, nil)
+	resumed, err := Resume(&cfg, snap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,16 +239,16 @@ func TestReviewApprovalDoesNotReplaceParentDecision(t *testing.T) {
 	sid := protocol.SessionID(newSessionID())
 	r := &managedRun{parent: a, done: done, cancel: func() {}, opts: Options{Permissions: permissions.NewManager(permissions.ModeDefault, permissions.Policy{})},
 		fact: session.ChildRunRecorded{Child: protocol.ChildSession{SessionID: sid, ParentSessionID: protocol.SessionID(a.SessionID()), Purpose: childPurposeReview, Run: protocol.RunView{ID: "approval-review", Status: "starting", WaitPolicy: "observe"}}}}
-	a.supervisor.mu.Lock()
-	a.supervisor.children[sid] = r
-	a.supervisor.mu.Unlock()
-	defer func() { a.supervisor.mu.Lock(); delete(a.supervisor.children, sid); a.supervisor.mu.Unlock() }()
+	a.services.supervisor.directory.Restore(r.fact.Child, r, true)
+	defer func() {
+		a.services.supervisor.directory.Forget(sid)
+	}()
 	a.mu.Lock()
-	a.pendingApproval = &ApprovalRequest{ID: "main-decision", Tool: "Bash"}
+	a.decisions.pendingApproval = &ApprovalRequest{ID: "main-decision", Tool: "Bash"}
 	a.mu.Unlock()
 	result := make(chan error, 1)
 	go func() {
-		result <- a.supervisor.authorizeReviewGit(r, ctx, map[string]any{"command": "requires-explicit-approval"})
+		result <- a.services.supervisor.authorizeReviewGit(r, ctx, map[string]any{"command": "requires-explicit-approval"})
 	}()
 	var approvalID string
 	for approvalID == "" {
@@ -278,8 +278,8 @@ func TestReviewApprovalDoesNotReplaceParentDecision(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.mu.Lock()
-	unchanged := a.pendingApproval != nil && a.pendingApproval.ID == "main-decision"
-	a.pendingApproval = nil
+	unchanged := a.decisions.pendingApproval != nil && a.decisions.pendingApproval.ID == "main-decision"
+	a.decisions.pendingApproval = nil
 	a.mu.Unlock()
 	if !unchanged {
 		t.Fatal("review replaced the main decision")

@@ -22,9 +22,34 @@ Go/Bubble Tea; the Codex reference and attribution live in `third_party/codex`.
 | `PanelManager` / `Selector` | Shared display/focus priority and one typed selection/scroll state. Approval scrolling also has one state; opening a decision visibly focuses the first choice (Allow once / Approve plan). |
 | `frameChrome` / layout | Shared measurement and rendering inputs, native chat history, full-height cached transcript viewport with bottom-anchored controls and explicit alternate-screen readers. |
 
+Watch begins with a complete `SessionView` and sends `SessionState` for ordinary
+updates. State explicitly replaces decisions, usage, phase, goal and the bounded
+transcript window; `nil` decisions mean cleared. History and catalog are not
+copied into every state update. Catalog replacements travel separately when
+settings or registered tools change. `HistoryLength` supplies the current count;
+full history is read only through an explicit snapshot/history operation.
+The current workspace travels in `SettingsSnapshot.Workspace`; path completion,
+custom commands and relative links follow that confirmed state, including when
+viewing an isolated child. A command receipt or status string does not change
+the working directory locally.
+`OutstandingWork` is runtime-owned and includes running child tasks and results
+awaiting delivery, so clients do not inspect concrete Agent methods to decide
+whether execution has finished.
+
 The root `Model` is the Bubble Tea reducer: it coordinates effects between these
 owners. Retaining reducer methods on `Model` does not introduce a second state
 owner. Runtime objects are not imported into rendering/input/protocol modules.
+
+Input operations retain the complete submitted command. An explicit refusal
+restores the draft for a new admission attempt with a new identity. A transport
+failure retains the original envelope for an explicit idempotent retry, including
+its input strategy, images and expected run. History arrows and reverse search
+recall text, attachments and attachment expiry through the same entry index.
+
+Untrusted display metadata is sanitized after decoding structured data and
+before terminal styling. Original source remains available to readers and
+export; the terminal host preserves trusted renderer controls and does not
+sanitize complete frames.
 
 ## Removed migration paths
 
@@ -80,7 +105,7 @@ SpawnAgent cards use supervisor projections for live child status. WaitAgent() h
 
 The footer shows `cache N%` beside context usage. This is the token-weighted
 cache read ratio across requests owned by the viewed session, excluding child
-usage folded into billing totals. It survives resume and compaction. The context
+usage folded into token totals. It survives resume and compaction. The context
 popover shows the numerator/denominator and scope. `cache —` means no input usage;
 `cache ?` means missing/partial provider reporting or legacy history without
 cache-presence metadata. An explicit cached-token count of zero shows `cache 0%`.

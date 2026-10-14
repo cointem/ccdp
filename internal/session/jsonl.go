@@ -2,7 +2,6 @@ package session
 
 import (
 	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,9 +15,8 @@ import (
 )
 
 const (
-	eventsFileName   = "events.v1.jsonl"
-	writerLockName   = "writer.lock"
-	snapshotFileName = "snapshot.json"
+	eventsFileName = "events.v1.jsonl"
+	writerLockName = "writer.lock"
 )
 
 // JSONLStore is a single-writer append-only session log.  A writer handle
@@ -308,102 +306,11 @@ func (s *JSONLStore) RecoveryReport() RecoveryReport {
 	return s.recovery
 }
 
-// SkippedRecords returns the durable events replay could not decode because
-// this build has no type for them. The log remains readable and appendable; the
-// list exists so callers can tell the user that some history was not shown.
-func (s *JSONLStore) SkippedRecords() []SkippedRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.state.Skipped) == 0 {
-		return nil
-	}
-	return append([]SkippedRecord(nil), s.state.Skipped...)
-}
+func (s *JSONLStore) SessionID() string { return s.sessionID }
 
-func (s *JSONLStore) SessionID() string  { return s.sessionID }
-func (s *JSONLStore) Dir() string        { return s.dir }
+func (s *JSONLStore) Dir() string { return s.dir }
+
 func (s *JSONLStore) EventsPath() string { return s.eventsPath }
-
-type snapshotDisk struct {
-	SchemaVersion uint32    `json:"schema_version"`
-	SessionID     string    `json:"session_id"`
-	LastSeq       Cursor    `json:"last_seq"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	Data          []byte    `json:"data,omitempty"`
-}
-
-func (s *JSONLStore) Snapshot() (Snapshot, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return Snapshot{}, ErrClosed
-	}
-	data, err := os.ReadFile(filepath.Join(s.dir, snapshotFileName))
-	if errors.Is(err, os.ErrNotExist) {
-		return Snapshot{}, ErrSnapshotNotFound
-	}
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("session: read snapshot: %w", err)
-	}
-	var disk snapshotDisk
-	if err := decodeStrict(data, &disk); err != nil {
-		return Snapshot{}, fmt.Errorf("%w: %v", ErrSnapshotInvalid, err)
-	}
-	if disk.SchemaVersion > SchemaVersion {
-		return Snapshot{}, fmt.Errorf("%w: snapshot schema_version %d", ErrFutureVersion, disk.SchemaVersion)
-	}
-	if disk.SchemaVersion != SchemaVersion || disk.SessionID != s.sessionID || disk.UpdatedAt.IsZero() {
-		return Snapshot{}, fmt.Errorf("%w: snapshot metadata", ErrSnapshotInvalid)
-	}
-	if disk.LastSeq > s.state.Cursor {
-		return Snapshot{}, fmt.Errorf("%w: last_seq %d exceeds log cursor %d", ErrSnapshotInvalid, disk.LastSeq, s.state.Cursor)
-	}
-	return Snapshot{SchemaVersion: disk.SchemaVersion, SessionID: disk.SessionID, LastSeq: disk.LastSeq, UpdatedAt: disk.UpdatedAt, Data: copyBytes(disk.Data)}, nil
-}
-
-func (s *JSONLStore) SaveSnapshot(snapshot Snapshot) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return ErrClosed
-	}
-	if s.readOnly {
-		return ErrReadOnly
-	}
-	if snapshot.SchemaVersion == 0 {
-		snapshot.SchemaVersion = SchemaVersion
-	}
-	if snapshot.SchemaVersion > SchemaVersion {
-		return ErrFutureVersion
-	}
-	if snapshot.SchemaVersion != SchemaVersion {
-		return ErrSnapshotInvalid
-	}
-	if snapshot.SessionID == "" {
-		snapshot.SessionID = s.sessionID
-	}
-	if snapshot.SessionID != s.sessionID {
-		return fmt.Errorf("%w: snapshot session ID %q", ErrSnapshotInvalid, snapshot.SessionID)
-	}
-	if snapshot.LastSeq > s.state.Cursor {
-		return &CursorConflictError{Expected: snapshot.LastSeq, Actual: s.state.Cursor}
-	}
-	if snapshot.UpdatedAt.IsZero() {
-		snapshot.UpdatedAt = time.Now().UTC()
-	}
-	disk := snapshotDisk{SchemaVersion: snapshot.SchemaVersion, SessionID: snapshot.SessionID, LastSeq: snapshot.LastSeq, UpdatedAt: snapshot.UpdatedAt, Data: copyBytes(snapshot.Data)}
-	data, err := json.Marshal(disk)
-	if err != nil {
-		return err
-	}
-	if s.options.MaxTransactionBytes > 0 && int64(len(data)) > s.options.MaxTransactionBytes {
-		return fmt.Errorf("%w: snapshot is %d bytes, limit %d", ErrTooLarge, len(data), s.options.MaxTransactionBytes)
-	}
-	if err := atomicfile.WriteFileWithSync(filepath.Join(s.dir, snapshotFileName), data, 0o600, s.options.SyncFile, s.options.SyncDir); err != nil {
-		return err
-	}
-	return nil
-}
 
 func (s *JSONLStore) Close() error {
 	s.mu.Lock()
@@ -499,7 +406,7 @@ func readLog(path string, maxBytes int64) (logState, bool, *logTail, error) {
 			}
 		}
 		result := CommitResult{TransactionID: envelope.TransactionID, FirstSeq: envelope.FirstSeq, LastSeq: envelope.LastSeq, Cursor: envelope.LastSeq, Applied: true}
-		applyPrepared(&state, preparedCommit{TransactionID: envelope.TransactionID, InputFingerprint: envelope.InputFingerprint, Events: events, Wires: wires, Seqs: parsed.seqs, Skipped: parsed.skipped, Envelope: envelope, Result: result})
+		applyPrepared(&state, preparedCommit{TransactionID: envelope.TransactionID, InputFingerprint: envelope.InputFingerprint, Events: events, Wires: wires, Envelope: envelope, Result: result})
 		if !terminated {
 			noNewline = true
 		}

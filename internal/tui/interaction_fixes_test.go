@@ -159,9 +159,9 @@ func TestPendingChildApprovalInline(t *testing.T) {
 	m.sessionID = "root-session"
 	m.layout()
 
-	child := m.pendingChildApproval()
+	child := m.pendingChildInteraction()
 	if child == nil {
-		t.Fatal("expected pendingChildApproval to find child-worker-1")
+		t.Fatal("expected pendingChildInteraction to find child-worker-1")
 	}
 
 	view := sanitizeANSI(m.View())
@@ -183,12 +183,12 @@ func TestCompletedChildCannotLeavePhantomPendingApproval(t *testing.T) {
 		Approval: &protocol.ApprovalView{ID: "approval-1", Tool: "Bash"},
 	}}}
 	m.sessionID = "root-session"
-	if m.pendingChildApproval() == nil {
+	if m.pendingChildInteraction() == nil {
 		t.Fatal("expected active child approval")
 	}
 	m.applyChildUpdate(protocol.ChildSession{SessionID: "child-worker-1", Run: protocol.RunView{Status: "succeeded"},
 		Approval: &protocol.ApprovalView{ID: "approval-1", Tool: "Bash"}})
-	if m.pendingChildApproval() != nil || strings.Contains(m.pendingDecisionSummary(), "pending") {
+	if m.pendingChildInteraction() != nil || strings.Contains(m.pendingDecisionSummary(), "pending") {
 		t.Fatal("terminal child retained a phantom pending approval")
 	}
 }

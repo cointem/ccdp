@@ -499,23 +499,15 @@ func (m *Model) submitInput(strategy protocol.InputStrategy) (tea.Model, tea.Cmd
 
 	m.viewport.GotoBottom()
 	commandID := nextUICommandID()
-	if m.retryCommandID != "" && m.retryDraft == text && sameInputImages(m.retryImages, images) {
-		// A rejected/transport-failed input is the same user intent when the
-		// restored draft is submitted again; reuse its durable command id so a
-		// runtime dedupe cannot create a second message.
-		commandID = m.retryCommandID
-		m.retryCommandID = ""
-		m.retryDraft = ""
-		m.retryImages = nil
-		if m.receiptKeys != nil {
-			delete(m.receiptKeys, commandID)
-			for i, id := range m.receiptOrder {
-				if id == commandID {
-					m.receiptOrder = append(m.receiptOrder[:i], m.receiptOrder[i+1:]...)
-					break
-				}
-			}
+	if retry := m.inputRetry; retry != nil && retry.command.Input.Text == text && sameInputImages(retry.command.Input.Images, images) {
+		m.inputRetry = nil
+		if retry.replay {
+			// A transport failure has an unknown result. Replay the entire frozen
+			// envelope, including the original strategy and expected run.
+			m.forgetReceipt(retry.command.ID)
+			return m, m.submitPreparedCommand(retry.command, "message submitted")
 		}
+		strategy = retry.command.Input.Strategy
 	}
 	cmd := protocol.NewSubmitInput(commandID, protocol.SessionID(m.sessionID), protocol.InputID(commandID), text, strategy)
 	cmd.Input.Images = images
@@ -542,7 +534,7 @@ func (m *Model) historyPrev() tea.Model {
 		return m
 	}
 	if m.historyIdx >= len(m.history) {
-		m.historyDraft = &composerDraft{text: m.textarea.Value(), images: cloneInputImages(m.inputImages), paste: clonePasteFold(m.pasteFold)}
+		m.historyDraft = &composerDraft{text: m.textarea.Value(), images: cloneInputImages(m.inputImages), paste: clonePasteFold(m.pasteFold), missingImages: m.missingHistoryImages}
 	}
 	if m.historyIdx <= 0 {
 		m.historyIdx = 1
@@ -551,12 +543,7 @@ func (m *Model) historyPrev() tea.Model {
 	if m.historyIdx < 0 {
 		m.historyIdx = 0
 	}
-	m.pasteFold = nil
-	m.textarea.SetValue(m.history[m.historyIdx])
-	m.recallHistoryImages()
-	m.textarea.CursorEnd()
-	m.syncInputHeight()
-	m.refreshCmdSuggest()
+	m.recallHistory(m.historyIdx)
 	return m
 }
 
@@ -571,9 +558,9 @@ func (m *Model) historyNext() tea.Model {
 			m.textarea.SetValue(m.historyDraft.text)
 			m.inputImages = m.historyDraft.images
 			m.pasteFold = m.historyDraft.paste
+			m.missingHistoryImages = m.historyDraft.missingImages
 			m.historyDraft = nil
-			m.missingHistoryImages = false
-			m.selectedImage = -1
+			m.selectedImage = max(0, len(m.inputImages)-1)
 		} else {
 			m.textarea.SetValue("")
 			m.recallHistoryImages()
@@ -584,11 +571,19 @@ func (m *Model) historyNext() tea.Model {
 		return m
 	}
 	m.historyIdx++
+	m.recallHistory(m.historyIdx)
+	return m
+}
+
+// Every history entry is recalled through its index, so text, attachments and
+// expiry state cannot come from different submissions.
+func (m *Model) recallHistory(index int) {
+	m.historyIdx = index
 	m.pasteFold = nil
-	m.textarea.SetValue(m.history[m.historyIdx])
+	m.textarea.SetValue(m.history[index])
 	m.recallHistoryImages()
 	m.textarea.CursorEnd()
 	m.syncInputHeight()
 	m.refreshCmdSuggest()
-	return m
+	m.refreshFileMention()
 }

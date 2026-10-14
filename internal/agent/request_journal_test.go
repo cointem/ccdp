@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -25,42 +24,43 @@ import (
 	"ccdp/internal/session"
 )
 
-func newJournalAgent(t *testing.T, memory bool) (*Agent, *sessionPersistence, *config.Config) {
+func newJournalAgent(t testing.TB, memory bool) (*Agent, *sessionPersistence, *config.Config) {
 	t.Helper()
 	root := t.TempDir()
 	cfg := config.Default()
 	cfg.Workspace = root
 	cfg.SessionDir = filepath.Join(root, "sessions")
 	cfg.Model = "journal-model"
-	cfg.Pricing = map[string]config.Pricing{"journal-model": {Input: 1, Output: 2}}
+
 	cfg.NoSessionPersistence = memory
-	p, err := openSessionPersistence(&cfg, "journal-session", time.Unix(1, 0).UTC())
+	backend := &journalTestBackend{}
+	p, err := openSessionPersistenceModeWithParent(&cfg, "journal-session", time.Unix(1, 0).UTC(), "agent", false, "", backend.options())
 	if err != nil {
 		t.Fatal(err)
 	}
 	a := &Agent{
-		deps: deps{
+		services: sessionServices{
 			cfg:         &cfg,
 			persistence: p,
 			perms:       permissions.NewManager(permissions.ModeDefault, permissions.Policy{}),
 			evbus:       events.NewBus(),
 		},
-		sessionData: sessionData{
+		conversation: conversationState{
 			sessionID: "journal-session",
 		},
-		seqState: seqState{
+		sequences: seqState{
 			settingsRev: 7,
 			contextRev:  9,
 			turnSeq:     2,
 			stepSeq:     4,
 		},
-		runtimeData: runtimeData{
-			eventQueue: make(chan Event, 8),
-			eventDone:  make(chan struct{}),
-		},
-		watchState: watchState{watchers: make(map[uint64]*runtimeWatcher)},
+		publications: watchState{},
 	}
-	t.Cleanup(func() { _ = p.close() })
+	if err := p.BindState(&a.conversation.durable, &a.mu); err != nil {
+		t.Fatal(err)
+	}
+	registerJournalBackend(t, p, backend)
+	t.Cleanup(func() { _ = p.Close() })
 	return a, p, &cfg
 }
 
@@ -128,7 +128,7 @@ func TestRequestJournalReconstructsExactWireMemoryAndDisk(t *testing.T) {
 			if err := a.finishRequestAttempt(attempt, llm.StreamResult{PromptTokens: 11, CompletionTok: 5, CachedTokens: 2, CacheReported: true}, nil); err != nil {
 				t.Fatal(err)
 			}
-			if got := a.Usage(); got.InputTokens != 11 || got.OutputTokens != 5 || got.CachedTokens != 2 || got.Cache.InputTokens != 11 || got.Cache.ReportedInputTokens != 11 || got.Cache.CachedTokens != 2 || got.TurnCount != 1 || math.Abs(got.Cost-0.000021) > 1e-15 {
+			if got := a.Usage(); got.InputTokens != 11 || got.OutputTokens != 5 || got.CachedTokens != 2 || got.Cache.InputTokens != 11 || got.Cache.ReportedInputTokens != 11 || got.Cache.CachedTokens != 2 || got.TurnCount != 1 {
 				t.Fatalf("live usage = %+v", got)
 			}
 			records, err := p.Read(session.Beginning)
@@ -191,10 +191,11 @@ func TestRequestJournalFailurePoisonsAdmissionButCancellationDoesNot(t *testing.
 	if got := a.persistenceFailure(); got != nil {
 		t.Fatalf("cancelled prepare poisoned persistence: %v", got)
 	}
-	p.mu.Lock()
-	underlying := p.store
-	p.store = failingCommitStore{Store: underlying}
-	p.mu.Unlock()
+	backend := journalBackend(t, p)
+	backend.mu.Lock()
+	underlying := backend.store
+	backend.store = failingCommitStore{Store: underlying}
+	backend.mu.Unlock()
 	if _, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest()); !errors.Is(err, session.ErrPersistenceFailed) {
 		t.Fatalf("failed RequestPrepared err=%v", err)
 	}
@@ -215,8 +216,8 @@ func TestRequestJournalAttemptErrorRedactsURLAndConfiguredKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.mu.Lock()
-	a.tokenBaseline.promptTokens = 99
-	a.tokenBaseline.historyLen = 77
+	a.turnMemory.tokenBaseline.promptTokens = 99
+	a.turnMemory.tokenBaseline.historyLen = 77
 	a.mu.Unlock()
 	networkErr := &url.Error{Op: "Post", URL: "https://user:pass@example.test/v1/chat?api_key=provider-secret&foo=query-secret", Err: errors.New("Authorization: Bearer provider-secret")}
 	if err := a.finishRequestAttempt(attempt, llm.StreamResult{}, networkErr); err != nil {
@@ -235,7 +236,7 @@ func TestRequestJournalAttemptErrorRedactsURLAndConfiguredKey(t *testing.T) {
 				t.Fatalf("safe endpoint context lost: %q", event.Attempt.Error)
 			}
 			a.mu.Lock()
-			baseline := a.tokenBaseline
+			baseline := a.turnMemory.tokenBaseline
 			a.mu.Unlock()
 			if baseline.promptTokens != 99 || baseline.historyLen != 77 {
 				t.Fatalf("failed attempt changed token baseline: %+v", baseline)
@@ -251,7 +252,7 @@ func TestRequestJournalCapturesStepMetadataBeforeFinish(t *testing.T) {
 	cfg.Providers = map[string]config.ProviderConfig{
 		"provider-a": {BaseURL: "https://example.test/v1", APIKey: "frozen-key", Models: []string{"journal-model"}},
 	}
-	cfg.Pricing = map[string]config.Pricing{"journal-model": {Input: 3, Output: 5}}
+
 	stepConfig := cloneConfig(cfg)
 	ctx := withRequestJournalMetadata(context.Background(), requestJournalMetadata{
 		Config: stepConfig, SettingsRevision: 8, Turn: 4, Step: 5, HistoryLen: 19,
@@ -261,32 +262,31 @@ func TestRequestJournalCapturesStepMetadataBeforeFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.mu.Lock()
-	a.cfg.Pricing["journal-model"] = config.Pricing{Input: 100, Output: 100}
-	a.cfg.Providers["provider-a"] = config.ProviderConfig{APIKey: "live-key", Models: []string{"journal-model"}}
-	a.history = append(a.history, messages.Message{Content: "future history"})
+	a.services.cfg.Providers["provider-a"] = config.ProviderConfig{APIKey: "live-key", Models: []string{"journal-model"}}
+	a.conversation.durable.History = append(a.conversation.durable.History, messages.Message{Content: "future history"})
 	a.mu.Unlock()
 	if err := a.finishRequestAttempt(attempt, llm.StreamResult{PromptTokens: 2, CompletionTok: 4}, nil); err != nil {
 		t.Fatal(err)
 	}
 	got := a.Usage()
-	if math.Abs(got.Cost-0.000026) > 1e-15 {
-		t.Fatalf("finish used live pricing instead of step pricing: %+v", got)
+	if got.InputTokens != 2 || got.OutputTokens != 4 {
+		t.Fatalf("wrong token usage: %+v", got)
 	}
 	a.mu.Lock()
-	baseline := a.tokenBaseline
+	baseline := a.turnMemory.tokenBaseline
 	a.mu.Unlock()
 	if baseline.promptTokens != 2 || baseline.historyLen != 19 {
 		t.Fatalf("finish used live history baseline: %+v", baseline)
 	}
 }
 
-func TestRequestJournalUsageSubscriberCanSave(t *testing.T) {
+func TestRequestJournalUsageSubscriberCanPersist(t *testing.T) {
 	a, _, _ := newJournalAgent(t, false)
 	called := false
 	var saveErr error
-	a.evbus.Subscribe(events.TopicUsageUpdated, func(events.Topic, events.Payload) {
+	a.services.evbus.Subscribe(events.TopicUsageUpdated, func(events.Topic, events.Payload) {
 		called = true
-		saveErr = a.Save()
+		saveErr = a.persistWorkflowFact(session.WorkflowState{})
 	})
 	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest())
 	if err != nil {
@@ -299,7 +299,7 @@ func TestRequestJournalUsageSubscriberCanSave(t *testing.T) {
 		t.Fatal("usage subscriber was not called")
 	}
 	if saveErr != nil {
-		t.Fatalf("usage subscriber could not re-enter Save: %v", saveErr)
+		t.Fatalf("usage subscriber could not re-enter persistence: %v", saveErr)
 	}
 }
 
@@ -312,7 +312,7 @@ func TestLoadSessionReplaysCreatedParentID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := child.close(); err != nil {
+	if err := child.Close(); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := LoadSession(cfg.SessionDir, "child-session")
@@ -377,7 +377,7 @@ func newJournalRuntimeAgent(t *testing.T, provider llm.Provider) *Agent {
 	registry := plugin.NewModelRegistry()
 	registry.Register(provider)
 	registry.Route(cfg.Model, provider.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,13 +422,14 @@ func TestRequestJournalFailureStopsRealLoop(t *testing.T) {
 			provider := &requestJournalGateProvider{}
 			a := newJournalRuntimeAgent(t, provider)
 			a.mu.Lock()
-			a.fallbackBinding = modelBinding{model: "fallback-model", provider: provider.Name(), client: provider}
-			a.cfg.FallbackModel = "fallback-model"
+			a.modelsState.fallbackBinding = modelBinding{model: "fallback-model", provider: provider.Name(), client: provider}
+			a.services.cfg.FallbackModel = "fallback-model"
 			a.mu.Unlock()
 			persistence := a.persistenceHandle()
-			persistence.mu.Lock()
-			persistence.store = requestJournalFailEventStore{Store: persistence.store, event: kind}
-			persistence.mu.Unlock()
+			backend := journalBackend(t, persistence)
+			backend.mu.Lock()
+			backend.store = requestJournalFailEventStore{Store: backend.store, event: kind}
+			backend.mu.Unlock()
 			submitJournalRuntimeInput(t, a)
 			view := waitJournalRuntimeIdle(t, a)
 			wantCalls := int32(0)
@@ -470,11 +471,13 @@ func TestSessionCacheWeightedPersistedAndExcludesChildUsage(t *testing.T) {
 		t.Fatalf("wrong weighted counters: %+v", want)
 	}
 	run := &managedRun{parent: a, fact: session.ChildRunRecorded{Version: 1, Child: protocol.ChildSession{
-		SessionID: "child", RootSessionID: protocol.SessionID(a.sessionID), ParentSessionID: protocol.SessionID(a.sessionID),
+		SessionID: "child", RootSessionID: protocol.SessionID(a.conversation.sessionID), ParentSessionID: protocol.SessionID(a.conversation.sessionID),
 		DelegationID: "cache-test", Purpose: childPurposeTask,
 		Run: protocol.RunView{ID: "cache-run", Status: "succeeded", WaitPolicy: "join", Usage: protocol.UsageSnapshot{InputTokens: 500, CachedTokens: 50, TurnCount: 1}},
 	}}}
-	if err := a.supervisor.recordOutcome(run); err != nil {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if err := a.services.supervisor.recordOutcome(run); err != nil {
 		t.Fatal(err)
 	}
 	if a.Usage().Cache != want {

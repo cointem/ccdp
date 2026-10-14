@@ -68,7 +68,7 @@ func LanguageQuery(ctx context.Context, root, path, operation string, line, char
 	if e != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 		return nil, errors.New("LSP document must be inside workspace")
 	}
-	f, e := fsops.OpenRegular(root, resolved)
+	f, e := fsops.OpenAuthorizedRegular(root, resolved, policy.ResolveRead)
 	if e != nil {
 		return nil, e
 	}

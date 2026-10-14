@@ -40,23 +40,20 @@ func TestAgentPersistenceProjectionRoundTrip(t *testing.T) {
 		{Role: messages.RoleAssistant, ToolCalls: []messages.ToolCall{{ID: "call-1", Name: "Read", Arguments: map[string]any{"file_path": "x"}}}, CreatedAt: time.Unix(103, 0).UTC()},
 		{Role: messages.RoleTool, ToolCallID: "call-1", Content: "ok", CreatedAt: time.Unix(104, 0).UTC()},
 	}
-	if err := p.persistSettingsSnapshot(session.Settings{Workspace: cfg.Workspace, Model: cfg.Model}, 1); err != nil {
+	if err := p.PersistSettingsSnapshot(session.Settings{Workspace: cfg.Workspace, Model: cfg.Model}, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.persistUsage(Usage{InputTokens: 12, OutputTokens: 7, CachedTokens: 2, Cost: 0.75, TurnCount: 3}); err != nil {
+	if err := p.persistUsage(Usage{InputTokens: 12, OutputTokens: 7, CachedTokens: 2, TurnCount: 3}); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.persistInputQueued("queued-1", "later", "followup", "", created); err != nil {
+	if err := p.PersistInputQueued("queued-1", "later", "followup", "", created); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.persistHistoryMessages(history, "turn-1"); err != nil {
+	if err := p.PersistHistoryMessages(history, "turn-1"); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := SessionSnapshot{ID: "round-trip", CreatedAt: time.Unix(100, 0).UTC(), UpdatedAt: time.Unix(105, 0).UTC(), Workspace: cfg.Workspace, Model: cfg.Model, History: history, Usage: Usage{InputTokens: 12, OutputTokens: 7, CachedTokens: 2, Cost: 0.75, TurnCount: 3}, Pending: []string{"later"}}
-	if err := p.saveProjection(snapshot); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.close(); err != nil {
+	snapshot := SessionSnapshot{ID: "round-trip", CreatedAt: time.Unix(100, 0).UTC(), UpdatedAt: time.Unix(105, 0).UTC(), Workspace: cfg.Workspace, Model: cfg.Model, History: history, Usage: Usage{InputTokens: 12, OutputTokens: 7, CachedTokens: 2, TurnCount: 3}}
+	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -81,8 +78,8 @@ func TestAgentPersistenceProjectionRoundTrip(t *testing.T) {
 	if got.History[3].ToolCalls[0].Name != "Read" || got.History[3].ToolCalls[0].Arguments["file_path"] != "x" {
 		t.Fatalf("tool call was not preserved: %+v", got.History[3])
 	}
-	if len(got.Pending) != 1 || got.Pending[0] != "later" {
-		t.Fatalf("pending = %v", got.Pending)
+	if len(got.PendingInputs) != 1 || got.PendingInputs[0].Text != "later" {
+		t.Fatalf("pending = %v", got.PendingInputs)
 	}
 	if len(got.PendingInputs) != 1 || got.PendingInputs[0].ID != "queued-1" || got.PendingInputs[0].Strategy != protocol.InputFollowup {
 		t.Fatalf("typed pending = %+v", got.PendingInputs)
@@ -90,8 +87,8 @@ func TestAgentPersistenceProjectionRoundTrip(t *testing.T) {
 	if got.Usage != snapshot.Usage {
 		t.Fatalf("usage = %+v, want %+v", got.Usage, snapshot.Usage)
 	}
-	if _, err := os.Stat(filepath.Join(cfg.SessionDir, "round-trip", "snapshot.json")); err != nil {
-		t.Fatalf("snapshot cache missing: %v", err)
+	if _, err := os.Stat(filepath.Join(cfg.SessionDir, "round-trip", "snapshot.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected snapshot cache: %v", err)
 	}
 }
 
@@ -104,7 +101,7 @@ func TestSessionPersistenceLockReleasedByClose(t *testing.T) {
 	if _, err := session.OpenJSONLStore(cfg.SessionDir, "locked"); !errors.Is(err, session.ErrWriterLocked) {
 		t.Fatalf("second writer err = %v, want ErrWriterLocked", err)
 	}
-	if err := p.close(); err != nil {
+	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
 	second, err := session.OpenJSONLStore(cfg.SessionDir, "locked")
@@ -131,7 +128,7 @@ func TestFlatJSONSessionIsNotImportedOrModified(t *testing.T) {
 	if _, err := LoadSession(cfg.SessionDir, "retired"); err == nil {
 		t.Fatal("flat JSON loaded as a current session")
 	}
-	if a, err := Resume(&cfg, &SessionSnapshot{ID: "retired"}, nil); err == nil {
+	if a, err := Resume(&cfg, &SessionSnapshot{ID: "retired"}); err == nil {
 		a.Close()
 		t.Fatal("resume created a session instead of rejecting missing JSONL")
 	}
@@ -174,11 +171,11 @@ func TestNewRefusesExistingSessionAndResumeUsesProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.close(); err != nil {
+	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
 	cfg.SessionID = "existing"
-	if ag, err := New(&cfg, make(chan Event, 4)); err == nil {
+	if ag, err := testNew(t, &cfg); err == nil {
 		ag.Close()
 		t.Fatal("New attached to an existing session")
 	}
@@ -186,7 +183,7 @@ func TestNewRefusesExistingSessionAndResumeUsesProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ag, err := Resume(&cfg, snap, make(chan Event, 4))
+	ag, err := Resume(&cfg, snap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,14 +195,11 @@ func TestNewRefusesExistingSessionAndResumeUsesProjection(t *testing.T) {
 
 func TestOpenSessionPreparesIndependentHandleWithoutMutatingSource(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	source, err := New(&cfg, make(chan Event, 8))
+	source, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	source.appendHistory(messages.Message{Role: messages.RoleAssistant, Content: "source", CreatedAt: time.Unix(650, 0).UTC()})
-	if err := source.Save(); err != nil {
-		t.Fatal(err)
-	}
 	sourceID := source.SessionID()
 	if err := source.closePersistence(); err != nil {
 		t.Fatal(err)
@@ -230,20 +224,17 @@ func TestOpenSessionPreparesIndependentHandleWithoutMutatingSource(t *testing.T)
 
 func TestOpenSessionLockFailureLeavesSourceUntouched(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	source, err := New(&cfg, nil)
+	source, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer source.Close()
 	source.appendHistory(messages.Message{Role: messages.RoleUser, Content: "source", CreatedAt: time.Unix(675, 0).UTC()})
-	if err := source.Save(); err != nil {
-		t.Fatal(err)
-	}
 	oldID := source.SessionID()
 	oldCfg := source.configSnapshot()
 	oldHistory := source.History()
 
-	target, err := New(&cfg, nil)
+	target, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,12 +260,13 @@ func TestOpenSessionLockFailureLeavesSourceUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSession after target close: %v", err)
 	}
-	if opened.events != nil {
-		t.Fatal("opened session inherited source event channel")
+	view, err := opened.Snapshot(context.Background())
+	if err != nil || view.SessionID != protocol.SessionID(targetID) {
+		t.Fatalf("opened view identity = %s: %v", view.SessionID, err)
 	}
 	openedCfg := opened.configSnapshot()
 	openedCfg.Model = "changed-only-in-opened"
-	opened.cfg.Model = openedCfg.Model
+	opened.services.cfg.Model = openedCfg.Model
 	if source.configSnapshot().Model == openedCfg.Model {
 		t.Fatal("opened config aliases source config")
 	}
@@ -285,7 +277,7 @@ func TestOpenSessionLockFailureLeavesSourceUntouched(t *testing.T) {
 
 func TestSessionCloseResumeCloseUsesDistinctLifecycleTransactions(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	first, err := New(&cfg, nil)
+	first, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +290,7 @@ func TestSessionCloseResumeCloseUsesDistinctLifecycleTransactions(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := Resume(&cfg, snapshot, nil)
+	second, err := Resume(&cfg, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,13 +331,13 @@ func TestHistoryClearDoesNotResurrectOldProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	history := []messages.Message{{Role: messages.RoleUser, Content: "a", CreatedAt: time.Unix(701, 0).UTC()}, {Role: messages.RoleAssistant, Content: "b", CreatedAt: time.Unix(702, 0).UTC()}}
-	if err := p.persistHistoryMessages(history, "turn-a"); err != nil {
+	if err := p.PersistHistoryMessages(history, "turn-a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.persistHistoryMessages(nil, "rewind"); err != nil {
+	if err := p.PersistHistoryMessages(nil, "rewind"); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.close(); err != nil {
+	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
 	got, err := LoadSession(cfg.SessionDir, "history-clear")
@@ -365,16 +357,16 @@ func TestHistoryAThenBThenAIsNotSwallowedByTransactionDedup(t *testing.T) {
 	}
 	historyA := []messages.Message{{Role: messages.RoleUser, Content: "A", CreatedAt: time.Unix(726, 0).UTC()}}
 	historyB := []messages.Message{{Role: messages.RoleUser, Content: "B", CreatedAt: time.Unix(727, 0).UTC()}}
-	if err := p.persistHistoryMessages(historyA, "command-a"); err != nil {
+	if err := p.PersistHistoryMessages(historyA, "command-a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.persistHistoryMessages(historyB, "command-b"); err != nil {
+	if err := p.PersistHistoryMessages(historyB, "command-b"); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.persistHistoryMessages(historyA, "command-a-again"); err != nil {
+	if err := p.PersistHistoryMessages(historyA, "command-a-again"); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.close(); err != nil {
+	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
 	got, err := LoadSession(cfg.SessionDir, "history-cycle")
@@ -388,8 +380,7 @@ func TestHistoryAThenBThenAIsNotSwallowedByTransactionDedup(t *testing.T) {
 
 func TestAgentPendingAndDeliveredInputsSurviveRestartWithoutRerun(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	events := make(chan Event, 32)
-	ag, err := New(&cfg, events)
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,12 +398,8 @@ func TestAgentPendingAndDeliveredInputsSurviveRestartWithoutRerun(t *testing.T) 
 		t.Fatal(err)
 	}
 	ag.mu.Lock()
-	ag.pendingMsgs = []string{"same"}
-	ag.history = []messages.Message{{Role: messages.RoleUser, Content: "same", CreatedAt: created.Add(2 * time.Second)}}
+	ag.conversation.durable.History = []messages.Message{{Role: messages.RoleUser, Content: "same", CreatedAt: created.Add(2 * time.Second)}}
 	ag.mu.Unlock()
-	if err := ag.Save(); err != nil {
-		t.Fatal(err)
-	}
 	// One queue item remains paused; the other is represented by its durable
 	// InputDelivered fact. Identical text must not collapse the two IDs.
 	if err := ag.closePersistence(); err != nil {
@@ -424,13 +411,13 @@ func TestAgentPendingAndDeliveredInputsSurviveRestartWithoutRerun(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snap.History) != 1 || len(snap.Pending) != 1 {
-		t.Fatalf("restart projection history=%d pending=%v", len(snap.History), snap.Pending)
+	if len(snap.History) != 1 || len(snap.PendingInputs) != 1 {
+		t.Fatalf("restart projection history=%d pending=%v", len(snap.History), snap.PendingInputs)
 	}
 	if len(snap.PendingInputs) != 1 || snap.PendingInputs[0].ID != "input-delivered" {
 		t.Fatalf("restart typed pending = %+v", snap.PendingInputs)
 	}
-	resumed, err := Resume(&cfg, snap, make(chan Event, 32))
+	resumed, err := Resume(&cfg, snap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,29 +426,29 @@ func TestAgentPendingAndDeliveredInputsSurviveRestartWithoutRerun(t *testing.T) 
 		resumed.Close()
 	}()
 	resumed.mu.Lock()
-	if resumed.busy || len(resumed.pendingMsgs) != 1 || len(resumed.seenInputs) != 2 {
+	if resumed.turn.busy || len(resumed.conversation.durable.PendingInputViews()) != 1 || len(resumed.inbox.seenInputs) != 2 {
 		resumed.mu.Unlock()
-		t.Fatalf("resumed runtime state busy=%v pending=%v seen=%d", resumed.busy, resumed.pendingMsgs, len(resumed.seenInputs))
+		t.Fatalf("resumed runtime state busy=%v pending=%v seen=%d", resumed.turn.busy, resumed.conversation.durable.PendingInputViews(), len(resumed.inbox.seenInputs))
 	}
 	resumed.mu.Unlock()
-	before := len(resumed.pendingMsgs)
+	before := len(resumed.conversation.durable.PendingInputViews())
 	receipt := resumed.applySubmitInput(protocol.Command{ID: "retry-command", Input: &protocol.SubmitInput{ID: "input-delivered", Text: "same", Strategy: protocol.InputFollowup}})
 	if receipt.Rejected() {
 		t.Fatalf("durable duplicate was rejected: %+v", receipt)
 	}
 	resumed.mu.Lock()
-	after := len(resumed.pendingMsgs)
-	busy := resumed.busy
+	after := len(resumed.conversation.durable.PendingInputViews())
+	busy := resumed.turn.busy
 	resumed.mu.Unlock()
 	if after != before || busy {
 		t.Fatalf("durable duplicate started work: before=%d after=%d busy=%v", before, after, busy)
 	}
 }
 
-func TestAgentSaveUsesMemoryStoreWhenPersistenceDisabled(t *testing.T) {
+func TestAgentCommitsUseMemoryStoreWhenPersistenceDisabled(t *testing.T) {
 	cfg := testPersistenceConfig(t)
 	cfg.NoSessionPersistence = true
-	ag, err := New(&cfg, make(chan Event, 8))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,14 +457,11 @@ func TestAgentSaveUsesMemoryStoreWhenPersistenceDisabled(t *testing.T) {
 		ag.Close()
 	}()
 	ag.appendHistory(messages.Message{Role: messages.RoleUser, Content: "memory", CreatedAt: time.Unix(900, 0).UTC()})
-	if err := ag.Save(); err != nil {
-		t.Fatal(err)
-	}
 	p := ag.persistenceHandle()
 	if p == nil {
 		t.Fatal("memory persistence missing")
 	}
-	got, err := SessionSnapshotProjection(p.store, ag.SessionID())
+	got, err := SessionSnapshotProjection(p, ag.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +477,7 @@ func TestPopulateMemoryResumePreservesSnapshotIdentityAndInbox(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.close()
+	defer p.Close()
 	created := time.Unix(1001, 0).UTC()
 	pendingAt := time.Unix(1002, 0).UTC()
 	snapshot := &SessionSnapshot{
@@ -503,15 +487,14 @@ func TestPopulateMemoryResumePreservesSnapshotIdentityAndInbox(t *testing.T) {
 			{ID: "user-stable", Role: messages.RoleUser, Content: "hello", CreatedAt: created.Add(time.Second)},
 			{ID: "assistant-stable", Role: messages.RoleAssistant, Content: "world", CreatedAt: created.Add(2 * time.Second)},
 		},
-		Usage:         Usage{InputTokens: 9, OutputTokens: 4, CachedTokens: 2, Cost: 0.5, TurnCount: 1},
-		Pending:       []string{"queued"},
+		Usage:         Usage{InputTokens: 9, OutputTokens: 4, CachedTokens: 2, TurnCount: 1},
 		PendingInputs: []protocol.InputView{{ID: "pending-stable", Text: "queued", Strategy: protocol.InputSteer, State: "queued", CreatedAt: pendingAt}},
 		ParentID:      "parent-session", BranchPoint: 1, BranchSummary: "already tried",
 	}
 	if err := p.populateMemoryResume(snapshot); err != nil {
 		t.Fatal(err)
 	}
-	got, err := SessionSnapshotProjection(p.Store(), snapshot.ID)
+	got, err := SessionSnapshotProjection(p, snapshot.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +513,7 @@ func TestPopulateMemoryResumePreservesSnapshotIdentityAndInbox(t *testing.T) {
 	if err := p.populateMemoryResume(snapshot); err != nil {
 		t.Fatal(err)
 	}
-	again, err := SessionSnapshotProjection(p.Store(), snapshot.ID)
+	again, err := SessionSnapshotProjection(p, snapshot.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,10 +531,9 @@ func TestResumeNoPersistenceRetainsProvidedHistoryAndPending(t *testing.T) {
 		Workspace: cfg.Workspace, Model: cfg.Model,
 		History:       []messages.Message{{ID: "resume-user", Role: messages.RoleUser, Content: "keep me", CreatedAt: created.Add(2 * time.Second)}},
 		Usage:         Usage{InputTokens: 5, OutputTokens: 6, TurnCount: 1},
-		Pending:       []string{"wait me"},
 		PendingInputs: []protocol.InputView{{ID: "resume-pending", Text: "wait me", Strategy: protocol.InputFollowup, State: "queued", CreatedAt: created.Add(3 * time.Second)}},
 	}
-	ag, err := Resume(&cfg, snapshot, nil)
+	ag, err := Resume(&cfg, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,14 +543,10 @@ func TestResumeNoPersistenceRetainsProvidedHistoryAndPending(t *testing.T) {
 		t.Fatalf("resumed memory history = %+v", history)
 	}
 	ag.mu.Lock()
-	pending := cloneInputViews(ag.pendingInputs)
-	pendingTexts := append([]string(nil), ag.pendingMsgs...)
+	pending := cloneInputViews(ag.conversation.durable.PendingInputViews())
 	ag.mu.Unlock()
 	if len(pending) != 1 || pending[0].ID != "resume-pending" || pending[0].Strategy != protocol.InputFollowup {
 		t.Fatalf("resumed memory typed pending = %+v", pending)
-	}
-	if len(pendingTexts) != 1 || pendingTexts[0] != "wait me" {
-		t.Fatalf("resumed memory compatibility pending = %v", pendingTexts)
 	}
 	if got := ag.Usage(); got != snapshot.Usage {
 		t.Fatalf("resumed memory usage = %+v, want %+v", got, snapshot.Usage)
@@ -583,7 +561,7 @@ func (s failingCommitStore) Commit(session.Cursor, session.Batch) (session.Commi
 
 func TestAgentSaveStopsAfterDurableWriteFailure(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	ag, err := New(&cfg, make(chan Event, 8))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,10 +573,11 @@ func TestAgentSaveStopsAfterDurableWriteFailure(t *testing.T) {
 	if p == nil {
 		t.Fatal("persistence missing")
 	}
-	p.mu.Lock()
-	underlying := p.store
-	p.store = failingCommitStore{Store: underlying}
-	p.mu.Unlock()
+	backend := journalBackend(t, p)
+	backend.mu.Lock()
+	underlying := backend.store
+	backend.store = failingCommitStore{Store: underlying}
+	backend.mu.Unlock()
 	message := messages.Message{Role: messages.RoleAssistant, Content: "must not be confirmed", CreatedAt: time.Unix(950, 0).UTC()}
 	if err := ag.appendHistory(message); !errors.Is(err, session.ErrPersistenceFailed) {
 		t.Fatalf("appendHistory error = %v, want ErrPersistenceFailed", err)
@@ -618,8 +597,8 @@ func TestAgentSaveStopsAfterDurableWriteFailure(t *testing.T) {
 	if !receipt.Rejected() || receipt.Error == nil {
 		t.Fatalf("provider admission after persistence failure = %+v, want rejection", receipt)
 	}
-	if err := ag.Save(); !errors.Is(err, session.ErrPersistenceFailed) {
-		t.Fatalf("second Save error = %v, want poisoned writer", err)
+	if err := ag.appendHistory(messages.Message{Role: messages.RoleAssistant, Content: "must not persist"}); !errors.Is(err, session.ErrPersistenceFailed) {
+		t.Fatalf("append after failure = %v, want poisoned writer", err)
 	}
 }
 
@@ -629,7 +608,7 @@ func TestListSessionsSkipsDamagedSessionAndReportsIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := good.close(); err != nil {
+	if err := good.Close(); err != nil {
 		t.Fatal(err)
 	}
 	damaged := filepath.Join(cfg.SessionDir, "damaged")

@@ -80,7 +80,7 @@ func TestM1StepFreezesModelClientAndConfigAcrossStream(t *testing.T) {
 		"provider-a": {BaseURL: firstServer.URL, APIKey: "key-a", Models: []string{"model-a"}},
 		"provider-b": {BaseURL: secondServer.URL, APIKey: "key-b", Models: []string{"model-b"}},
 	}
-	ag, err := New(&cfg, make(chan Event, 256))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,9 +120,9 @@ func TestM1StepFreezesModelClientAndConfigAcrossStream(t *testing.T) {
 	// so the first request it is streaming is undisturbed (verified above) and
 	// the change applied immediately.
 	ag.mu.Lock()
-	if ag.activeBinding.model != "model-b" {
+	if ag.modelsState.activeBinding.model != "model-b" {
 		ag.mu.Unlock()
-		t.Fatalf("model did not apply immediately: active=%q", ag.activeBinding.model)
+		t.Fatalf("model did not apply immediately: active=%q", ag.modelsState.activeBinding.model)
 	}
 	ag.mu.Unlock()
 	close(releaseFirst)
@@ -142,9 +142,9 @@ func TestM1StepFreezesModelClientAndConfigAcrossStream(t *testing.T) {
 	// The second request must be built from the same frozen binding: the client
 	// used to send it is the B client, and no A model may be paired with it.
 	ag.mu.Lock()
-	if ag.activeBinding.model != "model-b" || ag.activeBinding.client == nil || ag.activeBinding.client.Name() != "model-b" {
+	if ag.modelsState.activeBinding.model != "model-b" || ag.modelsState.activeBinding.client == nil || ag.modelsState.activeBinding.client.Name() != "model-b" {
 		ag.mu.Unlock()
-		t.Fatalf("active binding after barrier = %+v", ag.activeBinding)
+		t.Fatalf("active binding after barrier = %+v", ag.modelsState.activeBinding)
 	}
 	ag.mu.Unlock()
 }
@@ -165,13 +165,13 @@ func TestM1CapturedStepRemainsFrozenAfterBindingSwitch(t *testing.T) {
 		"a": {BaseURL: first.URL, APIKey: "key-a", Models: []string{"model-a"}},
 		"b": {BaseURL: second.URL, APIKey: "key-b", Models: []string{"model-b"}},
 	}
-	ag, err := New(&cfg, make(chan Event, 16))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ag.Close()
 	ag.mu.Lock()
-	ag.cfg.SystemPrompt = "before-switch"
+	ag.services.cfg.SystemPrompt = "before-switch"
 	ag.mu.Unlock()
 	old := ag.beginStep()
 
@@ -180,7 +180,7 @@ func TestM1CapturedStepRemainsFrozenAfterBindingSwitch(t *testing.T) {
 		t.Fatalf("model switch rejected: %+v", receipt)
 	}
 	ag.mu.Lock()
-	ag.cfg.SystemPrompt = "after-switch"
+	ag.services.cfg.SystemPrompt = "after-switch"
 	ag.mu.Unlock()
 	oldReq := ag.buildRequestForStep(old)
 	system, _ := oldReq.Messages[0].Content.(string)
@@ -199,10 +199,11 @@ func TestM1CapturedStepRemainsFrozenAfterBindingSwitch(t *testing.T) {
 func TestM1SnapshotProjectsContextUsageAndStablePlanVersion(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	ag.mu.Lock()
-	ag.cfg.ContextWindow = 8192
-	ag.history = []messages.Message{{Role: messages.RoleUser, Content: strings.Repeat("context", 32)}}
-	ag.pendingPlan = &PlanRequest{ID: "plan-stable", Plan: "keep this plan"}
-	ag.settingsRev = 7
+	ag.services.cfg.ContextWindow = 8192
+	ag.conversation.durable.History = []messages.Message{{Role: messages.RoleUser, Content: strings.Repeat("context", 32)}}
+	ag.plan.pendingPlan = &PlanRequest{ID: "plan-stable", Plan: "keep this plan"}
+	ag.sequences.settingsRev = 7
+	ag.refreshSnapshotLocked()
 	ag.mu.Unlock()
 
 	view, err := ag.Snapshot(context.Background())
@@ -222,7 +223,8 @@ func TestM1SnapshotProjectsContextUsageAndStablePlanVersion(t *testing.T) {
 	// Settings revisions may advance while a plan is pending; the plan token is
 	// tied to its immutable ID, not reused as a settings revision.
 	ag.mu.Lock()
-	ag.settingsRev = 99
+	ag.sequences.settingsRev = 99
+	ag.refreshSnapshotLocked()
 	ag.mu.Unlock()
 	view, err = ag.Snapshot(context.Background())
 	if err != nil {
@@ -245,7 +247,7 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 	cfg.NetworkAccess = true
 	cfg.AdditionalDirectories = []string{dir + "/extra"}
 	cfg.DisallowedDirectories = []string{dir + "/blocked"}
-	ag, err := New(&cfg, make(chan Event, 32))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,9 +259,9 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 		t.Fatalf("mode-only command rejected: %+v", receipt)
 	}
 	ag.mu.Lock()
-	if strings.Join(ag.cfg.AlwaysDeny, "\n") != "Bash:rm *" || strings.Join(ag.cfg.AlwaysAllow, "\n") != "Read:*" {
+	if strings.Join(ag.services.cfg.AlwaysDeny, "\n") != "Bash:rm *" || strings.Join(ag.services.cfg.AlwaysAllow, "\n") != "Read:*" {
 		ag.mu.Unlock()
-		t.Fatalf("mode-only changed rules: allow=%v deny=%v", ag.cfg.AlwaysAllow, ag.cfg.AlwaysDeny)
+		t.Fatalf("mode-only changed rules: allow=%v deny=%v", ag.services.cfg.AlwaysAllow, ag.services.cfg.AlwaysDeny)
 	}
 	ag.mu.Unlock()
 
@@ -270,8 +272,8 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 		t.Fatalf("sandbox-only command rejected: %+v", receipt)
 	}
 	ag.mu.Lock()
-	if !ag.cfg.NetworkAccess || len(ag.cfg.AdditionalDirectories) != 1 || len(ag.cfg.DisallowedDirectories) != 1 {
-		t.Fatalf("sandbox policy changed unexpectedly: network=%v additional=%v disallowed=%v", ag.cfg.NetworkAccess, ag.cfg.AdditionalDirectories, ag.cfg.DisallowedDirectories)
+	if !ag.services.cfg.NetworkAccess || len(ag.services.cfg.AdditionalDirectories) != 1 || len(ag.services.cfg.DisallowedDirectories) != 1 {
+		t.Fatalf("sandbox policy changed unexpectedly: network=%v additional=%v disallowed=%v", ag.services.cfg.NetworkAccess, ag.services.cfg.AdditionalDirectories, ag.services.cfg.DisallowedDirectories)
 	}
 	ag.mu.Unlock()
 
@@ -283,9 +285,9 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 		t.Fatalf("canonical mode-only command rejected: %+v", receipt)
 	}
 	ag.mu.Lock()
-	if len(ag.cfg.AlwaysDeny) != 1 || len(ag.cfg.AlwaysAllow) != 1 {
+	if len(ag.services.cfg.AlwaysDeny) != 1 || len(ag.services.cfg.AlwaysAllow) != 1 {
 		ag.mu.Unlock()
-		t.Fatalf("canonical mode-only changed rules: allow=%v deny=%v", ag.cfg.AlwaysAllow, ag.cfg.AlwaysDeny)
+		t.Fatalf("canonical mode-only changed rules: allow=%v deny=%v", ag.services.cfg.AlwaysAllow, ag.services.cfg.AlwaysDeny)
 	}
 	ag.mu.Unlock()
 	canonicalSandbox := protocol.Command{ID: "sandbox-only", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandSetSandboxPolicy,
@@ -295,9 +297,9 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 		t.Fatalf("canonical sandbox-only command rejected: %+v", receipt)
 	}
 	ag.mu.Lock()
-	if !ag.cfg.NetworkAccess || len(ag.cfg.AdditionalDirectories) != 1 || len(ag.cfg.DisallowedDirectories) != 1 {
+	if !ag.services.cfg.NetworkAccess || len(ag.services.cfg.AdditionalDirectories) != 1 || len(ag.services.cfg.DisallowedDirectories) != 1 {
 		ag.mu.Unlock()
-		t.Fatalf("canonical sandbox policy changed unexpectedly: network=%v additional=%v disallowed=%v", ag.cfg.NetworkAccess, ag.cfg.AdditionalDirectories, ag.cfg.DisallowedDirectories)
+		t.Fatalf("canonical sandbox policy changed unexpectedly: network=%v additional=%v disallowed=%v", ag.services.cfg.NetworkAccess, ag.services.cfg.AdditionalDirectories, ag.services.cfg.DisallowedDirectories)
 	}
 	ag.mu.Unlock()
 }
@@ -309,7 +311,7 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 func TestM1SafetyChangesApplyImmediatelyWhileBusy(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	ag.mu.Lock()
-	ag.busy = true
+	ag.turn.busy = true
 	ag.mu.Unlock()
 	session := protocol.SessionID(ag.SessionID())
 	commands := []protocol.Command{
@@ -326,13 +328,13 @@ func TestM1SafetyChangesApplyImmediatelyWhileBusy(t *testing.T) {
 	// The discrete lane mutates live state immediately.
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	if !ag.planMode {
+	if !ag.plan.planMode {
 		t.Fatal("plan mode did not apply immediately")
 	}
-	if ag.cfg.PermissionMode != string(permissions.ModeBypass) {
-		t.Fatalf("permission mode did not apply immediately: %s", ag.cfg.PermissionMode)
+	if ag.services.cfg.PermissionMode != string(permissions.ModeBypass) {
+		t.Fatalf("permission mode did not apply immediately: %s", ag.services.cfg.PermissionMode)
 	}
-	if !ag.cfg.NetworkAccess {
+	if !ag.services.cfg.NetworkAccess {
 		t.Fatal("network capability did not apply immediately")
 	}
 }
@@ -350,8 +352,8 @@ func TestM1PlanApprovalRestoresPermissionAndRejectStaysDrafting(t *testing.T) {
 
 	ag.setExecutionMode(true)
 	ag.mu.Lock()
-	ag.pendingPlan = &PlanRequest{ID: "plan-approve", Plan: "do it"}
-	ag.planResp = make(chan bool, 1)
+	ag.plan.pendingPlan = &PlanRequest{ID: "plan-approve", Plan: "do it"}
+	ag.plan.planResp = make(chan bool, 1)
 	ag.mu.Unlock()
 	approve := protocol.Command{ID: "approve", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandApprovePlan,
 		Plan: &protocol.ApprovePlan{PlanID: "plan-approve", Approve: true}}
@@ -364,8 +366,8 @@ func TestM1PlanApprovalRestoresPermissionAndRejectStaysDrafting(t *testing.T) {
 
 	ag.setExecutionMode(true)
 	ag.mu.Lock()
-	ag.pendingPlan = &PlanRequest{ID: "plan-reject", Plan: "revise"}
-	ag.planResp = make(chan bool, 1)
+	ag.plan.pendingPlan = &PlanRequest{ID: "plan-reject", Plan: "revise"}
+	ag.plan.planResp = make(chan bool, 1)
 	ag.mu.Unlock()
 	reject := protocol.Command{ID: "reject", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandApprovePlan,
 		Plan: &protocol.ApprovePlan{PlanID: "plan-reject", Approve: false}}
@@ -374,8 +376,8 @@ func TestM1PlanApprovalRestoresPermissionAndRejectStaysDrafting(t *testing.T) {
 	}
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	if !ag.planMode || ag.workflow != protocol.WorkflowDrafting || ag.perms.CurrentMode() != permissions.ModeAcceptEdits {
-		t.Fatalf("rejection changed execution/permission state: plan=%v workflow=%s mode=%s", ag.planMode, ag.workflow, ag.perms.CurrentMode())
+	if !ag.plan.planMode || ag.lifecycle.workflow != protocol.WorkflowDrafting || ag.services.perms.CurrentMode() != permissions.ModeAcceptEdits {
+		t.Fatalf("rejection changed execution/permission state: plan=%v workflow=%s mode=%s", ag.plan.planMode, ag.lifecycle.workflow, ag.services.perms.CurrentMode())
 	}
 }
 
@@ -400,7 +402,7 @@ func TestM1CompactInterruptDoesNotDrainQueuedInput(t *testing.T) {
 	cfg.APIKey = "test"
 	cfg.PermissionMode = string(permissions.ModeBypass)
 	cfg.KeepAfterCompact = 4
-	ag, err := New(&cfg, make(chan Event, 128))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +430,7 @@ func TestM1CompactInterruptDoesNotDrainQueuedInput(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		ag.mu.Lock()
-		busy, pending, phase := ag.busy, len(ag.pendingMsgs), ag.phase
+		busy, pending, phase := ag.turn.busy, len(ag.conversation.durable.PendingInputViews()), ag.lifecycle.phase
 		ag.mu.Unlock()
 		if !busy && pending == 1 && phase == protocol.PhaseIdle {
 			return
@@ -437,13 +439,13 @@ func TestM1CompactInterruptDoesNotDrainQueuedInput(t *testing.T) {
 	}
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	t.Fatalf("interrupted compaction drained/ran queue: busy=%v pending=%d phase=%s", ag.busy, len(ag.pendingMsgs), ag.phase)
+	t.Fatalf("interrupted compaction drained/ran queue: busy=%v pending=%d phase=%s", ag.turn.busy, len(ag.conversation.durable.PendingInputViews()), ag.lifecycle.phase)
 }
 
 func TestM1SubmitPersistsInputBeforeQueueAdmission(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	ag.mu.Lock()
-	ag.busy = true
+	ag.turn.busy = true
 	ag.mu.Unlock()
 
 	cmd := protocol.NewSubmitInput("durable-command", protocol.SessionID(ag.SessionID()), "durable-input", "must survive restart", protocol.InputFollowup)
@@ -455,8 +457,8 @@ func TestM1SubmitPersistsInputBeforeQueueAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load durable queue: %v", err)
 	}
-	if len(snapshot.Pending) != 1 || snapshot.Pending[0] != "must survive restart" {
-		t.Fatalf("durable pending inbox = %v", snapshot.Pending)
+	if len(snapshot.PendingInputs) != 1 || snapshot.PendingInputs[0].Text != "must survive restart" {
+		t.Fatalf("durable pending inbox = %v", snapshot.PendingInputs)
 	}
 	if receipt.Revision.LogSeq == 0 {
 		t.Fatalf("receipt did not expose durable cursor: %+v", receipt)
@@ -489,7 +491,7 @@ func TestM1DurableInputResumeDoesNotReexecuteDeliveredID(t *testing.T) {
 	cfg.BaseURL = server.URL
 	cfg.APIKey = "resume-key"
 	cfg.PermissionMode = string(permissions.ModeBypass)
-	first, err := New(&cfg, make(chan Event, 256))
+	first, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +551,7 @@ func TestM1DurableInputResumeDoesNotReexecuteDeliveredID(t *testing.T) {
 		t.Fatalf("durable input timestamps missing: %+v", snap.PendingInputs)
 	}
 
-	resumed, err := Resume(&cfg, snap, make(chan Event, 256))
+	resumed, err := Resume(&cfg, snap)
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -582,7 +584,7 @@ func TestM1SubmitStoreFailureDoesNotStartProvider(t *testing.T) {
 	cfg.BaseURL = server.URL
 	cfg.APIKey = "failure-key"
 	cfg.PermissionMode = string(permissions.ModeBypass)
-	ag, err := New(&cfg, make(chan Event, 64))
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,10 +593,11 @@ func TestM1SubmitStoreFailureDoesNotStartProvider(t *testing.T) {
 	if p == nil {
 		t.Fatal("persistence missing")
 	}
-	p.mu.Lock()
-	underlying := p.store
-	p.store = failingCommitStore{Store: underlying}
-	p.mu.Unlock()
+	backend := journalBackend(t, p)
+	backend.mu.Lock()
+	underlying := backend.store
+	backend.store = failingCommitStore{Store: underlying}
+	backend.mu.Unlock()
 	before, err := ag.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -641,9 +644,6 @@ func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 		messages.Message{Role: messages.RoleUser, Content: "A"},
 		messages.Message{Role: messages.RoleAssistant, Content: "answer A"},
 	)
-	if err := ag.Save(); err != nil {
-		t.Fatalf("save A: %v", err)
-	}
 
 	clearA := protocol.Command{ID: "clear-a", SessionID: sessionID, Type: protocol.CommandClearConversation}
 	if receipt := ag.applyCommand(clearA); receipt.Rejected() {
@@ -659,16 +659,10 @@ func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 		messages.Message{Role: messages.RoleUser, Content: "A"},
 		messages.Message{Role: messages.RoleAssistant, Content: "answer A"},
 	)
-	if err := ag.Save(); err != nil {
-		t.Fatalf("save A again: %v", err)
-	}
 	ag.appendHistory(
 		messages.Message{Role: messages.RoleUser, Content: "B"},
 		messages.Message{Role: messages.RoleAssistant, Content: "answer B"},
 	)
-	if err := ag.Save(); err != nil {
-		t.Fatalf("save B: %v", err)
-	}
 
 	// The projection moves A → B → A. The final remove must commit first and
 	// only then replace the in-memory history.
@@ -695,8 +689,8 @@ func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 	// Once the writer is unavailable, the command is rejected and the live
 	// projection remains the previously confirmed A history.
 	ag.mu.Lock()
-	ag.tokenBaseline.promptTokens = 123
-	ag.tokenBaseline.historyLen = len(ag.history)
+	ag.turnMemory.tokenBaseline.promptTokens = 123
+	ag.turnMemory.tokenBaseline.historyLen = len(ag.conversation.durable.History)
 	ag.mu.Unlock()
 	ag.closePersistence()
 	rewind := protocol.Command{ID: "rewind-failed", SessionID: sessionID, Type: protocol.CommandRewindConversation,
@@ -713,9 +707,9 @@ func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 		t.Fatalf("failed rewind mutated history = %+v", view.History)
 	}
 	ag.mu.Lock()
-	if ag.tokenBaseline.promptTokens != 123 || ag.tokenBaseline.historyLen != 2 {
+	if ag.turnMemory.tokenBaseline.promptTokens != 123 || ag.turnMemory.tokenBaseline.historyLen != 2 {
 		ag.mu.Unlock()
-		t.Fatalf("failed rewind mutated token baseline: %+v", ag.tokenBaseline)
+		t.Fatalf("failed rewind mutated token baseline: %+v", ag.turnMemory.tokenBaseline)
 	}
 	ag.mu.Unlock()
 }

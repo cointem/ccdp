@@ -30,7 +30,7 @@ func TestGitignoreMatch(t *testing.T) {
 		{"node_modules", true, true},
 		{"node_modules/pkg/index.js", false, true},
 		{"important.log", false, false}, // negated
-		{"build", true, true},
+		{"build", true, false},          // build/** leaves the parent traversable
 		{"build/out.js", false, true},
 		{"top.go", false, true},      // anchored to root
 		{"sub/top.go", false, false}, // anchored pattern doesn't match deeper

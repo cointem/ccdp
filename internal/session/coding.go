@@ -5,13 +5,13 @@ import (
 	"time"
 )
 
-// RecoveryPointRecorded binds a workspace snapshot to the pre-input context.
-// A later record for the same ID seals its post-turn snapshot.
+// RecoveryPointRecorded binds recorded edits to the pre-input context.
+// Before/After are present only for an explicitly requested full snapshot.
 type RecoveryPointRecorded struct {
 	ID        string    `json:"id"`
 	TurnID    string    `json:"turn_id"`
 	Workspace string    `json:"workspace"`
-	Before    string    `json:"before"`
+	Before    string    `json:"before,omitempty"`
 	After     string    `json:"after,omitempty"`
 	History   string    `json:"history"`
 	Summary   string    `json:"summary"`
@@ -21,9 +21,11 @@ type RecoveryPointRecorded struct {
 const EventTypeRecoveryPointRecorded EventType = "RecoveryPointRecorded"
 
 func (RecoveryPointRecorded) Type() EventType { return EventTypeRecoveryPointRecorded }
-func (RecoveryPointRecorded) seal()           {}
+
+func (RecoveryPointRecorded) seal() {}
+
 func (e RecoveryPointRecorded) validate() error {
-	if e.ID == "" || e.Workspace == "" || len(e.Before) != 64 || len(e.History) != 64 {
+	if e.ID == "" || e.Workspace == "" || (e.Before != "" && len(e.Before) != 64) || len(e.History) != 64 {
 		return errors.New("invalid recovery point")
 	}
 	return nil
@@ -46,7 +48,9 @@ type ReviewRecorded struct {
 const EventTypeReviewRecorded EventType = "ReviewRecorded"
 
 func (ReviewRecorded) Type() EventType { return EventTypeReviewRecorded }
-func (ReviewRecorded) seal()           {}
+
+func (ReviewRecorded) seal() {}
+
 func (e ReviewRecorded) validate() error {
 	if e.ID == "" || (e.ReportPath == "" && e.ReportText == "" && (len(e.SnapshotID) != 64 || len(e.ReportHash) != 64)) {
 		return errors.New("invalid review record")
@@ -67,7 +71,9 @@ type FileMutationRecorded struct {
 const EventTypeFileMutationRecorded EventType = "FileMutationRecorded"
 
 func (FileMutationRecorded) Type() EventType { return EventTypeFileMutationRecorded }
-func (FileMutationRecorded) seal()           {}
+
+func (FileMutationRecorded) seal() {}
+
 func (e FileMutationRecorded) validate() error {
 	if e.ID == "" || e.Path == "" || e.Workspace == "" || len(e.Before) != 64 {
 		return errors.New("invalid mutation")
@@ -86,7 +92,9 @@ type RestoreRecorded struct {
 const EventTypeRestoreRecorded EventType = "RestoreRecorded"
 
 func (RestoreRecorded) Type() EventType { return EventTypeRestoreRecorded }
-func (RestoreRecorded) seal()           {}
+
+func (RestoreRecorded) seal() {}
+
 func (e RestoreRecorded) validate() error {
 	if e.ID == "" || (e.History != "" && len(e.History) != 64) || e.Backup == "" || (e.Status != "started" && e.Status != "completed") {
 		return errors.New("invalid restore record")

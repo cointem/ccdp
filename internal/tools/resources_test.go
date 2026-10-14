@@ -34,7 +34,7 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 		t.Fatalf("A TodoWrite: %v", err)
 	}
 	bCtx := b.Context(nil, bDir, sandbox.New(root))
-	if got := b.Todos.Section(); got != "" {
+	if got, err := b.Todos.Section(); err != nil || got != "" {
 		t.Fatalf("B observed A's todo state: %q", got)
 	}
 

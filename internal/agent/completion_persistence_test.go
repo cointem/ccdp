@@ -24,6 +24,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/journal"
 	"ccdp/internal/tools"
 	"ccdp/internal/workspace"
 )
@@ -94,12 +95,13 @@ func TestFormalToolFactsGateRealLoop(t *testing.T) {
 			provider := &formalToolFactProvider{}
 			a := newJournalRuntimeAgent(t, provider)
 			fixture := &formalAuditEffect{t: t, a: a}
-			a.registry.Register(fixture)
+			a.services.registry.Register(fixture)
 			if failure != "" {
 				p := a.persistenceHandle()
-				p.mu.Lock()
-				p.store = requestJournalFailEventStore{Store: p.store, event: failure}
-				p.mu.Unlock()
+				backend := journalBackend(t, p)
+				backend.mu.Lock()
+				backend.store = requestJournalFailEventStore{Store: backend.store, event: failure}
+				backend.mu.Unlock()
 			}
 			submitJournalRuntimeInput(t, a)
 			view := waitJournalRuntimeIdle(t, a)
@@ -125,7 +127,7 @@ func TestFormalMalformedToolArgumentsHaveNoEffect(t *testing.T) {
 			provider := &formalToolFactProvider{args: raw}
 			a := newJournalRuntimeAgent(t, provider)
 			fixture := &formalAuditEffect{t: t, a: a}
-			a.registry.Register(fixture)
+			a.services.registry.Register(fixture)
 			submitJournalRuntimeInput(t, a)
 			view := waitJournalRuntimeIdle(t, a)
 			if got := fixture.count.Load(); got != 0 {
@@ -145,7 +147,7 @@ func formalHookAgent(t *testing.T, provider llm.Provider, hook hooks.HookSpec) *
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,9 +183,10 @@ func TestFormalHookStartFailureDoesNotRunExternalHook(t *testing.T) {
 	provider := &formalCompletionProvider{}
 	a := formalHookAgent(t, provider, hooks.HookSpec{Command: "touch " + sentinel})
 	p := a.persistenceHandle()
-	p.mu.Lock()
-	p.store = requestJournalFailEventStore{Store: p.store, event: session.EventTypeHookStarted}
-	p.mu.Unlock()
+	backend := journalBackend(t, p)
+	backend.mu.Lock()
+	backend.store = requestJournalFailEventStore{Store: backend.store, event: session.EventTypeHookStarted}
+	backend.mu.Unlock()
 	submitJournalRuntimeInput(t, a)
 	view := waitJournalRuntimeIdle(t, a)
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
@@ -229,7 +232,7 @@ func formalCompletionAgent(t *testing.T, provider *formalCompletionProvider) (*A
 	models := plugin.NewModelRegistry()
 	models.Register(provider)
 	models.Route(cfg.Model, provider.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: models})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,9 +240,13 @@ func formalCompletionAgent(t *testing.T, provider *formalCompletionProvider) (*A
 	return a, cfg
 }
 
-func formalCompletionTurn(t *testing.T, a *Agent, id, text string) {
+func formalCompletionTurn(t *testing.T, a *Agent, id, text string, waitTimeout ...time.Duration) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	timeout := 10 * time.Second
+	if len(waitTimeout) > 0 {
+		timeout = waitTimeout[0]
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	watch, err := a.Watch(ctx, protocol.Cursor{})
 	if err != nil {
@@ -336,15 +343,10 @@ func TestFormalMissingFrozenImageBlobStopsProvider(t *testing.T) {
 		t.Fatal("first turn did not persist a frozen image blob")
 	}
 	p := a.persistenceHandle()
-	p.mu.Lock()
-	memoryArtifacts := p.memoryArtifacts
-	p.mu.Unlock()
-	if memoryArtifacts == nil {
-		t.Fatal("memory artifact store was not initialized")
-	}
-	memoryArtifacts.mu.Lock()
-	delete(memoryArtifacts.blobs, hash)
-	memoryArtifacts.mu.Unlock()
+	backend := journalBackend(t, p)
+	backend.mu.Lock()
+	backend.blobs = missingImageArtifacts{ArtifactAccess: backend.blobs, hash: hash}
+	backend.mu.Unlock()
 
 	formalCompletionTurn(t, a, "formal-image-missing-second", "continue after the image blob disappeared")
 	if providerRequests := func() int {
@@ -393,9 +395,10 @@ func TestFormalSettingsFailureDoesNotPublish(t *testing.T) {
 				t.Fatal(err)
 			}
 			p := a.persistenceHandle()
-			p.mu.Lock()
-			p.store = requestJournalFailEventStore{Store: p.store, event: session.EventTypeSettingsChanged}
-			p.mu.Unlock()
+			backend := journalBackend(t, p)
+			backend.mu.Lock()
+			backend.store = requestJournalFailEventStore{Store: backend.store, event: session.EventTypeSettingsChanged}
+			backend.mu.Unlock()
 			command := protocol.Command{ID: protocol.CommandID("formal-settings-failure"), SessionID: protocol.SessionID(a.SessionID()), Type: commandType}
 			switch commandType {
 			case protocol.CommandSetExecutionMode:
@@ -455,7 +458,7 @@ func waitFormalCommandReceipt(t *testing.T, a *Agent, id protocol.CommandID) pro
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		a.mu.Lock()
-		receipt, ok := a.seenReceipts[id]
+		receipt, ok := a.inbox.seenReceipts[id]
 		a.mu.Unlock()
 		if ok && receipt.Status != protocol.ReceiptScheduled {
 			return receipt
@@ -481,9 +484,10 @@ func TestFormalCommandFactsPreventResumeRetry(t *testing.T) {
 			cmd := protocol.Command{ID: "formal-export-once", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandExport, Export: &protocol.ExportCommand{Path: path}}
 			if unknown {
 				p := a.persistenceHandle()
-				p.mu.Lock()
-				p.store = requestJournalFailEventStore{Store: p.store, event: session.EventTypeCommandCompleted}
-				p.mu.Unlock()
+				backend := journalBackend(t, p)
+				backend.mu.Lock()
+				backend.store = requestJournalFailEventStore{Store: backend.store, event: session.EventTypeCommandCompleted}
+				backend.mu.Unlock()
 			}
 			admitted, err := a.Submit(context.Background(), cmd)
 			if err != nil || admitted.Rejected() || admitted.Status != protocol.ReceiptScheduled {
@@ -522,7 +526,7 @@ func TestFormalCommandFactsPreventResumeRetry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			resumed, err := Resume(&cfg, snapshot, nil)
+			resumed, err := Resume(&cfg, snapshot)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -555,4 +559,16 @@ func TestFormalCommandFactsPreventResumeRetry(t *testing.T) {
 			}
 		})
 	}
+}
+
+type missingImageArtifacts struct {
+	journal.ArtifactAccess
+	hash string
+}
+
+func (s missingImageArtifacts) Read(ref session.BlobRef, maxBytes int64) ([]byte, error) {
+	if ref.Hash == s.hash {
+		return nil, ErrPreparedRequestBlobMissing
+	}
+	return s.ArtifactAccess.Read(ref, maxBytes)
 }

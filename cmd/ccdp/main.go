@@ -35,35 +35,37 @@ func main() {
 		os.Exit(runCodingCLI(os.Args[1:], os.Stdout, os.Stderr))
 	}
 	var (
-		effortFlag    = flag.String("effort", "", "reasoning effort (empty = built-in default medium)")
-		verbosityFlag = flag.String("verbosity", "", "response verbosity: low|medium|high (empty = provider default)")
-		modelFlag     = flag.String("m", "", "model to use (overrides config)")
-		dirFlag       = flag.String("d", "", "working directory (default: current directory)")
-		resumeFlag    = flag.String("r", "", "resume session by id")
-		continueFlag  = flag.Bool("c", false, "open the session picker on start (continue a session)")
-		replayFlag    = flag.String("replay", "", "print a saved session as a markdown replay and exit")
-		modeFlag      = flag.String("mode", "", "permission mode: manual|edits|bypass (default: edits)")
-		listSessions  = flag.Bool("l", false, "list saved sessions and exit")
-		showVersion   = flag.Bool("version", false, "print version and exit")
-		noWarnMissing = flag.Bool("y", false, "do not prompt on missing config")
-		promptFlag    = flag.String("p", "", "run one prompt in headless mode, print the response and exit")
-		outputFlag    = flag.String("output-format", "text", "headless output format: text | json | stream-json")
-		inputFormat   = flag.String("input-format", "text", "headless input format: text | stream-json")
-		timeoutFlag   = flag.Int("timeout", 600, "headless mode timeout in seconds")
-		maxTurnsFlag  = flag.Int("max-turns", 0, "cap the model-call iterations per turn (0 = unlimited)")
-		maxBudgetFlag = flag.Float64("max-budget", 0, "hard USD spending cap for the session (0 = unlimited)")
-		configFlag    = flag.String("config-file", "", "path to a config file (default ~/.ccdp/config.json)")
-		appendPrompt  = flag.String("append-system-prompt", "", "extra instructions appended to the system prompt")
-		allowTools    = flag.String("allowedTools", "", "comma-separated tools always allowed (overrides the gate)")
-		denyTools     = flag.String("disallowedTools", "", "comma-separated tools always denied")
-		verboseFlag   = flag.Bool("verbose", false, "print extra progress diagnostics to stderr")
-		debugFlag     = flag.Bool("debug", false, "print LLM request details to stderr")
-		sessionIDFlag = flag.String("session-id", "", "use a specific session id instead of generating one")
-		sysPromptFlag = flag.String("system-prompt", "", "override the system prompt")
-		sysPromptFile = flag.String("system-prompt-file", "", "read the system prompt from a file")
-		addDirFlag    = flag.String("add-dir", "", "grant the sandbox access to an additional directory")
-		noPersistFlag = flag.Bool("no-session-persistence", false, "do not write session files to disk")
-		fallbackFlag  = flag.String("fallback-model", "", "model to fall back to when the primary fails")
+		effortFlag     = flag.String("effort", "", "reasoning effort (empty = built-in default medium)")
+		verbosityFlag  = flag.String("verbosity", "", "response verbosity: low|medium|high (empty = provider default)")
+		modelFlag      = flag.String("m", "", "model to use (overrides config)")
+		dirFlag        = flag.String("d", "", "working directory (default: current directory)")
+		resumeFlag     = flag.String("r", "", "resume session by id")
+		continueFlag   = flag.Bool("c", false, "open the session picker on start (continue a session)")
+		replayFlag     = flag.String("replay", "", "print a saved session as a markdown replay and exit")
+		modeFlag       = flag.String("mode", "", "permission mode: manual|edits|bypass (default: edits)")
+		listSessions   = flag.Bool("l", false, "list saved sessions and exit")
+		showVersion    = flag.Bool("version", false, "print version and exit")
+		noWarnMissing  = flag.Bool("y", false, "do not prompt on missing config")
+		goalFlag       = flag.String("goal", "", "run a persistent goal in headless mode until complete or stopped")
+		goalBudgetFlag = flag.Int64("goal-budget", 0, "token budget for --goal or --resume-goal (noncached input + output)")
+		resumeGoalFlag = flag.Bool("resume-goal", false, "resume the saved goal from -r <session> in headless mode")
+		promptFlag     = flag.String("p", "", "run one prompt in headless mode, print the response and exit")
+		outputFlag     = flag.String("output-format", "text", "headless output format: text | json | stream-json")
+		inputFormat    = flag.String("input-format", "text", "headless input format: text | stream-json")
+		timeoutFlag    = flag.Int("timeout", 600, "headless mode timeout in seconds")
+		maxTurnsFlag   = flag.Int("max-turns", 0, "cap the model-call iterations per turn (0 = unlimited)")
+		configFlag     = flag.String("config-file", "", "path to a config file (default ~/.ccdp/config.json)")
+		appendPrompt   = flag.String("append-system-prompt", "", "extra instructions appended to the system prompt")
+		allowTools     = flag.String("allowedTools", "", "comma-separated tools always allowed (overrides the gate)")
+		denyTools      = flag.String("disallowedTools", "", "comma-separated tools always denied")
+		verboseFlag    = flag.Bool("verbose", false, "print extra progress diagnostics to stderr")
+		debugFlag      = flag.Bool("debug", false, "print LLM request details to stderr")
+		sessionIDFlag  = flag.String("session-id", "", "use a specific session id instead of generating one")
+		sysPromptFlag  = flag.String("system-prompt", "", "override the system prompt")
+		sysPromptFile  = flag.String("system-prompt-file", "", "read the system prompt from a file")
+		addDirFlag     = flag.String("add-dir", "", "grant the sandbox access to an additional directory")
+		noPersistFlag  = flag.Bool("no-session-persistence", false, "do not write session files to disk")
+		fallbackFlag   = flag.String("fallback-model", "", "model to fall back to when the primary fails")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `ccdp %s — a TUI coding agent (Codex-style loop, Claude-style UX)
@@ -82,6 +84,15 @@ Flags:
 		return
 	}
 
+	goalCommand, goalErr := headlessGoalCommand(*goalFlag, *goalBudgetFlag, cliFlagWasVisited(flag.CommandLine, "goal-budget"), *resumeGoalFlag, *resumeFlag, *promptFlag, *inputFormat, *continueFlag)
+	if goalErr == nil && cliFlagWasVisited(flag.CommandLine, "goal") && strings.TrimSpace(*goalFlag) == "" {
+		goalErr = fmt.Errorf("--goal requires a nonempty objective")
+	}
+	if goalErr != nil {
+		fmt.Fprintln(os.Stderr, "error:", goalErr)
+		os.Exit(1)
+	}
+
 	cfg, err := loadConfig(*configFlag)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -94,7 +105,6 @@ Flags:
 		"r":                      *resumeFlag,
 		"mode":                   *modeFlag,
 		"max-turns":              *maxTurnsFlag,
-		"max-budget":             *maxBudgetFlag,
 		"append-system-prompt":   *appendPrompt,
 		"allowedTools":           *allowTools,
 		"disallowedTools":        *denyTools,
@@ -184,7 +194,7 @@ Flags:
 			fmt.Fprintln(os.Stderr, "error: cannot load session:", err)
 			os.Exit(1)
 		}
-		// Replay is strictly read-only: project the JSONL/legacy snapshot and
+		// Replay is strictly read-only: project the JSONL session and
 		// render it without constructing an Agent, MCP host, or writer lock.
 		fmt.Println(agent.ExportSessionMarkdown(snap))
 		return
@@ -201,14 +211,14 @@ Flags:
 			fmt.Fprintf(os.Stderr, "error: cannot resume session %q: %v\n", *resumeFlag, err)
 			os.Exit(1)
 		}
-		ag, err = agent.Resume(&cfg, snap, nil)
+		ag, err = agent.Resume(&cfg, snap)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "resumed session %s\n", *resumeFlag)
 	} else {
-		ag, err = agent.New(&cfg, nil)
+		ag, err = agent.New(&cfg)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
@@ -235,7 +245,7 @@ Flags:
 		prompts = ps
 	default:
 		headlessPrompt := *promptFlag
-		if headlessPrompt == "" && *resumeFlag == "" {
+		if headlessPrompt == "" && *resumeFlag == "" && goalCommand == nil {
 			if st, _ := os.Stdin.Stat(); st != nil && st.Mode()&os.ModeCharDevice == 0 {
 				data, readErr := io.ReadAll(io.LimitReader(os.Stdin, maxCLIPromptBytes+1))
 				if readErr != nil {
@@ -258,19 +268,11 @@ Flags:
 
 	// The TUI shows a welcome banner itself for fresh sessions.
 	// Configure the human channel before recovery can launch a background run.
-	ag.SetChildInteraction(len(prompts) == 0)
+	ag.SetChildInteraction(len(prompts) == 0 && goalCommand == nil)
 	go ag.Run()
 
-	if len(prompts) > 0 {
-		code := runHeadless(ag, prompts, outputFormat(*outputFlag), *timeoutFlag)
-		if !cfg.NoSessionPersistence {
-			if saveErr := ag.Save(); saveErr != nil {
-				fmt.Fprintln(os.Stderr, "error: save session:", saveErr)
-				if code == 0 {
-					code = 1
-				}
-			}
-		}
+	if len(prompts) > 0 || goalCommand != nil {
+		code := runHeadlessClientWithGoal(ag, prompts, outputFormat(*outputFlag), *timeoutFlag, goalCommand)
 		if closeErr := ag.CloseContext(context.Background()); closeErr != nil {
 			fmt.Fprintln(os.Stderr, "error: close session:", closeErr)
 			if code == 0 {
@@ -297,11 +299,6 @@ Flags:
 			fmt.Fprintln(os.Stderr, "error: close TUI subscription:", tuiCloseErr)
 		}
 		if finalAgent != nil {
-			if !cfg.NoSessionPersistence {
-				if saveErr := finalAgent.Save(); saveErr != nil {
-					fmt.Fprintln(os.Stderr, "error: save session:", saveErr)
-				}
-			}
 			if closeErr := finalAgent.CloseContext(context.Background()); closeErr != nil {
 				fmt.Fprintln(os.Stderr, "error: close session:", closeErr)
 			}
@@ -317,18 +314,11 @@ Flags:
 		os.Exit(1)
 	}
 	finalID := finalAgent.SessionID()
-	var saveErr error
-	if !cfg.NoSessionPersistence {
-		saveErr = finalAgent.Save()
-	}
 	closeErr := finalAgent.CloseContext(context.Background())
-	if saveErr != nil {
-		fmt.Fprintln(os.Stderr, "error: save session:", saveErr)
-	}
 	if closeErr != nil {
 		fmt.Fprintln(os.Stderr, "error: close session:", closeErr)
 	}
-	if tuiCloseErr != nil || saveErr != nil || closeErr != nil {
+	if tuiCloseErr != nil || closeErr != nil {
 		os.Exit(1)
 	}
 	if cfg.NoSessionPersistence {
@@ -459,7 +449,6 @@ func applyCLIOverrides(cfg *config.Config, fs *flag.FlagSet, values map[string]a
 		{"m", "model"},
 		{"mode", "permission_mode"},
 		{"max-turns", "max_turns"},
-		{"max-budget", "max_budget_usd"},
 		{"d", "workspace"},
 		{"session-id", "session_id"},
 		{"fallback-model", "fallback_model"},
@@ -562,7 +551,7 @@ func applyCLIOverrides(cfg *config.Config, fs *flag.FlagSet, values map[string]a
 
 // shutdownTUIModel handles both concrete forms Bubble Tea may return. Most
 // command/key paths return *tui.Model while constructors and some message
-// paths return tui.Model; missing the pointer form would save/close the
+// paths return tui.Model; missing the pointer form would close the
 // startup Agent after a successful resume.
 func shutdownTUIModel(model tea.Model) (*agent.Agent, error) {
 	switch final := model.(type) {

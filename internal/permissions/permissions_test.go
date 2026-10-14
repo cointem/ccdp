@@ -1,6 +1,7 @@
 package permissions
 
 import (
+	"strings"
 	"sync"
 	"testing"
 )
@@ -9,11 +10,11 @@ func TestWebLookupAllowedWithoutPerCallApproval(t *testing.T) {
 	for _, mode := range []Mode{ModeDefault, ModeAcceptEdits, ModeBypass} {
 		for _, name := range []string{"WebSearch", "WebFetch"} {
 			m := NewManager(mode, Policy{})
-			if decision, reason := m.Check(name, nil); decision != DecisionAllow {
+			if decision, reason := m.Check(name, nil, KindNetwork); decision != DecisionAllow {
 				t.Errorf("%s/%s: %s (%s)", mode, name, decision, reason)
 			}
 			m = NewManager(mode, Policy{AlwaysDeny: []string{name}})
-			if decision, _ := m.Check(name, nil); decision != DecisionDeny {
+			if decision, _ := m.Check(name, nil, KindNetwork); decision != DecisionDeny {
 				t.Errorf("%s/%s ignored explicit deny", mode, name)
 			}
 		}
@@ -37,33 +38,33 @@ func TestParseModeIncludesPlan(t *testing.T) {
 // non-bypass path to auto-approve it.
 func TestNamespacedMCPToolNeverAutoAllowed(t *testing.T) {
 	m := NewManager(ModeAcceptEdits, Policy{})
-	if d, _ := m.Check("mcp__evil__Read", map[string]any{"file_path": "a.go"}); d != DecisionAsk {
+	if d, _ := m.Check("mcp__evil__Read", map[string]any{"file_path": "a.go"}, KindUnknown); d != DecisionAsk {
 		t.Errorf("shadowing MCP Read should ask, got %v", d)
 	}
-	if d, _ := m.Check("mcp__evil__Write", map[string]any{"file_path": "a.go"}); d != DecisionAsk {
+	if d, _ := m.Check("mcp__evil__Write", map[string]any{"file_path": "a.go"}, KindUnknown); d != DecisionAsk {
 		t.Errorf("MCP Write in acceptEdits must still ask, got %v", d)
 	}
-	if d, _ := m.Check("Read", map[string]any{"file_path": "a.go"}); d != DecisionAllow {
+	if d, _ := m.Check("Read", map[string]any{"file_path": "a.go"}, KindRead); d != DecisionAllow {
 		t.Errorf("built-in Read must remain read-only-allowed, got %v", d)
 	}
 	allow := NewManager(ModeDefault, Policy{AlwaysAllow: []string{"mcp__evil__Read"}})
-	if d, _ := allow.Check("mcp__evil__Read", map[string]any{"file_path": "a.go"}); d != DecisionAllow {
+	if d, _ := allow.Check("mcp__evil__Read", map[string]any{"file_path": "a.go"}, KindUnknown); d != DecisionAllow {
 		t.Errorf("explicit always_allow on the qualified name should permit it, got %v", d)
 	}
 }
 
 func TestPlanModeGates(t *testing.T) {
 	m := NewManager(ModePlan, Policy{})
-	if d, _ := m.Check("Bash", map[string]any{"command": "ls"}); d != DecisionAsk {
+	if d, _ := m.Check("Bash", map[string]any{"command": "ls"}, KindShell); d != DecisionAsk {
 		t.Errorf("plan mode should gate Bash, got %v", d)
 	}
-	if d, _ := m.Check("Write", map[string]any{"file_path": "a.go"}); d != DecisionAsk {
+	if d, _ := m.Check("Write", map[string]any{"file_path": "a.go"}, KindWrite); d != DecisionAsk {
 		t.Errorf("plan mode should gate Write, got %v", d)
 	}
-	if d, _ := m.Check("Read", map[string]any{"file_path": "a.go"}); d != DecisionAllow {
+	if d, _ := m.Check("Read", map[string]any{"file_path": "a.go"}, KindRead); d != DecisionAllow {
 		t.Errorf("plan mode should allow Read, got %v", d)
 	}
-	if d, _ := m.Check("ToolSearch", map[string]any{"query": "x"}); d != DecisionAllow {
+	if d, _ := m.Check("ToolSearch", map[string]any{"query": "x"}, KindRead); d != DecisionAllow {
 		t.Errorf("ToolSearch should be read-only, got %v", d)
 	}
 }
@@ -71,25 +72,25 @@ func TestPlanModeGates(t *testing.T) {
 func TestAlwaysAllowRules(t *testing.T) {
 	// Tool-level rule.
 	m := NewManager(ModeDefault, Policy{AlwaysAllow: []string{"WebFetch"}})
-	if d, _ := m.Check("WebFetch", map[string]any{"url": "https://x"}); d != DecisionAllow {
+	if d, _ := m.Check("WebFetch", map[string]any{"url": "https://x"}, KindNetwork); d != DecisionAllow {
 		t.Errorf("tool-level allow rule failed: %v", d)
 	}
 
 	// Tool:value prefix glob ("Bash:git *" style).
 	m = NewManager(ModeDefault, Policy{AlwaysAllow: []string{"Bash:git status*"}})
-	if d, _ := m.Check("Bash", map[string]any{"command": "git status --short"}); d != DecisionAllow {
+	if d, _ := m.Check("Bash", map[string]any{"command": "git status --short"}, KindShell); d != DecisionAllow {
 		t.Errorf("prefix glob allow failed: %v", d)
 	}
-	if d, _ := m.Check("Bash", map[string]any{"command": "git push"}); d != DecisionAsk {
+	if d, _ := m.Check("Bash", map[string]any{"command": "git push"}, KindShell); d != DecisionAsk {
 		t.Errorf("non-matching command should still ask: %v", d)
 	}
 
 	// Bare command rule ("go test *" without the Bash: prefix).
 	m = NewManager(ModeDefault, Policy{AlwaysAllow: []string{"go test *"}})
-	if d, _ := m.Check("Bash", map[string]any{"command": "go test ./..."}); d != DecisionAllow {
+	if d, _ := m.Check("Bash", map[string]any{"command": "go test ./..."}, KindShell); d != DecisionAllow {
 		t.Errorf("bare command rule failed: %v", d)
 	}
-	if d, _ := m.Check("Bash", map[string]any{"command": "go build ./..."}); d != DecisionAsk {
+	if d, _ := m.Check("Bash", map[string]any{"command": "go build ./..."}, KindShell); d != DecisionAsk {
 		t.Errorf("bare rule must not match other commands: %v", d)
 	}
 
@@ -98,7 +99,7 @@ func TestAlwaysAllowRules(t *testing.T) {
 		AlwaysAllow: []string{"Bash:git *"},
 		AlwaysDeny:  []string{"Bash:git push*"},
 	})
-	if d, _ := m.Check("Bash", map[string]any{"command": "git push origin"}); d != DecisionDeny {
+	if d, _ := m.Check("Bash", map[string]any{"command": "git push origin"}, KindShell); d != DecisionDeny {
 		t.Errorf("deny should win over allow: %v", d)
 	}
 }
@@ -106,7 +107,7 @@ func TestAlwaysAllowRules(t *testing.T) {
 func TestSudoIsNotAutoAllowed(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{})
 	for _, cmd := range []string{"sudo cat /etc/shadow", "sudo ls /root", "sudo -i"} {
-		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d == DecisionAllow {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d == DecisionAllow {
 			t.Errorf("%q must not be auto-allowed, got %v", cmd, d)
 		}
 	}
@@ -116,10 +117,10 @@ func TestNewlineOperatorBlocksAutoAllow(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{})
 	// The second line is not read-only; a bare newline must defeat the
 	// first-token allowlist.
-	if d, _ := m.Check("Bash", map[string]any{"command": "cat foo\nsudo reboot"}); d == DecisionAllow {
+	if d, _ := m.Check("Bash", map[string]any{"command": "cat foo\nsudo reboot"}, KindShell); d == DecisionAllow {
 		t.Error("multiline command with non-readonly tail must not be allowed")
 	}
-	if d, reason := m.Check("Bash", map[string]any{"command": "echo hi\nrm -rf /"}); d != DecisionDeny {
+	if d, reason := m.Check("Bash", map[string]any{"command": "echo hi\nrm -rf /"}, KindShell); d != DecisionDeny {
 		t.Errorf("multiline dangerous command should hit deny patterns, got %v (%s)", d, reason)
 	}
 }
@@ -133,11 +134,11 @@ func TestFindMutationPrimariesAreNotReadOnly(t *testing.T) {
 		"find . -fprint output.txt",
 		"find . -fprintf output.txt %p",
 	} {
-		if decision, _ := m.Check("Bash", map[string]any{"command": command}); decision == DecisionAllow {
+		if decision, _ := m.Check("Bash", map[string]any{"command": command}, KindShell); decision == DecisionAllow {
 			t.Errorf("mutating find command was auto-allowed: %q", command)
 		}
 	}
-	if decision, _ := m.Check("Bash", map[string]any{"command": "find . -type f -print"}); decision != DecisionAllow {
+	if decision, _ := m.Check("Bash", map[string]any{"command": "find . -type f -print"}, KindShell); decision != DecisionAllow {
 		t.Errorf("read-only find command should remain allowed, got %v", decision)
 	}
 }
@@ -145,20 +146,18 @@ func TestFindMutationPrimariesAreNotReadOnly(t *testing.T) {
 func TestGitSafeRejectsOperators(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{})
 	for _, cmd := range []string{"git status; rm -rf x", "git diff > /etc/passwd", "git log && reboot", "git status | sh"} {
-		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d == DecisionAllow {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d == DecisionAllow {
 			t.Errorf("%q must not be auto-allowed via gitSafe, got %v", cmd, d)
 		}
 	}
-	// Plain read-only git commands stay allowed.
-	if d, _ := m.Check("Bash", map[string]any{"command": "git status --short"}); d != DecisionAllow {
-		t.Errorf("plain git status should be allowed, got %v", d)
+	// Raw Git requires approval because repository config can run helpers.
+	if d, _ := m.Check("Bash", map[string]any{"command": "git status --short"}, KindShell); d != DecisionAsk {
+		t.Errorf("raw git status should ask, got %v", d)
 	}
 }
 
-// TestQuotedArgvReadOnlyGitAutoAllowed guards the /diff regression: the
-// runtime formats typed external commands with per-token shell quoting
-// ('git' 'diff'), which must classify identically to the bare argv.
-func TestQuotedArgvReadOnlyGitAutoAllowed(t *testing.T) {
+// Quoting cannot change the raw Git approval requirement.
+func TestQuotedArgvGitRequiresApproval(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{})
 	for _, cmd := range []string{
 		"'git' 'diff' '--no-ext-diff' '--no-textconv'",
@@ -167,8 +166,12 @@ func TestQuotedArgvReadOnlyGitAutoAllowed(t *testing.T) {
 		"git 'diff' --no-ext-diff --no-textconv",
 		"env ls",
 	} {
-		if d, reason := m.Check("Bash", map[string]any{"command": cmd}); d != DecisionAllow {
-			t.Errorf("%q must be auto-allowed, got %v (%s)", cmd, d, reason)
+		want := DecisionAsk
+		if cmd == "env ls" {
+			want = DecisionAllow
+		}
+		if d, reason := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d != want {
+			t.Errorf("%q: got %v (%s), want %v", cmd, d, reason, want)
 		}
 	}
 	for _, cmd := range []string{
@@ -179,7 +182,7 @@ func TestQuotedArgvReadOnlyGitAutoAllowed(t *testing.T) {
 		"'git' 'diff",
 		"'git' 'diff' '",
 	} {
-		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d == DecisionAllow {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d == DecisionAllow {
 			t.Errorf("%q must not be auto-allowed, got %v", cmd, d)
 		}
 	}
@@ -189,38 +192,38 @@ func TestSessionAllowCannotBypassAlwaysDeny(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{AlwaysDeny: []string{"Bash:git push*"}})
 	key := SessionKey("Bash", map[string]any{"command": "git push origin"})
 	m.RememberAllow(key)
-	if d, reason := m.Check("Bash", map[string]any{"command": "git push origin"}); d != DecisionDeny {
+	if d, reason := m.Check("Bash", map[string]any{"command": "git push origin"}, KindShell); d != DecisionDeny {
 		t.Errorf("session allow must not bypass always_deny, got %v (%s)", d, reason)
 	}
 
 	// Session deny still applies even when a persistent allow rule matches.
 	m = NewManager(ModeDefault, Policy{AlwaysAllow: []string{"Bash:git *"}})
 	m.RememberDeny(key)
-	if d, _ := m.Check("Bash", map[string]any{"command": "git push origin"}); d != DecisionDeny {
+	if d, _ := m.Check("Bash", map[string]any{"command": "git push origin"}, KindShell); d != DecisionDeny {
 		t.Errorf("session deny should win over persistent allow, got %v", d)
 	}
 }
 
 func TestPathGlobSemantics(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{AlwaysAllow: []string{"Write:/tmp/*.log"}})
-	if d, _ := m.Check("Write", map[string]any{"file_path": "/tmp/a.log"}); d != DecisionAllow {
+	if d, _ := m.Check("Write", map[string]any{"file_path": "/tmp/a.log"}, KindWrite); d != DecisionAllow {
 		t.Errorf("single-segment path glob should match, got %v", d)
 	}
-	if d, _ := m.Check("Write", map[string]any{"file_path": "/tmp/sub/a.log"}); d == DecisionAllow {
+	if d, _ := m.Check("Write", map[string]any{"file_path": "/tmp/sub/a.log"}, KindWrite); d == DecisionAllow {
 		t.Error("path glob * must not cross / boundaries")
 	}
-	if d, _ := m.Check("Write", map[string]any{"file_path": "/etc/hosts"}); d == DecisionAllow {
+	if d, _ := m.Check("Write", map[string]any{"file_path": "/etc/hosts"}, KindWrite); d == DecisionAllow {
 		t.Error("path glob must stay anchored to the extension")
 	}
 
 	m = NewManager(ModeDefault, Policy{AlwaysAllow: []string{"Write:/tmp/**"}})
-	if d, _ := m.Check("Write", map[string]any{"file_path": "/tmp/deep/nested/a.log"}); d != DecisionAllow {
+	if d, _ := m.Check("Write", map[string]any{"file_path": "/tmp/deep/nested/a.log"}, KindWrite); d != DecisionAllow {
 		t.Errorf("** should span path segments, got %v", d)
 	}
 
 	// Command globs keep the loose (cross-separator) semantics.
 	m = NewManager(ModeDefault, Policy{AlwaysAllow: []string{"Bash:git status*"}})
-	if d, _ := m.Check("Bash", map[string]any{"command": "git status --short -b"}); d != DecisionAllow {
+	if d, _ := m.Check("Bash", map[string]any{"command": "git status --short -b"}, KindShell); d != DecisionAllow {
 		t.Errorf("command glob should match across spaces, got %v", d)
 	}
 }
@@ -234,7 +237,7 @@ func TestManagerConcurrentAccess(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			for j := 0; j < 200; j++ {
-				_, _ = m.Check("Bash", args)
+				_, _ = m.Check("Bash", args, KindShell)
 				m.RememberAllow(CommandKey("echo hi"))
 				m.RememberDeny(CommandKey("rm x"))
 				_ = m.CurrentMode()
@@ -258,16 +261,16 @@ func TestClonePreservesRememberedDecisionsWithoutSharingState(t *testing.T) {
 	parent.RememberDeny(denyKey)
 
 	child := parent.Clone()
-	if got, _ := child.Check("Write", map[string]any{"file_path": "child.txt"}); got != DecisionAllow {
+	if got, _ := child.Check("Write", map[string]any{"file_path": "child.txt"}, KindWrite); got != DecisionAllow {
 		t.Fatalf("clone lost remembered allow: %v", got)
 	}
-	if got, _ := child.Check("Bash", map[string]any{"command": "git push"}); got != DecisionDeny {
+	if got, _ := child.Check("Bash", map[string]any{"command": "git push"}, KindShell); got != DecisionDeny {
 		t.Fatalf("clone lost remembered deny: %v", got)
 	}
 
 	child.RememberAllow(SessionKey("Write", map[string]any{"file_path": "other.txt"}))
 	child.SetMode(ModeBypass)
-	if got, _ := parent.Check("Write", map[string]any{"file_path": "other.txt"}); got == DecisionAllow {
+	if got, _ := parent.Check("Write", map[string]any{"file_path": "other.txt"}, KindWrite); got == DecisionAllow {
 		t.Fatal("child mutation leaked into parent")
 	}
 	if parent.CurrentMode() == ModeBypass {
@@ -280,11 +283,11 @@ func TestClonePreservesRememberedDecisionsWithoutSharingState(t *testing.T) {
 // sanction (the historic whole-string glob matched `git status && rm x`).
 func TestHeadAllowRuleCannotAuthorizeChainedTail(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{AlwaysAllow: []string{"Bash:git status*"}})
-	if d, _ := m.Check("Bash", map[string]any{"command": "git status && rm x"}); d == DecisionAllow {
+	if d, _ := m.Check("Bash", map[string]any{"command": "git status && rm x"}, KindShell); d == DecisionAllow {
 		t.Errorf("chained tail must not be auto-allowed by the head rule, got %v", d)
 	}
 	// The head command on its own is still allowed by the rule.
-	if d, _ := m.Check("Bash", map[string]any{"command": "git status --short"}); d != DecisionAllow {
+	if d, _ := m.Check("Bash", map[string]any{"command": "git status --short"}, KindShell); d != DecisionAllow {
 		t.Errorf("git status --short should still be allowed, got %v", d)
 	}
 }
@@ -299,14 +302,17 @@ func TestGitSafeRejectsMutatingSubcommands(t *testing.T) {
 		"git branch -D main",
 		"git tag v9.9",
 	} {
-		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d == DecisionAllow {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d == DecisionAllow {
 			t.Errorf("mutating git subcommand must not be auto-allowed: %q", cmd)
 		}
 	}
-	// Read-only git forms remain allowed.
+	// Query arguments are recognized for hardened typed adapters only.
 	for _, cmd := range []string{"git remote", "git remote -v", "git branch -a", "git tag", "git config --list"} {
-		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d != DecisionAllow {
-			t.Errorf("read-only git form should stay allowed: %q got %v", cmd, d)
+		if !ReadOnlyGitArguments(strings.Fields(cmd)) {
+			t.Errorf("query argv rejected: %q", cmd)
+		}
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d != DecisionAsk {
+			t.Errorf("raw git requires approval: %q got %v", cmd, d)
 		}
 	}
 }
@@ -315,12 +321,12 @@ func TestGitSafeRejectsMutatingSubcommands(t *testing.T) {
 func TestForcePushShortFlagDenied(t *testing.T) {
 	m := NewManager(ModeDefault, Policy{})
 	for _, cmd := range []string{"git push -f origin main", "git push --force origin main"} {
-		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d != DecisionDeny {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d != DecisionDeny {
 			t.Errorf("%q should be denied as a force push, got %v", cmd, d)
 		}
 	}
 	// A plain push is not denied outright — it just asks.
-	if d, _ := m.Check("Bash", map[string]any{"command": "git push origin main"}); d != DecisionAsk {
+	if d, _ := m.Check("Bash", map[string]any{"command": "git push origin main"}, KindShell); d != DecisionAsk {
 		t.Errorf("plain git push should ask, got %v", d)
 	}
 }
@@ -335,7 +341,7 @@ func TestCommandSubstitutionFailsClosed(t *testing.T) {
 		"cat <(secret)",
 		"echo unbalanced \"quote",
 	} {
-		if d, _ := m.Check("Bash", map[string]any{"command": cmd}); d == DecisionAllow {
+		if d, _ := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d == DecisionAllow {
 			t.Errorf("unsafe-to-parse command must not be auto-allowed: %q", cmd)
 		}
 	}

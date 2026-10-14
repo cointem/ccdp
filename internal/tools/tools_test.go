@@ -28,8 +28,13 @@ func TestWriteFileNoFollowRejectsHardlinkTarget(t *testing.T) {
 	if err := os.Link(target, alias); err != nil {
 		t.Skipf("hard links unavailable: %v", err)
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
 	v, _ := fsops.Observe(alias)
-	if _, err := fsops.Publish(alias, []byte("changed\n"), 0o600, &v); err == nil {
+	if _, err := fsops.PublishAt(context.Background(), root, filepath.Base(alias), []byte("changed\n"), 0o600, &v); err == nil {
 		t.Fatal("writeFileNoFollow accepted a multiply-linked target")
 	}
 	data, err := os.ReadFile(target)

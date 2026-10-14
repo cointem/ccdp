@@ -138,3 +138,35 @@ func TestRegressionFileDirectoryTransition(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyRemovesSymlinkWithoutChangingItsTarget(t *testing.T) {
+	root := t.TempDir()
+	root, _ = filepath.EvalSymlinks(root)
+	target := filepath.Join(t.TempDir(), "reference.txt")
+	if err := os.WriteFile(target, []byte("external reference"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "reference")); err != nil {
+		t.Fatal(err)
+	}
+	store := New("")
+	policy := sandbox.New(root)
+	base, err := store.CapturePaths(context.Background(), root, []string{"reference"}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := store.Prepare(base, Snapshot{Root: root, Files: map[string]File{}}, base, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Apply(context.Background(), plan, policy); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "external reference" {
+		t.Fatalf("target changed: %q %v", data, err)
+	}
+	if _, err = os.Lstat(filepath.Join(root, "reference")); !os.IsNotExist(err) {
+		t.Fatalf("symlink retained: %v", err)
+	}
+}

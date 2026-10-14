@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"ccdp/internal/executable"
 	"ccdp/internal/sandbox"
 )
 
@@ -47,12 +48,13 @@ const (
 
 // Request describes one admitted local process invocation.
 type Request struct {
-	Context context.Context
-	Command string
-	Argv    []string
-	Dir     string
-	Timeout time.Duration
-	Input   io.Reader
+	readOnlyGit bool // set only by the typed Git query adapter
+	Context     context.Context
+	Command     string
+	Argv        []string
+	Dir         string
+	Timeout     time.Duration
+	Input       io.Reader
 	// Env replaces the inherited environment when non-nil. A nil value gets a
 	// credential-filtered copy of the host environment; callers may opt into a
 	// narrower purpose-specific set by supplying one explicitly.
@@ -87,11 +89,12 @@ type Result struct {
 // similar adapters). It uses the same interactive/sandbox admission as Run
 // but deliberately does not impose Run's short invocation timeout.
 type StartRequest struct {
-	Context context.Context
-	Argv    []string
-	Dir     string
-	Env     []string
-	Sandbox *sandbox.Sandbox
+	readOnlyGit bool
+	Context     context.Context
+	Argv        []string
+	Dir         string
+	Env         []string
+	Sandbox     *sandbox.Sandbox
 }
 
 // StartArgv starts one admitted process without interpreting argument values
@@ -107,7 +110,7 @@ func StartArgv(req StartRequest) (*Process, error) {
 	if req.Sandbox == nil {
 		return nil, fmt.Errorf("execution: sandbox policy is unavailable")
 	}
-	if err := sandbox.CheckInteractive(strings.Join(req.Argv, " ")); err != nil {
+	if err := sandbox.CheckInteractiveArgv(req.Argv); err != nil {
 		return nil, err
 	}
 	policy := req.Sandbox.Snapshot()
@@ -119,16 +122,18 @@ func StartArgv(req StartRequest) (*Process, error) {
 	argv, procEnv = preferNativeGit(argv, "", procEnv, req.Dir)
 	argv, procEnv = preferNativeCLTPython(argv, "", procEnv, req.Dir, nativeCLTPythonPath())
 	addExecutionReadRoots(policy, argv, "", req.Dir, procEnv)
-	profile, err := policy.Profile()
+	profile, err := processProfile(policy, argv, req.readOnlyGit)
 	if err != nil {
 		cleanupScratch()
 		return nil, err
 	}
-	if err := verifyProfileContext(ctx, profile); err != nil {
+	if err := verifyProcessProfile(ctx, profile, argv, req.readOnlyGit); err != nil {
 		cleanupScratch()
 		return nil, err
 	}
-	argv = applyArgvLimits(policy, argv)
+	if !req.readOnlyGit {
+		argv = applyArgvLimits(policy, argv)
+	}
 	cmd := newProcess(exec.CommandContext(ctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, argv...)...))
 	cmd.cmd.Dir = req.Dir
 	cmd.cmd.Env = procEnv
@@ -290,20 +295,23 @@ func Run(req Request) (Result, error) {
 		if argv[0] == "" {
 			return Result{}, fmt.Errorf("execution: empty argv")
 		}
-		if err := sandbox.CheckInteractive(strings.Join(argv, " ")); err != nil {
+		if err := sandbox.CheckInteractiveArgv(argv); err != nil {
 			return Result{}, err
 		}
-		profile, err := policy.Profile()
+		profile, err := processProfile(policy, argv, req.readOnlyGit)
 		if err != nil {
 			return Result{}, err
 		}
-		if err := verifyProfileContext(cctx, profile); err != nil {
+		if err := verifyProcessProfile(cctx, profile, argv, req.readOnlyGit); err != nil {
 			if cctx.Err() != nil {
 				return Result{TimedOut: true, ExitCode: -1}, nil
 			}
 			return Result{}, err
 		}
-		limitedArgv := applyArgvLimits(policy, argv)
+		limitedArgv := argv
+		if !req.readOnlyGit {
+			limitedArgv = applyArgvLimits(policy, argv)
+		}
 		cmd = newProcess(exec.CommandContext(cctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, limitedArgv...)...))
 	} else {
 		command, err := sandbox.PrepareCommandContext(cctx, policy, req.Command)
@@ -754,43 +762,11 @@ func addExecutionReadRoots(policy *sandbox.Sandbox, argv []string, command, dir 
 }
 
 func resolveExecutable(name, searchPath, dir string) string {
-	if name == "" {
-		return ""
-	}
-	if strings.ContainsRune(name, filepath.Separator) {
-		if !filepath.IsAbs(name) {
-			if dir == "" {
-				dir, _ = os.Getwd()
-			}
-			name = filepath.Join(dir, name)
-		}
-		return executableFile(name)
-	}
-	for _, entry := range filepath.SplitList(searchPath) {
-		if entry == "" {
-			entry = "."
-		}
-		candidate := filepath.Join(entry, name)
-		if resolved := executableFile(candidate); resolved != "" {
-			return resolved
-		}
-	}
-	return ""
+	path, _ := executable.Resolve(name, searchPath, dir)
+	return path
 }
 
-func executableFile(path string) string {
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() || info.Mode()&0111 == 0 {
-		return ""
-	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
-	if absolute, err := filepath.Abs(path); err == nil {
-		path = absolute
-	}
-	return filepath.Clean(path)
-}
+func executableFile(path string) string { return executable.File(path) }
 
 func executableReadRoot(executable, workspace string) string {
 	executable = filepath.Clean(executable)

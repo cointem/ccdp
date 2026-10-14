@@ -72,7 +72,7 @@ func TestClipboardInputReachesProviderAsImage(t *testing.T) {
 
 func TestClipboardInputDurableQueueReplayAndIdentity(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,17 +84,14 @@ func TestClipboardInputDurableQueueReplayAndIdentity(t *testing.T) {
 	cmd := protocol.NewSubmitInput("queued-images", protocol.SessionID(a.SessionID()), "image-input", "compare ![local](local.png)", protocol.InputFollowup)
 	cmd.Input.Images = []protocol.InputImage{pasted}
 	a.mu.Lock()
-	a.busy = true
+	a.turn.busy = true
 	a.mu.Unlock()
 	receipt := a.applySubmitInput(cmd)
 	a.mu.Lock()
-	a.busy = false
+	a.turn.busy = false
 	a.mu.Unlock()
 	if receipt.Rejected() {
 		t.Fatal(receipt.Error)
-	}
-	if err := a.Save(); err != nil {
-		t.Fatal(err)
 	}
 	if err := a.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
@@ -103,7 +100,7 @@ func TestClipboardInputDurableQueueReplayAndIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := Resume(&cfg, snapshot, nil)
+	resumed, err := Resume(&cfg, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,8 +116,8 @@ func TestClipboardInputDurableQueueReplayAndIdentity(t *testing.T) {
 		t.Fatal("different image reused input ID")
 	}
 	resumed.mu.Lock()
-	pending := resumed.pendingInputs[0]
-	frozen := resumed.inputAttachments[pending.ID]
+	pending := resumed.conversation.durable.PendingInputViews()[0]
+	frozen := resumed.inbox.inputAttachments[pending.ID]
 	resumed.mu.Unlock()
 	msg := messages.Message{Role: messages.RoleUser, Content: pending.Text, ImagesFrozen: true, ImageAttachments: frozen.Attachments}
 	parts, _, hasImage, err := resumed.imageContentPartsForMessage(cfg.Workspace, msg, maxAttachmentBytes)

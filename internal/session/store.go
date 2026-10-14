@@ -52,8 +52,6 @@ var (
 	ErrTorn              = errors.New("session: incomplete event-log tail")
 	ErrTooLarge          = errors.New("session: content exceeds configured limit")
 	ErrPersistenceFailed = errors.New("session: persistence failed")
-	ErrSnapshotNotFound  = errors.New("session: snapshot cache not found")
-	ErrSnapshotInvalid   = errors.New("session: invalid snapshot cache")
 	ErrUnknownEventType  = errors.New("session: unknown event type")
 	ErrInvalidSessionID  = errors.New("session: invalid session id")
 )
@@ -90,6 +88,16 @@ type Batch struct {
 
 func NewBatch(events ...Event) Batch { return Batch{Events: events} }
 
+// ValidateBatch checks a future transaction without committing it. Reserve the
+// maximum sequence-number width so appending intervening facts cannot make a
+// size-checked batch exceed the limit later.
+func ValidateBatch(batch Batch) error {
+	state := newLogState()
+	state.Cursor = AnyCursor - Cursor(len(batch.Events))
+	_, err := prepareCommit(&state, AnyCursor, batch, defaultJSONLOptions())
+	return err
+}
+
 func (b Batch) id() (string, error) {
 	return b.TransactionID, nil
 }
@@ -112,26 +120,12 @@ type CommitResult struct {
 	Deduplicated  bool
 }
 
-// Snapshot is an optional acceleration cache.  It is never consulted by Read
-// or replay, and callers can safely delete it and rebuild from the log.
-// Data is opaque bytes owned by the projection layer, not an untyped event
-// payload; JSONL stores it base64-encoded in snapshot.json.
-type Snapshot struct {
-	SchemaVersion uint32
-	SessionID     string
-	LastSeq       Cursor
-	UpdatedAt     time.Time
-	Data          []byte
-}
-
 // Store is the persistence contract shared by MemoryStore and JSONLStore.
 // Commit is the only mutating business-fact operation.  Sequence allocation,
 // event validation, transaction checksum and idempotency are store-owned.
 type Store interface {
 	Commit(expected Cursor, batch Batch) (CommitResult, error)
 	Read(after Cursor) ([]Record, error)
-	Snapshot() (Snapshot, error)
-	SaveSnapshot(snapshot Snapshot) error
 	CurrentCursor() Cursor
 	Close() error
 }
@@ -141,7 +135,6 @@ type Store interface {
 // mutating methods.
 type ReadOnlyStore interface {
 	Read(after Cursor) ([]Record, error)
-	Snapshot() (Snapshot, error)
 	CurrentCursor() Cursor
 }
 
@@ -306,19 +299,12 @@ func parseTransaction(data []byte) (parsedTransaction, error) {
 		envelope: envelope,
 		events:   make([]Event, 0, len(envelope.Events)),
 		wires:    make([]wireEvent, 0, len(envelope.Events)),
-		seqs:     make([]Cursor, 0, len(envelope.Events)),
 	}
 	for i, wire := range envelope.Events {
-		seq := envelope.FirstSeq + Cursor(i)
 		event, err := decodeEvent(wire)
 		if err != nil {
 			if errors.Is(err, ErrUnknownEventType) {
-				// Version skew, not damage: the record is intact and checksummed,
-				// this build simply has no type for it. Count and skip it so a log
-				// written by another build still resumes; everything else in the
-				// transaction keeps its own sequence position.
-				parsed.skipped = append(parsed.skipped, SkippedRecord{Seq: seq, Kind: wire.Type, Reason: err.Error()})
-				continue
+				return parsedTransaction{}, fmt.Errorf("event %d: %w", i, err)
 			}
 			if isUnexpectedEOF(err) {
 				return parsedTransaction{}, fmt.Errorf("%w: event %d: %v", ErrTorn, i, err)
@@ -327,29 +313,15 @@ func parseTransaction(data []byte) (parsedTransaction, error) {
 		}
 		parsed.events = append(parsed.events, event)
 		parsed.wires = append(parsed.wires, wire)
-		parsed.seqs = append(parsed.seqs, seq)
 	}
 	return parsed, nil
 }
 
-// parsedTransaction is one verified transaction line as replay sees it: the
-// events this build can decode, each with the sequence number it occupies in
-// the log, plus the records it had to skip.
+// parsedTransaction is one fully decoded, verified transaction.
 type parsedTransaction struct {
 	envelope transactionEnvelope
 	events   []Event
 	wires    []wireEvent
-	seqs     []Cursor
-	skipped  []SkippedRecord
-}
-
-// SkippedRecord names one durable event that replay could not decode because
-// this build has no type for it. Skipping is confined to version skew; corrupt
-// or torn records still fail the open.
-type SkippedRecord struct {
-	Seq    Cursor
-	Kind   EventType
-	Reason string
 }
 
 type storedTransaction struct {
@@ -368,9 +340,6 @@ type logState struct {
 	Records      []Record
 	Transactions map[string]storedTransaction
 	Dedupe       map[string]dedupeEntry
-	// Skipped lists records replay could not decode because this build has no
-	// event type for them. It is only ever filled while reading a log.
-	Skipped []SkippedRecord
 }
 
 func newLogState() logState {
@@ -391,16 +360,9 @@ type preparedCommit struct {
 	InputFingerprint string
 	Events           []Event
 	Wires            []wireEvent
-	// Seqs gives each event its sequence number in the log. The live write path
-	// leaves it nil, because there the events are contiguous from FirstSeq;
-	// replay fills it in, because skipped records leave holes behind.
-	Seqs []Cursor
-	// Skipped carries the records replay dropped for version skew, so applying
-	// the transaction also accounts for them.
-	Skipped  []SkippedRecord
-	Line     []byte
-	Envelope transactionEnvelope
-	Result   CommitResult
+	Line             []byte
+	Envelope         transactionEnvelope
+	Result           CommitResult
 }
 
 func prepareCommit(state *logState, expected Cursor, batch Batch, options JSONLOptions) (preparedCommit, error) {
@@ -513,15 +475,11 @@ func applyPrepared(state *logState, prepared preparedCommit) {
 	state.Transactions[prepared.TransactionID] = storedTransaction{Result: prepared.Result, Fingerprint: fingerprint, InputFingerprint: prepared.InputFingerprint}
 	for i, event := range prepared.Events {
 		seq := prepared.Envelope.FirstSeq + Cursor(i)
-		if prepared.Seqs != nil {
-			seq = prepared.Seqs[i]
-		}
 		state.Records = append(state.Records, Record{Seq: seq, TransactionID: prepared.TransactionID, Event: event})
 		if key := eventDedupeKey(event); key != "" {
 			state.Dedupe[key] = dedupeEntry{Fingerprint: eventFingerprint(prepared.Wires[i]), Result: prepared.Result}
 		}
 	}
-	state.Skipped = append(state.Skipped, prepared.Skipped...)
 	state.Cursor = prepared.Result.Cursor
 }
 
@@ -762,4 +720,13 @@ func isUnexpectedEOF(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), "unexpected end of JSON input")
+}
+
+// CloneRecords freezes a read or finalization result without sharing mutable
+// event payloads with the caller. Artifact bytes remain separately addressed.
+func CloneRecords(records []Record) ([]Record, error) {
+	if records == nil {
+		return nil, nil
+	}
+	return cloneRecords(records)
 }

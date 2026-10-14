@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"unicode/utf8"
 
+	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/sessionview"
 )
 
 // A cursor pins an immutable run or transcript item. It is not an execution ID
@@ -95,10 +97,8 @@ func (s *SessionSupervisor) readAgent(ctx context.Context, req protocol.AgentRea
 }
 
 func (s *SessionSupervisor) savedAgentResult(id protocol.SessionID, runID protocol.RunID) (protocol.RunView, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var result protocol.RunView
-	for _, r := range s.runs {
+	for _, r := range s.directory.Runs() {
 		r.mu.Lock()
 		row := r.fact.Child
 		saved := r.fact.UsageAccounted
@@ -165,20 +165,20 @@ func (s *SessionSupervisor) readAgentTranscript(ctx context.Context, page protoc
 	if err != nil {
 		return "", err
 	}
-	t := &transcriptState{index: make(map[string]uint64), before: c.Before, window: 64}
+	t := sessionview.NewTranscript(c.Before, 64)
 	for _, record := range records {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		t.facts([]session.Event{record.Event})
+		t.Facts([]session.Event{record.Event})
 	}
-	items, _ := t.snapshot()
+	items, _ := t.Snapshot()
 	page.Items = []protocol.TranscriptItem{}
 	for i := len(items) - 1; i >= 0; i-- {
 		item := items[i]
 		// History is an index with previews, not another copy of raw tool logs.
 		if len(item.Text) > 2048 {
-			item.Text = truncateUTF8Bytes(item.Text, 2048)
+			item.Text = messages.TruncateUTF8(item.Text, 2048)
 			item.Truncated = true
 		}
 		if len(item.Args) > 2048 {
@@ -187,7 +187,7 @@ func (s *SessionSupervisor) readAgentTranscript(ctx context.Context, page protoc
 		}
 		candidate := page
 		candidate.Items = append([]protocol.TranscriptItem{item}, page.Items...)
-		before := t.index[item.ID]
+		before := t.Position(item.ID)
 		candidate.More = before > 1
 		candidate.NextCursor = ""
 		if candidate.More {

@@ -185,7 +185,7 @@ func TestImagePasteLimitsAndFailedDraftIsolation(t *testing.T) {
 			continue
 		}
 		m.restoreFailedSubmission(id)
-		if len(m.inputImages) != 1 || len(m.retryImages) != protocol.MaxInputImages {
+		if len(m.inputImages) != 1 || len(m.inputRetry.command.Input.Images) != protocol.MaxInputImages {
 			t.Fatal("failure overwrote new image draft")
 		}
 	}

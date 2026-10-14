@@ -1,10 +1,5 @@
 package agent
 
-// This file is the execution-side adapter for the typed tool journal. The
-// compatibility Agent event stream remains useful for old callers, but the
-// session log is the authority for whether a tool was admitted, completed,
-// and projected into the next model request.
-
 import (
 	"context"
 	"crypto/sha256"
@@ -12,17 +7,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
-	"unicode/utf8"
 
-	"ccdp/internal/llm"
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/tooling"
 	"ccdp/internal/tools"
 )
+
+// This file is the execution-side adapter for the typed tool journal. The
+// compatibility Agent event stream remains useful for old callers, but the
+// session log is the authority for whether a tool was admitted, completed,
+// and projected into the next model request.
 
 const (
 	// Keep the event inline preview comfortably below the JSONL transaction
@@ -59,53 +57,6 @@ func releaseStepLease(step stepRuntime) {
 	if step.toolLease != nil {
 		step.toolLease.Close()
 	}
-}
-
-// decodeProviderToolCalls is intentionally strict. UnmarshalArgs historically
-// converted malformed, null, and array arguments into {}, which could turn a
-// corrupt model response into a real default-argument side effect. Preserve
-// JSON numbers with UseNumber so permission fingerprints and typed journal
-// facts use the same value the provider returned.
-func decodeProviderToolCalls(raw []llm.ToolCall) ([]messages.ToolCall, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	calls := make([]messages.ToolCall, 0, len(raw))
-	seen := make(map[string]bool, len(raw))
-	for i, call := range raw {
-		if strings.TrimSpace(call.ID) == "" {
-			return nil, fmt.Errorf("tool call %d has an empty id", i)
-		}
-		if seen[call.ID] {
-			return nil, fmt.Errorf("tool call %q is duplicated", call.ID)
-		}
-		seen[call.ID] = true
-		if strings.TrimSpace(call.Function.Name) == "" {
-			return nil, fmt.Errorf("tool call %q has no tool name", call.ID)
-		}
-		rawArgs := strings.TrimSpace(call.Function.Arguments.String())
-		if rawArgs == "" || rawArgs == "null" {
-			return nil, fmt.Errorf("tool call %q has null or empty arguments", call.ID)
-		}
-		decoder := json.NewDecoder(strings.NewReader(rawArgs))
-		decoder.UseNumber()
-		var args map[string]any
-		if err := decoder.Decode(&args); err != nil || args == nil {
-			if err == nil {
-				err = errors.New("arguments must be a JSON object")
-			}
-			return nil, fmt.Errorf("tool call %q arguments must be an object: %w", call.ID, err)
-		}
-		var trailing any
-		if err := decoder.Decode(&trailing); err != io.EOF {
-			if err == nil {
-				return nil, fmt.Errorf("tool call %q arguments contain trailing JSON", call.ID)
-			}
-			return nil, fmt.Errorf("tool call %q arguments are malformed: %w", call.ID, err)
-		}
-		calls = append(calls, messages.ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: args})
-	}
-	return calls, nil
 }
 
 func toolJournalContextForStep(step stepRuntime) toolJournalContext {
@@ -165,13 +116,11 @@ func (j *toolJournalExecution) start(a *Agent, tc messages.ToolCall) error {
 	if p == nil {
 		return fail(errors.New("agent: session persistence is unavailable"))
 	}
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
 	if err := a.persistenceFailure(); err != nil {
 		return fail(err)
 	}
 	if _, err := p.Commit(session.Batch{
-		TransactionID: stableID("tool-started", struct {
+		TransactionID: messages.StableID("tool-started", struct {
 			TurnID string
 			StepID string
 			CallID string
@@ -207,7 +156,7 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 	// durable completion is a recovery fact, so artifact publication uses a
 	// non-cancellable context; otherwise an ordinary interrupt would poison a
 	// session after the tool's outcome was already known.
-	artifacts, err := p.requestArtifacts()
+	artifacts, err := p.RequestArtifacts()
 	if err != nil {
 		return fail(err)
 	}
@@ -236,8 +185,8 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 			sideEffect = "completed"
 		}
 	}
-	resultText := boundedToolFactText(output, toolFactPreviewBytes)
-	effectID := stableID("tool-effect", struct {
+	resultText := tooling.BoundedFactText(output, toolFactPreviewBytes)
+	effectID := messages.StableID("tool-effect", struct {
 		TurnID string
 		StepID string
 		CallID string
@@ -251,20 +200,8 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 	if isErr {
 		event.Error = resultText
 	}
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
-	if err := a.persistenceFailure(); err != nil {
+	if err := a.settleToolResult(event); err != nil {
 		return fail(err)
-	}
-	if _, err := p.Commit(session.Batch{
-		TransactionID: stableID("tool-finished", struct {
-			TurnID string
-			StepID string
-			CallID string
-		}{j.ctx.turnID, j.ctx.stepID, tc.ID}),
-		Events: []session.Event{event},
-	}); err != nil {
-		return fail(fmt.Errorf("agent: persist ToolFinished: %w", err))
 	}
 	j.finished = true
 	return nil
@@ -278,38 +215,11 @@ func (a *Agent) toolJournalFailure(err error) error {
 	return err
 }
 
-func boundedToolFactText(value string, maxBytes int) string {
-	if maxBytes <= 0 || len(value) <= maxBytes {
-		return value
-	}
-	return truncateUTF8Bytes(value, maxBytes)
-}
-
-func truncateUTF8Bytes(value string, maxBytes int) string {
-	if maxBytes < 0 || len(value) <= maxBytes {
-		return value
-	}
-	if maxBytes == 0 {
-		return ""
-	}
-	if maxBytes >= len(value) {
-		return value
-	}
-	cut := value[:maxBytes]
-	for len(cut) > 0 && !utf8.ValidString(cut) {
-		_, size := utf8.DecodeLastRuneInString(cut)
-		if size <= 0 || size > len(cut) {
-			cut = cut[:len(cut)-1]
-		} else {
-			cut = cut[:len(cut)-size]
-		}
-	}
-	return cut
-}
-
 func (a *Agent) toolOutputPreview(value string, maxBytes int) string {
 	if maxBytes <= 0 {
-		maxBytes = a.cfg.MaxResultSizeChars
+		a.mu.Lock()
+		maxBytes = a.services.cfg.MaxResultSizeChars
+		a.mu.Unlock()
 	}
 	if maxBytes <= 0 {
 		maxBytes = toolJournalMaxText
@@ -328,7 +238,7 @@ func (a *Agent) toolOutputPreview(value string, maxBytes int) string {
 	if maxBytes < len(marker) {
 		return ""
 	}
-	return truncateUTF8Bytes(value, maxBytes-len(marker)) + marker
+	return messages.TruncateUTF8(value, maxBytes-len(marker)) + marker
 }
 
 // finishUnexecutedTool records a rejected/cancelled call that never crossed
@@ -371,13 +281,11 @@ func (a *Agent) persistToolResultsProjected(jc toolJournalContext, calls []messa
 	if p == nil {
 		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
 	}
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
 	if err := a.persistenceFailure(); err != nil {
 		return err
 	}
 	if _, err := p.Commit(session.Batch{
-		TransactionID: stableID("tool-projected", struct{ TurnID, StepID string }{jc.turnID, jc.stepID}),
+		TransactionID: messages.StableID("tool-projected", struct{ TurnID, StepID string }{jc.turnID, jc.stepID}),
 		Events:        []session.Event{session.ToolResultsProjected{TurnID: jc.turnID, StepID: jc.stepID, Results: projected, Budget: budget}},
 	}); err != nil {
 		return a.toolJournalFailure(fmt.Errorf("agent: persist ToolResultsProjected: %w", err))
@@ -387,47 +295,42 @@ func (a *Agent) persistToolResultsProjected(jc toolJournalContext, calls []messa
 
 func (a *Agent) persistTasksSnapshot() error {
 	a.mu.Lock()
-	p := a.persistence
-	resources := a.resources
+	p := a.services.persistence
+	resources := a.services.resources
 	a.mu.Unlock()
 	if p == nil || resources == nil || resources.Todos == nil {
 		return errors.New("agent: task persistence resources are unavailable")
 	}
-	states := resources.Todos.Snapshot()
+	states, err := resources.Todos.Snapshot()
+	if err != nil {
+		return err
+	}
 	tasks := make([]session.Task, 0, len(states))
 	for _, state := range states {
 		tasks = append(tasks, session.Task{TaskID: state.ID, Title: state.Content, Status: state.Status})
 	}
-	if err := p.persistTasks(tasks); err != nil {
+	if err := a.saveTasksFromWorker(tasks); err != nil {
 		return a.toolJournalFailure(fmt.Errorf("agent: persist task state: %w", err))
 	}
 	return nil
 }
 
-func (a *Agent) persistToolDiscovery(name string) error {
+func (a *Agent) persistToolDiscovery(version uint64, name, description string, parameters map[string]any) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("agent: discovered tool name is required")
 	}
-	a.mu.Lock()
-	p := a.persistence
-	registry := a.registry
-	version := a.catalogVersion
-	a.mu.Unlock()
-	if p == nil || registry == nil {
+	p := a.persistenceHandle()
+	if p == nil {
 		return errors.New("agent: tool discovery persistence is unavailable")
 	}
-	tool, ok := registry.Get(name)
-	if !ok || tool == nil {
-		return fmt.Errorf("agent: discovered tool %q is no longer registered", name)
-	}
-	schema, err := json.Marshal(tool.Parameters())
+	schema, err := json.Marshal(parameters)
 	if err != nil {
 		return fmt.Errorf("agent: encode discovered tool %q schema: %w", name, err)
 	}
 	if version == 0 {
 		version = 1
 	}
-	return p.persistToolsDiscovered(version, []session.ToolSchema{{ToolID: name, Version: fmt.Sprintf("catalog-%d", version), Description: tool.Description(), Schema: schema}})
+	return a.discoverToolsFromWorker(version, []session.ToolSchema{{ToolID: name, Version: fmt.Sprintf("catalog-%d", version), Description: description, Schema: schema}})
 }
 
 // toolCallIsReadOnly is deliberately conservative.  Only built-ins whose
@@ -440,73 +343,27 @@ func (a *Agent) toolCallIsReadOnly(jc toolJournalContext, call messages.ToolCall
 	var tool tools.Tool
 	if jc.toolLease != nil {
 		tool, _ = jc.toolLease.Get(call.Name)
-	} else if a != nil && a.registry != nil {
+	} else if a != nil && a.services.registry != nil {
 		// The zero-context compatibility path may be used by package tests and
 		// old embedders. Resolve the implementation before classifying it so a
 		// custom tool that merely steals a built-in name cannot be treated as
 		// read-only.
-		tool, _ = a.registry.Get(call.Name)
+		tool, _ = a.services.registry.Get(call.Name)
 	} else {
 		return false
 	}
-	return readOnlyImplementation(tool)
+	return toolKind(tool).Concurrent()
 }
 
 // projectToolResults applies the aggregate budget in original call order.
 // The returned values are exactly the strings appended to history, so the
 // event and live projection cannot disagree when workers finish out of order.
 func (a *Agent) projectToolResults(jc toolJournalContext, calls []messages.ToolCall, results []toolRunResult) (session.Budget, error) {
-	budget := session.Budget{}
-	if jc.maxOutputChars > 0 {
-		budget.Limit = int64(jc.maxOutputChars)
-	}
-	a.mu.Lock()
-	budget.Used = int64(a.outputBudget)
-	a.mu.Unlock()
-	for i := range results {
-		out := results[i].output
-		if jc.maxOutputChars > 0 {
-			// Reserve a small, deterministic envelope for each result's call
-			// identity/status.  The envelope is counted in Budget.Used even
-			// though it is represented by typed fields in the event, so a
-			// zero/very-small budget cannot accidentally become unlimited and
-			// later results cannot consume bytes needed to identify this call.
-			reserve := int64(32 + len(calls[i].ID))
-			remaining := budget.Limit - budget.Used
-			if remaining < 0 {
-				remaining = 0
-			}
-			outputLimit := remaining - reserve
-			if outputLimit < 0 {
-				outputLimit = 0
-			}
-			if int64(len(out)) > outputLimit {
-				budget.Truncated = true
-				if json.Valid([]byte(out)) {
-					out = "" // typed data is either whole or explicitly unavailable
-					results[i].isErr, results[i].status = true, "error"
-				} else {
-					marker := "\n[incomplete: tool output budget exhausted]"
-					if outputLimit >= int64(len(marker)) {
-						out = truncateUTF8Bytes(out, int(outputLimit)-len(marker)) + marker
-					} else {
-						out = ""
-						results[i].isErr, results[i].status = true, "error"
-					}
-				}
-			}
-			budget.Used += reserve + int64(len(out))
-			if budget.Used > budget.Limit {
-				// A cap smaller than the minimum envelope is still a hard cap;
-				// do not report a usage value that exceeds it.
-				budget.Used = budget.Limit
-			}
-		} else {
-			budget.Used += int64(len(out))
-		}
-		if out != results[i].output && calls[i].Name == "Read" {
+	projected := a.projectToolsFromWorker(jc, calls, results)
+	for i, result := range projected.results {
+		if result.output != results[i].output && calls[i].Name == "Read" {
 			a.mu.Lock()
-			resources, sb := a.resources, a.sandbox
+			resources, sb := a.services.resources, a.services.sandbox
 			a.mu.Unlock()
 			if resources != nil && sb != nil {
 				if path, e := sb.ResolveRead(tools.StringArg(calls[i].Arguments, "file_path", "")); e == nil {
@@ -514,18 +371,9 @@ func (a *Agent) projectToolResults(jc toolJournalContext, calls []messages.ToolC
 				}
 			}
 		}
-		results[i].output = out
+		results[i] = result
 	}
-	a.mu.Lock()
-	a.outputBudget = int(budget.Used)
-	a.mu.Unlock()
-	if !jc.enabled {
-		return budget, nil
-	}
-	if err := a.persistToolResultsProjected(jc, calls, results, budget); err != nil {
-		return budget, err
-	}
-	return budget, nil
+	return projected.budget, projected.err
 }
 
 func (a *Agent) persistTurnStarted(turnID, stepID, inputID string) error {
@@ -534,10 +382,8 @@ func (a *Agent) persistTurnStarted(turnID, stepID, inputID string) error {
 		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
 	}
 	a.mu.Lock()
-	settingsRev, contextRev := a.settingsRev, a.contextRev
+	settingsRev, contextRev := a.sequences.settingsRev, a.sequences.contextRev
 	a.mu.Unlock()
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
 	if err := a.persistenceFailure(); err != nil {
 		return err
 	}
@@ -557,9 +403,7 @@ func (a *Agent) persistTurnFinished(turnID, outcome, finishErr string, duration 
 		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
 	}
 	durationMs := max(int64(1), duration.Milliseconds())
-	event := session.TurnFinished{TurnID: turnID, Outcome: outcome, Error: boundedToolFactText(finishErr, toolFactPreviewBytes), DurationMs: durationMs}
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
+	event := session.TurnFinished{TurnID: turnID, Outcome: outcome, Error: tooling.BoundedFactText(finishErr, toolFactPreviewBytes), DurationMs: durationMs}
 	if err := a.persistenceFailure(); err != nil {
 		return err
 	}
@@ -574,8 +418,6 @@ func (a *Agent) persistApprovalRequested(request session.ApprovalRequest) error 
 	if p == nil {
 		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
 	}
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
 	if err := a.persistenceFailure(); err != nil {
 		return err
 	}
@@ -590,8 +432,6 @@ func (a *Agent) persistApprovalResolved(resolution session.ApprovalResolution) e
 	if p == nil {
 		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
 	}
-	a.persistMu.Lock()
-	defer a.persistMu.Unlock()
 	if err := a.persistenceFailure(); err != nil {
 		return err
 	}
@@ -613,10 +453,10 @@ func toolApprovalRequest(a *Agent, tc messages.ToolCall, reason string, capabili
 	businessJSON, _ := json.Marshal(businessArgs)
 	businessSum := sha256.Sum256(businessJSON)
 	a.mu.Lock()
-	sessionID, turnID, workspace, policyRevision, stepID := a.sessionID, fmt.Sprintf("turn-%d", a.turnSeq), a.cfg.Workspace, a.settingsRev, a.stepSeq
+	sessionID, turnID, workspace, policyRevision, stepID := a.conversation.sessionID, fmt.Sprintf("turn-%d", a.sequences.turnSeq), a.services.cfg.Workspace, a.sequences.settingsRev, a.sequences.stepSeq
 	a.mu.Unlock()
 	return session.ApprovalRequest{
-		ApprovalID: stableID("approval", struct {
+		ApprovalID: messages.StableID("approval", struct {
 			SessionID string
 			TurnID    string
 			StepID    uint64

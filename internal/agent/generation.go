@@ -1,15 +1,16 @@
 package agent
 
 import (
+	"net/url"
+	"strings"
+
 	"ccdp/internal/config"
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
-	"net/url"
-	"strings"
 )
 
-func (a *Agent) applyGeneration(cmd protocol.Command) protocol.Receipt {
+func (a *Agent) applyGeneration(cmd protocol.Command, owned ...bool) protocol.Receipt {
 	if err := protocol.ValidateGeneration(valueOrEmpty(cmd.Generation.ReasoningEffort), valueOrEmpty(cmd.Generation.Verbosity)); err != nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
 	}
@@ -22,7 +23,7 @@ func (a *Agent) applyGeneration(cmd protocol.Command) protocol.Receipt {
 		}
 		target.GenerationOptionsSet = true
 		return nil
-	})
+	}, owned...)
 }
 
 func valueOrEmpty(value *string) string {

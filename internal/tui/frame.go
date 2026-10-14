@@ -85,9 +85,9 @@ func (m *Model) headerPresentation() string {
 				break
 			}
 		}
-		crumb := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(name)
+		crumb := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(displayLabel(name))
 		if status != "" {
-			crumb += styleHints.Render(" · " + status)
+			crumb += styleHints.Render(" · " + displayLabel(status))
 		}
 		if idx, total := m.agentOrdinal(); idx > 0 && total > 1 {
 			crumb += styleHints.Render(fmt.Sprintf(" · %d/%d", idx, total))
@@ -103,7 +103,7 @@ func (m *Model) headerPresentation() string {
 				if row.Run.Active() {
 					active++
 				}
-				if row.Approval != nil {
+				if row.Approval != nil || row.Question != nil || row.Plan != nil {
 					approvals++
 				}
 			}
@@ -115,7 +115,7 @@ func (m *Model) headerPresentation() string {
 			crumb += " " + styleRunning.Render(fmt.Sprintf("(%d awaiting decision)", approvals))
 		}
 		leftCrumb = dot + " " + crumb
-		ws := shortenPath(m.workspace)
+		ws := shortenPath(displayLabel(m.workspace))
 		if ws != "" {
 			right = styleHints.Render(truncateDisplay(ws, 36))
 		}

@@ -229,7 +229,7 @@ func providerBinding(cfg config.Config, models *plugin.ModelRegistry, model stri
 // has already been built from a step snapshot; NewPreparedCall then freezes
 // both the complete wire input and the provider pointer before any network or
 // plugin code runs.
-func prepareProviderCall(binding modelBinding, req llm.CompletionRequest) (llm.PreparedCall, error) {
+func (a *Agent) prepareProviderCall(binding modelBinding, req llm.CompletionRequest) (llm.PreparedCall, error) {
 	if binding.client == nil {
 		return nil, errors.New("agent: provider binding is unavailable")
 	}
@@ -273,14 +273,26 @@ func (a *Agent) streamPrepared(ctx context.Context, purpose string, call llm.Pre
 		return llm.StreamResult{}, &requestJournalFailure{err: errors.New("prepared call is nil")}
 	}
 	defer call.Close()
-	manifest := call.Manifest()
-	req, err := llm.PreparedRequest(call)
-	if err != nil {
-		return llm.StreamResult{}, &requestJournalFailure{err: err}
-	}
 	ctx = withRequestJournalMetadata(ctx, metadata)
+	goalOwner, goalID := a.goalAccount()
 
 	for retry := 0; ; retry++ {
+		if !goalBeforeAttempt(goalOwner, goalID) {
+			if goalOwner != nil {
+				if err := goalOwner.persistenceFailure(); err != nil {
+					return llm.StreamResult{}, &requestJournalFailure{err: err}
+				}
+			}
+			if err := a.persistenceFailure(); err != nil {
+				return llm.StreamResult{}, &requestJournalFailure{err: err}
+			}
+			return llm.StreamResult{}, errGoalStopped
+		}
+		manifest := call.Manifest()
+		req, err := llm.PreparedRequest(call)
+		if err != nil {
+			return llm.StreamResult{}, &requestJournalFailure{err: err}
+		}
 		attempt, err := a.recordPreparedRequest(ctx, purpose, manifest.Provider, manifest.Endpoint, req)
 		if err != nil {
 			return llm.StreamResult{}, &requestJournalFailure{err: err}

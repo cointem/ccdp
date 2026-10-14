@@ -1,18 +1,22 @@
 package agent
 
 import (
-	"ccdp/internal/messages"
-	"ccdp/internal/tools"
 	"errors"
 	"strings"
 	"testing"
+
+	"ccdp/internal/messages"
+	"ccdp/internal/tools"
 )
 
 type diagnosticFailureTool struct{}
 
-func (diagnosticFailureTool) Name() string               { return "DiagnosticFailure" }
-func (diagnosticFailureTool) Description() string        { return "test" }
+func (diagnosticFailureTool) Name() string { return "DiagnosticFailure" }
+
+func (diagnosticFailureTool) Description() string { return "test" }
+
 func (diagnosticFailureTool) Parameters() map[string]any { return map[string]any{"type": "object"} }
+
 func (diagnosticFailureTool) Run(*tools.Context) (string, error) {
 	return "fatal: not a git repository\n", errors.New("exit 128")
 }

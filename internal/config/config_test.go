@@ -119,21 +119,6 @@ func TestEndpointFor(t *testing.T) {
 	}
 }
 
-func TestCostFor(t *testing.T) {
-	cfg := Default()
-	cfg.Model = "gpt-4o"
-	cfg.Pricing = DefaultPricing()
-	cost := cfg.CostFor("gpt-4o", 1_000_000, 500_000)
-	if cost != 2.5+5.0 {
-		t.Errorf("cost = %v, want 7.5", cost)
-	}
-	// Unknown model falls back to cfg.Model pricing.
-	cost = cfg.CostFor("weird-model", 1_000_000, 0)
-	if cost != 2.5 {
-		t.Errorf("fallback cost = %v, want 2.5", cost)
-	}
-}
-
 func TestLoadFromMerge(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -141,7 +126,6 @@ func TestLoadFromMerge(t *testing.T) {
 		"providers": {"custom": {"base_url":"https://custom.example/v1", "wire_api":"chat", "models":{"custom-model":{}}}},
 		"model": "custom/custom-model",
 		"permission_mode": "acceptEdits",
-		"max_budget_usd": 2.5,
 		"tools": [{"name": "fmt", "description": "fmt", "command": "gofmt"}]
 	}`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
@@ -157,9 +141,6 @@ func TestLoadFromMerge(t *testing.T) {
 	}
 	if cfg.PermissionMode != "acceptEdits" {
 		t.Errorf("mode = %q", cfg.PermissionMode)
-	}
-	if cfg.MaxBudgetUSD != 2.5 {
-		t.Errorf("max_budget = %v", cfg.MaxBudgetUSD)
 	}
 	if len(cfg.Tools) != 1 || cfg.Tools[0].Name != "fmt" {
 		t.Errorf("tools not merged: %+v", cfg.Tools)
@@ -217,7 +198,6 @@ func TestLoadFromPreservesExplicitZeroAndEmptyValuesAndSources(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{
 		"max_turns": 0,
-		"max_budget_usd": 0,
 		"always_allow": [],
 		"always_deny": [],
 		"tools": [],
@@ -230,10 +210,10 @@ func TestLoadFromPreservesExplicitZeroAndEmptyValuesAndSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxTurns != 0 || cfg.MaxBudgetUSD != 0 || cfg.WebToolsEnabled() {
+	if cfg.MaxTurns != 0 || cfg.WebToolsEnabled() {
 		t.Fatalf("explicit zero/false values were not retained: %+v", cfg)
 	}
-	for _, field := range []string{"max_turns", "max_budget_usd", "always_allow", "always_deny", "tools", "additional_directories", "enable_web_tools"} {
+	for _, field := range []string{"max_turns", "always_allow", "always_deny", "tools", "additional_directories", "enable_web_tools"} {
 		if !cfg.IsExplicit(field) || cfg.SourceOf(field) != SourceUserFile {
 			t.Fatalf("field %q provenance = %+v", field, cfg.SourceReport().Fields[field])
 		}

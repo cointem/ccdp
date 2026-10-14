@@ -347,8 +347,8 @@ func TestAnthropicBodySystemBlocks(t *testing.T) {
 		_, ok := m["cache_control"]
 		return ok
 	}
-	if !hasCC(sys[0].(map[string]any)) || !hasCC(sys[1].(map[string]any)) {
-		t.Fatalf("cacheable system blocks must carry cache_control: %v", sys)
+	if hasCC(sys[0].(map[string]any)) || !hasCC(sys[1].(map[string]any)) {
+		t.Fatalf("only the stable system prefix endpoint must carry cache_control: %v", sys)
 	}
 	if hasCC(sys[2].(map[string]any)) {
 		t.Fatalf("dynamic system block must not be cached: %v", sys[2])

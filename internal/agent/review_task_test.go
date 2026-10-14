@@ -119,7 +119,7 @@ func TestReviewCleanupPreservesActiveOwner(t *testing.T) {
 func TestReviewSaveRetryDoesNotRunModel(t *testing.T) {
 	a, _ := codingFixture(t)
 	a.mu.Lock()
-	dir := filepath.Join(a.cfg.SessionDir, a.sessionID, "reviews")
+	dir := filepath.Join(a.services.cfg.SessionDir, a.conversation.sessionID, "reviews")
 	a.mu.Unlock()
 	if e := os.MkdirAll(filepath.Dir(dir), 0700); e != nil {
 		t.Fatal(e)

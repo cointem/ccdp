@@ -62,9 +62,9 @@ func (r *reviewCopy) admit(path string) bool {
 
 func (a *Agent) prepareReviewCopy(ctx context.Context, cmd protocol.Command) (r *reviewCopy, err error) {
 	a.mu.Lock()
-	root := a.cfg.Workspace
-	limits := a.cfg.Review.Limits()
-	policy := a.sandbox.Snapshot()
+	root := a.services.cfg.Workspace
+	limits := a.services.cfg.Review.Limits()
+	policy := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
 	if pinned, ok := ctx.Value(reviewSourceKey{}).(reviewSource); ok {
 		root, policy = pinned.root, pinned.policy
@@ -235,6 +235,7 @@ func readReviewSource(root *os.Root, path string, expected os.FileInfo, limit in
 	}
 	return io.ReadAll(io.LimitReader(f, limit+1))
 }
+
 func (r *reviewCopy) task(ctx context.Context, w *protocol.WorkflowCommand) (string, int, error) {
 	selected := func(p string) bool {
 		if len(w.Paths) == 0 {
@@ -294,8 +295,8 @@ func (r *reviewCopy) task(ctx context.Context, w *protocol.WorkflowCommand) (str
 			status = "deleted"
 			right = "/dev/null"
 		}
-		argv, _ := execution.ReadOnlyGitArgv([]string{"git", "diff", "--no-index", "--no-color", "--", left, right})
-		res, e := execution.RunArgv(ctx, argv, execution.Request{Dir: r.dir, Sandbox: sb, Env: execution.ReadOnlyGitEnvironment(os.Environ()), OutputLimit: 64 << 20})
+		argv := []string{"git", "diff", "--no-index", "--no-color", "--", left, right}
+		res, e := execution.RunReadOnlyGit(ctx, argv, execution.Request{Dir: r.dir, Sandbox: sb, OutputLimit: 64 << 20})
 		if e != nil {
 			return "", 0, e
 		}
@@ -348,7 +349,7 @@ func (a *Agent) runReviewWith(ctx context.Context, cmd protocol.Command, execute
 	started := time.Now()
 	a.reviewProgress(ctx, cmd.ID, "审查：准备只读副本")
 	a.mu.Lock()
-	limits := a.cfg.Review.Limits()
+	limits := a.services.cfg.Review.Limits()
 	a.mu.Unlock()
 	prepCtx, cancel := context.WithTimeout(ctx, time.Duration(limits.PrepareSeconds)*time.Second)
 	copy, e := a.prepareReviewCopy(prepCtx, cmd)

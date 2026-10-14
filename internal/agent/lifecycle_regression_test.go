@@ -26,7 +26,7 @@ func TestLifecycleDeliveredImageCacheReleased(t *testing.T) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if v, ok := a.inputAttachments["audit-image"]; ok {
+	if v, ok := a.inbox.inputAttachments["audit-image"]; ok {
 		t.Fatalf("delivered and cleared image retained in pending cache: %d attachments, %d bytes", len(v.Attachments), len(v.Attachments[0].Data))
 	}
 }
@@ -45,7 +45,7 @@ func TestLifecycleCommandDrainsPendingInput(t *testing.T) {
 	if e != nil || r.Rejected() {
 		t.Fatalf("submit: %+v %v", r, e)
 	}
-	a.operationWG.Wait()
+	a.lifecycle.operationWG.Wait()
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		v, _ := a.Snapshot(context.Background())
@@ -61,15 +61,15 @@ func TestLifecycleCommandDrainsPendingInput(t *testing.T) {
 func TestLifecycleCompactCurrentLongTurn(t *testing.T) {
 	a := newRuntimeAgent(t)
 	a.mu.Lock()
-	a.cfg.KeepAfterCompact = 4
-	a.history = []messages.Message{{Role: messages.RoleUser, Content: "review all code"}}
+	a.services.cfg.KeepAfterCompact = 4
+	a.conversation.durable.History = []messages.Message{{Role: messages.RoleUser, Content: "review all code"}}
 	for i := 0; i < 6; i++ {
 		call := messages.ToolCall{ID: string(rune('a' + i)), Name: "Read", Arguments: map[string]any{"file_path": "large.go"}}
-		a.history = append(a.history, messages.AssistantWithTools("inspect next file", []messages.ToolCall{call}), messages.NewToolResult(call, strings.Repeat("large step output ", 10000), false))
+		a.conversation.durable.History = append(a.conversation.durable.History, messages.AssistantWithTools("inspect next file", []messages.ToolCall{call}), messages.NewToolResult(call, strings.Repeat("large step output ", 10000), false))
 	}
-	before := len(a.history)
+	before := len(a.conversation.durable.History)
 	a.mu.Unlock()
-	_, summarized, tail, _, _, ok := a.compactSpans()
+	_, summarized, tail, _, _, ok, _ := a.compactSpans()
 	if !ok {
 		t.Fatal("no compaction available")
 	}
@@ -84,7 +84,10 @@ func TestLifecycleCompactFIFO(t *testing.T) {
 		t.Fatal(e)
 	}
 	done := make(chan error, 1)
-	go func() { _, e := readBoundedRegularFile(path, 100); done <- e }()
+	go func() {
+		_, e := readBoundedRegularFile(path, 100, func(p string) (string, error) { return p, nil })
+		done <- e
+	}()
 	select {
 	case e := <-done:
 		if e == nil {
@@ -111,7 +114,7 @@ func TestLifecycleCheckpointFailureIsFailedTurn(t *testing.T) {
 	p := &formalCompletionProvider{}
 	a, _ := formalCompletionAgent(t, p)
 	a.mu.Lock()
-	a.cfg.Workspace = filepath.Join(t.TempDir(), "workspace-no-longer-present")
+	a.services.cfg.Workspace = filepath.Join(t.TempDir(), "workspace-no-longer-present")
 	a.mu.Unlock()
 	cmd := protocol.NewSubmitInput("audit-checkpoint-cmd", protocol.SessionID(a.SessionID()), "audit-checkpoint-input", "continue", protocol.InputSteer)
 	if r, e := a.Submit(context.Background(), cmd); e != nil || r.Rejected() {
@@ -127,7 +130,7 @@ func TestPartialProviderOutputDoesNotRestartOnFallback(t *testing.T) {
 	provider := &callbackRetryProvider{}
 	a := newJournalRuntimeAgent(t, provider)
 	a.mu.Lock()
-	a.fallbackBinding = modelBinding{model: "fallback-model", provider: provider.Name(), client: provider}
+	a.modelsState.fallbackBinding = modelBinding{model: "fallback-model", provider: provider.Name(), client: provider}
 	a.mu.Unlock()
 	submitJournalRuntimeInput(t, a)
 	view := waitJournalRuntimeIdle(t, a)

@@ -39,7 +39,7 @@ func TestHeadlessQuestionSnapshotAndEventCancelOnce(t *testing.T) {
 	question := &protocol.QuestionRequest{ID: "q"}
 	snapshot := client.snapshot
 	snapshot.Question = question
-	client.publish(protocol.Update{Type: protocol.UpdateState, Snapshot: &snapshot})
+	client.publish(protocol.Update{Type: protocol.UpdateState, State: statePointer(snapshot)})
 	client.publish(protocol.Update{Type: protocol.UpdateStream, Event: &protocol.EventView{Kind: protocol.EventQuestionRequest, Question: question}})
 	client.publish(protocol.Update{Type: protocol.UpdateStream, Event: &protocol.EventView{Kind: protocol.EventTurnDone}})
 	if err := consumeHeadlessTurn(ctx, ctx, watch, snapshot.SessionID, outText, &turnSink{}, 0, client); err != nil {

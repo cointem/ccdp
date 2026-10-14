@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"ccdp/internal/protocol"
+	"ccdp/internal/session"
+	"ccdp/internal/supervision"
 	"ccdp/internal/tools"
 )
 
@@ -41,60 +43,63 @@ func (s *SessionSupervisor) queueDormantMessage(r *managedRun, id protocol.Comma
 	}
 	r.fact.PendingMessages = append(r.fact.PendingMessages, protocol.InputView{ID: protocol.InputID(id), Text: text, Strategy: protocol.InputMessage, State: "queued", CreatedAt: time.Now().UTC()})
 	if err := s.persist(r, "mail-"+string(id)); err != nil {
-		r.fact.PendingMessages = r.fact.PendingMessages[:len(r.fact.PendingMessages)-1]
+		for i, input := range r.fact.PendingMessages {
+			if input.ID == protocol.InputID(id) {
+				r.fact.PendingMessages = append(r.fact.PendingMessages[:i:i], r.fact.PendingMessages[i+1:]...)
+				break
+			}
+		}
 		return err
 	}
 	return nil
 }
 
-func (s *SessionSupervisor) flushChildMessages(r *managedRun, child *Agent) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for len(r.fact.PendingMessages) > 0 {
+func (s *SessionSupervisor) flushChildMessages(r *managedRun, child supervision.ChildRuntime) error {
+	for {
+		r.mu.Lock()
+		if len(r.fact.PendingMessages) == 0 {
+			r.mu.Unlock()
+			return nil
+		}
 		input := r.fact.PendingMessages[0]
-		cmd := protocol.NewSubmitInput(protocol.CommandID(input.ID), protocol.SessionID(child.sessionID), input.ID, input.Text, protocol.InputMessage)
-		receipt := child.applySubmitInput(cmd)
+		r.mu.Unlock()
+		cmd := protocol.NewSubmitInput(protocol.CommandID(input.ID), protocol.SessionID(child.SessionID()), input.ID, input.Text, protocol.InputMessage)
+		receipt, submitErr := child.AdmitMessage(cmd)
+		if submitErr != nil {
+			return submitErr
+		}
 		if receipt.Rejected() {
 			return fmt.Errorf("child mailbox admission: %v", receipt.Error)
 		}
+		r.mu.Lock()
+		// Another delivery may already have acknowledged this stable input.
+		// Never remove a newer message based on a delayed acknowledgement.
+		if len(r.fact.PendingMessages) == 0 || r.fact.PendingMessages[0].ID != input.ID {
+			r.mu.Unlock()
+			continue
+		}
 		pending := r.fact.PendingMessages
 		r.fact.PendingMessages = pending[1:]
-		if err := s.persist(r, "mail-delivered-"+string(input.ID)); err != nil {
-			r.fact.PendingMessages = pending
+		err := s.persist(r, "mail-delivered-"+string(input.ID))
+		if err != nil {
+			r.fact.PendingMessages = append([]protocol.InputView{input}, r.fact.PendingMessages...)
+		}
+		r.mu.Unlock()
+		if err != nil {
 			return err
 		}
 	}
-	return nil
 }
 
 // Reserve workspace-changing workflows against queued/running shared workers.
 // Child admission uses the same supervisor lock. No file ownership service is
 // introduced: this protects harness workflows, not arbitrary concurrent shells.
 func (a *Agent) reserveWorkspaceMutation() (func(), error) {
-	s := a.supervisor
+	s := a.services.supervisor
 	if s == nil {
 		return func() {}, nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.workspaceMutation {
-		return nil, errors.New("another workspace operation is running")
-	}
-	for _, r := range s.children {
-		r.mu.Lock()
-		shared := r.fact.Child.WorkspaceMode == "shared" && r.fact.Child.Role == "worker"
-		done := r.done
-		r.mu.Unlock()
-		if shared {
-			select {
-			case <-done:
-			default:
-				return nil, errors.New("stop or wait for shared worker agents before changing workspace state")
-			}
-		}
-	}
-	s.workspaceMutation = true
-	return func() { s.mu.Lock(); s.workspaceMutation = false; s.mu.Unlock() }, nil
+	return s.directory.ReserveWorkspace()
 }
 
 func hasTurnStartingInput(inputs []protocol.InputView) bool {
@@ -107,12 +112,14 @@ func hasTurnStartingInput(inputs []protocol.InputView) bool {
 }
 
 // Caller holds a.mu.
-func (a *Agent) hasTurnStartingInputLocked() bool { return hasTurnStartingInput(a.pendingInputs) }
+func (a *Agent) hasTurnStartingInputLocked() bool {
+	return hasTurnStartingInput(a.conversation.durable.PendingInputViews())
+}
 
 func (a *Agent) hasAgentMessage() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, input := range a.pendingInputs {
+	for _, input := range a.conversation.durable.PendingInputViews() {
 		if input.Strategy == protocol.InputMessage {
 			return true
 		}
@@ -143,44 +150,116 @@ func (a *Agent) sendAgentMessage(ctx context.Context, id protocol.CommandID, tar
 	if strings.TrimSpace(text) == "" || len(text) > 32<<10 {
 		return errors.New("message must contain 1..32768 bytes")
 	}
-	if a.supervisor == nil {
+	if a.services.supervisor == nil {
 		return errors.New("agent messaging unavailable")
 	}
-	sender := a.sessionID
+	sender := a.conversation.sessionID
 	body := protocol.EncodeCollaboration(protocol.CollaborationMessage{Kind: "message", AgentID: protocol.SessionID(sender), Text: text})
-	var recipient *Agent
-	if a.childState != nil {
-		if a.childState.purpose != childPurposeTask || target != "parent" {
+	var recipient interface {
+		SessionID() string
+		AdmitMessage(protocol.Command) (protocol.Receipt, error)
+	}
+	if a.children.childState != nil {
+		if a.children.childState.purpose != childPurposeTask || target != "parent" {
 			return errors.New("children may message only parent")
 		}
-		r, err := a.supervisor.lookup(protocol.SessionID(a.sessionID))
+		r, err := a.services.supervisor.lookup(protocol.SessionID(a.conversation.sessionID))
 		if err != nil {
 			return err
 		}
 		recipient = r.parent
 	} else {
-		a.supervisor.mu.Lock()
-		defer a.supervisor.mu.Unlock()
-		r := a.supervisor.children[protocol.SessionID(target)]
+		// Persist the parent's outbox before crossing into the child. No
+		// directory/run lock may be held while waiting on another owner.
+	retryMailbox:
+		a.services.supervisor.publicationMu.Lock()
+		r := a.services.supervisor.directory.Current(protocol.SessionID(target))
 		if r == nil {
+			a.services.supervisor.publicationMu.Unlock()
 			return errors.New("unknown child session")
 		}
 		r.mu.Lock()
-		defer r.mu.Unlock()
+		if pending := r.handoff; pending != nil {
+			r.mu.Unlock()
+			a.services.supervisor.publicationMu.Unlock()
+			select {
+			case <-pending:
+				goto retryMailbox
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		if r.parent != a || r.fact.Child.Purpose != childPurposeTask {
+			r.mu.Unlock()
+			a.services.supervisor.publicationMu.Unlock()
 			return errors.New("message target is not your task child")
 		}
+		a.services.supervisor.publicationMu.Unlock()
+		err := a.services.supervisor.queueDormantMessage(r, id, body)
 		recipient = r.agent
-		if recipient == nil || r.fact.Child.Run.Status != "running" {
-			return a.supervisor.queueDormantMessage(r, id, body)
+		child := r.agent
+		running := r.fact.Child.Run.Status == "running"
+		r.mu.Unlock()
+		if err != nil {
+			return err
 		}
+		if recipient != nil && running {
+			// A concurrent finish may close the child's inbox. The durable
+			// parent outbox retains the message for its next continuation.
+			_ = a.services.supervisor.flushChildMessages(r, child)
+		}
+		return nil
 	}
-	cmd := protocol.NewSubmitInput(id, protocol.SessionID(recipient.sessionID), protocol.InputID(id), body, protocol.InputMessage)
-	// This admission method owns the durable inbox lock and does not start a
-	// model for InputMessage. Avoid waiting on the receiver's control loop.
-	receipt := recipient.applySubmitInput(cmd)
+	cmd := protocol.NewSubmitInput(id, protocol.SessionID(recipient.SessionID()), protocol.InputID(id), body, protocol.InputMessage)
+	// Mail uses the reliable control lane even during settings preparation.
+	// InputMessage never starts a model turn.
+	receipt, admitErr := recipient.AdmitMessage(cmd)
+	if admitErr != nil {
+		return admitErr
+	}
 	if receipt.Rejected() {
 		return fmt.Errorf("message rejected: %v", receipt.Error)
 	}
 	return nil
+}
+
+// AdmitMessage is the narrow mailbox capability used during cross-session
+// settlement. It cannot start a turn or accept arbitrary control commands.
+func (a *Agent) AdmitMessage(cmd protocol.Command) (protocol.Receipt, error) {
+	normalized, err := cmd.Normalize()
+	if err != nil {
+		return protocol.Receipt{}, err
+	}
+	if normalized.Type != protocol.CommandSubmitInput || normalized.Input == nil || normalized.Input.Strategy != protocol.InputMessage || normalized.SessionID != protocol.SessionID(a.SessionID()) {
+		return protocol.Receipt{}, errors.New("mailbox admission requires a message addressed to this session")
+	}
+	return a.admitInputFromWorker(normalized)
+}
+
+// mailboxAdmission bypasses ordinary command deferral, so a child reporting
+// during a settings drain cannot deadlock the parent waiting for that child.
+type mailboxAdmission struct {
+	command protocol.Command
+	result  chan protocol.Receipt
+}
+
+func (mailboxAdmission) ownerControlMessage() {}
+
+func (a *Agent) admitInputFromWorker(normalized protocol.Command) (protocol.Receipt, error) {
+	if a.owner == nil {
+		return a.applySubmitInput(normalized), nil
+	}
+	a.ensureRun()
+	request := mailboxAdmission{command: normalized, result: make(chan protocol.Receipt, 1)}
+	select {
+	case a.owner.control <- request:
+	case <-a.owner.done:
+		return protocol.Receipt{}, session.ErrClosed
+	}
+	select {
+	case receipt := <-request.result:
+		return receipt, nil
+	case <-a.owner.done:
+		return protocol.Receipt{}, session.ErrClosed
+	}
 }

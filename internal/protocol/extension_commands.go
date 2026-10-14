@@ -218,6 +218,7 @@ const (
 	QuerySkills      QueryKind = "skills"
 	QueryStatus      QueryKind = "status"
 	QueryGitHub      QueryKind = "github"
+	QueryGoal        QueryKind = "goal"
 )
 
 type QueryCommand struct {
@@ -243,7 +244,6 @@ type TrustProjectCommand struct {
 
 type ReloadCommand struct{}
 type ClearMemoryCommand struct{}
-type SaveSessionCommand struct{}
 
 const (
 	maxExternalArgs      = 64

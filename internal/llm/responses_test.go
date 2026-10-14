@@ -26,6 +26,10 @@ func TestNormalizeBaseURL(t *testing.T) {
 		// Loopback (local gateways serving at root) → unchanged.
 		{"http://localhost:11434", "http://localhost:11434"},
 		{"http://127.0.0.1:8080", "http://127.0.0.1:8080"},
+		{"http://[::1]:11434", "http://[::1]:11434"},
+		{"http://[::1]", "http://[::1]"},
+		{"http://[::1]:11434/api", "http://[::1]:11434/api"},
+		{"https://[2001:db8::1]:8080", "https://[2001:db8::1]:8080/v1"},
 	}
 	for _, c := range cases {
 		if got := normalizeBaseURL(c.in); got != c.want {

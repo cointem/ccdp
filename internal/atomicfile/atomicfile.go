@@ -42,6 +42,13 @@ func syncFile(f *os.File, syncFn SyncFile) error {
 	return f.Sync()
 }
 
+// PublishedError reports failure after the new directory entry became visible.
+// Callers must not treat an old cached value as the current disk contents.
+type PublishedError struct{ Err error }
+
+func (e *PublishedError) Error() string { return e.Err.Error() }
+func (e *PublishedError) Unwrap() error { return e.Err }
+
 // WriteFile publishes data at path atomically.  The temporary file is always
 // created beside path, so rename cannot cross filesystems.
 func WriteFile(path string, data []byte, perm fs.FileMode) error {
@@ -88,7 +95,7 @@ func WriteFileWithSync(path string, data []byte, perm fs.FileMode, syncFn SyncFi
 		syncDirFn = SyncDir
 	}
 	if err := syncDirFn(dir); err != nil {
-		return fmt.Errorf("atomicfile: sync parent %s after publishing %s: %w", dir, path, err)
+		return &PublishedError{Err: fmt.Errorf("atomicfile: sync parent %s after publishing %s: %w", dir, path, err)}
 	}
 	return nil
 }
@@ -148,7 +155,7 @@ func WriteReaderWithSync(path string, r io.Reader, perm fs.FileMode, maxBytes in
 		syncDirFn = SyncDir
 	}
 	if err := syncDirFn(dir); err != nil {
-		return n, fmt.Errorf("atomicfile: sync parent %s after publishing %s: %w", dir, path, err)
+		return n, &PublishedError{Err: fmt.Errorf("atomicfile: sync parent %s after publishing %s: %w", dir, path, err)}
 	}
 	return n, nil
 }

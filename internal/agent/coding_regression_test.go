@@ -16,7 +16,7 @@ import (
 
 func TestMergedWorkspaceRecoveryPreservesActiveAndChangedDirectories(t *testing.T) {
 	a, _ := codingFixture(t)
-	base := filepath.Join(filepath.Dir(a.cfg.SessionDir), "workspaces")
+	base := filepath.Join(filepath.Dir(a.services.cfg.SessionDir), "workspaces")
 	if err := os.MkdirAll(base, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestMergedWorkspaceRecoveryPreservesActiveAndChangedDirectories(t *testing.
 	if err = os.WriteFile(path, []byte("saved"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	policy := a.sandbox.Snapshot()
+	policy := a.services.sandbox.Snapshot()
 	policy.AddReadOnlyDir(dir)
 	snap, err := a.codingState().store.CapturePaths(context.Background(), dir, []string{"file"}, policy)
 	if err != nil {
@@ -38,19 +38,15 @@ func TestMergedWorkspaceRecoveryPreservesActiveAndChangedDirectories(t *testing.
 	done := make(chan struct{})
 	close(done)
 	r := &managedRun{done: done, fact: session.ChildRunRecorded{Child: protocol.ChildSession{SessionID: "recovery-child", Workspace: dir, MergeStatus: "merged", ResultSnapshotID: snap.ID, Run: protocol.RunView{Status: "succeeded"}}}}
-	a.supervisor.mu.Lock()
-	a.supervisor.children["recovery-child"] = r
-	a.supervisor.mu.Unlock()
+	a.services.supervisor.directory.Restore(r.fact.Child, r, true)
 	t.Cleanup(func() {
-		a.supervisor.mu.Lock()
-		delete(a.supervisor.children, "recovery-child")
-		a.supervisor.mu.Unlock()
+		a.services.supervisor.directory.Forget("recovery-child")
 	})
 	lock, err := fsops.LeaseWorkspace(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.supervisor.cleanupMergedWorkspaces()
+	a.services.supervisor.cleanupMergedWorkspaces()
 	if _, err = os.Stat(path); err != nil {
 		t.Fatal("removed active workspace", err)
 	}
@@ -58,14 +54,14 @@ func TestMergedWorkspaceRecoveryPreservesActiveAndChangedDirectories(t *testing.
 	if err = os.WriteFile(path, []byte("new user edit"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	a.supervisor.cleanupMergedWorkspaces()
+	a.services.supervisor.cleanupMergedWorkspaces()
 	if _, err = os.Stat(path); err != nil {
 		t.Fatal("removed newer edits", err)
 	}
 	if err = os.WriteFile(path, []byte("saved"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	a.supervisor.cleanupMergedWorkspaces()
+	a.services.supervisor.cleanupMergedWorkspaces()
 	if _, err = os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatal("merged crash residue retained", err)
 	}
@@ -74,7 +70,7 @@ func TestMergedWorkspaceRecoveryPreservesActiveAndChangedDirectories(t *testing.
 func TestPartialChildMergeRetainsUnmergedWork(t *testing.T) {
 	f := &fakeLLM{script: []string{"tool:Read|file_path=a.txt", "tool:Write|file_path=a.txt;mode=replace;content=child a", "tool:Read|file_path=b.txt", "tool:Write|file_path=b.txt;mode=replace;content=child b", "text:done"}}
 	a, _ := newTestAgent(t, f)
-	root := a.cfg.Workspace
+	root := a.services.cfg.Workspace
 	git(t, root, "init", "-q")
 	git(t, root, "config", "user.name", "Test")
 	git(t, root, "config", "user.email", "test@example.invalid")
@@ -126,7 +122,7 @@ func TestChildCleanupRejectsUnownedDirectory(t *testing.T) {
 
 func TestChildCleanupRecoversMissingWorktreeDirectory(t *testing.T) {
 	a, root := codingFixture(t)
-	base := filepath.Join(filepath.Dir(a.cfg.SessionDir), "workspaces")
+	base := filepath.Join(filepath.Dir(a.services.cfg.SessionDir), "workspaces")
 	if err := os.MkdirAll(base, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +177,7 @@ func TestDeliveryIndexLockRecoveryPreservesForeignLocks(t *testing.T) {
 func TestDeliveryResumeReusesCandidate(t *testing.T) {
 	a, root := codingFixture(t)
 	a.mu.Lock()
-	a.cfg.Delivery.Checks = []config.DeliveryCheck{{Name: "retry", Argv: []string{"sh", "-c", "test -f retry-marker || { touch retry-marker; exit 1; }"}}}
+	a.services.cfg.Delivery.Checks = []config.DeliveryCheck{{Name: "retry", Argv: []string{"sh", "-c", "test -f retry-marker || { touch retry-marker; exit 1; }"}}}
 	a.mu.Unlock()
 	if err := os.WriteFile(filepath.Join(root, "chosen.txt"), []byte("changed\n"), 0644); err != nil {
 		t.Fatal(err)
@@ -255,20 +251,19 @@ func TestReviewSourceRejectsReplacedEntry(t *testing.T) {
 func TestReviewStageProgressDoesNotReplaceMainStatus(t *testing.T) {
 	a, _ := codingFixture(t)
 	a.mu.Lock()
-	a.workLabel = "main task"
+	a.turn.workLabel = "main task"
 	a.mu.Unlock()
 	a.reviewProgress(context.Background(), "review-progress", "preparing review")
 	a.mu.Lock()
-	label := a.workLabel
+	label := a.turn.workLabel
 	a.mu.Unlock()
 	if label != "main task" {
 		t.Fatal("overwrote main task status")
 	}
-	a.transcript.mu.Lock()
-	defer a.transcript.mu.Unlock()
+	transcriptItems, _ := a.transcript.Snapshot()
 	// The same snapshot projection used by watch reconnects contains progress.
 	found := false
-	for _, item := range a.transcript.items {
+	for _, item := range transcriptItems {
 		if strings.HasPrefix(item.ID, "review:review-progress:") && item.Text == "preparing review" {
 			found = true
 		}

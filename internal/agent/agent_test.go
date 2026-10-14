@@ -142,7 +142,7 @@ func buildArgsJSON(s string) string {
 	return string(b)
 }
 
-func newTestAgent(t *testing.T, f *fakeLLM) (*Agent, <-chan Event) {
+func newTestAgent(t *testing.T, f *fakeLLM) (*Agent, <-chan protocol.EventView) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(f.handler))
 	t.Cleanup(srv.Close)
@@ -156,8 +156,7 @@ func newTestAgent(t *testing.T, f *fakeLLM) (*Agent, <-chan Event) {
 	cfg.SessionDir = t.TempDir()
 	cfg.SystemPrompt = "test system prompt"
 
-	events := make(chan Event, 4096)
-	ag, err := New(&cfg, events)
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -166,7 +165,7 @@ func newTestAgent(t *testing.T, f *fakeLLM) (*Agent, <-chan Event) {
 		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) {
 			ag.mu.Lock()
-			busy := ag.busy
+			busy := ag.turn.busy
 			ag.mu.Unlock()
 			if !busy {
 				break
@@ -175,7 +174,7 @@ func newTestAgent(t *testing.T, f *fakeLLM) (*Agent, <-chan Event) {
 		}
 		ag.Close()
 	})
-	return ag, events
+	return ag, watchTestEvents(t, ag)
 }
 
 func submitTestCommand(t *testing.T, ag *Agent, cmd protocol.Command) protocol.Receipt {
@@ -195,9 +194,9 @@ func submitTestInput(t *testing.T, ag *Agent, text string) protocol.Receipt {
 }
 
 // drainEvents consumes events until a predicate matches or a timeout passes.
-func drainUntil(t *testing.T, events <-chan Event, timeout time.Duration, pred func(Event) bool) []Event {
+func drainUntil(t *testing.T, events <-chan protocol.EventView, timeout time.Duration, pred func(protocol.EventView) bool) []protocol.EventView {
 	t.Helper()
-	var seen []Event
+	var seen []protocol.EventView
 	deadline := time.After(timeout)
 	for {
 		select {
@@ -223,12 +222,12 @@ func TestTurnWithToolCall(t *testing.T) {
 	submitTestInput(t, ag, "list the directory")
 
 	// Expect a tool result carrying the bash output.
-	saw := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
-		return ev.Type == EventToolResult && ev.Tool != nil && ev.Tool.Status == "success"
+	saw := drainUntil(t, events, 10*time.Second, func(ev protocol.EventView) bool {
+		return ev.Kind == protocol.EventToolResult && ev.Tool != nil && ev.Tool.Status == "success"
 	})
 	found := false
 	for _, ev := range saw {
-		if ev.Type == EventToolResult && strings.Contains(ev.Tool.Output, "hello") {
+		if ev.Kind == protocol.EventToolResult && strings.Contains(ev.Tool.Output, "hello") {
 			found = true
 		}
 	}
@@ -237,12 +236,12 @@ func TestTurnWithToolCall(t *testing.T) {
 	}
 
 	// Turn should end; the final assistant streamed text must be "done".
-	finished := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
-		return ev.Type == EventTurnDone
+	finished := drainUntil(t, events, 10*time.Second, func(ev protocol.EventView) bool {
+		return ev.Kind == protocol.EventTurnDone
 	})
 	foundDone := false
 	for _, ev := range finished {
-		if ev.Type == EventStream && strings.Contains(ev.Text, "done") {
+		if ev.Kind == protocol.EventStream && strings.Contains(ev.Text, "done") {
 			foundDone = true
 		}
 	}
@@ -264,8 +263,8 @@ func TestPermissionDenied(t *testing.T) {
 
 	submitTestInput(t, ag, "delete root")
 
-	saw := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
-		return ev.Type == EventToolResult && ev.Tool != nil && ev.Tool.Status == "denied"
+	saw := drainUntil(t, events, 10*time.Second, func(ev protocol.EventView) bool {
+		return ev.Kind == protocol.EventToolResult && ev.Tool != nil && ev.Tool.Status == "denied"
 	})
 	if len(saw) == 0 {
 		t.Fatalf("expected denied tool event for dangerous command")
@@ -273,7 +272,7 @@ func TestPermissionDenied(t *testing.T) {
 
 	// The history should contain a permission-denied tool result.
 	ag.mu.Lock()
-	last := ag.history[len(ag.history)-1]
+	last := ag.conversation.durable.History[len(ag.conversation.durable.History)-1]
 	ag.mu.Unlock()
 	if last.Role != "tool" || !strings.Contains(last.Content, "permission denied") {
 		t.Fatalf("expected permission denied tool result, got %+v", last)
@@ -291,11 +290,11 @@ func TestApprovalGate(t *testing.T) {
 		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)}}})
 	go ag.Run()
 
-	submitTestInput(t, ag, "install deps")
+	submitTestInput(t, ag, "install sessionServices")
 
 	// Approval should be requested (npm install is not in the safe allowlist).
-	req := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
-		return ev.Type == EventApproval
+	req := drainUntil(t, events, 10*time.Second, func(ev protocol.EventView) bool {
+		return ev.Kind == protocol.EventApprovalRequest
 	})
 	ap := req[len(req)-1].Approval
 	if ap == nil {
@@ -308,8 +307,8 @@ func TestApprovalGate(t *testing.T) {
 		Approval: &protocol.ApproveTool{ApprovalID: ap.ID, Approve: true, Remember: false}})
 
 	// Tool should then run successfully.
-	saw := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
-		return ev.Type == EventToolResult && ev.Tool != nil && ev.Tool.Status == "success"
+	saw := drainUntil(t, events, 10*time.Second, func(ev protocol.EventView) bool {
+		return ev.Kind == protocol.EventToolResult && ev.Tool != nil && ev.Tool.Status == "success"
 	})
 	if len(saw) == 0 {
 		t.Fatalf("expected tool to run after approval")
@@ -327,10 +326,10 @@ func TestApprovalDeniedRemembered(t *testing.T) {
 		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)}}})
 	go ag.Run()
 
-	submitTestInput(t, ag, "install deps")
+	submitTestInput(t, ag, "install sessionServices")
 
-	req := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
-		return ev.Type == EventApproval
+	req := drainUntil(t, events, 10*time.Second, func(ev protocol.EventView) bool {
+		return ev.Kind == protocol.EventApprovalRequest
 	})
 	ap := req[len(req)-1].Approval
 
@@ -339,16 +338,16 @@ func TestApprovalDeniedRemembered(t *testing.T) {
 		Type:     protocol.CommandApproveTool,
 		Approval: &protocol.ApproveTool{ApprovalID: ap.ID, Approve: false, Remember: true}})
 
-	saw := drainUntil(t, events, 10*time.Second, func(ev Event) bool {
-		return ev.Type == EventToolResult && ev.Tool != nil && ev.Tool.Status == "denied"
+	saw := drainUntil(t, events, 10*time.Second, func(ev protocol.EventView) bool {
+		return ev.Kind == protocol.EventToolResult && ev.Tool != nil && ev.Tool.Status == "denied"
 	})
 	if len(saw) == 0 {
 		t.Fatalf("expected denied tool event")
 	}
 
 	// Let the first turn finish completely (it consumes script index 1).
-	drainUntil(t, events, 10*time.Second, func(ev Event) bool {
-		return ev.Type == EventTurnDone
+	drainUntil(t, events, 10*time.Second, func(ev protocol.EventView) bool {
+		return ev.Kind == protocol.EventTurnDone
 	})
 
 	// Second identical request must be auto-denied without asking.
@@ -357,7 +356,7 @@ func TestApprovalDeniedRemembered(t *testing.T) {
 	f.script = []string{"tool:Bash|command=npm install", "text:done"}
 	f.mu.Unlock()
 
-	submitTestInput(t, ag, "install deps again")
+	submitTestInput(t, ag, "install sessionServices again")
 	// No approval event should arrive; the tool is denied immediately.
 	deadline := time.After(3 * time.Second)
 	gotApproval := false
@@ -365,10 +364,10 @@ func TestApprovalDeniedRemembered(t *testing.T) {
 	for !gotDenied {
 		select {
 		case ev := <-events:
-			if ev.Type == EventApproval {
+			if ev.Kind == protocol.EventApprovalRequest {
 				gotApproval = true
 			}
-			if ev.Type == EventToolResult && ev.Tool != nil && ev.Tool.Status == "denied" {
+			if ev.Kind == protocol.EventToolResult && ev.Tool != nil && ev.Tool.Status == "denied" {
 				gotDenied = true
 			}
 		case <-deadline:

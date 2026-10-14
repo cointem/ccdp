@@ -17,8 +17,7 @@ func newGithubAgent(t *testing.T, dir string) *Agent {
 	cfg := config.Default()
 	cfg.Workspace = dir
 	cfg.SessionDir = dir + "/sessions"
-	events := make(chan Event, 64)
-	ag, err := New(&cfg, events)
+	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -82,8 +81,8 @@ func TestPRQueriesUseBranchPositionArgument(t *testing.T) {
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	a := newGithubAgent(t, dir)
 	defer a.Close()
-	a.perms.SetAllowAll(true)
-	a.sandbox.SetAllowNetwork(true)
+	a.services.perms.SetAllowAll(true)
+	a.services.sandbox.SetAllowNetwork(true)
 	if got := a.PRComments(); got != "comments" {
 		t.Fatalf("comments: %s", got)
 	}
@@ -168,8 +167,8 @@ func TestGitHubStatusSurfacesGHFailure(t *testing.T) {
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	ag := newGithubAgent(t, dir)
 	defer ag.Close()
-	ag.perms.SetAllowAll(true)
-	ag.sandbox.SetAllowNetwork(true)
+	ag.services.perms.SetAllowAll(true)
+	ag.services.sandbox.SetAllowNetwork(true)
 
 	out := ag.GitHubStatus()
 	if !strings.Contains(out, "gh: unavailable") || !strings.Contains(out, "forbidden") {

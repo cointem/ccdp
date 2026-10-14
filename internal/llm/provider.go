@@ -215,5 +215,6 @@ func cloneToolCalls(src []ToolCall) []ToolCall {
 func CloneStreamResult(src StreamResult) StreamResult {
 	dst := src
 	dst.ToolCalls = cloneToolCalls(src.ToolCalls)
+	dst.ProviderContent = cloneRawBlocks(src.ProviderContent)
 	return dst
 }

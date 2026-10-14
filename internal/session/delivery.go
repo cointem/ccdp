@@ -1,6 +1,8 @@
 package session
 
-import "errors"
+import (
+	"errors"
+)
 
 type DeliveryRecorded struct {
 	PlanID    string `json:"plan_id"`
@@ -17,7 +19,9 @@ type DeliveryRecorded struct {
 const EventTypeDeliveryRecorded EventType = "DeliveryRecorded"
 
 func (DeliveryRecorded) Type() EventType { return EventTypeDeliveryRecorded }
-func (DeliveryRecorded) seal()           {}
+
+func (DeliveryRecorded) seal() {}
+
 func (e DeliveryRecorded) validate() error {
 	if len(e.PlanID) != 64 {
 		return errors.New("invalid delivery plan")

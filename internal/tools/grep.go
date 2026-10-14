@@ -2,27 +2,25 @@ package tools
 
 import (
 	"bufio"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"ccdp/internal/execution"
+	"ccdp/internal/executable"
 	"ccdp/internal/fsops"
+	"ccdp/internal/workspace"
 )
 
-// Grep runs through ripgrep when it is available and falls back to an
-// in-process engine otherwise. Both backends answer the same query and produce
-// the same grepLine values, so a missing binary degrades speed, not semantics.
+// Grep uses one Go/RE2 matcher on every platform so installation state never
+// changes the accepted regex syntax or search results.
 
 const (
 	// grepDefaultMaxLines caps one search result set.
@@ -40,6 +38,7 @@ type grepLine struct {
 	line  int
 	text  string
 	match bool
+	count int // preaggregated matching-line count from a streamed file
 }
 
 type grepRequest struct {
@@ -75,21 +74,27 @@ func (r *grepRequest) fetchLines() int {
 	return n + r.offset
 }
 
-func searchGrep(ctx *Context, r *grepRequest) (string, error) {
+func canonicalGrepRequest(ctx *Context, r *grepRequest) (*grepRequest, error) {
 	if ctx == nil || ctx.Sandbox == nil {
-		return "", fmt.Errorf("Grep: sandbox policy is unavailable")
+		return nil, fmt.Errorf("Grep: sandbox policy is unavailable")
 	}
-	if ripgrepUsableFor(ctx) {
-		lines, truncated, err := ripgrepSearch(ctx, r)
-		if err == nil {
-			return formatGrepResult(lines, r, truncated), nil
-		}
-		if !isRipgrepUnavailable(err) {
-			return "", err
-		}
-		// The binary could not run at all (gone since probe, sandbox denial).
-		// The in-process engine answers the same query.
+	path, err := ctx.ResolveRead(r.base)
+	if err != nil {
+		return nil, err
 	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := ctx.ResolveRead(path); err != nil {
+		return nil, err
+	}
+	copy := *r
+	copy.base = path
+	return &copy, nil
+}
+
+func searchGrep(ctx *Context, r *grepRequest) (string, error) {
 	lines, truncated, err := inProcessSearch(ctx, r)
 	if err != nil {
 		return "", err
@@ -97,229 +102,11 @@ func searchGrep(ctx *Context, r *grepRequest) (string, error) {
 	return formatGrepResult(lines, r, truncated), nil
 }
 
-// ripgrepUsableFor reports whether the sandboxed ripgrep backend can serve this request.
-func ripgrepUsableFor(ctx *Context) bool {
-	return ctx != nil && ctx.Sandbox != nil && ripgrepBinary() != ""
-}
-
-var (
-	rgOnce     sync.Once
-	rgResolved string
-)
-
-// ripgrepBinary resolves the ripgrep executable once per process. An explicit
-// CCDP_RG_PATH wins over PATH lookup so a bundled or relocated binary can be
-// pinned without touching PATH.
-func ripgrepBinary() string {
-	rgOnce.Do(func() {
-		if p := strings.TrimSpace(os.Getenv("CCDP_RG_PATH")); p != "" {
-			if st, err := os.Stat(p); err == nil && !st.IsDir() {
-				rgResolved = p
-				return
-			}
-		}
-		if p, err := exec.LookPath("rg"); err == nil {
-			rgResolved = p
-		}
-	})
-	return rgResolved
-}
-
-var errRipgrepUnavailable = fmt.Errorf("ripgrep unavailable")
-
-func isRipgrepUnavailable(err error) bool {
-	return err != nil && strings.Contains(err.Error(), errRipgrepUnavailable.Error())
-}
-
-// ripgrepSearch builds the rg invocation and normalizes its output.
-func ripgrepSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
-	args := []string{"--no-heading", "--no-messages", "--color", "never", "--hidden", "--no-require-git", "--sort", "path"}
-	// The pruned-directory table is shared with the in-process engine, so a
-	// repository whose .gitignore omits node_modules still behaves identically
-	// whichever backend answers.
-	for _, dir := range skipDirNamesSorted() {
-		args = append(args, "--glob", "!"+dir)
-	}
-	if r.ignoreCase {
-		args = append(args, "-i")
-	}
-	if r.multiline {
-		args = append(args, "-U", "--multiline-dotall")
-	}
-	if r.onlyMatch {
-		args = append(args, "-o")
-	}
-	for _, g := range r.globs {
-		args = append(args, "--glob", g)
-	}
-	for _, t := range r.types {
-		args = append(args, "--type", t)
-	}
-	jsonOut := false
-	switch r.outputMode {
-	case grepModeFiles:
-		args = append(args, "-l")
-	default:
-		// content and count both consume per-line events: count is aggregated
-		// during rendering so the two backends cannot disagree on the numbers.
-		jsonOut = true
-		switch {
-		case r.before > 0 && r.after > 0:
-			args = append(args, "-B", strconv.Itoa(r.before), "-A", strconv.Itoa(r.after))
-		case r.before > 0:
-			args = append(args, "-B", strconv.Itoa(r.before))
-		case r.after > 0:
-			args = append(args, "-A", strconv.Itoa(r.after))
-		}
-		args = append(args, "--json")
-	}
-	target := "."
-	if r.singleFile != "" {
-		target = "./" + r.singleFile
-	}
-	args = append(args, "--", r.pattern, target)
-
-	timeout := ctx.Timeout
-	if timeout <= 0 || timeout > grepTimeout {
-		timeout = grepTimeout
-	}
-	// argv crosses the execution boundary unquoted: pattern and glob values
-	// never reach a shell parser.
-	res, err := execution.RunArgv(ctx.Context, append([]string{ripgrepBinary()}, args...), execution.Request{
-		Context:     ctx.Context,
-		Dir:         r.base,
-		Timeout:     timeout,
-		Sandbox:     ctx.Sandbox,
-		OutputLimit: ctx.outputLimit(),
-	})
-	if err != nil {
-		return nil, false, fmt.Errorf("%w: %v", errRipgrepUnavailable, err)
-	}
-	switch res.ExitCode {
-	case 0, 1:
-		// 1 means "no matches", a valid empty result.
-	case 127:
-		return nil, false, fmt.Errorf("%w: exit 127", errRipgrepUnavailable)
-	default:
-		msg := strings.TrimSpace(res.Stderr)
-		if msg == "" {
-			msg = strings.TrimSpace(res.Output)
-		}
-		if strings.Contains(msg, "Operation not permitted") || strings.Contains(msg, "sandbox-exec") {
-			return nil, false, fmt.Errorf("%w: %s", errRipgrepUnavailable, msg)
-		}
-		if msg == "" {
-			msg = "unknown error"
-		}
-		return nil, false, fmt.Errorf("Grep: %s", firstLine(msg))
-	}
-
-	// A truncated JSON stream can end halfway through a file. Never report
-	// that prefix as its complete count; the fallback counts complete files.
-	if r.outputMode == grepModeCount && res.Truncated {
-		return inProcessSearch(ctx, r)
-	}
-	if jsonOut {
-		return parseRipgrepJSON(res.Stdout, r), res.Truncated, nil
-	}
-	return parseRipgrepList(res.Stdout), res.Truncated, nil
-}
-
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return strings.TrimSpace(s[:i])
-	}
-	return strings.TrimSpace(s)
-}
-
-type rgJSONEvent struct {
-	Type string `json:"type"`
-	Data struct {
-		Path struct {
-			Text string `json:"text"`
-		} `json:"path"`
-		Lines struct {
-			Text string `json:"text"`
-		} `json:"lines"`
-		LineNumber int `json:"line_number"`
-		Submatches []struct {
-			Match struct {
-				Text string `json:"text"`
-			} `json:"match"`
-		} `json:"submatches"`
-	} `json:"data"`
-}
-
-func parseRipgrepJSON(out string, r *grepRequest) []grepLine {
-	var lines []grepLine
-	sc := bufio.NewScanner(strings.NewReader(out))
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	limit := r.fetchLines()
-	if r.outputMode == grepModeContent {
-		limit *= 1 + r.before + r.after
-	}
-	files := map[string]bool{}
-	for sc.Scan() {
-		var ev rgJSONEvent
-		if json.Unmarshal(sc.Bytes(), &ev) != nil {
-			continue
-		}
-		if ev.Type != "match" && ev.Type != "context" {
-			continue
-		}
-		file := normalizeSearchPath(ev.Data.Path.Text)
-		if r.outputMode == grepModeCount {
-			if !files[file] && len(files) > limit {
-				return lines
-			}
-			files[file] = true
-		}
-		// A multiline match arrives as one event whose text spans newlines. The
-		// in-process engine reports each covered line, so expand here to keep the
-		// two backends identical.
-		for i, raw := range strings.Split(strings.TrimSuffix(ev.Data.Lines.Text, "\n"), "\n") {
-			text := strings.TrimSuffix(raw, "\r")
-			match := ev.Type == "match"
-			if match && r.onlyMatch && i == 0 && len(ev.Data.Submatches) > 0 {
-				text = ev.Data.Submatches[0].Match.Text
-			}
-			lines = append(lines, grepLine{
-				file:  file,
-				line:  ev.Data.LineNumber + i,
-				text:  clipLine(text),
-				match: match,
-			})
-			if r.outputMode != grepModeCount && len(lines) > limit {
-				return lines
-			}
-		}
-	}
-	return lines
-}
-
-func parseRipgrepList(out string) []grepLine {
-	var lines []grepLine
-	for _, raw := range strings.Split(out, "\n") {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			continue
-		}
-		lines = append(lines, grepLine{file: normalizeSearchPath(raw), match: true})
-	}
-	return lines
-}
-
-// normalizeSearchPath strips the "./" prefix ripgrep adds for a "." search root
-// so both backends report workspace-relative paths.
-func normalizeSearchPath(p string) string {
-	return strings.TrimPrefix(filepath.ToSlash(p), "./")
-}
-
 func clipLine(s string) string {
 	if len(s) <= grepLineCap {
 		return s
 	}
-	return s[:grepLineCap] + "…"
+	return truncateUTF8(s, grepLineCap) + "…"
 }
 
 // ---------- in-process engine ----------
@@ -345,16 +132,12 @@ var skipDirNames = map[string]bool{
 	".tox":             true,
 }
 
-func skipDirNamesSorted() []string {
-	out := make([]string, 0, len(skipDirNames))
-	for name := range skipDirNames {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func inProcessSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
+	canonical, err := canonicalGrepRequest(ctx, r)
+	if err != nil {
+		return nil, false, err
+	}
+	r = canonical
 	re, err := compileGrepPattern(r)
 	if err != nil {
 		return nil, false, err
@@ -363,8 +146,43 @@ func inProcessSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	ign := newIgnoreRules()
-	_ = ign.loadDir(r.base, "")
+	call := ctx.Context
+	if call == nil {
+		call = context.Background()
+	}
+	timeout := grepTimeout
+	if ctx.Timeout > 0 {
+		timeout = ctx.Timeout
+	}
+	call, cancel := context.WithTimeout(call, timeout)
+	defer cancel()
+	local := *ctx
+	local.Context = call
+	ctx = &local
+	ignoreRoot := grepIgnoreRoot(ctx, r.base)
+	ign := workspace.NewMatcherSafe()
+	loadIgnore := func(dir, rel string) {
+		if data, ok := readGrepFileLimit(ctx, filepath.Join(dir, ".gitignore"), min(ctx.readLimit(), 256<<10)); ok {
+			ign.AddGitignore(data, rel)
+		}
+	}
+	ignored := func(rel string, isDir bool) bool { hit, _ := ign.Match(rel, isDir); return hit }
+	// Match coordinates remain relative to the authorized enclosing root so
+	// anchored parent rules keep their meaning when searching a subdirectory.
+	var ancestors []string
+	for dir := r.base; ; dir = filepath.Dir(dir) {
+		ancestors = append(ancestors, dir)
+		if dir == ignoreRoot {
+			break
+		}
+	}
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		rel, _ := filepath.Rel(ignoreRoot, ancestors[i])
+		if rel == "." {
+			rel = ""
+		}
+		loadIgnore(ancestors[i], filepath.ToSlash(rel))
+	}
 
 	var (
 		out       []grepLine
@@ -380,6 +198,9 @@ func inProcessSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
 		walkRoot = filepath.Join(r.base, r.singleFile)
 	}
 	walkErr := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
+		if err := call.Err(); err != nil {
+			return err
+		}
 		if err != nil {
 			return nil
 		}
@@ -393,18 +214,26 @@ func inProcessSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
 		if rerr != nil || rel == "." {
 			return nil
 		}
+		ignoreRel, _ := filepath.Rel(ignoreRoot, path)
 		if d.IsDir() {
-			if skipDirNames[d.Name()] || ign.ignored(rel, true) {
+			if skipDirNames[d.Name()] || ignored(ignoreRel, true) {
 				return fs.SkipDir
 			}
-			_ = ign.loadDir(path, filepath.ToSlash(rel))
+			loadIgnore(path, filepath.ToSlash(ignoreRel))
 			return nil
 		}
-		if (r.singleFile == "" && ign.ignored(rel, false)) || !filter.match(filepath.ToSlash(rel), d.Name()) {
+		if r.singleFile == "" && d.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
-		fileLines, ferr := grepFile(ctx, path, filepath.ToSlash(rel), re, r)
+		if (r.singleFile == "" && ignored(ignoreRel, false)) || !filter.match(filepath.ToSlash(rel), d.Name()) {
+			return nil
+		}
+		fileLines, incomplete, ferr := grepFile(ctx, path, filepath.ToSlash(rel), re, r)
+		truncated = truncated || incomplete
 		if ferr != nil {
+			if errors.Is(ferr, errGrepReadLimit) {
+				truncated = true
+			}
 			return nil
 		}
 		if r.outputMode == grepModeCount || r.outputMode == grepModeFiles {
@@ -431,10 +260,48 @@ func inProcessSearch(ctx *Context, r *grepRequest) ([]grepLine, bool, error) {
 		}
 		return nil
 	})
+	if err := call.Err(); err != nil {
+		return nil, false, err
+	}
 	if walkErr != nil && walkErr != fs.SkipAll {
 		return nil, false, walkErr
 	}
 	return out, truncated, nil
+}
+
+// grepIgnoreRoot confines ignore discovery to the enclosing authorized
+// workspace root. A separately requested path starts its own search scope.
+func grepIgnoreRoot(ctx *Context, base string) string {
+	policy := ctx.Sandbox.Snapshot()
+	roots := []string{policy.Workspace}
+	if ctx.ReadRoot != "" {
+		roots = []string{ctx.ReadRoot}
+	}
+	if ctx.ReadRoot == "" {
+		roots = append(roots, policy.AdditionalDirs...)
+		roots = append(roots, policy.ReadOnlyDirs...)
+	}
+	root := base
+	for _, candidate := range roots {
+		if candidate == "" {
+			continue
+		}
+		canonical, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			continue
+		}
+		if executable.Within(canonical, base) && (root == base || executable.Within(canonical, root)) {
+			root = canonical
+		}
+	}
+	// A denied or snapshot-external ancestor cannot contribute rules.
+	for dir := base; dir != root; dir = filepath.Dir(dir) {
+		parent := filepath.Dir(dir)
+		if _, err := ctx.ResolveRead(parent); err != nil {
+			return dir
+		}
+	}
+	return root
 }
 
 func compileGrepPattern(r *grepRequest) (*regexp.Regexp, error) {
@@ -459,19 +326,22 @@ func compileGrepPattern(r *grepRequest) (*regexp.Regexp, error) {
 
 // grepFile matches one file and expands before/after context into merged
 // windows so overlapping matches are not emitted twice.
-func grepFile(ctx *Context, path, rel string, re *regexp.Regexp, r *grepRequest) ([]grepLine, error) {
-	data, ok := readGrepFile(ctx, path)
-	if !ok {
-		return nil, nil
+func grepFile(ctx *Context, path, rel string, re *regexp.Regexp, r *grepRequest) ([]grepLine, bool, error) {
+	if !r.multiline {
+		return grepFileLines(ctx, path, rel, re, r)
+	}
+	data, err := readGrepFileDetailed(ctx, path, ctx.readLimit())
+	if err != nil {
+		return nil, errors.Is(err, errGrepReadLimit), err
 	}
 	text := string(data)
 	if strings.IndexByte(text, 0) >= 0 {
-		return nil, nil // binary
+		return nil, false, nil // binary
 	}
 	lines := splitGrepLines(text)
 	var matched []int
 	if r.multiline {
-		starts := lineStartOffsets(lines)
+		starts := lineStartOffsets(strings.Split(text, "\n"))[:len(lines)]
 		for _, rng := range re.FindAllStringIndex(text, -1) {
 			matched = append(matched, coveredLines(starts, rng[0], rng[1])...)
 		}
@@ -484,7 +354,7 @@ func grepFile(ctx *Context, path, rel string, re *regexp.Regexp, r *grepRequest)
 		}
 	}
 	if len(matched) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	isMatch := make(map[int]bool, len(matched))
 	for _, i := range matched {
@@ -523,34 +393,158 @@ func grepFile(ctx *Context, path, rel string, re *regexp.Regexp, r *grepRequest)
 		start, end = lo, hi
 	}
 	flush()
-	return out, nil
+	return out, false, nil
 }
 
-// readGrepFile reads a bounded prefix of a file through the sandbox resolver,
-// refusing symlinks under strict mode like every other read path. ok=false means
-// "skip this file", not an error: an unreadable or oversized file is noise.
+// readGrepFile admits bounded auxiliary input, such as .gitignore contents.
+// Search files use streaming lines or explicitly report incomplete reads.
 func readGrepFile(ctx *Context, path string) ([]byte, bool) {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > int64(ctx.readLimit()) {
-		return nil, false
+	return readGrepFileLimit(ctx, path, ctx.readLimit())
+}
+
+var errGrepReadLimit = errors.New("Grep file read limit exceeded")
+
+func readGrepFileLimit(ctx *Context, path string, limit int) ([]byte, bool) {
+	data, err := readGrepFileDetailed(ctx, path, limit)
+	return data, err == nil
+}
+
+func openGrepFile(ctx *Context, path string) (*os.File, error) {
+	if err := ctx.checkResources(); err != nil {
+		return nil, err
 	}
-	if ctx == nil || ctx.Sandbox == nil {
-		return nil, false
-	}
-	readPath, err := ctx.Sandbox.ResolveRead(path)
+	return fsops.OpenAuthorizedRegular(ctx.ReadRoot, path, ctx.ResolveRead)
+}
+
+func readGrepFileDetailed(ctx *Context, path string, limit int) ([]byte, error) {
+	f, err := openGrepFile(ctx, path)
 	if err != nil {
-		return nil, false
-	}
-	f, err := fsops.OpenRegular("", readPath)
-	if err != nil {
-		return nil, false
+		return nil, err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, int64(ctx.readLimit())+1))
-	if err != nil || len(data) > ctx.readLimit() {
-		return nil, false
+	data, err := io.ReadAll(io.LimitReader(grepContextReader{ctx: ctx, reader: f}, int64(limit)+1))
+	if err != nil {
+		return nil, err
 	}
-	return data, true
+	if len(data) > limit {
+		return nil, errGrepReadLimit
+	}
+	return data, ctx.checkResources()
+}
+
+// Ordinary searches stream lines. Memory is bounded by one line, context and
+// the requested result window; count mode finishes the file before reporting.
+func grepFileLines(ctx *Context, path, rel string, re *regexp.Regexp, r *grepRequest) ([]grepLine, bool, error) {
+	f, err := openGrepFile(ctx, path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	reader := bufio.NewReaderSize(grepContextReader{ctx: ctx, reader: f}, min(64<<10, ctx.readLimit()))
+	var out, previous []grepLine
+	var line []byte
+	incomplete, oversized := false, false
+	lineNumber, after, matches := 0, 0, 0
+	lastAdded := 0
+	resultLimit := r.fetchLines()*(1+r.before+r.after) + 1
+	appendLine := func(row grepLine) {
+		if row.line > lastAdded {
+			out = append(out, row)
+			lastAdded = row.line
+		}
+	}
+	for {
+		part, readErr := reader.ReadSlice('\n')
+		if readErr != nil && readErr != io.EOF && readErr != bufio.ErrBufferFull {
+			return nil, incomplete, readErr
+		}
+		if len(part) == 0 && readErr == io.EOF {
+			break
+		}
+		if !oversized {
+			if len(line)+len(part) > ctx.readLimit() {
+				oversized, incomplete = true, true
+				line = nil
+			} else {
+				line = append(line, part...)
+			}
+		}
+		if readErr == bufio.ErrBufferFull {
+			continue
+		}
+		lineNumber++
+		if oversized {
+			previous = nil
+			after = 0
+		} else {
+			text := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
+			if strings.IndexByte(text, 0) >= 0 {
+				return nil, false, nil
+			}
+			hit := re.MatchString(text)
+			if hit {
+				matches++
+			}
+			if r.outputMode == grepModeFiles && hit {
+				return []grepLine{{file: rel, match: true}}, incomplete, nil
+			}
+			if r.outputMode != grepModeCount {
+				row := grepLine{file: rel, line: lineNumber, text: clipLine(text), match: hit}
+				if hit {
+					if r.onlyMatch {
+						row.text = clipLine(re.FindString(text))
+					}
+					for _, before := range previous {
+						appendLine(before)
+					}
+					appendLine(row)
+					after = r.after
+				} else if after > 0 {
+					appendLine(row)
+					after--
+				}
+				if r.before > 0 {
+					previous = append(previous, row)
+					if len(previous) > r.before {
+						previous = previous[1:]
+					}
+				}
+				if len(out) >= resultLimit {
+					return out, true, nil
+				}
+			}
+		}
+		line, oversized = line[:0], false
+		if readErr == io.EOF {
+			break
+		}
+	}
+	if r.outputMode == grepModeCount {
+		if incomplete {
+			return nil, true, nil
+		} // a partial file count would be misleading
+		if matches > 0 {
+			return []grepLine{{file: rel, line: matches, match: true, count: matches}}, false, nil
+		}
+	}
+	return out, incomplete, nil
+}
+
+type grepContextReader struct {
+	ctx    *Context
+	reader io.Reader
+}
+
+func (r grepContextReader) Read(p []byte) (int, error) {
+	if r.ctx.Context != nil {
+		if err := r.ctx.Context.Err(); err != nil {
+			return 0, err
+		}
+	}
+	if len(p) > 32<<10 {
+		p = p[:32<<10]
+	}
+	return r.reader.Read(p)
 }
 
 func splitGrepLines(text string) []string {
@@ -763,117 +757,6 @@ func grepTypeNames() []string {
 	return out
 }
 
-// ---------- gitignore ----------
-
-type ignoreRule struct {
-	re *regexp.Regexp
-	// contents is set for directory-only rules and matches paths underneath the
-	// ignored directory, so a file is excluded even when the walk reached it
-	// without pruning its parent first.
-	contents *regexp.Regexp
-	negate   bool
-	dirOnly  bool
-}
-
-// ignoreRules accumulates .gitignore patterns as the walk descends, so a rule
-// declared deeper in the tree overrides one declared above it.
-type ignoreRules struct {
-	rules []ignoreRule
-}
-
-func newIgnoreRules() *ignoreRules { return &ignoreRules{} }
-
-func (ir *ignoreRules) loadDir(dir, relDir string) error {
-	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	prefix := ""
-	if relDir != "" {
-		prefix = relDir + "/"
-	}
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimRight(raw, " \t")
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		negate := strings.HasPrefix(line, "!")
-		if negate {
-			line = strings.TrimSpace(line[1:])
-		}
-		line = strings.TrimPrefix(line, `\!`)
-		dirOnly := strings.HasSuffix(line, "/")
-		line = strings.TrimSuffix(line, "/")
-		if line == "" {
-			continue
-		}
-		anchored := strings.HasPrefix(line, "/") || strings.Contains(line, "/")
-		line = strings.TrimPrefix(line, "/")
-		body := ignorePatternBody(prefix, line, anchored)
-		re, err := regexp.Compile(body + "(/.*)?$")
-		if err != nil {
-			continue
-		}
-		rule := ignoreRule{re: re, negate: negate, dirOnly: dirOnly}
-		if dirOnly {
-			if contents, cerr := regexp.Compile(body + "/[^/].*$"); cerr == nil {
-				rule.contents = contents
-			}
-		}
-		ir.rules = append(ir.rules, rule)
-	}
-	return nil
-}
-
-// ignorePatternBody translates a gitignore pattern into the anchored regexp
-// prefix shared by the entry and contents forms.
-func ignorePatternBody(prefix, pattern string, anchored bool) string {
-	escaped := escapeIgnorePattern(pattern)
-	// Ordered: `**` spans separators, `*` and `?` do not.
-	escaped = strings.ReplaceAll(escaped, `\*\*`, "\x00")
-	escaped = strings.ReplaceAll(escaped, `\*`, `[^/]*`)
-	escaped = strings.ReplaceAll(escaped, `\?`, `[^/]`)
-	body := regexp.QuoteMeta(prefix) + strings.ReplaceAll(escaped, "\x00", ".*")
-	if anchored {
-		return "^" + body
-	}
-	// Unanchored patterns match the basename at any depth.
-	return "(^|.*/)" + body
-}
-
-func escapeIgnorePattern(p string) string {
-	var b strings.Builder
-	for _, r := range p {
-		switch r {
-		case '*', '?', '[', ']', '(', ')', '+', '.', '^', '$', '|', '{', '}', '\\':
-			b.WriteByte('\\')
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
-}
-
-func (ir *ignoreRules) ignored(rel string, isDir bool) bool {
-	ignored := false
-	for _, rule := range ir.rules {
-		re := rule.re
-		if rule.dirOnly && !isDir {
-			re = rule.contents
-		}
-		if re == nil {
-			continue
-		}
-		if re.MatchString(rel) {
-			ignored = !rule.negate
-		}
-	}
-	return ignored
-}
-
 // ---------- rendering ----------
 
 func formatGrepResult(lines []grepLine, r *grepRequest, truncated bool) string {
@@ -935,7 +818,7 @@ func writeTruncationNote(sb *strings.Builder, remaining int) {
 	if remaining < 0 {
 		remaining = 0
 	}
-	fmt.Fprintf(sb, "…(%d more result(s) available — refine the pattern or increase limit)\n", remaining)
+	fmt.Fprintf(sb, "…(%d more result(s) buffered; search incomplete — refine the query or use Read/Bash for oversized lines or multiline files)\n", remaining)
 }
 
 // grepFileEntries collapses matches to their files, preserving first-seen order.
@@ -962,11 +845,11 @@ func grepCountEntries(lines []grepLine) []grepLine {
 			continue
 		}
 		if i, ok := index[l.file]; ok {
-			out[i].line++
+			out[i].line += max(1, l.count)
 			continue
 		}
 		index[l.file] = len(out)
-		out = append(out, grepLine{file: l.file, line: 1, match: true})
+		out = append(out, grepLine{file: l.file, line: max(1, l.count), match: true})
 	}
 	return out
 }

@@ -1,16 +1,18 @@
 package agent
 
 import (
-	"ccdp/internal/config"
-	"ccdp/internal/messages"
-	"ccdp/internal/protocol"
-	"ccdp/internal/tools"
 	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ccdp/internal/config"
+	"ccdp/internal/messages"
+	"ccdp/internal/protocol"
+	"ccdp/internal/sessionview"
+	"ccdp/internal/tools"
 )
 
 func TestRegressionSelectedOpaqueRewind(t *testing.T) {
@@ -22,7 +24,7 @@ func TestRegressionSelectedOpaqueRewind(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(root, "chosen.txt"), []byte("external\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err = a.sealRecoveryPoint(point); err != nil {
+	if err = a.sealRecoveryPoint(context.Background(), point); err != nil {
 		t.Fatal(err)
 	}
 	current, err := a.captureCoding(context.Background())
@@ -94,7 +96,7 @@ func TestRegressionCodeRestoreRetryPreservesNewConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := deliveryID(t, out)
-	tc := a.resources.Context(ctx, root, a.sandbox)
+	tc := a.services.resources.Context(ctx, root, a.services.sandbox)
 	tc.Args = map[string]any{"command": "sleep 30", "yield_ms": 0}
 	raw, err := tools.NewBashTool().Run(tc)
 	if err != nil {
@@ -143,11 +145,11 @@ func TestRegressionReviewFromRepositorySubdirectory(t *testing.T) {
 	if err := os.WriteFile(path, []byte("package b\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := a.cfg.Clone()
+	cfg := a.services.cfg.Clone()
 	cfg.Workspace = sub
 	cfg.SessionDir = t.TempDir()
 	cfg.SessionID = ""
-	child, err := New(&cfg, nil)
+	child, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,13 +168,13 @@ func TestRegressionReviewFromRepositorySubdirectory(t *testing.T) {
 }
 
 func TestRegressionInterleavedReasoningNotPrematurelyCompleted(t *testing.T) {
-	tr := &transcriptState{}
+	tr := &sessionview.Transcript{}
 	ev := protocol.EventView{Kind: protocol.EventReasoning, TurnID: "1", Text: "first thought"}
-	tr.event(ev)
-	tr.event(protocol.EventView{Kind: protocol.EventStream, TurnID: "1", Text: "interim answer"})
+	tr.Event(ev)
+	tr.Event(protocol.EventView{Kind: protocol.EventStream, TurnID: "1", Text: "interim answer"})
 	ev.Text = "later thought"
-	tr.event(ev)
-	got := tr.eventItem(ev)
+	tr.Event(ev)
+	got := tr.EventItem(ev)
 	if got.Status != "streaming" {
 		t.Fatalf("live reasoning has immutable completed status: %+v", got)
 	}

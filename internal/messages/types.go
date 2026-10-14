@@ -48,8 +48,12 @@ type StreamSegment struct {
 
 // Message is a single entry in the conversation history.
 type Message struct {
-	StreamSegments   []StreamSegment `json:"stream_segments,omitempty"`
-	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	ProviderOrigin   string            `json:"provider_origin,omitempty"`
+	ProviderWire     string            `json:"provider_wire,omitempty"`
+	ProviderContent  []json.RawMessage `json:"provider_content,omitempty"`
+	InternalSource   string            `json:"internal_source,omitempty"`
+	StreamSegments   []StreamSegment   `json:"stream_segments,omitempty"`
+	ReasoningContent string            `json:"reasoning_content,omitempty"`
 	// ID is stable for the lifetime of a message and is used by session
 	// projections/UI resync.  Legacy JSON may omit it; the persistence adapter
 	// assigns one when a message first enters the new log.

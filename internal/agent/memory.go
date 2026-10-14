@@ -2,12 +2,11 @@ package agent
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"ccdp/internal/messages"
 	"ccdp/internal/session"
 )
 
@@ -21,33 +20,14 @@ const (
 	maxMemoryEntries = 30
 )
 
-// memoryFile returns the AutoMem session memory file path (scoped per session
-// id so it survives /resume).
-func (a *Agent) memoryFile() string {
-	return filepath.Join(a.cfg.SessionDir, a.sessionID+"-memory.md")
-}
-
-// MemoryText loads the session memory log (used by /memory).
+// MemoryText reads the authoritative typed session memory projection.
 func (a *Agent) MemoryText() string {
 	if p := a.persistenceHandle(); p != nil {
-		if text, seen, err := p.memoryText(); err == nil && seen {
+		if text, _, err := p.MemoryText(); err == nil {
 			return strings.TrimSpace(text)
 		}
-		// No-session persistence is a strict in-memory mode. Do not probe the
-		// configured session directory as a fallback when its typed log has not
-		// received a memory fact yet.
-		a.mu.Lock()
-		noDisk := a.cfg != nil && a.cfg.NoSessionPersistence
-		a.mu.Unlock()
-		if noDisk {
-			return ""
-		}
 	}
-	data, err := os.ReadFile(a.memoryFile())
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
+	return ""
 }
 
 // MemorySection renders the memory log for injection into the system prompt.
@@ -63,13 +43,13 @@ func (a *Agent) MemorySection() string {
 // recordMemory appends one AutoMem entry for the turn that just finished and
 // caps the log at maxMemoryEntries. Called from turnFinished.
 func (a *Agent) recordMemory() error {
-	if !a.cfg.MemoryEnabled() {
+	if !a.services.cfg.MemoryEnabled() {
 		return nil
 	}
 	a.mu.Lock()
-	userMsg := a.turnUserMsg
-	touched := append([]string(nil), a.turnTouched...)
-	summary := a.turnSummary
+	userMsg := a.turnMemory.turnUserMsg
+	touched := append([]string(nil), a.turnMemory.turnTouched...)
+	summary := a.turnMemory.turnSummary
 	a.mu.Unlock()
 
 	if userMsg == "" && len(touched) == 0 && summary == "" {
@@ -103,77 +83,50 @@ func (a *Agent) recordMemory() error {
 	text := strings.Join(entries, "\n\n") + "\n"
 	maxMemoryBytes := int(session.DefaultMaxTransactionBytes / 2)
 	if len(text) > maxMemoryBytes {
-		text = truncateUTF8Bytes(text, maxMemoryBytes)
+		text = messages.TruncateUTF8(text, maxMemoryBytes)
 	}
-	if p := a.persistenceHandle(); p != nil {
-		if err := p.persistMemory(text, false); err != nil {
-			a.markPersistenceFailure(err)
-			return err
-		}
-		// Keep the historical markdown file only as a read-compatible cache in
-		// disk mode. Typed MemoryChanged is authoritative; no-session mode must
-		// not create this file.
-		if a.cfg.NoSessionPersistence {
-			return nil
-		}
+	p := a.persistenceHandle()
+	if p == nil {
+		return fmt.Errorf("agent: session persistence is unavailable")
 	}
-	if err := os.MkdirAll(a.cfg.SessionDir, 0o755); err != nil {
-		// The markdown file is only a compatibility/read cache once the typed
-		// MemoryChanged fact has committed.  A cache filesystem failure must not
-		// make the authoritative session unusable; surface it as a bounded
-		// diagnostic and keep the typed memory available.
-		a.emitStatus("memory cache unavailable: %v", err)
-		return nil
-	}
-	if err := os.WriteFile(a.memoryFile(), []byte(text), 0o600); err != nil {
-		a.emitStatus("memory cache unavailable: %v", err)
-		return nil
+	if err := p.PersistMemory(text, false); err != nil {
+		a.markPersistenceFailure(err)
+		return err
 	}
 	return nil
 }
 
-// ClearMemory empties the session memory log (/memory clear).
+// ClearMemory records the cleared value in the typed session log.
 func (a *Agent) ClearMemory() error {
-	if p := a.persistenceHandle(); p != nil {
-		if err := p.persistMemory("", true); err != nil {
-			a.markPersistenceFailure(err)
-			return err
-		}
-		a.mu.Lock()
-		noDisk := a.cfg != nil && a.cfg.NoSessionPersistence
-		a.mu.Unlock()
-		if noDisk {
-			return nil
-		}
+	if a.owner == nil {
+		return a.clearMemoryOwned()
 	}
-	if err := os.Remove(a.memoryFile()); err != nil && !os.IsNotExist(err) {
-		// Once the typed MemoryChanged fact is committed this file is only a
-		// compatibility cache. Failure to remove it must not poison the session
-		// or hide the authoritative cleared value on replay.
-		a.emitStatus("memory cache unavailable: %v", err)
-		return nil
+	a.ensureRun()
+	r := memoryClearRequested{result: make(chan error, 1)}
+	select {
+	case a.owner.control <- r:
+	case <-a.owner.done:
+		return session.ErrClosed
 	}
-	return nil
+	select {
+	case err := <-r.result:
+		return err
+	case <-a.owner.done:
+		return session.ErrClosed
+	}
 }
 
 // recordTouched tracks a file path modified this turn (deduplicated) so the
 // AutoMem entry can summarize what changed.
 func (a *Agent) recordTouched(path string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for _, p := range a.turnTouched {
-		if p == path {
-			return
-		}
-	}
-	a.turnTouched = append(a.turnTouched, path)
+	a.postTurnNote(turnNoteRecorded{touched: path})
 }
 
 // memoryOneLine flattens newlines and caps a string for the memory log.
 func memoryOneLine(s string, max int) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > max {
-		s = truncateUTF8Bytes(s, max) + "…"
+		s = messages.TruncateUTF8(s, max) + "…"
 	}
 	return s
 }

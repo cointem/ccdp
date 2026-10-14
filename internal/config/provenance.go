@@ -71,11 +71,11 @@ var configFieldNames = []string{
 	"permission_mode", "always_allow", "always_deny", "system_prompt",
 	"context_window", "compact_threshold", "max_result_size_chars",
 	"keep_after_compact", "bash_timeout_seconds", "max_turns",
-	"max_budget_usd", "fallback_model",
+	"fallback_model",
 	"max_tool_output_chars_per_turn", "enable_guardian", "enable_memory",
 	"max_parallel_tools", "sandbox_limits", "network_access",
 	"additional_directories", "additional_read_only_directories", "disallowed_directories",
-	"hooks", "enable_web_tools", "tools", "mcp_servers", "pricing", "session_dir",
+	"hooks", "enable_web_tools", "tools", "mcp_servers", "session_dir",
 	"verbose", "debug", "session_id", "no_session_persistence", "review", "delivery", "automatic_checkpoints", "language_servers",
 }
 
@@ -266,8 +266,6 @@ func (c *Config) ApplyCLIOverride(field string, value any) error {
 		err = setInt(&c.BashTimeoutSeconds)
 	case "max_turns":
 		err = setInt(&c.MaxTurns)
-	case "max_budget_usd":
-		err = setFloat(&c.MaxBudgetUSD)
 	case "verbose":
 		err = setBool(&c.Verbose)
 	case "debug":
@@ -382,8 +380,6 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			dst.BashTimeoutSeconds = src.BashTimeoutSeconds
 		case "max_turns":
 			dst.MaxTurns = src.MaxTurns
-		case "max_budget_usd":
-			dst.MaxBudgetUSD = src.MaxBudgetUSD
 		case "verbose":
 			dst.Verbose = src.Verbose
 		case "debug":
@@ -419,8 +415,6 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			}
 		case "mcp_servers":
 			dst.MCPServers = cloneMCPServers(src.MCPServers)
-		case "pricing":
-			dst.Pricing = clonePricing(src.Pricing)
 		case "session_dir":
 			dst.SessionDir = src.SessionDir
 		case "session_id":
@@ -476,7 +470,6 @@ func (c Config) Clone() Config {
 	}
 	c.Providers = cloneProviders(c.Providers)
 	c.MCPServers = cloneMCPServers(c.MCPServers)
-	c.Pricing = clonePricing(c.Pricing)
 	c.Hooks = cloneHooks(c.Hooks)
 	if c.SandboxLimits != nil {
 		limits := *c.SandboxLimits
@@ -536,10 +529,6 @@ func cloneProviders(src map[string]ProviderConfig) map[string]ProviderConfig {
 		if v.ModelConfigs != nil {
 			models := make(map[string]ModelConfig, len(v.ModelConfigs))
 			for name, model := range v.ModelConfigs {
-				if model.Pricing != nil {
-					price := *model.Pricing
-					model.Pricing = &price
-				}
 				models[name] = model
 			}
 			v.ModelConfigs = models
@@ -561,14 +550,6 @@ func cloneMCPServers(src map[string]mcp.ServerConfig) map[string]mcp.ServerConfi
 	for k, v := range src {
 		v.Args = append([]string(nil), v.Args...)
 		v.Env = cloneStringMap(v.Env)
-		dst[k] = v
-	}
-	return dst
-}
-
-func clonePricing(src map[string]Pricing) map[string]Pricing {
-	dst := make(map[string]Pricing, len(src))
-	for k, v := range src {
 		dst[k] = v
 	}
 	return dst

@@ -84,7 +84,7 @@ func TestWatchConversationResetErasesNativeHistory(t *testing.T) {
 	cleared := protocolSnapshot("session")
 	cleared.Revision.LogSeq = m.snapshot.Revision.LogSeq
 	next, _ := m.handleWatchUpdate(watchUpdateMsg{sub: sub, update: protocol.Update{
-		Type: protocol.UpdateState, Snapshot: &cleared, Revision: cleared.Revision},
+		Type: protocol.UpdateState, State: statePointer(cleared), Revision: cleared.Revision},
 		sessionID: protocol.SessionID(m.sessionID), generation: m.watchGeneration})
 	m = modelValue(t, next)
 
@@ -379,7 +379,7 @@ func TestApprovalReceiptOnlyClosesMatchingModal(t *testing.T) {
 	}
 }
 
-func TestRejectedInputRestoresDraftAndReusesCommandID(t *testing.T) {
+func TestRejectedInputRestoresDraftAndUsesNewCommandID(t *testing.T) {
 	m := *sugModel()
 	client := m.client.(*recordingClient)
 	client.receipt = &protocol.Receipt{Status: protocol.ReceiptRejected,
@@ -397,16 +397,16 @@ func TestRejectedInputRestoresDraftAndReusesCommandID(t *testing.T) {
 	if got := m.textarea.Value(); got != "retry this exact draft" {
 		t.Fatalf("rejected input did not restore draft: %q", got)
 	}
-	if m.pendingSubmissionCount() != 0 || m.retryCommandID != firstID {
-		t.Fatalf("retry record missing or still in-flight: pending=%#v retry=%q", m.operations, m.retryCommandID)
+	if m.pendingSubmissionCount() != 0 || m.inputRetry == nil || m.inputRetry.command.ID != firstID {
+		t.Fatalf("retry record missing or still in-flight: pending=%#v retry=%+v", m.operations, m.inputRetry)
 	}
 	_, retryCmd := m.submit()
 	if retryCmd == nil {
 		t.Fatal("restored draft did not produce a retry command")
 	}
 	_ = retryCmd()
-	if len(client.submits) != 2 || client.submits[1].ID != firstID {
-		t.Fatalf("logical retry changed command id: first=%q retry=%q", firstID, client.submits[1].ID)
+	if len(client.submits) != 2 || client.submits[1].ID == firstID {
+		t.Fatalf("confirmed rejection reused command id: first=%q retry=%q", firstID, client.submits[1].ID)
 	}
 }
 
@@ -431,8 +431,8 @@ func TestRejectedInputClearsPendingRecordWithNewDraft(t *testing.T) {
 	if m.pendingSubmissionCount() != 0 {
 		t.Fatalf("rejected old draft remained in-flight while new draft was active: %#v", m.operations)
 	}
-	if m.retryCommandID != firstID || m.retryDraft != "old draft" {
-		t.Fatalf("failed old draft lost from retry slot: command=%q draft=%q", m.retryCommandID, m.retryDraft)
+	if m.inputRetry == nil || m.inputRetry.command.ID != firstID || m.inputRetry.command.Input.Text != "old draft" {
+		t.Fatalf("failed old draft lost from retry slot: %+v", m.inputRetry)
 	}
 }
 
@@ -454,8 +454,8 @@ func TestSubmissionTransportFailureClearsPendingAndRestoresRetry(t *testing.T) {
 	if got.textarea.Value() != "retry this message" {
 		t.Fatalf("transport failure did not restore draft: %q", got.textarea.Value())
 	}
-	if got.retryCommandID != commandID || got.retryDraft != "retry this message" {
-		t.Fatalf("retry slot = (%q,%q), want failed command and draft", got.retryCommandID, got.retryDraft)
+	if got.inputRetry == nil || got.inputRetry.command.ID != commandID || got.inputRetry.command.Input.Text != "retry this message" {
+		t.Fatalf("retry slot = %+v, want failed command and draft", got.inputRetry)
 	}
 }
 
@@ -537,7 +537,7 @@ func newLifecycleTestAgent(t *testing.T) *agent.Agent {
 	cfg.NoSessionPersistence = true
 	cfg.APIKey = "test-key"
 	cfg.BaseURL = "http://127.0.0.1:1"
-	ag, err := agent.New(&cfg, nil)
+	ag, err := agent.New(&cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

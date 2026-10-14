@@ -198,7 +198,7 @@ func (m *Model) renderQuestionInline() string {
 	index := min(max(0, s.index), len(s.request.Questions)-1)
 	q := s.request.Questions[index]
 	width := max(1, m.width-2)
-	rows := []string{styleRunning.Render(truncateDisplay(fmt.Sprintf("◇ %s · %d/%d", q.Header, index+1, len(s.request.Questions)), width))}
+	rows := []string{styleRunning.Render(truncateDisplay(fmt.Sprintf("◇ %s · %d/%d", displayLabel(q.Header), index+1, len(s.request.Questions)), width))}
 	body := wrapDisplay(sanitizeANSI(q.Question), width)
 	focusRow := len(body)
 	for i, option := range q.Options {

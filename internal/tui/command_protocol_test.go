@@ -106,11 +106,6 @@ func TestWorkspaceCommandsUseTypedRuntimePayloads(t *testing.T) {
 				t.Fatalf("reload command = %#v", command)
 			}
 		}},
-		{line: "/save", check: func(t *testing.T, command protocol.Command) {
-			if command.Type != protocol.CommandSaveSession || command.SaveSession == nil {
-				t.Fatalf("save command = %#v", command)
-			}
-		}},
 		{line: "/trust", check: func(t *testing.T, command protocol.Command) {
 			if command.Type != protocol.CommandTrustProject || command.TrustProject == nil || command.TrustProject.Revoke {
 				t.Fatalf("trust command = %#v", command)

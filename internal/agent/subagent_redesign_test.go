@@ -22,14 +22,14 @@ func TestSharedWorkerDefaultCanWriteWithoutGit(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}
-	data, err := os.ReadFile(filepath.Join(a.cfg.Workspace, "child.txt"))
+	data, err := os.ReadFile(filepath.Join(a.services.cfg.Workspace, "child.txt"))
 	if err != nil || string(data) != "created" {
 		t.Fatalf("write=%q %v", data, err)
 	}
-	if rows[0].Role != "worker" || rows[0].WorkspaceMode != "shared" || rows[0].Workspace != a.cfg.Workspace {
+	if rows[0].Role != "worker" || rows[0].WorkspaceMode != "shared" || rows[0].Workspace != a.services.cfg.Workspace {
 		t.Fatalf("wrong defaults: %+v", rows)
 	}
-	saved, err := LoadSession(a.cfg.SessionDir, rows[0].SessionID)
+	saved, err := LoadSession(a.services.cfg.SessionDir, rows[0].SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,15 +51,15 @@ func TestExplorerCanReportButCannotWrite(t *testing.T) {
 	if err != nil || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}
-	if _, err := os.Stat(filepath.Join(a.cfg.Workspace, "forbidden.txt")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(a.services.cfg.Workspace, "forbidden.txt")); !os.IsNotExist(err) {
 		t.Fatal("explorer wrote")
 	}
 	if !a.hasAgentMessage() {
 		t.Fatal("explorer report missing")
 	}
 	a.mu.Lock()
-	busy := a.busy
-	messages := len(a.pendingInputs)
+	busy := a.turn.busy
+	messages := len(a.conversation.durable.PendingInputViews())
 	a.mu.Unlock()
 	if messages != 2 {
 		t.Fatalf("expected two mid-run reports, got %d", messages)
@@ -76,12 +76,12 @@ func TestAgentMailboxDurableAndDoesNotStartTurn(t *testing.T) {
 		t.Fatal(receipt.Error)
 	}
 	a.mu.Lock()
-	busy, starting := a.busy, a.hasTurnStartingInputLocked()
+	busy, starting := a.turn.busy, a.hasTurnStartingInputLocked()
 	a.mu.Unlock()
 	if busy || starting || !a.hasAgentMessage() {
 		t.Fatal("queue-only message changed turn admission")
 	}
-	saved, err := LoadSession(a.cfg.SessionDir, a.sessionID)
+	saved, err := LoadSession(a.services.cfg.SessionDir, a.conversation.sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,11 +102,11 @@ func TestAgentMessageDoesNotBlockUserSteering(t *testing.T) {
 		t.Fatal(receipt.Error)
 	}
 	a.mu.Lock()
-	a.busy = true
+	a.turn.busy = true
 	a.mu.Unlock()
 	receipt := a.applySubmitInput(protocol.NewSubmitInput("steer-next", "", "steer-next", "new direction", protocol.InputSteer))
 	a.mu.Lock()
-	a.busy = false
+	a.turn.busy = false
 	a.mu.Unlock()
 	if receipt.Rejected() {
 		t.Fatal(receipt.Error)
@@ -128,7 +128,7 @@ func TestChildDormantMessagesSurviveContinuation(t *testing.T) {
 	if err := a.sendAgentMessage(context.Background(), "queued-message", string(id), "remember this"); err != nil {
 		t.Fatal(err)
 	}
-	r, _ := a.supervisor.lookup(id)
+	r, _ := a.services.supervisor.lookup(id)
 	r.mu.Lock()
 	pending := len(r.fact.PendingMessages)
 	r.mu.Unlock()
@@ -139,7 +139,7 @@ func TestChildDormantMessagesSurviveContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, _ := a.supervisor.lookup(id)
+	next, _ := a.services.supervisor.lookup(id)
 	select {
 	case <-next.done:
 	case <-time.After(8 * time.Second):
@@ -148,7 +148,7 @@ func TestChildDormantMessagesSurviveContinuation(t *testing.T) {
 	if run.ID == protocol.RunID(rows[0].RunID) {
 		t.Fatal("run identity reused")
 	}
-	saved, err := LoadSession(a.cfg.SessionDir, string(id))
+	saved, err := LoadSession(a.services.cfg.SessionDir, string(id))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestChildDormantMessagesSurviveContinuation(t *testing.T) {
 
 func TestIsolatedNonGitIncludesCurrentFiles(t *testing.T) {
 	a, _ := newTestAgent(t, &fakeLLM{script: []string{"text:done"}})
-	if err := os.WriteFile(filepath.Join(a.cfg.Workspace, "untracked.txt"), []byte("working content"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(a.services.cfg.Workspace, "untracked.txt"), []byte("working content"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := runTestChildren(a, []childTask{{Description: "inspect", WorkspaceMode: "isolated"}}, "isolated")
@@ -182,7 +182,7 @@ func TestIsolatedNonGitIncludesCurrentFiles(t *testing.T) {
 	if err != nil || string(data) != "working content" {
 		t.Fatalf("%q %v", data, err)
 	}
-	if dir == a.cfg.Workspace {
+	if dir == a.services.cfg.Workspace {
 		t.Fatal("not isolated")
 	}
 }
@@ -192,7 +192,7 @@ func TestSharedWorkerRetainsParentDeny(t *testing.T) {
 		return llm.StreamResult{Text: "done", FinishReason: "stop"}, nil
 	}}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	a.perms.RememberDeny(permissions.SessionKey("Write", map[string]any{"file_path": "x"}))
+	a.services.perms.RememberDeny(permissions.SessionKey("Write", map[string]any{"file_path": "x"}))
 	cfg, opts, err := childOptionsFromParent(a, childPurposeTask)
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +202,7 @@ func TestSharedWorkerRetainsParentDeny(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision, _ := opts.Permissions.Check("Write", map[string]any{"file_path": "x"}); decision != permissions.DecisionDeny {
+	if decision, _ := opts.Permissions.Check("Write", map[string]any{"file_path": "x"}, permissions.KindWrite); decision != permissions.DecisionDeny {
 		t.Fatalf("lost deny: %v", decision)
 	}
 	if !opts.AllowedTools["Bash"] {
@@ -219,14 +219,14 @@ func TestSharedWorkerCannotEscapeParentPlan(t *testing.T) {
 	if err != nil || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}
-	if _, err := os.Stat(filepath.Join(a.cfg.Workspace, "escape.txt")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(a.services.cfg.Workspace, "escape.txt")); !os.IsNotExist(err) {
 		t.Fatal("worker escaped parent plan restriction")
 	}
 }
 
 func TestExplorerRetainsParentDecisionHooks(t *testing.T) {
 	a, _ := newTestAgent(t, &fakeLLM{script: []string{"text:done"}})
-	a.cfg.Hooks = hooks.Config{hooks.EventPreToolUse: {{Matcher: "Read", Command: "exit 2"}}}
+	a.services.cfg.Hooks = hooks.Config{hooks.EventPreToolUse: {{Matcher: "Read", Command: "exit 2"}}}
 	cfg, opts, err := childOptionsFromParent(a, childPurposeTask)
 	if err != nil {
 		t.Fatal(err)
@@ -249,7 +249,7 @@ func TestIsolatedChildCanContinue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, _ := a.supervisor.lookup(id)
+	r, _ := a.services.supervisor.lookup(id)
 	select {
 	case <-r.done:
 	case <-time.After(8 * time.Second):
@@ -263,7 +263,7 @@ func TestIsolatedChildCanContinue(t *testing.T) {
 func TestChildForkCopiesBalancedPrefix(t *testing.T) {
 	a, _ := newTestAgent(t, &fakeLLM{script: []string{"text:child finished"}})
 	a.mu.Lock()
-	a.history = []messages.Message{
+	a.conversation.durable.History = []messages.Message{
 		{Role: messages.RoleUser, Content: "parent context"},
 		{Role: messages.RoleAssistant, Content: "prior answer"},
 		{Role: messages.RoleAssistant, ToolCalls: []messages.ToolCall{{ID: "pending", Name: "SpawnAgent"}}},
@@ -273,11 +273,11 @@ func TestChildForkCopiesBalancedPrefix(t *testing.T) {
 	if err != nil || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}
-	saved, err := LoadSession(a.cfg.SessionDir, rows[0].SessionID)
+	saved, err := LoadSession(a.services.cfg.SessionDir, rows[0].SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved.ParentID != a.sessionID || len(saved.History) < 4 || saved.History[0].Content != "parent context" {
+	if saved.ParentID != a.conversation.sessionID || len(saved.History) < 4 || saved.History[0].Content != "parent context" {
 		t.Fatalf("fork lost history/lineage: %+v", saved)
 	}
 	for _, m := range saved.History {
@@ -320,7 +320,7 @@ func TestSharedWorkerBlocksWorkspaceMutationUntilSettled(t *testing.T) {
 	a, _ := newChildRuntimeTestAgent(t, p)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r, err := a.supervisor.launch(a, ctx, childTask{Description: "wait"}, childPurposeTask, "busy")
+	r, err := a.services.supervisor.launch(a, ctx, childTask{Description: "wait"}, childPurposeTask, "busy")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -39,35 +39,36 @@ func (a *Agent) applyExternalCommand(cmd protocol.Command) protocol.Receipt {
 	argv := append([]string{ext.Program}, ext.Args...)
 	command := formatExternalCommand(argv)
 	readOnly := externalCommandReadOnly(argv)
-	actualArgv := append([]string(nil), argv...)
-	if readOnly && argv[0] == "git" {
-		hardened, err := execution.ReadOnlyGitArgv(argv)
-		if err != nil {
-			return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
-		}
-		actualArgv = hardened
-	}
 	if !readOnly {
 		if a.inPlanMode() {
 			return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "mutating external commands are unavailable in plan mode")
 		}
 	}
-	if err := a.precheckCommand("Bash", map[string]any{"command": command}); err != nil {
+	if err := a.precheckCommand("Bash", map[string]any{"command": command}, permissions.KindShell); err != nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
 	}
 	return a.scheduleCommandOperation(cmd, ext.Program, func(ctx context.Context) (string, error) {
-		if err := a.authorizeCommand(ctx, cmd.ID, "Bash", map[string]any{"command": command}); err != nil {
-			return "", err
+		var authorizationErr error
+		if readOnly && argv[0] == "git" {
+			authorizationErr = a.authorizeGitQuery(ctx, cmd.ID, argv)
+		} else {
+			authorizationErr = a.authorizeCommand(ctx, cmd.ID, "Bash", map[string]any{"command": command}, permissions.KindShell)
+		}
+		if authorizationErr != nil {
+			return "", authorizationErr
 		}
 		a.mu.Lock()
-		sb, dir := a.sandbox, a.cfg.Workspace
+		sb, dir := a.services.sandbox, a.services.cfg.Workspace
 		a.mu.Unlock()
 		env := execution.SanitizedEnvironment(os.Environ())
-		if readOnly && actualArgv[0] == "git" {
-			env = execution.ReadOnlyGitEnvironment(env)
+		request := execution.Request{Context: ctx, Dir: dir, Sandbox: sb, Env: env, OutputLimit: commandOutputLimit}
+		var res execution.Result
+		var err error
+		if readOnly && argv[0] == "git" {
+			res, err = execution.RunReadOnlyGit(ctx, argv, request)
+		} else {
+			res, err = execution.RunArgv(ctx, argv, request)
 		}
-		res, err := execution.RunArgv(ctx, actualArgv, execution.Request{Context: ctx, Dir: dir,
-			Sandbox: sb, Env: env, OutputLimit: commandOutputLimit})
 		if err != nil {
 			return strings.TrimSpace(res.Output), err
 		}
@@ -140,8 +141,11 @@ func (a *Agent) applyApplyCommand(cmd protocol.Command) protocol.Receipt {
 		}
 		if !looksLikeUnifiedPatch(content) {
 			text := "Apply the following plan in the current workspace, following normal approval and sandbox policy.\n\n" + content
-			receipt := a.applySubmitInput(protocol.Command{ID: cmd.ID, SessionID: cmd.SessionID,
+			receipt, err := a.admitInputFromWorker(protocol.Command{ID: cmd.ID, SessionID: cmd.SessionID,
 				Type: protocol.CommandSubmitInput, Input: &protocol.SubmitInput{ID: protocol.InputID(cmd.ID), Text: text, Strategy: protocol.InputSteer}})
+			if err != nil {
+				return "", err
+			}
 			if receipt.Rejected() {
 				if receipt.Error != nil {
 					return "", receipt.Error
@@ -154,14 +158,14 @@ func (a *Agent) applyApplyCommand(cmd protocol.Command) protocol.Receipt {
 			return "", errors.New("patch application is unavailable in plan mode")
 		}
 		args := map[string]any{"command": "git apply --whitespace=nowarn -"}
-		if err := a.precheckCommand("Bash", args); err != nil {
+		if err := a.precheckCommand("Bash", args, permissions.KindShell); err != nil {
 			return "", err
 		}
-		if err := a.authorizeCommand(ctx, cmd.ID, "Bash", args); err != nil {
+		if err := a.authorizeCommand(ctx, cmd.ID, "Bash", args, permissions.KindShell); err != nil {
 			return "", err
 		}
 		a.mu.Lock()
-		sb, dir := a.sandbox, a.cfg.Workspace
+		sb, dir := a.services.sandbox, a.services.cfg.Workspace
 		a.mu.Unlock()
 		res, err := execution.RunArgv(ctx, []string{"git", "apply", "--whitespace=nowarn", "-"}, execution.Request{
 			Context: ctx, Dir: dir, Sandbox: sb, Input: strings.NewReader(content),
@@ -201,7 +205,7 @@ func (a *Agent) applyCheckpointCommand(cmd protocol.Command) protocol.Receipt {
 				return "", e
 			}
 			p.After = p.Before
-			if _, e = a.persistenceHandle().commitEvents(p.ID+"-sealed", p); e != nil {
+			if _, e = a.commitAuxiliary(p.ID+"-sealed", p); e != nil {
 				return "", e
 			}
 			return "checkpoint " + p.ID + " created; /rewind prepare " + p.ID + " --mode both previews recovery", nil
@@ -226,7 +230,7 @@ func (a *Agent) applyExportCommand(cmd protocol.Command) protocol.Receipt {
 	a.mu.Lock()
 	path := cmd.Export.Path
 	if path == "" {
-		path = "ccdp-export-" + a.sessionID + ".md"
+		path = "ccdp-export-" + a.conversation.sessionID + ".md"
 	}
 	resolved, err := a.commandPathLocked(path, true)
 	a.mu.Unlock()
@@ -234,11 +238,11 @@ func (a *Agent) applyExportCommand(cmd protocol.Command) protocol.Receipt {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
 	}
 	args := map[string]any{"file_path": resolved}
-	if err := a.precheckCommand("Write", args); err != nil {
+	if err := a.precheckCommand("Write", args, permissions.KindWrite); err != nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
 	}
 	return a.scheduleCommandOperation(cmd, "export", func(ctx context.Context) (string, error) {
-		if err := a.authorizeCommand(ctx, cmd.ID, "Write", args); err != nil {
+		if err := a.authorizeCommand(ctx, cmd.ID, "Write", args, permissions.KindWrite); err != nil {
 			return "", err
 		}
 		data := []byte(a.ExportMarkdown())
@@ -257,17 +261,17 @@ func (a *Agent) applyInitCommand(cmd protocol.Command) protocol.Receipt {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "init is unavailable in plan mode")
 	}
 	a.mu.Lock()
-	path, err := a.commandPathLocked(filepath.Join(a.cfg.Workspace, workspace.InstructionFile), true)
+	path, err := a.commandPathLocked(filepath.Join(a.services.cfg.Workspace, workspace.InstructionFile), true)
 	a.mu.Unlock()
 	if err != nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
 	}
 	args := map[string]any{"file_path": path}
-	if err := a.precheckCommand("Write", args); err != nil {
+	if err := a.precheckCommand("Write", args, permissions.KindWrite); err != nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
 	}
 	return a.scheduleCommandOperation(cmd, "init", func(ctx context.Context) (string, error) {
-		if err := a.authorizeCommand(ctx, cmd.ID, "Write", args); err != nil {
+		if err := a.authorizeCommand(ctx, cmd.ID, "Write", args, permissions.KindWrite); err != nil {
 			return "", err
 		}
 		if _, err := os.Lstat(path); err == nil {
@@ -324,8 +328,8 @@ func (a *Agent) applyWorkflowCommand(cmd protocol.Command) protocol.Receipt {
 	case protocol.WorkflowIndex:
 		return a.scheduleCommandOperation(cmd, "index", func(ctx context.Context) (string, error) {
 			a.mu.Lock()
-			root := a.cfg.Workspace
-			policy := a.sandbox.Snapshot()
+			root := a.services.cfg.Workspace
+			policy := a.services.sandbox.Snapshot()
 			a.mu.Unlock()
 			if cmd.Workflow.Action == "refresh" {
 				workspace.Invalidate(root)
@@ -355,9 +359,9 @@ func boundedCommandOutput(value string) string {
 	return truncateResult(value, commandOutputLimit)
 }
 
-func (a *Agent) precheckCommand(toolName string, args map[string]any) error {
+func (a *Agent) precheckCommand(toolName string, args map[string]any, kind permissions.ToolKind) error {
 	a.mu.Lock()
-	perms := a.perms
+	perms := a.services.perms
 	a.mu.Unlock()
 	if perms == nil {
 		return errors.New("permission manager is unavailable")
@@ -365,16 +369,16 @@ func (a *Agent) precheckCommand(toolName string, args map[string]any) error {
 	if denied, reason := perms.HardDeny(toolName, args); denied {
 		return errors.New(reason)
 	}
-	decision, reason := perms.Check(toolName, args)
+	decision, reason := perms.Check(toolName, args, kind)
 	if decision == permissions.DecisionDeny {
 		return errors.New(reason)
 	}
 	return nil
 }
 
-func (a *Agent) authorizeCommand(ctx context.Context, id protocol.CommandID, toolName string, args map[string]any) error {
+func (a *Agent) authorizeCommand(ctx context.Context, id protocol.CommandID, toolName string, args map[string]any, kind permissions.ToolKind) error {
 	a.mu.Lock()
-	perms := a.perms
+	perms := a.services.perms
 	a.mu.Unlock()
 	if perms == nil {
 		return errors.New("permission manager is unavailable")
@@ -382,7 +386,22 @@ func (a *Agent) authorizeCommand(ctx context.Context, id protocol.CommandID, too
 	if denied, reason := perms.HardDeny(toolName, args); denied {
 		return errors.New(reason)
 	}
-	decision, reason := perms.Check(toolName, args)
+	decision, reason := perms.Check(toolName, args, kind)
+	return a.authorizeCommandDecision(ctx, id, toolName, args, decision, reason)
+}
+
+func (a *Agent) authorizeGitQuery(ctx context.Context, id protocol.CommandID, argv []string) error {
+	a.mu.Lock()
+	perms := a.services.perms
+	a.mu.Unlock()
+	decision, reason := perms.CheckReadOnlyGit(argv)
+	return a.authorizeCommandDecision(ctx, id, "Bash", map[string]any{"command": formatExternalCommand(argv)}, decision, reason)
+}
+
+func (a *Agent) authorizeCommandDecision(ctx context.Context, id protocol.CommandID, toolName string, args map[string]any, decision permissions.Decision, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if decision == permissions.DecisionDeny {
 		return errors.New(reason)
 	}
@@ -408,13 +427,13 @@ func (a *Agent) commandPathLocked(path string, write bool) (string, error) {
 	}
 	var resolved string
 	var err error
-	if a.sandbox == nil {
+	if a.services.sandbox == nil {
 		return "", errors.New("sandbox policy is unavailable")
 	}
 	if write {
-		resolved, err = a.sandbox.ResolveWrite(path)
+		resolved, err = a.services.sandbox.ResolveWrite(path)
 	} else {
-		resolved, err = a.sandbox.ResolveRead(path)
+		resolved, err = a.services.sandbox.ResolveRead(path)
 	}
 	if err != nil {
 		return "", err
@@ -426,8 +445,8 @@ func (a *Agent) commandPathLocked(path string, write bool) (string, error) {
 		}
 	}
 	resolved = filepath.Clean(resolved)
-	protected := []string{a.cfg.SessionDir, filepath.Join(a.cfg.Workspace, ".ccdp")}
-	if source := a.cfg.SourcePath(); source != "" {
+	protected := []string{a.services.cfg.SessionDir, filepath.Join(a.services.cfg.Workspace, ".ccdp")}
+	if source := a.services.cfg.SourcePath(); source != "" {
 		protected = append(protected, source)
 	}
 	for _, root := range protected {
@@ -534,25 +553,7 @@ func externalCommandReadOnly(argv []string) bool {
 		}
 		return !hasExternalWriteFlag(argv[3:])
 	}
-	switch argv[1] {
-	case "status":
-		return gitStatusReadOnlyArgs(argv[2:])
-	case "diff":
-		// --output/-o writes a file even though the git subcommand is usually
-		// read-only. External commands are argv-only, so reject both forms.
-		return gitReadOnlyArgs(argv[2:], true)
-	case "log", "show", "rev-parse", "ls-files", "describe":
-		return gitReadOnlyArgs(argv[2:], false)
-	case "branch":
-		return gitBranchReadOnlyArgs(argv[2:])
-	case "remote":
-		// `--` must precede the remote name when present. Do not accept
-		// arbitrary remote subcommands or a write-capable remote operation.
-		return len(argv) == 4 && argv[2] == "get-url" && argv[3] == "origin" ||
-			len(argv) == 5 && argv[2] == "get-url" && argv[3] == "--" && argv[4] == "origin"
-	default:
-		return false
-	}
+	return permissions.ReadOnlyGitArguments(argv)
 }
 
 func hasExternalWriteFlag(args []string) bool {
@@ -565,59 +566,6 @@ func hasExternalWriteFlag(args []string) bool {
 		}
 	}
 	return false
-}
-
-func gitStatusReadOnlyArgs(args []string) bool {
-	for _, arg := range args {
-		if arg == "--" {
-			// Pathspecs after -- are read-only.
-			return true
-		}
-		if strings.HasPrefix(arg, "-") {
-			switch arg {
-			case "--short", "-s", "--porcelain", "--porcelain=v1", "--porcelain=v2", "--branch", "--show-stash", "--ahead-behind", "--no-renames", "--renames", "--ignored", "--untracked-files", "-u", "--untracked-files=all", "--untracked-files=normal", "--untracked-files=no":
-				continue
-			default:
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func gitBranchReadOnlyArgs(args []string) bool {
-	for _, arg := range args {
-		if arg == "--" {
-			return false
-		}
-		if strings.HasPrefix(arg, "-") {
-			switch arg {
-			case "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--list", "-l", "--show-current", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--column", "--sort", "--color", "--no-color":
-				continue
-			default:
-				return false
-			}
-		}
-		// A bare branch name creates a branch; no positional arguments are
-		// accepted by the read-only adapter.
-		return false
-	}
-	return true
-}
-
-func gitReadOnlyArgs(args []string, diff bool) bool {
-	if hasExternalWriteFlag(args) {
-		return false
-	}
-	for _, arg := range args {
-		if arg == "--no-index" || arg == "--ext-diff" || arg == "--textconv" {
-			return false
-		}
-		if diff && (arg == "--output" || strings.HasPrefix(arg, "--output=")) {
-			return false
-		}
-	}
-	return true
 }
 
 func looksLikeUnifiedPatch(content string) bool {

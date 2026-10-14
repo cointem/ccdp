@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"ccdp/internal/session"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 
 	"ccdp/internal/config"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session"
 )
 
 func codingFixture(t *testing.T) (*Agent, string) {
@@ -37,13 +37,14 @@ func codingFixture(t *testing.T) (*Agent, string) {
 	cfg.EnableGuardian = config.BoolPtr(false)
 	cfg.EnableMemory = config.BoolPtr(false)
 	cfg.MCPServers = nil
-	a, e := New(&cfg, nil)
+	a, e := testNew(t, &cfg)
 	if e != nil {
 		t.Fatal(e)
 	}
 	t.Cleanup(a.Close)
 	return a, root
 }
+
 func runCoding(t *testing.T, a *Agent, w protocol.WorkflowCommand) (string, error) {
 	t.Helper()
 	cmd := protocol.Command{ID: protocol.CommandID(nextRuntimeID("test")), SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandRunWorkflow, Workflow: &w}
@@ -78,6 +79,7 @@ func runCoding(t *testing.T, a *Agent, w protocol.WorkflowCommand) (string, erro
 type codingTestError struct{ s string }
 
 func (e *codingTestError) Error() string { return e.s }
+
 func deliveryID(t *testing.T, out string) string {
 	t.Helper()
 	var v struct {
@@ -135,7 +137,7 @@ func TestDeliveryRejectsStaleSelectionAndFailedChecks(t *testing.T) {
 			_ = os.WriteFile(filepath.Join(root, "chosen.txt"), []byte("chosen\n"), 0644)
 			if which == "check" {
 				a.mu.Lock()
-				a.cfg.Delivery.Checks = []config.DeliveryCheck{{Name: "required", Argv: []string{"/bin/sh", "-c", "exit 17"}}}
+				a.services.cfg.Delivery.Checks = []config.DeliveryCheck{{Name: "required", Argv: []string{"/bin/sh", "-c", "exit 17"}}}
 				a.mu.Unlock()
 			}
 			before := git(t, root, "rev-parse", "HEAD")
@@ -169,7 +171,7 @@ func TestDeliveryInterruptStopsBeforeCommit(t *testing.T) {
 	a, root := codingFixture(t)
 	_ = os.WriteFile(filepath.Join(root, "chosen.txt"), []byte("chosen\n"), 0644)
 	a.mu.Lock()
-	a.cfg.Delivery.Checks = []config.DeliveryCheck{{Name: "wait", Argv: []string{"/bin/sh", "-c", "sleep 30"}}}
+	a.services.cfg.Delivery.Checks = []config.DeliveryCheck{{Name: "wait", Argv: []string{"/bin/sh", "-c", "sleep 30"}}}
 	a.mu.Unlock()
 	out, e := runCoding(t, a, protocol.WorkflowCommand{Kind: protocol.WorkflowCommitPushPR, Message: "selected", Mode: "commit", Paths: []string{"chosen.txt"}})
 	if e != nil {
@@ -209,7 +211,7 @@ func TestRecoveryPreservesUserChangesAndIsIdempotent(t *testing.T) {
 	if e = finish(); e != nil {
 		t.Fatal(e)
 	}
-	if e = a.sealRecoveryPoint(point); e != nil {
+	if e = a.sealRecoveryPoint(context.Background(), point); e != nil {
 		t.Fatal(e)
 	}
 	_ = os.WriteFile(path, []byte("agent\ntwo\nuser\n"), 0644)
@@ -242,7 +244,7 @@ func TestRecoveryOpaqueWritesRequireResolution(t *testing.T) {
 		t.Fatal(e)
 	}
 	_ = os.WriteFile(filepath.Join(root, "chosen.txt"), []byte("external\n"), 0644)
-	if e = a.sealRecoveryPoint(point); e != nil {
+	if e = a.sealRecoveryPoint(context.Background(), point); e != nil {
 		t.Fatal(e)
 	}
 	current, e := a.captureCoding(context.Background())
@@ -260,7 +262,7 @@ func TestRecoveryOpaqueWritesRequireResolution(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if _, e = a.codingState().store.Apply(context.Background(), resolved, a.sandbox); e != nil {
+	if _, e = a.codingState().store.Apply(context.Background(), resolved, a.services.sandbox); e != nil {
 		t.Fatal(e)
 	}
 	b, _ := os.ReadFile(filepath.Join(root, "chosen.txt"))
@@ -283,7 +285,7 @@ func TestReviewPersistsReadableReportsWithoutJSONRequirement(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer sub.Close()
-			root := a.cfg.Workspace
+			root := a.services.cfg.Workspace
 			git(t, root, "init", "-q")
 			git(t, root, "config", "user.name", "Test")
 			git(t, root, "config", "user.email", "test@example.invalid")
@@ -373,7 +375,7 @@ func TestReviewCancelledBeforeSnapshotHasVisibleResult(t *testing.T) {
 func TestWriteChildIsIsolatedAndExplicitlyMerged(t *testing.T) {
 	f := &fakeLLM{script: []string{"tool:Read|file_path=a.txt", "tool:Write|file_path=a.txt;mode=replace;content=child change", "text:done"}}
 	a, _ := newTestAgent(t, f)
-	root := a.cfg.Workspace
+	root := a.services.cfg.Workspace
 	git(t, root, "init", "-q")
 	git(t, root, "config", "user.name", "Test")
 	git(t, root, "config", "user.email", "test@example.invalid")
@@ -439,7 +441,7 @@ func TestDeliveryCreatesInitialCommitWithoutIndex(t *testing.T) {
 	cfg.SessionDir = t.TempDir()
 	cfg.PermissionMode = "bypass"
 	cfg.EnableGuardian = config.BoolPtr(false)
-	a, e := New(&cfg, nil)
+	a, e := testNew(t, &cfg)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -471,7 +473,7 @@ func TestPreparedRestoreSurvivesSessionRestart(t *testing.T) {
 	if e = finish(); e != nil {
 		t.Fatal(e)
 	}
-	if e = a.sealRecoveryPoint(point); e != nil {
+	if e = a.sealRecoveryPoint(context.Background(), point); e != nil {
 		t.Fatal(e)
 	}
 	out, e := runCoding(t, a, protocol.WorkflowCommand{Kind: protocol.WorkflowRestore, Action: "prepare", ID: point.ID, Mode: "both"})
@@ -479,14 +481,14 @@ func TestPreparedRestoreSurvivesSessionRestart(t *testing.T) {
 		t.Fatal(e)
 	}
 	id := deliveryID(t, out)
-	cfg := a.cfg.Clone()
+	cfg := a.services.cfg.Clone()
 	sid := a.SessionID()
 	a.Close()
 	snap, e := LoadSession(cfg.SessionDir, sid)
 	if e != nil {
 		t.Fatal(e)
 	}
-	resumed, e := Resume(&cfg, snap, nil)
+	resumed, e := Resume(&cfg, snap)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -511,7 +513,7 @@ func TestDeliveryResumeAfterNetworkDenialDoesNotCommitAgain(t *testing.T) {
 		t.Fatal(e)
 	}
 	id := deliveryID(t, out)
-	a.sandbox.SetAllowNetwork(false)
+	a.services.sandbox.SetAllowNetwork(false)
 	_, e = runCoding(t, a, protocol.WorkflowCommand{Kind: protocol.WorkflowCommitPushPR, Action: "apply", ID: id})
 	if e == nil {
 		t.Fatal("push bypassed network denial")
@@ -521,8 +523,8 @@ func TestDeliveryResumeAfterNetworkDenialDoesNotCommitAgain(t *testing.T) {
 	if e != nil || status.Stage != "committed" {
 		t.Fatalf("local commit not retained: %+v %v", status, e)
 	}
-	a.sandbox.SetAllowNetwork(true)
-	a.sandbox.AddDir(remote)
+	a.services.sandbox.SetAllowNetwork(true)
+	a.services.sandbox.AddDir(remote)
 	if _, e = runCoding(t, a, protocol.WorkflowCommand{Kind: protocol.WorkflowCommitPushPR, Action: "resume", ID: id}); e != nil {
 		t.Fatal(e)
 	}

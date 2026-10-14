@@ -15,6 +15,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/sessionview"
 )
 
 func TestSupervisorInterruptCancelsQueuedInputsAndPreservesReceipt(t *testing.T) {
@@ -25,7 +26,7 @@ func TestSupervisorInterruptCancelsQueuedInputsAndPreservesReceipt(t *testing.T)
 		return llm.StreamResult{}, ctx.Err()
 	}}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "block"}, childPurposeTask, "call")
+	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "block"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,7 @@ func TestSupervisorInterruptCancelsQueuedInputsAndPreservesReceipt(t *testing.T)
 	if r.fact.Child.Run.Status != "cancelled" {
 		t.Fatalf("outcome: %+v", r.fact.Child.Run)
 	}
-	records, _, err := a.supervisor.readSessionRecords(context.Background(), row.SessionID)
+	records, _, err := a.services.supervisor.readSessionRecords(context.Background(), row.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,12 +80,12 @@ func TestSupervisorMemoryContinueRetainsHistoryAndCommandIdentity(t *testing.T) 
 	registry := plugin.NewModelRegistry()
 	registry.Register(p)
 	registry.Route(cfg.Model, p.Name())
-	a, err := NewWithOptions(&cfg, nil, Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: registry})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	r, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "memory original"}, childPurposeTask, "call")
+	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "memory original"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +96,7 @@ func TestSupervisorMemoryContinueRetainsHistoryAndCommandIdentity(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	nr, _ := a.supervisor.lookup(row.SessionID)
+	nr, _ := a.services.supervisor.lookup(row.SessionID)
 	waitManaged(t, nr)
 	if nr.err != nil {
 		t.Fatal(nr.err)
@@ -132,47 +133,80 @@ func TestSupervisorRecoversDurableOutboxWithoutExecution(t *testing.T) {
 	}}
 	a, cfg := newChildRuntimeTestAgent(t, p)
 	id := newSessionID()
-	fact := session.ChildRunRecorded{Version: 1, Child: protocol.ChildSession{SessionID: protocol.SessionID(id), ParentSessionID: protocol.SessionID(a.sessionID), RootSessionID: protocol.SessionID(a.sessionID), DelegationID: "delegation", Purpose: childPurposeTask, Run: protocol.RunView{ID: "crashed-run", Status: "running", WaitPolicy: "join"}}}
-	if _, err := a.persistenceHandle().commitEvents("catalog-before-crash", fact); err != nil {
+	fact := session.ChildRunRecorded{Version: 1, Child: protocol.ChildSession{SessionID: protocol.SessionID(id), ParentSessionID: protocol.SessionID(a.conversation.sessionID), RootSessionID: protocol.SessionID(a.conversation.sessionID), DelegationID: "delegation", Purpose: childPurposeTask, Run: protocol.RunView{ID: "crashed-run", Status: "running", WaitPolicy: "join"}}}
+	if _, err := a.persistenceHandle().CommitEvents("catalog-before-crash", fact); err != nil {
 		t.Fatal(err)
 	}
-	store, err := session.OpenJSONLStore(cfg.SessionDir, id)
+	childCfg := cfg.Clone()
+	childCfg.SessionID = id
+	child, err := testNewWithOptions(t, &childCfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: a.services.models})
 	if err != nil {
+		t.Fatal(err)
+	}
+	req := journalRequest()
+	req.Model = cfg.Model
+	attempt, err := child.recordPreparedRequest(context.Background(), "task", p.Name(), "", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.finishRequestAttempt(attempt, llm.StreamResult{PromptTokens: 7, CompletionTok: 3}, nil); err != nil {
 		t.Fatal(err)
 	}
 	fact.Child.Run.Status = "succeeded"
 	fact.Child.Run.Output = "saved answer"
 	fact.Child.Run.Usage.InputTokens = 7
+	fact.Child.Run.Usage.OutputTokens = 3
+
 	fact.DeliveryID = "child-result-crashed-run"
-	_, err = store.Commit(session.Beginning, session.NewBatch(session.SessionCreated{SessionID: id, FormatVersion: session.SchemaVersion, Source: "task", ParentID: a.sessionID, CreatedAt: time.Now().UTC()}, fact))
+	_, err = child.persistenceHandle().CommitEvents("terminal-outbox-before-root-accounting", fact)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = store.Close()
-	s := newSessionSupervisor(a)
-	r, err := s.lookup(protocol.SessionID(id))
-	if err != nil {
+	if a.Usage().InputTokens != 0 {
+		t.Fatal("fixture already copied child accounting")
+	}
+	if err := child.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if r.fact.Child.Run.Status != "succeeded" || r.fact.Child.Run.Output != "saved answer" {
-		t.Fatalf("outbox not recovered: %+v", r.fact)
+	rootID := a.SessionID()
+	if err := a.CloseContext(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	r.mu.Lock()
-	err = s.recordOutcome(r)
-	if err == nil {
+	for i := 0; i < 2; i++ {
+		snap, err := LoadSession(cfg.SessionDir, rootID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resumed, err := Resume(&cfg, snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := resumed.services.supervisor
+		r, err := s.lookup(protocol.SessionID(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.fact.Child.Run.Status != "succeeded" || r.fact.Child.Run.Output != "saved answer" {
+			t.Fatalf("outbox not recovered: %+v", r.fact)
+		}
+		r.mu.Lock()
 		err = s.recordOutcome(r)
-	}
-	r.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a.Usage().InputTokens != 7 {
-		t.Fatal("usage not idempotent")
-	}
-	again := newSessionSupervisor(a)
-	rr, _ := again.lookup(protocol.SessionID(id))
-	if !rr.fact.UsageAccounted {
-		t.Fatal("usage receipt not durable")
+		if err == nil {
+			err = s.recordOutcome(r)
+		}
+		r.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := resumed.Usage(); got.InputTokens != 7 || got.OutputTokens != 3 {
+			t.Fatalf("resume %d usage not idempotent: %+v", i, got)
+		}
+		if !r.fact.UsageAccounted {
+			t.Fatal("usage receipt not durable")
+		}
+		if err := resumed.CloseContext(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -180,18 +214,22 @@ func TestSupervisorOutputPagesReadFullScopedArtifact(t *testing.T) {
 	a, _ := newChildRuntimeTestAgent(t, &childRuntimeTestProvider{name: "output"})
 	full := strings.Repeat("中文 output\n", 9000)
 	p := a.persistenceHandle()
-	ref, err := p.Artifacts().Put([]byte(full))
+	artifacts, err := p.RequestArtifacts()
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = p.commitEvents("saved-output", session.ToolFinished{TurnID: "turn", CallID: "call", Status: "success", RawOutput: &ref, Result: session.ToolResult{CallID: "call", Status: "success", Text: "preview"}})
+	ref, err := artifacts.PutContext(context.Background(), []byte(full))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.CommitEvents("saved-output", session.ToolFinished{TurnID: "turn", CallID: "call", Status: "success", RawOutput: &ref, Result: session.ToolResult{CallID: "call", Status: "success", Text: "preview"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var out strings.Builder
 	var offset int64
 	for {
-		page, err := a.Sessions().ReadOutput(context.Background(), protocol.SessionID(a.sessionID), "tool:turn:call", offset, 1025)
+		page, err := a.Sessions().ReadOutput(context.Background(), protocol.SessionID(a.conversation.sessionID), "tool:turn:call", offset, 1025)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -216,14 +254,14 @@ func TestSupervisorTranscriptPaginationIsStableAndBounded(t *testing.T) {
 		events[i] = session.InputQueued{InputID: fmt.Sprintf("input-%d", i), Text: fmt.Sprintf("item %d", i), Strategy: "followup"}
 	}
 	for start := 0; start < len(events); start += 200 {
-		if _, err := a.persistenceHandle().commitEvents(fmt.Sprintf("many-inputs-%d", start), events[start:min(start+200, len(events))]...); err != nil {
+		if _, err := a.persistenceHandle().CommitEvents(fmt.Sprintf("many-inputs-%d", start), events[start:min(start+200, len(events))]...); err != nil {
 			t.Fatal(err)
 		}
 	}
 	seen := map[string]bool{}
 	var before uint64
 	for {
-		page, err := a.Sessions().ReadTranscript(context.Background(), protocol.SessionID(a.sessionID), before, 17)
+		page, err := a.Sessions().ReadTranscript(context.Background(), protocol.SessionID(a.conversation.sessionID), before, 17)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -258,7 +296,7 @@ func TestSupervisorStopTreeJoinsAllTargets(t *testing.T) {
 	}}
 	a, _ := newChildRuntimeTestAgent(t, p)
 	for i := 0; i < 2; i++ {
-		if _, err := a.supervisor.launch(a, a.rootCtx, childTask{Description: "block", WaitPolicy: "notify"}, childPurposeTask, fmt.Sprint(i)); err != nil {
+		if _, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "block", WaitPolicy: "notify"}, childPurposeTask, fmt.Sprint(i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -266,7 +304,7 @@ func TestSupervisorStopTreeJoinsAllTargets(t *testing.T) {
 	<-started
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := a.Sessions().Control(ctx, protocol.AgentControl{ID: "stop-tree", SessionID: protocol.SessionID(a.sessionID), Action: "stop_tree"})
+	_, err := a.Sessions().Control(ctx, protocol.AgentControl{ID: "stop-tree", SessionID: protocol.SessionID(a.conversation.sessionID), Action: "stop_tree"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,9 +322,9 @@ func TestSupervisorStopTreeJoinsAllTargets(t *testing.T) {
 func TestTranscriptLiveToolEventUsesDurableStepIdentity(t *testing.T) {
 	a, _ := newChildRuntimeTestAgent(t, &childRuntimeTestProvider{name: "transcript-event"})
 	a.mu.Lock()
-	a.turnSeq, a.stepSeq = 1, 2
+	a.sequences.turnSeq, a.sequences.stepSeq = 1, 2
 	a.mu.Unlock()
-	a.transcript.facts([]session.Event{session.ToolStarted{TurnID: "turn-1", StepID: "step-2", Call: session.ToolCall{CallID: "call", ToolID: "Read", Arguments: []byte(`{}`)}}})
+	a.transcript.Facts([]session.Event{session.ToolStarted{TurnID: "turn-1", StepID: "step-2", Call: session.ToolCall{CallID: "call", ToolID: "Read", Arguments: []byte(`{}`)}}})
 	sub, err := a.Watch(context.Background(), protocol.Cursor{})
 	if err != nil {
 		t.Fatal(err)
@@ -306,18 +344,18 @@ func TestTranscriptLiveToolEventUsesDurableStepIdentity(t *testing.T) {
 func TestSupervisorLateOldDeliveryCannotReplaceCurrentRunOnRecovery(t *testing.T) {
 	a, _ := newChildRuntimeTestAgent(t, &childRuntimeTestProvider{name: "late-recovery"})
 	id := protocol.SessionID(newSessionID())
-	old := session.ChildRunRecorded{Version: 1, Child: protocol.ChildSession{SessionID: id, ParentSessionID: protocol.SessionID(a.sessionID), RootSessionID: protocol.SessionID(a.sessionID), DelegationID: "delegation", Purpose: "task", Run: protocol.RunView{ID: "old-run", Status: "queued", WaitPolicy: "notify"}}}
+	old := session.ChildRunRecorded{Version: 1, Child: protocol.ChildSession{SessionID: id, ParentSessionID: protocol.SessionID(a.conversation.sessionID), RootSessionID: protocol.SessionID(a.conversation.sessionID), DelegationID: "delegation", Purpose: "task", Run: protocol.RunView{ID: "old-run", Status: "queued", WaitPolicy: "notify"}}}
 	next := old
 	next.Child.Run.ID = "new-run"
 	p := a.persistenceHandle()
 	for i, fact := range []session.ChildRunRecorded{old, next} {
-		if _, err := p.commitEvents(fmt.Sprint("queue-", i), fact); err != nil {
+		if _, err := p.CommitEvents(fmt.Sprint("queue-", i), fact); err != nil {
 			t.Fatal(err)
 		}
 	}
 	old.Child.Run.Status = "succeeded"
 	old.Delivered, old.UsageAccounted = true, true
-	if _, err := p.commitEvents("late-delivered", old); err != nil {
+	if _, err := p.CommitEvents("late-delivered", old); err != nil {
 		t.Fatal(err)
 	}
 	s := newSessionSupervisor(a)
@@ -328,37 +366,37 @@ func TestSupervisorLateOldDeliveryCannotReplaceCurrentRunOnRecovery(t *testing.T
 	if r.fact.Child.Run.ID != "new-run" {
 		t.Fatalf("late receipt rolled back current run: %+v", r.fact.Child.Run)
 	}
-	if !s.runs["old-run"].fact.Delivered {
+	if !s.directory.Run("old-run").fact.Delivered {
 		t.Fatal("older delivery receipt lost")
 	}
 }
 
 func TestSupervisorRejectsExpiredStepInsteadOfBorrowingClosedMCP(t *testing.T) {
 	a, cfg := newChildRuntimeTestAgent(t, &childRuntimeTestProvider{name: "expired-step"})
-	lease := a.mcp.AcquireStep(a.registry)
+	lease := a.services.mcp.AcquireStep(a.services.registry)
 	lease.Close()
 	a.mu.Lock()
-	a.busy = true
-	a.turnSeq = 1
-	a.childStep = &childStepSnapshot{mcpLease: lease, toolLease: lease.Tools, cfg: cfg, binding: a.activeBinding, models: a.models.Freeze(), turn: 1, registryNames: a.registry.Names()}
+	a.turn.busy = true
+	a.sequences.turnSeq = 1
+	a.children.childStep = &childStepSnapshot{mcpLease: lease, toolLease: lease.Tools, cfg: cfg, binding: a.modelsState.activeBinding, models: a.services.models.Freeze(), turn: 1, registryNames: a.services.registry.Names()}
 	a.mu.Unlock()
-	_, _, _, _, _, err := a.supervisor.prepare(a, childPurposeTask, "")
+	_, _, _, _, _, err := a.services.supervisor.prepare(a, childPurposeTask, "")
 	if err == nil {
 		t.Fatal("closed generation was borrowed by continuation")
 	}
 	a.mu.Lock()
-	a.busy = false
-	a.childStep = nil
+	a.turn.busy = false
+	a.children.childStep = nil
 	a.mu.Unlock()
 }
 
 func TestTranscriptRestoredToolResultSettlesQueuedCall(t *testing.T) {
-	state := &transcriptState{}
-	state.facts([]session.Event{
+	state := &sessionview.Transcript{}
+	state.Facts([]session.Event{
 		session.AssistantCommitted{TurnID: "turn-1", StepID: "step-1", Message: session.Message{MessageID: "assistant", Role: "assistant", Content: []session.ContentBlock{{Kind: session.ContentToolCall, ToolCall: &session.ToolCall{CallID: "call", ToolID: "Read", Arguments: []byte(`{}`)}}}}},
 		session.AssistantCommitted{TurnID: "turn-1", StepID: "step-1", Message: session.Message{MessageID: "result", Role: "tool", Content: []session.ContentBlock{{Kind: session.ContentToolResult, ToolResult: &session.ToolResult{CallID: "call", Status: "success", Text: "restored output"}}}}},
 	})
-	items, _ := state.snapshot()
+	items, _ := state.Snapshot()
 	if len(items) != 1 || items[0].Status != "success" || items[0].Text != "restored output" {
 		t.Fatalf("restored tool left queued: %+v", items)
 	}
@@ -371,7 +409,7 @@ func TestTranscriptRestoredToolResultSettlesQueuedCall(t *testing.T) {
 func TestChildRowLockedEnrichesApprovalForEventStream(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	ag.mu.Lock()
-	ag.pendingApproval = &ApprovalRequest{ID: "ap-1", Tool: "Bash", Reason: "needs review"}
+	ag.decisions.pendingApproval = &ApprovalRequest{ID: "ap-1", Tool: "Bash", Reason: "needs review"}
 	ag.mu.Unlock()
 
 	s := &SessionSupervisor{}

@@ -1,6 +1,9 @@
 package agent
 
-import "ccdp/internal/protocol"
+import (
+	"ccdp/internal/protocol"
+	"ccdp/internal/sessionview"
+)
 
 // Review observations are UI transcript items, not messages in the parent's
 // model context. The snapshot projection retains them across watch reconnects.
@@ -25,17 +28,15 @@ func (a *Agent) publishReviewItem(id protocol.CommandID, item protocol.Transcrip
 	}
 	item.Args = append([]byte(nil), item.Args...)
 	var clipped bool
-	item.Text, clipped = clipTranscript(item.Text)
+	item.Text, clipped = sessionview.Clip(item.Text)
 	item.Truncated = item.Truncated || clipped
-	if len(item.Args) > transcriptArgsLimit {
+	if len(item.Args) > sessionview.ArgsLimit {
 		item.Args = nil
 		item.Truncated = true
 	}
-	a.watchMu.Lock()
-	defer a.watchMu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.flushStreamsLocked()
-	a.transcript.mu.Lock()
-	a.transcript.put(item)
-	a.transcript.mu.Unlock()
+	a.transcript.Put(item)
 	a.publishViewLocked(protocol.EventView{Kind: protocol.EventOperationProgress, SessionID: protocol.SessionID(a.SessionID()), Transcript: &item})
 }

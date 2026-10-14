@@ -1,11 +1,12 @@
 package agent
 
 import (
-	"ccdp/internal/protocol"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"time"
+
+	"ccdp/internal/protocol"
 )
 
 // traceRec is one JSONL line in the diagnostics stream. It is deliberately
@@ -71,7 +72,7 @@ func eventTypeName(t EventType) string {
 // <root>/<id>.trace.jsonl; new diagnostics live below the same session scope as
 // events and never participate in List/Resume replay.
 func (a *Agent) openTrace() {
-	if a.cfg.SessionDir == "" || a.cfg.NoSessionPersistence {
+	if a.services.cfg.SessionDir == "" || a.services.cfg.NoSessionPersistence {
 		return
 	}
 	path := a.TracePath()
@@ -135,8 +136,8 @@ func (a *Agent) closeTrace() {
 // TracePath returns the diagnostics path for this session.  It is retained as
 // a compatibility accessor for hooks/tests; restore never reads this file.
 func (a *Agent) TracePath() string {
-	if a.cfg.SessionDir == "" || a.sessionID == "" {
+	if a.services.cfg.SessionDir == "" || a.conversation.sessionID == "" {
 		return ""
 	}
-	return filepath.Join(a.cfg.SessionDir, a.sessionID, "diagnostics.jsonl")
+	return filepath.Join(a.services.cfg.SessionDir, a.conversation.sessionID, "diagnostics.jsonl")
 }
