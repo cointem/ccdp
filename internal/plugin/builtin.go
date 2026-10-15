@@ -26,7 +26,7 @@ func (p *toolsPlugin) Init(ctx *Context) error {
 		tools.NewWriteTool(),
 		tools.NewEditTool(),
 		tools.NewGlobTool(),
-		tools.NewGrepTool(),
+		tools.NewRgTool(),
 		tools.NewCodeNavigateTool(),
 		tools.NewLSTool(),
 		tools.NewTodoWriteTool(),

@@ -78,7 +78,7 @@ func (t *WebFetchTool) Run(ctx *Context) (string, error) {
 		return "", fmt.Errorf("WebFetch: max_chars must be 256..40000")
 	}
 
-	body, finalURL, contentType, status, err := httpGetDetails(ctx.Context, u.String())
+	body, finalURL, contentType, status, err := httpGetDetails(ctx.Context, u.String(), webProxy(ctx))
 	if err != nil {
 		return "", fmt.Errorf("WebFetch: %w", err)
 	}
@@ -172,7 +172,7 @@ func (t *WebSearchTool) Run(ctx *Context) (string, error) {
 	}
 
 	endpoint := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(q)
-	body, err := httpGet(ctx.Context, endpoint)
+	body, _, _, _, err := httpGetDetails(ctx.Context, endpoint, webProxy(ctx))
 	if err != nil {
 		return "", fmt.Errorf("WebSearch: %w", err)
 	}
@@ -322,11 +322,35 @@ func httpGet(ctx context.Context, u string) ([]byte, error) {
 	b, _, _, _, e := httpGetDetails(ctx, u)
 	return b, e
 }
-func httpGetDetails(ctx context.Context, u string) (body []byte, finalURL, contentType string, status int, err error) {
+func webProxy(ctx *Context) string {
+	if ctx.Sandbox == nil {
+		return ""
+	}
+	return ctx.Sandbox.Snapshot().NetworkProxy
+}
+
+func httpGetDetails(ctx context.Context, u string, proxies ...string) (body []byte, finalURL, contentType string, status int, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := validateExternalURL(ctx, u); err != nil {
+	proxy := ""
+	if len(proxies) > 0 {
+		proxy = proxies[0]
+	}
+	validate := validateExternalURL
+	if proxy != "" {
+		validate = func(ctx context.Context, raw string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			target, err := url.Parse(raw)
+			if err != nil {
+				return err
+			}
+			return netguard.ValidateTarget(target)
+		}
+	}
+	if err := validate(ctx, u); err != nil {
 		return nil, "", "", 0, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -339,8 +363,16 @@ func httpGetDetails(ctx context.Context, u string) (body []byte, finalURL, conte
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; ccdp/0.1)")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 
-	transport := netguard.PublicTransport()
-	client := &http.Client{Transport: transport, CheckRedirect: checkExternalRedirect}
+	transport, err := netguard.RoutedTransport(proxy)
+	if err != nil {
+		return nil, "", "", 0, err
+	}
+	client := &http.Client{Transport: transport, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return validate(req.Context(), req.URL.String())
+	}}
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {

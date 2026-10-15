@@ -104,7 +104,7 @@ func (a *Agent) waitAgentEvent(ctx context.Context) (string, error) {
 			}
 		}
 		if !waitingStatus {
-			a.emitStatus("等待子任务消息…")
+			a.setPhase(protocol.PhaseWaitingAgents)
 			waitingStatus = true
 		}
 		select {

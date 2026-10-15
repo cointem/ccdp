@@ -19,7 +19,7 @@ type ReadTool struct{}
 func NewReadTool() *ReadTool   { return &ReadTool{} }
 func (*ReadTool) Name() string { return "Read" }
 func (*ReadTool) Description() string {
-	return "Read UTF-8 text with line numbers. offset is a 1-based LINE number, limit a LINE count (maximum 2000). Results include actual range and next_offset. Use Glob/LS for paths and Grep for text search."
+	return "Read UTF-8 text with line numbers. offset is a 1-based LINE number, limit a LINE count (maximum 2000). Results include actual range and next_offset. Use Glob/LS for paths and Rg for text search."
 }
 func (*ReadTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "offset": map[string]any{"type": "integer", "minimum": 1}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 2000}}, "required": []string{"file_path"}}

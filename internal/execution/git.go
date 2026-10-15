@@ -89,7 +89,7 @@ func RunReadOnlyGit(ctx context.Context, argv []string, req Request) (Result, er
 	if err != nil {
 		return Result{}, err
 	}
-	req.readOnlyGit = true
+	req.readOnlyQuery = true
 	req.Env = queryGitEnvironment(req.Env)
 	return RunArgv(ctx, prepared, req)
 }
@@ -99,7 +99,7 @@ func StartReadOnlyGit(req StartRequest) (*Process, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Argv, req.readOnlyGit = prepared, true
+	req.Argv, req.readOnlyQuery = prepared, true
 	req.Env = queryGitEnvironment(req.Env)
 	return StartArgv(req)
 }
@@ -111,15 +111,18 @@ func queryGitEnvironment(env []string) []string {
 	return ReadOnlyGitEnvironment(env)
 }
 
-func processProfile(policy *sandbox.Sandbox, argv []string, readOnlyGit bool) (string, error) {
-	if readOnlyGit {
+func processProfile(policy *sandbox.Sandbox, argv []string, readOnlyQuery bool, readRoot ...string) (string, error) {
+	if readOnlyQuery {
+		if len(readRoot) > 0 && readRoot[0] != "" {
+			return policy.ReadOnlyCommandProfileWithin(argv[0], readRoot[0])
+		}
 		return policy.ReadOnlyCommandProfile(argv[0])
 	}
 	return policy.Profile()
 }
 
-func verifyProcessProfile(ctx context.Context, profile string, argv []string, readOnlyGit bool) error {
-	if !readOnlyGit {
+func verifyProcessProfile(ctx context.Context, profile string, argv []string, readOnlyQuery bool) error {
+	if !readOnlyQuery {
 		return verifyProfileContext(ctx, profile)
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -128,7 +131,7 @@ func verifyProcessProfile(ctx context.Context, profile string, argv []string, re
 	// rlimit shell wrapper, because Git helpers use that same shell executable.
 	probe := exec.CommandContext(probeCtx, sandbox.BackendPath, "-p", profile, "--", argv[0], "--version")
 	if output, err := probe.CombinedOutput(); err != nil {
-		return fmt.Errorf("execution: Seatbelt rejected read-only Git profile: %w (%s)", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("execution: Seatbelt rejected read-only query profile: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }

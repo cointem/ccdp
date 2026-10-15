@@ -708,6 +708,7 @@ const (
 	PhaseStreaming       RuntimePhase = "streaming"
 	PhaseFinalizing      RuntimePhase = "finalizing"
 	PhaseExecutingTools  RuntimePhase = "executing_tools"
+	PhaseWaitingAgents   RuntimePhase = "waiting_agents"
 	PhaseWaitingApproval RuntimePhase = "waiting_approval"
 	PhaseCompacting      RuntimePhase = "compacting"
 	PhaseStopping        RuntimePhase = "stopping"
@@ -922,6 +923,7 @@ type TaskView struct {
 // grants are deliberately separate from Settings so replay can never turn a
 // former approval into a current authorization.
 type SandboxRuntimeView struct {
+	NetworkProxy              string              `json:"network_proxy,omitempty"`
 	SessionGrants             []CapabilityRequest `json:"session_grants,omitempty"`
 	RevocationPending         bool                `json:"revocation_pending,omitempty"`
 	ExternalExecutionPossible bool                `json:"external_execution_possible,omitempty"`

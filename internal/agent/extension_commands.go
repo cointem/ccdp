@@ -338,7 +338,7 @@ func (a *Agent) applyWorkflowCommand(cmd protocol.Command) protocol.Receipt {
 			if err != nil {
 				return "", err
 			}
-			return fmt.Sprintf("%d files in the complete accessible inventory. Use Glob/LS for paths and Grep for text. CodeNavigate supports outline, definition and references when a trusted language server is configured.", len(paths)), nil
+			return fmt.Sprintf("%d files in the complete accessible inventory. Use Glob/LS for paths and Rg for text. CodeNavigate supports outline, definition and references when a trusted language server is configured.", len(paths)), nil
 		})
 	case protocol.WorkflowCommitPushPR:
 		if a.inPlanMode() {

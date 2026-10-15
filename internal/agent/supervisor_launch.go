@@ -87,7 +87,7 @@ func (s *SessionSupervisor) launchWithReview(parent *Agent, ctx context.Context,
 	if taskErr != nil {
 		return nil, taskErr
 	}
-	if purpose != childPurposeTask {
+	if purpose == childPurposeGuardian {
 		task.Role = "explorer"
 	}
 	if strings.TrimSpace(task.Description) == "" {
@@ -110,7 +110,7 @@ func (s *SessionSupervisor) launchWithReview(parent *Agent, ctx context.Context,
 	var childWorkspace, baselineID string
 	var workspaceLease *atomicfile.Lock
 	queued := false
-	if purpose == childPurposeTask {
+	if isTaskChild(purpose) {
 		childWorkspace, baselineID, err = parent.prepareChildWorkspace(ctx, task, &cfg, &opts)
 		if err != nil {
 			lease.Close()

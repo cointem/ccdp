@@ -31,7 +31,15 @@ func TestReviewTaskUsesOnDemandFilesInsteadOfInlineSource(t *testing.T) {
 		if len(prompt) > 1200 || strings.Contains(prompt, "UNIQUE_SOURCE_SENTINEL") || strings.Contains(prompt, `"before"`) {
 			t.Fatal("task still embeds source")
 		}
-		dir := filepath.Dir(cfg.Workspace)
+		if cfg.Workspace != root {
+			t.Fatalf("review changed workspace: %s", cfg.Workspace)
+		}
+		var dir string
+		for _, line := range strings.Split(prompt, "\n") {
+			if strings.HasPrefix(line, "变更清单：") {
+				dir = filepath.Dir(strings.TrimPrefix(line, "变更清单："))
+			}
+		}
 		if _, err := os.ReadFile(filepath.Join(dir, "changes.patch")); err != nil {
 			t.Fatal(err)
 		}
@@ -55,7 +63,7 @@ func TestReviewTaskUsesOnDemandFilesInsteadOfInlineSource(t *testing.T) {
 		if err != nil || string(old) != "base\n" {
 			t.Fatal("old version unavailable", err)
 		}
-		next, err := os.ReadFile(filepath.Join(cfg.Workspace, "chosen.txt"))
+		next, err := os.ReadFile(filepath.Join(dir, "after", "chosen.txt"))
 		if err != nil || string(next) != large {
 			t.Fatal("large version unavailable", err)
 		}

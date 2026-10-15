@@ -20,6 +20,7 @@ func TestWorkerInheritsNetworkBaseline(t *testing.T) {
 					t.Fatal("default configuration disabled network")
 				}
 				cfg.NetworkAccess = enabled
+				cfg.NetworkProxy = "http://127.0.0.1:7897"
 				cfg.PermissionMode = string(permissions.ModeDefault)
 				provider := &policyTestProvider{name: cfg.Model}
 				models := plugin.NewModelRegistry()
@@ -45,6 +46,9 @@ func TestWorkerInheritsNetworkBaseline(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = child.CloseContext(context.Background()) })
+				if child.currentSandbox().Snapshot().NetworkProxy != cfg.NetworkProxy {
+					t.Fatal("child lost trusted network proxy")
+				}
 				for _, name := range []string{"WebSearch", "WebFetch"} {
 					call := messages.ToolCall{Name: name}
 					if denied, reason := ChildToolGate(child, call, capabilityTestTool(t, child, call.Name)); denied {

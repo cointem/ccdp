@@ -1,7 +1,5 @@
-// Package netguard builds direct HTTP transports whose actual TCP dial is
-// constrained independently of an earlier URL/DNS preflight. Transports do
-// not consult proxy environment variables, so a host proxy or Unix socket can
-// never become an unreviewed network path.
+// Package netguard enforces direct IP checks or explicitly trusted proxy
+// routing. Transports never consult ambient proxy environment variables.
 package netguard
 
 import (
@@ -121,6 +119,9 @@ func publicIP(_ string, _ string, ip net.IP) error {
 		return fmt.Errorf("invalid resolved IP %q", ip)
 	}
 	addr = addr.Unmap()
+	if netip.MustParsePrefix("198.18.0.0/15").Contains(addr) {
+		return fmt.Errorf("blocked: benchmark/Fake-IP address; configure network_proxy for a trusted local proxy instead of direct access")
+	}
 	if !addr.IsValid() || !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsUnspecified() {
 		return fmt.Errorf("blocked: request to internal/private address")
 	}

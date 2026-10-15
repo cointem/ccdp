@@ -60,12 +60,12 @@ func TestLSFiltersDeniedEntries(t *testing.T) {
 	}
 }
 
-func TestGrepDefaultBaseRechecksReadPolicy(t *testing.T) {
+func TestRgDefaultBaseRechecksReadPolicy(t *testing.T) {
 	workspace := t.TempDir()
 	policy := sandbox.New(workspace)
 	policy.AddDisallowedDir(workspace)
-	if _, err := NewGrepTool().Run(globContext(workspace, policy, map[string]any{"pattern": "needle"})); err == nil {
-		t.Fatal("Grep searched a newly denied default working directory")
+	if _, err := NewRgTool().Run(globContext(workspace, policy, map[string]any{"pattern": "needle"})); err == nil {
+		t.Fatal("Rg searched a newly denied default working directory")
 	}
 }
 

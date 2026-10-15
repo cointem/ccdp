@@ -9,7 +9,7 @@ import (
 
 func TestCloneForkHistoryCompleteBoundaries(t *testing.T) {
 	user := messages.Message{Role: messages.RoleUser, Content: "investigate"}
-	call := messages.Message{Role: messages.RoleAssistant, ToolCalls: []messages.ToolCall{{ID: "a", Name: "Read"}, {ID: "b", Name: "Grep"}}}
+	call := messages.Message{Role: messages.RoleAssistant, ToolCalls: []messages.ToolCall{{ID: "a", Name: "Read"}, {ID: "b", Name: "Rg"}}}
 	a := messages.Message{Role: messages.RoleTool, ToolCallID: "a", Content: "file evidence"}
 	b := messages.Message{Role: messages.RoleTool, ToolCallID: "b", Content: "search evidence"}
 	pending := messages.Message{Role: messages.RoleAssistant, ToolCalls: []messages.ToolCall{{ID: "spawn", Name: "SpawnAgent"}}}

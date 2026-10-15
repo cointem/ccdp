@@ -138,9 +138,8 @@ func inlineItemComplete(item historyCell, turnDone bool) bool {
 		}
 		return turnDone || item.messageID != ""
 	case "tool":
-		if item.toolName == "SpawnAgent" && item.agent != nil {
-			return !item.agent.Run.Active()
-		}
+		// Spawn completion is the dispatch receipt. Live child progress belongs
+		// to the shelf and must not hold the parent's transcript in the frame.
 		switch strings.ToLower(strings.TrimSpace(item.status)) {
 		case "success", "done", "completed", "complete", "error", "failed", "failure", "denied", "rejected", "cancelled", "canceled", "stopped", "interrupted":
 			return true

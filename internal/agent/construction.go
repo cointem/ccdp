@@ -330,11 +330,7 @@ func (a *Agent) replayOwnedStore(initial *SessionSnapshot, opts Options, rootCan
 			return replayErr
 		}
 		if owned != nil {
-			// A completed review can discuss its report after its disposable
-			// workspace is removed. This continuation has an empty hard tool
-			// allowlist; ordinary resumes still require identical settings.
-			reportOnly := opts.Purpose == childPurposeReview && opts.AllowedTools != nil && len(opts.AllowedTools) == 0
-			if (owned.Model != "" && owned.Model != a.services.cfg.Model) || (!reportOnly && owned.Workspace != "" && owned.Workspace != a.services.cfg.Workspace) {
+			if (owned.Model != "" && owned.Model != a.services.cfg.Model) || (owned.Workspace != "" && owned.Workspace != a.services.cfg.Workspace) {
 				a.abortConstruction(rootCancel, true)
 				return fmt.Errorf("agent: session settings changed while opening %q; retry resume", a.conversation.sessionID)
 			}

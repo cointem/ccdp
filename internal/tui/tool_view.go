@@ -451,7 +451,7 @@ func agentMarkerStatus(status string) (string, lipgloss.Style, string) {
 	case "waiting_approval":
 		return "◆", styleAgentRun, "needs approval"
 	case "started":
-		return "◆", styleAgentRun, "已启动"
+		return "◆", styleAgentRun, "已派出"
 	case "queued":
 		return "◆", styleAgentRun, "排队中"
 	case "starting":
@@ -582,11 +582,12 @@ func quietAgentWait(p toolPresentation) bool {
 
 func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, width int) string {
 	name := strings.TrimSpace(p.Name)
-	// Only SpawnAgent represents a live task. Other tools show invocation status.
+	// The collapsed spawn records dispatch; the shelf owns live run progress.
+	// Expanded details retain the child's status, usage and failure diagnostics.
 	spawn := name == "SpawnAgent"
 	status := p.Status
 	if spawn {
-		if child != nil {
+		if child != nil && p.Expanded {
 			status = child.Run.Status
 		} else if toolStatusComplete(status) {
 			status = "started"
@@ -607,7 +608,7 @@ func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, width i
 	head := stateStyle.Render(glyph) + " " + styleAssistant.Bold(true).Render(name)
 	var tail string
 	stats := ""
-	if child != nil {
+	if child != nil && p.Expanded {
 		stats = agentChildStats(*child)
 	}
 	if completed && stats != "" {
@@ -625,6 +626,9 @@ func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, width i
 		}
 	}
 	rows := []string{head + tail}
+	if spawn && p.Expanded {
+		rows = append(rows, styleHints.Render("  [click to collapse]"))
+	}
 
 	switch label {
 	case "error", "stopped", "已中断":

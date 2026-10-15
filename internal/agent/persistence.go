@@ -21,7 +21,7 @@ func (a *Agent) openPersistenceMode(rejectExisting bool, backend ...journal.Back
 	a.mu.Lock()
 	parentID := a.conversation.parentID
 	source := "agent"
-	if a.children.childState != nil && (a.children.childState.purpose == childPurposeTask || a.children.childState.purpose == childPurposeGuardian) {
+	if a.children.childState != nil {
 		source = a.children.childState.purpose
 	}
 	a.mu.Unlock()

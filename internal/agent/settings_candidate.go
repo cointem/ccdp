@@ -149,7 +149,7 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	}
 	oldCfg := a.services.cfg.Clone()
 	oldSandbox := a.services.sandbox
-	sandboxPolicyChanged := oldCfg.NetworkAccess != candidate.cfg.NetworkAccess ||
+	sandboxPolicyChanged := oldCfg.NetworkProxy != candidate.cfg.NetworkProxy || oldCfg.NetworkAccess != candidate.cfg.NetworkAccess ||
 		!equalStringSlice(oldCfg.AdditionalDirectories, candidate.cfg.AdditionalDirectories) ||
 		!equalStringSlice(oldCfg.AdditionalReadOnlyDirectories, candidate.cfg.AdditionalReadOnlyDirectories) ||
 		!equalStringSlice(oldCfg.DisallowedDirectories, candidate.cfg.DisallowedDirectories)

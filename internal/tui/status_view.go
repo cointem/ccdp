@@ -76,6 +76,9 @@ func (m *Model) renderStatus() string {
 		}
 		if !startedAt.IsZero() {
 			elapsed = " · " + formatElapsed(now().Sub(startedAt))
+			if m.busy && m.activity.Phase == ActivityWaitingAgents {
+				elapsed = " · 本轮 " + formatElapsed(now().Sub(startedAt))
+			}
 		}
 		spinner := m.spinner.View()
 		if !m.animateWork() {

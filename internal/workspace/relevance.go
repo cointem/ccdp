@@ -75,7 +75,7 @@ func (i *Info) RelevantRepoMap(limit int, query string) string {
 	sort.Slice(out.Files, func(a, b int) bool { return out.Files[a].RelPath < out.Files[b].RelPath })
 	text := out.RepoMap(limit)
 	if len(rows) > len(out.Files) {
-		text += "\nRepository map is a relevant sample. Use Glob/LS to find paths and Grep to search file contents.\n"
+		text += "\nRepository map is a relevant sample. Use Glob/LS to find paths and Rg to search file contents.\n"
 	}
 	return text
 }

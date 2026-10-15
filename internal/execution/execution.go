@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"ccdp/internal/executable"
+	"ccdp/internal/netguard"
 	"ccdp/internal/sandbox"
 )
 
@@ -48,13 +49,15 @@ const (
 
 // Request describes one admitted local process invocation.
 type Request struct {
-	readOnlyGit bool // set only by the typed Git query adapter
-	Context     context.Context
-	Command     string
-	Argv        []string
-	Dir         string
-	Timeout     time.Duration
-	Input       io.Reader
+	readOnlyQuery bool      // set only by typed read-only adapters
+	readOnlyRoot  string    // strict snapshot data boundary for typed search
+	stdoutSink    io.Writer // optional bounded machine-output parser owned by a typed adapter
+	Context       context.Context
+	Command       string
+	Argv          []string
+	Dir           string
+	Timeout       time.Duration
+	Input         io.Reader
 	// Env replaces the inherited environment when non-nil. A nil value gets a
 	// credential-filtered copy of the host environment; callers may opt into a
 	// narrower purpose-specific set by supplying one explicitly.
@@ -89,12 +92,12 @@ type Result struct {
 // similar adapters). It uses the same interactive/sandbox admission as Run
 // but deliberately does not impose Run's short invocation timeout.
 type StartRequest struct {
-	readOnlyGit bool
-	Context     context.Context
-	Argv        []string
-	Dir         string
-	Env         []string
-	Sandbox     *sandbox.Sandbox
+	readOnlyQuery bool
+	Context       context.Context
+	Argv          []string
+	Dir           string
+	Env           []string
+	Sandbox       *sandbox.Sandbox
 }
 
 // StartArgv starts one admitted process without interpreting argument values
@@ -114,6 +117,10 @@ func StartArgv(req StartRequest) (*Process, error) {
 		return nil, err
 	}
 	policy := req.Sandbox.Snapshot()
+	if req.readOnlyQuery {
+		policy.AllowNetwork = false
+		policy.NetworkProxy = ""
+	}
 	procEnv, cleanupScratch, err := prepareProcessEnvironment(req.Env, policy)
 	if err != nil {
 		return nil, err
@@ -122,16 +129,16 @@ func StartArgv(req StartRequest) (*Process, error) {
 	argv, procEnv = preferNativeGit(argv, "", procEnv, req.Dir)
 	argv, procEnv = preferNativeCLTPython(argv, "", procEnv, req.Dir, nativeCLTPythonPath())
 	addExecutionReadRoots(policy, argv, "", req.Dir, procEnv)
-	profile, err := processProfile(policy, argv, req.readOnlyGit)
+	profile, err := processProfile(policy, argv, req.readOnlyQuery)
 	if err != nil {
 		cleanupScratch()
 		return nil, err
 	}
-	if err := verifyProcessProfile(ctx, profile, argv, req.readOnlyGit); err != nil {
+	if err := verifyProcessProfile(ctx, profile, argv, req.readOnlyQuery); err != nil {
 		cleanupScratch()
 		return nil, err
 	}
-	if !req.readOnlyGit {
+	if !req.readOnlyQuery {
 		argv = applyArgvLimits(policy, argv)
 	}
 	cmd := newProcess(exec.CommandContext(ctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, argv...)...))
@@ -282,6 +289,10 @@ func Run(req Request) (Result, error) {
 		return Result{}, fmt.Errorf("execution: sandbox policy is unavailable")
 	}
 	policy := req.Sandbox.Snapshot()
+	if req.readOnlyQuery {
+		policy.AllowNetwork = false
+		policy.NetworkProxy = ""
+	}
 	procEnv, cleanupScratch, err := prepareProcessEnvironment(req.Env, policy)
 	if err != nil {
 		return Result{}, err
@@ -298,18 +309,18 @@ func Run(req Request) (Result, error) {
 		if err := sandbox.CheckInteractiveArgv(argv); err != nil {
 			return Result{}, err
 		}
-		profile, err := processProfile(policy, argv, req.readOnlyGit)
+		profile, err := processProfile(policy, argv, req.readOnlyQuery, req.readOnlyRoot)
 		if err != nil {
 			return Result{}, err
 		}
-		if err := verifyProcessProfile(cctx, profile, argv, req.readOnlyGit); err != nil {
+		if err := verifyProcessProfile(cctx, profile, argv, req.readOnlyQuery); err != nil {
 			if cctx.Err() != nil {
 				return Result{TimedOut: true, ExitCode: -1}, nil
 			}
 			return Result{}, err
 		}
 		limitedArgv := argv
-		if !req.readOnlyGit {
+		if !req.readOnlyQuery {
 			limitedArgv = applyArgvLimits(policy, argv)
 		}
 		cmd = newProcess(exec.CommandContext(cctx, sandbox.BackendPath, append([]string{"-p", profile, "--"}, limitedArgv...)...))
@@ -349,6 +360,9 @@ func Run(req Request) (Result, error) {
 		stdoutCollector := &limitedBuffer{limit: limit}
 		stderrCollector := &limitedBuffer{limit: limit}
 		cmd.cmd.Stdout = stdoutCollector
+		if req.stdoutSink != nil {
+			cmd.cmd.Stdout = io.MultiWriter(stdoutCollector, req.stdoutSink)
+		}
 		cmd.cmd.Stderr = stderrCollector
 		runErr = cmd.Run()
 		resOutput := stdoutCollector.String()
@@ -531,6 +545,25 @@ func prepareProcessEnvironment(env []string, policy *sandbox.Sandbox) ([]string,
 	entries = setEnvironment(entries, "PIP_CACHE_DIR", filepath.Join(cache, "pip"))
 	if cleanup == nil {
 		cleanup = func() {}
+	}
+	if policy.AllowNetwork && policy.NetworkProxy != "" {
+		gateway, err := netguard.StartGateway(policy.NetworkProxy)
+		if err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		scratchCleanup := cleanup
+		cleanup = func() { gateway.Close(); scratchCleanup() }
+		policy.AllowNetwork = false
+		if err := policy.AddLocalService(sandbox.LocalService{Direction: "connect", Protocol: "tcp", Port: uint16(gateway.Port)}); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+			entries = setEnvironment(entries, key, gateway.URL)
+		}
+		entries = setEnvironment(entries, "NO_PROXY", "")
+		entries = setEnvironment(entries, "no_proxy", "")
 	}
 	return entries, cleanup, nil
 }

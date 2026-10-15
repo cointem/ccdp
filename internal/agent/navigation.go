@@ -49,5 +49,5 @@ func (a *Agent) semanticNavigate(ctx context.Context, cfg config.Config, sb *san
 		b, e := json.Marshal(map[string]any{"source": "lsp", "position_encoding": "utf-16", "locations": locations})
 		return string(b), e
 	}
-	return "", fmt.Errorf("no trusted language server configured for %s; use Grep and Read", filepath.Ext(path))
+	return "", fmt.Errorf("no trusted language server configured for %s; use Rg and Read", filepath.Ext(path))
 }

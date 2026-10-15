@@ -92,7 +92,7 @@ func (a *Agent) toolCapabilityPolicy(tc messages.ToolCall, tool tools.Tool) (*sa
 		if capabilityGranted(base, canonical) {
 			continue
 		}
-		if a.children.childState != nil && (a.children.childState.purpose != childPurposeTask || a.children.childState.nonInteractive) {
+		if a.children.childState != nil && (!isTaskChild(a.children.childState.purpose) || a.children.childState.nonInteractive) {
 			return nil, nil, version, fmt.Errorf("child sandbox capability ceiling does not allow requesting %s", describeCapability(canonical))
 		}
 		unique = append(unique, canonical)

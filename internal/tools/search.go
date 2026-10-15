@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 )
@@ -21,7 +20,7 @@ func (t *GlobTool) Name() string { return "Glob" }
 
 func (t *GlobTool) Description() string {
 	return `Find files matching a glob pattern, like "**/*.go" or "src/*.ts".
-Returns up to limit matches (default 100, maximum 1000) in lexical path order. Use Grep to search file contents.`
+Returns up to limit matches (default 100, maximum 1000) in lexical path order. Use Rg to search file contents.`
 }
 
 func (t *GlobTool) Parameters() map[string]any {
@@ -282,35 +281,44 @@ func scopedGlob(ctx *Context, anchor string, parts []string) ([]string, error) {
 	return matches, nil
 }
 
-// ---------- Grep ----------
+// ---------- Rg ----------
 
-// GrepTool searches file contents by regular expression.
-type GrepTool struct{}
+// RgTool searches file contents by regular expression.
+type RgTool struct{}
 
-// NewGrepTool creates the grep tool.
-func NewGrepTool() *GrepTool { return &GrepTool{} }
+// NewRgTool creates the ripgrep search tool.
+func NewRgTool() *RgTool { return &RgTool{} }
 
-func (t *GrepTool) Name() string { return "Grep" }
+func (t *RgTool) Name() string { return "Rg" }
 
-func (t *GrepTool) Description() string {
-	return `Search file contents with Go/RE2 regular expressions. \w, \d and \b use ASCII classes; use \p{L} and \p{N} for Unicode letters and numbers.
-Files ignored by .gitignore and VCS/dependency/cache directories are skipped.
-Output modes: "content" (default) prints matching lines with line numbers,
-"files" prints only paths, "count" prints matches per file.
-Use context for surrounding lines and limit for result entries (default 100, maximum 1000). literal=true searches exact text. Ordinary searches stream files; oversized individual lines or bounded multiline reads report incomplete results.`
+func (t *RgTool) Description() string {
+	return `Search file contents with ripgrep (rg). Uses rg's default Unicode-aware regular expressions; literal=true uses fixed strings. Requires rg installed on PATH.
+Respects scoped .gitignore rules and skips VCS/dependency/cache directories. Hidden files are included; recursive searches do not follow symlinks.
+mode="content" returns matching lines, "files" returns paths, "count" returns matching-line counts per file. Use context or before/after for surrounding lines, offset/limit for pagination. Multiline enables dot-all matching; oversized multiline files and output are reported as incomplete. All searches, including snapshots, run read-only inside the sandbox.`
 }
 
-func (t *GrepTool) Parameters() map[string]any {
-	return map[string]any{"type": "object", "properties": map[string]any{"pattern": map[string]any{"type": "string"}, "path": map[string]any{"type": "string"}, "mode": map[string]any{"type": "string", "enum": []string{"content", "files", "count"}}, "literal": map[string]any{"type": "boolean"}, "context": map[string]any{"type": "integer", "minimum": 0, "maximum": 20}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 1000}}, "required": []string{"pattern"}}
+func (t *RgTool) Parameters() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{
+		"pattern": map[string]any{"type": "string"}, "path": map[string]any{"type": "string"},
+		"mode":    map[string]any{"type": "string", "enum": []string{"content", "files", "count"}},
+		"literal": map[string]any{"type": "boolean"}, "ignore_case": map[string]any{"type": "boolean"},
+		"multiline": map[string]any{"type": "boolean"}, "only_matching": map[string]any{"type": "boolean"},
+		"glob": map[string]any{"type": "string"}, "type": map[string]any{"type": "string"},
+		"context": map[string]any{"type": "integer", "minimum": 0, "maximum": 20},
+		"before":  map[string]any{"type": "integer", "minimum": 0, "maximum": 20},
+		"after":   map[string]any{"type": "integer", "minimum": 0, "maximum": 20},
+		"offset":  map[string]any{"type": "integer", "minimum": 0, "maximum": 100000},
+		"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 1000},
+	}, "required": []string{"pattern"}}
 }
 
-func (t *GrepTool) Run(ctx *Context) (string, error) {
+func (t *RgTool) Run(ctx *Context) (string, error) {
 	if err := ctx.checkResources(); err != nil {
 		return "", err
 	}
 	pattern := StringArg(ctx.Args, "pattern", "")
 	if strings.TrimSpace(pattern) == "" {
-		return "", fmt.Errorf("Grep: missing pattern")
+		return "", fmt.Errorf("Rg: missing pattern")
 	}
 	base := ctx.WorkingDir
 	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
@@ -318,66 +326,59 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 	}
 	base, err := ctx.ResolveRead(base)
 	if err != nil {
-		return "", fmt.Errorf("Grep: %w", err)
+		return "", fmt.Errorf("Rg: %w", err)
 	}
 	info, err := os.Stat(base)
 	if err != nil {
-		return "", fmt.Errorf("Grep: %w", err)
+		return "", fmt.Errorf("Rg: %w", err)
 	}
 	singleFile := ""
 	if !info.IsDir() {
 		if !info.Mode().IsRegular() {
-			return "", fmt.Errorf("Grep: path %q is not a regular file or directory", base)
+			return "", fmt.Errorf("Rg: path %q is not a regular file or directory", base)
 		}
 		singleFile, base = filepath.Base(base), filepath.Dir(base)
 	}
 
-	if BoolArg(ctx.Args, "literal", false) {
-		pattern = regexp.QuoteMeta(pattern)
-	}
-	mode := StringArg(ctx.Args, "mode", StringArg(ctx.Args, "output_mode", grepModeContent))
-	if mode == "files" {
-		mode = grepModeFiles
-	}
+	mode := StringArg(ctx.Args, "mode", rgModeContent)
 	switch mode {
-	case grepModeContent, grepModeFiles, grepModeCount:
+	case rgModeContent, rgModeFiles, rgModeCount:
 	default:
-		return "", fmt.Errorf("Grep: unknown output_mode %q", mode)
+		return "", fmt.Errorf("Rg: unknown mode %q", mode)
 	}
-	headLimit, err := IntArgChecked(ctx.Args, "limit", IntArg(ctx.Args, "head_limit", 100))
+	headLimit, err := IntArgChecked(ctx.Args, "limit", 100)
 	if err != nil {
-		return "", fmt.Errorf("Grep: %w", err)
+		return "", fmt.Errorf("Rg: %w", err)
 	}
-	offset, err := IntArgChecked(ctx.Args, "offset", 0)
+	offset, err := boundedInt(ctx.Args, "offset", 0, 0, 100000)
 	if err != nil {
-		return "", fmt.Errorf("Grep: %w", err)
+		return "", fmt.Errorf("Rg: %w", err)
 	}
 	if headLimit < 1 || headLimit > 1000 {
-		return "", fmt.Errorf("Grep: limit must be 1..1000")
+		return "", fmt.Errorf("Rg: limit must be 1..1000")
 	}
-	contextLines, err := boundedInt(ctx.Args, "context", IntArg(ctx.Args, "-C", 0), 0, 20)
+	contextLines, err := boundedInt(ctx.Args, "context", 0, 0, 20)
 	if err != nil {
 		return "", err
 	}
-	before := IntArg(ctx.Args, "-B", 0)
-	after := IntArg(ctx.Args, "-A", 0)
-	if contextLines > 0 {
-		if before == 0 {
-			before = contextLines
-		}
-		if after == 0 {
-			after = contextLines
-		}
+	before, err := boundedInt(ctx.Args, "before", contextLines, 0, 20)
+	if err != nil {
+		return "", err
+	}
+	after, err := boundedInt(ctx.Args, "after", contextLines, 0, 20)
+	if err != nil {
+		return "", err
 	}
 
-	req := &grepRequest{
+	req := &rgRequest{
 		singleFile: singleFile,
 		pattern:    pattern,
+		literal:    BoolArg(ctx.Args, "literal", false),
 		base:       base,
 		outputMode: mode,
-		ignoreCase: BoolArg(ctx.Args, "-i", false),
+		ignoreCase: BoolArg(ctx.Args, "ignore_case", false),
 		multiline:  BoolArg(ctx.Args, "multiline", false),
-		onlyMatch:  BoolArg(ctx.Args, "-o", false),
+		onlyMatch:  BoolArg(ctx.Args, "only_matching", false),
 		before:     before,
 		after:      after,
 		maxLines:   headLimit,
@@ -397,7 +398,7 @@ func (t *GrepTool) Run(ctx *Context) (string, error) {
 	copy := *ctx
 	copy.OutputLimit = min(50<<10, ctx.outputLimit())
 	ctx = &copy
-	out, err := searchGrep(ctx, req)
+	out, err := searchRg(ctx, req)
 	if err != nil {
 		return "", err
 	}

@@ -69,6 +69,7 @@ func buildSandbox(cfg *config.Config, dir string) *sandbox.Sandbox {
 		s.Limits = &lim
 	}
 	s.AllowNetwork = cfg.NetworkAccess
+	s.NetworkProxy = cfg.NetworkProxy
 	for _, d := range cfg.AdditionalDirectories {
 		s.AddDir(d)
 	}
@@ -90,7 +91,6 @@ func buildSandbox(cfg *config.Config, dir string) *sandbox.Sandbox {
 		}
 	}
 	if cfg.SessionDir != "" {
-		s.AddDisallowedDir(cfg.SessionDir)
 		s.AddProtectedDir(cfg.SessionDir)
 	}
 	s.AddProtectedDir(config.ProjectSettingsDir(dir))

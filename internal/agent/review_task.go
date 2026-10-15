@@ -333,7 +333,7 @@ func (r *reviewCopy) task(ctx context.Context, w *protocol.WorkflowCommand) (str
 	case "commit":
 		scope = fmt.Sprintf("提交 %s 引入的变更", w.Commit)
 	}
-	prompt := fmt.Sprintf("请审查%s（%d 个选定文件），按优先级报告值得修复的具体问题。\n\n变更清单：../changes.json\n差异：../changes.patch\n新代码：当前目录\n旧代码：../before/", scope, len(entries))
+	prompt := fmt.Sprintf("请审查%s（%d 个选定文件），按优先级报告值得修复的具体问题。\n\n变更清单：%s\n差异：%s\n审查版本：%s\n旧代码：%s\n\n以上是本次准备的临时审查材料，任务结束后清理；工作区保持不变，可按需检查相关代码和运行验证。", scope, len(entries), filepath.Join(r.dir, "changes.json"), filepath.Join(r.dir, "changes.patch"), filepath.Join(r.dir, "after"), filepath.Join(r.dir, "before"))
 	if focus := strings.TrimSpace(w.Message); focus != "" {
 		prompt += "\n\n关注点：" + focus
 	}
@@ -347,7 +347,7 @@ func (a *Agent) runReviewWith(ctx context.Context, cmd protocol.Command, execute
 		return output, protocol.OutcomeSuccess, operationErr
 	}
 	started := time.Now()
-	a.reviewProgress(ctx, cmd.ID, "审查：准备只读副本")
+	a.reviewProgress(ctx, cmd.ID, "审查：准备变更材料")
 	a.mu.Lock()
 	limits := a.services.cfg.Review.Limits()
 	a.mu.Unlock()
@@ -396,7 +396,7 @@ func (a *Agent) runReviewWith(ctx context.Context, cmd protocol.Command, execute
 		if copy.omittedContext > 0 {
 			output += fmt.Sprintf("\n\n辅助上下文有 %d 个文件未复制；不计入选定变更的未覆盖项。", copy.omittedContext)
 		}
-		output += fmt.Sprintf("\n\n审查范围：%s；用时 %s。位置对应准备期间复制的内容；未执行测试。", cmd.Workflow.Scope, time.Since(started).Round(time.Millisecond))
+		output += fmt.Sprintf("\n\n审查范围：%s；用时 %s。变更材料对应准备期间的内容；实际检查与验证见报告。", cmd.Workflow.Scope, time.Since(started).Round(time.Millisecond))
 		row := session.ReviewRecorded{ID: string(cmd.ID), Status: string(outcome), Scope: cmd.Workflow.Scope, BaseOID: copy.baseOID, TargetOID: copy.targetOID, StartedAt: started, FinishedAt: time.Now()}
 		state := a.codingState()
 		state.reviewMu.Lock()
@@ -420,7 +420,7 @@ func (a *Agent) runReviewWith(ctx context.Context, cmd protocol.Command, execute
 	if e != nil {
 		return "", outcome, e
 	}
-	bindReviewWorkspace(&cfg, &opts, filepath.Join(copy.dir, "after"))
+	bindReviewInstructions(&cfg)
 	opts.RootContext = ctx
 	a.reviewProgress(ctx, cmd.ID, "审查：检查差异与相关代码")
 	output, e = execute(ctx, cfg, opts, prompt)

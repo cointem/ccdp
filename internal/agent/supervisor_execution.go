@@ -22,7 +22,7 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 	defer r.workspaceLease.Close()
 	defer r.cancel()
 	defer r.lease.Close()
-	if r.fact.Child.Purpose == childPurposeTask {
+	if isTaskChild(r.fact.Child.Purpose) {
 		r.parent.runChildHook(ctx, true, text)
 		defer func() {
 			cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)

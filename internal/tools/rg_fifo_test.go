@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestRegressionGrepFIFO(t *testing.T) {
+func TestRegressionRgFIFO(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "pipe")
 	if err := syscall.Mkfifo(path, 0600); err != nil {
@@ -19,7 +19,7 @@ func TestRegressionGrepFIFO(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
-	go func() { readGrepFile(&Context{Context: ctx, Sandbox: sandbox.New(root)}, path); close(done) }()
+	go func() { readRgFile(&Context{Context: ctx, Sandbox: sandbox.New(root)}, path); close(done) }()
 	select {
 	case <-done:
 		return
@@ -37,5 +37,5 @@ func TestRegressionGrepFIFO(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("reader did not unblock")
 	}
-	t.Fatal("Grep opened FIFO in blocking mode instead of rejecting it")
+	t.Fatal("Rg opened FIFO in blocking mode instead of rejecting it")
 }

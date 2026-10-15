@@ -27,7 +27,7 @@ func childSession(title, status string, in, out int, start time.Time, finish tim
 	}
 }
 
-func TestSpawnAgentMarkerTracksChildWithoutLegacyWaitPolicy(t *testing.T) {
+func TestSpawnAgentDetailsTrackChildWithoutLegacyWaitPolicy(t *testing.T) {
 	for _, tc := range []struct{ status, label string }{
 		{"queued", "排队中"},
 		{"starting", "准备中"},
@@ -51,7 +51,13 @@ func TestSpawnAgentMarkerTracksChildWithoutLegacyWaitPolicy(t *testing.T) {
 				toolArgs: map[string]any{"task": "create a list", "name": "rust-list-worker"},
 				text:     "SPAWN_ACCEPTANCE_JSON", agent: &child,
 			}
-			got := sanitizeANSI(renderItemWidth(&item, 160))
+			collapsed := sanitizeANSI(renderItemWidth(&item, 160))
+			if !strings.Contains(collapsed, " · 已派出") || strings.Contains(collapsed, "tokens") || strings.Contains(collapsed, "tool uses") || strings.Contains(collapsed, "27s") {
+				t.Fatalf("dispatch record duplicates live progress: %s", collapsed)
+			}
+			p := toolPresentationFromItem(&item)
+			p.Expanded = true
+			got := sanitizeANSI(renderToolPresentation(p, 160))
 			if !strings.Contains(got, " · "+tc.label) || strings.Contains(got, "Done") {
 				t.Fatalf("incorrect child status:\n%s", got)
 			}
@@ -71,7 +77,7 @@ func TestSpawnAgentMarkerTracksChildWithoutLegacyWaitPolicy(t *testing.T) {
 func TestSpawnAgentMarkerBeforeChildUpdate(t *testing.T) {
 	for _, tc := range []struct{ status, label string }{
 		{"running", "running"},
-		{"success", "已启动"},
+		{"success", "已派出"},
 		{"error", "error"},
 		{"denied", "error"},
 		{"cancelled", "stopped"},
@@ -95,7 +101,7 @@ func TestWaitAgentRunningHiddenByDefault(t *testing.T) {
 	p := toolPresentationFromItem(&item)
 	p.Expanded = true
 	got := sanitizeANSI(renderToolPresentation(p, 100))
-	if !strings.Contains(got, " · running") || strings.Contains(got, "已启动") {
+	if !strings.Contains(got, " · running") || strings.Contains(got, "已派出") {
 		t.Fatalf("wait call misclassified as spawn:\n%s", got)
 	}
 }
@@ -129,7 +135,9 @@ func TestSpawnCardOmitsReceiptAndResultBodies(t *testing.T) {
 	child := childSession("research auth", "succeeded", 40000, 5200, start, start.Add(63*time.Second))
 	child.Run.Output = "FULL_CHILD_REPORT"
 	item := agentTaskItem("success", nil, "ACCEPTANCE_RECEIPT", child)
-	got := sanitizeANSI(renderItemWidth(&item, 120))
+	p := toolPresentationFromItem(&item)
+	p.Expanded = true
+	got := sanitizeANSI(renderToolPresentation(p, 120))
 	for _, want := range []string{"✓", "运行结束", "45.2k tokens", "1m 03s"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %s: %s", want, got)
@@ -171,7 +179,7 @@ func TestLegacyAgentToolNamesAreNotSpecialCased(t *testing.T) {
 	}
 	// No legacy wait_policy can turn an inspection receipt into a live task.
 	p := toolPresentation{Name: "ListAgents", Status: "success", Args: map[string]any{"wait_policy": "notify"}, Output: "{}"}
-	if got := sanitizeANSI(renderAgentPresentation(p, 100)); strings.Contains(got, "已启动") || strings.Contains(got, "running") {
+	if got := sanitizeANSI(renderAgentPresentation(p, 100)); strings.Contains(got, "已派出") || strings.Contains(got, "running") {
 		t.Fatal(got)
 	}
 }
@@ -190,31 +198,28 @@ func TestInlineFlushRendersAgentMarkerNotRawOutput(t *testing.T) {
 	item := agentTaskItem("success", nil, "receipt", child)
 	item.messageID = "spawn-item"
 	m.items = []historyCell{item}
-	if cmd := planTestHistory(m); cmd != nil {
-		t.Fatal("running card printed as final")
-	}
-	child.Run.Status, child.Run.FinishedAt = "succeeded", start.Add(63*time.Second)
-	done := agentTaskItem("success", nil, "RAW_RECEIPT", child)
-	done.messageID = "spawn-item"
-	m.items, m.turnDone = []historyCell{done}, true
 	cmd := planTestHistory(m)
 	if cmd == nil {
-		t.Fatal("completed card not printed")
+		t.Fatal("dispatch receipt held back by running child")
 	}
 	printed, ok := cmd().(inlinePrintMsg)
 	if !ok {
 		t.Fatal("missing print message")
 	}
 	text := sanitizeANSI(printed.text)
-	if !strings.Contains(text, "运行结束") || strings.Contains(text, "RAW_RECEIPT") {
+	if !strings.Contains(text, "已派出") || strings.Contains(text, "receipt") || strings.Contains(text, "tokens") {
 		t.Fatal(text)
 	}
+	child.Run.Status, child.Run.FinishedAt = "succeeded", start.Add(63*time.Second)
+	done := agentTaskItem("success", nil, "RAW_RECEIPT", child)
+	done.messageID = "spawn-item"
+	m.items, m.turnDone = []historyCell{done}, true
 	if planTestHistory(m) != nil {
-		t.Fatal("card printed twice")
+		t.Fatal("child completion printed dispatch record twice")
 	}
 }
 
-func TestApplyChildUpdateDrivesParentMarker(t *testing.T) {
+func TestApplyChildUpdateKeepsDispatchStableAndRefreshesDetails(t *testing.T) {
 	m := inlineTestModel()
 	m.width, m.height, m.sessionID = 120, 24, "root"
 	m.routing = &sessionRouting{rootID: "root"}
@@ -223,14 +228,18 @@ func TestApplyChildUpdateDrivesParentMarker(t *testing.T) {
 	m.items = []historyCell{item}
 	start := time.Now().Add(-30 * time.Second)
 	m.applyChildUpdate(childSession("research auth", "running", 22000, 8000, start, time.Time{}))
-	if got := sanitizeANSI(renderItemWidth(&m.items[0], 120)); !strings.Contains(got, "30k tokens") || !strings.Contains(got, "running") {
+	before := sanitizeANSI(renderItemWidth(&m.items[0], 120))
+	if got := sanitizeANSI(m.detailContent(&m.items[0])); !strings.Contains(got, "30k tokens") || !strings.Contains(got, "running") {
 		t.Fatal(got)
 	}
 	m.applyChildUpdate(childSession("research auth", "succeeded", 40000, 5200, start, start.Add(30*time.Second)))
 	if len(m.routing.rows) != 1 {
 		t.Fatal("duplicate child card")
 	}
-	if got := sanitizeANSI(renderItemWidth(&m.items[0], 120)); !strings.Contains(got, "45.2k tokens") || !strings.Contains(got, "运行结束") {
+	if after := sanitizeANSI(renderItemWidth(&m.items[0], 120)); before != after {
+		t.Fatalf("child update changed dispatch record: %q -> %q", before, after)
+	}
+	if got := sanitizeANSI(m.detailContent(&m.items[0])); !strings.Contains(got, "45.2k tokens") || !strings.Contains(got, "运行结束") {
 		t.Fatal(got)
 	}
 }

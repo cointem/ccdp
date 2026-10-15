@@ -59,7 +59,7 @@ func (s *SessionSupervisor) childRowLocked(r *managedRun) protocol.ChildSession 
 		}
 	}
 	row.DeliveryPending = row.Run.WaitPolicy == "notify" && !r.fact.Delivered
-	row.Capabilities = protocol.AgentCapabilities{Observe: true, Continue: !row.Run.Active() && row.Purpose == childPurposeTask, Cancel: row.Run.Active()}
+	row.Capabilities = protocol.AgentCapabilities{Observe: true, Continue: !row.Run.Active() && isTaskChild(row.Purpose), Cancel: row.Run.Active()}
 	if row.Approval != nil && row.Purpose == childPurposeReview && r.agent == nil {
 		row.Capabilities.Approve = !r.opts.NonInteractive
 	}
@@ -68,7 +68,7 @@ func (s *SessionSupervisor) childRowLocked(r *managedRun) protocol.ChildSession 
 		live = r.agent.RunStatus()
 	}
 	if r.agent != nil && row.Run.Status == "running" {
-		row.Capabilities.Send = row.Purpose == childPurposeTask
+		row.Capabilities.Send = isTaskChild(row.Purpose)
 		row.Capabilities.Interrupt = true
 		row.Approval, row.Question, row.Plan = live.Approval, live.Question, live.Plan
 		if row.Question != nil {

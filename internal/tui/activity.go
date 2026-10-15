@@ -24,6 +24,7 @@ const (
 	ActivityStreaming       ActivityPhase = "streaming"
 	ActivityFinalizing      ActivityPhase = "finalizing"
 	ActivityRunningTool     ActivityPhase = "running_tool"
+	ActivityWaitingAgents   ActivityPhase = "waiting_agents"
 	ActivityWaitingApproval ActivityPhase = "waiting_approval"
 	ActivityWaitingQuestion ActivityPhase = "waiting_question"
 	ActivityRetrying        ActivityPhase = "retrying"
@@ -135,6 +136,8 @@ func activityPhase(phase protocol.RuntimePhase) ActivityPhase {
 		return ActivityFinalizing
 	case protocol.PhaseExecutingTools:
 		return ActivityRunningTool
+	case protocol.PhaseWaitingAgents:
+		return ActivityWaitingAgents
 	case protocol.PhaseWaitingApproval:
 		return ActivityWaitingApproval
 	case protocol.PhaseCompacting:
@@ -161,6 +164,8 @@ func activityCopy(phase protocol.RuntimePhase, busy bool, detail string) (string
 		return "正在保存本轮结果", detail
 	case protocol.PhaseExecutingTools:
 		return "正在运行工具", detail
+	case protocol.PhaseWaitingAgents:
+		return "等待子任务", detail
 	case protocol.PhaseWaitingApproval:
 		return "等待你的决定", detail
 	case protocol.PhaseCompacting:

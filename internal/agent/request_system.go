@@ -21,7 +21,7 @@ You are in PLAN MODE. Do NOT execute anything yet.
 - Analyze the user's request and produce a concise, concrete execution plan.
 - Structure the plan as a numbered list of steps; name the exact files, commands
   and tools each step will use.
-- You may call read-only tools (Read, Glob, Grep, LS, TodoWrite,
+- You may call read-only tools (Read, Glob, Rg, LS, TodoWrite,
   CodeNavigate, ListAgents, ReadAgent, WaitAgent) to investigate before planning.
 - Do NOT call any tool that modifies files, runs builds or tests with side
   effects, touches git history, or makes network calls.

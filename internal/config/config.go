@@ -21,6 +21,7 @@ import (
 	"ccdp/internal/atomicfile"
 	"ccdp/internal/hooks"
 	"ccdp/internal/mcp"
+	"ccdp/internal/netguard"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
@@ -96,7 +97,7 @@ Follow the loop: understand → plan → act → verify.
 # Tool usage policy
 
 - Always prefer a dedicated tool over shell text-munging: Read instead of
-  cat/head/tail, Grep instead of grep/rg commands, Glob instead of find/ls,
+  cat/head/tail, Rg instead of grep/rg commands, Glob instead of find/ls,
   Edit instead of sed/awk, Write instead of heredocs. Reserve Bash for what it
   is uniquely good at: building, testing, git, process management.
 - Batch independent tool calls in one message. If you plan to read three files
@@ -269,6 +270,7 @@ type Config struct {
 
 	// SandboxLimits apply per-process resource bounds (ulimit).
 	SandboxLimits *sandbox.Limits `json:"sandbox_limits"`
+	NetworkProxy  string          `json:"network_proxy,omitempty"`
 	NetworkAccess bool            `json:"network_access"`
 
 	// AdditionalDirectories are extra dirs the sandbox treats like the
@@ -533,6 +535,7 @@ func applyEnvChecked(cfg *Config) error {
 	if _, exists := os.LookupEnv("CCDP_SANDBOX_ALLOW_NETWORK"); exists {
 		return fmt.Errorf("config: CCDP_SANDBOX_ALLOW_NETWORK is no longer supported; use network_access")
 	}
+	apply("CCDP_NETWORK_PROXY", func(v string) error { cfg.NetworkProxy = strings.TrimSpace(v); return nil })
 	apply("CCDP_NETWORK_ACCESS", func(v string) error {
 		b, err := parseEnvBool("CCDP_NETWORK_ACCESS", v)
 		if err == nil {
@@ -659,6 +662,11 @@ func LoadFrom(path string) (Config, error) {
 
 // Validate checks the config for usable values.
 func (c *Config) Validate() error {
+	if c.NetworkProxy != "" {
+		if _, err := netguard.TrustedProxy(c.NetworkProxy); err != nil {
+			return err
+		}
+	}
 	for name, server := range c.LanguageServers {
 		if name == "" || len(server.Argv) == 0 || strings.TrimSpace(server.Argv[0]) == "" || len(server.Extensions) == 0 || strings.TrimSpace(server.LanguageID) == "" {
 			return fmt.Errorf("invalid language server %q", name)
@@ -818,6 +826,7 @@ func (c *Config) Sandbox() *sandbox.Sandbox {
 		s.Limits = &lim
 	}
 	s.AllowNetwork = c.NetworkAccess
+	s.NetworkProxy = c.NetworkProxy
 	for _, d := range c.AdditionalDirectories {
 		s.AddDir(d)
 	}
@@ -841,12 +850,9 @@ func (c *Config) Sandbox() *sandbox.Sandbox {
 			s.AddProtectedEntry(path)
 		}
 	}
-	// Session logs, blobs, and control metadata are owner resources rather
-	// than ordinary workspace files. They remain available to the persistence
-	// layer, but file/process tools cannot use the workspace sandbox to tamper
-	// with another session's durable state when SessionDir is nested here.
+	// Session data is readable, including full tool outputs. Protect it from
+	// model writes even when SessionDir is nested in a writable workspace.
 	if c.SessionDir != "" {
-		s.AddDisallowedDir(c.SessionDir)
 		s.AddProtectedDir(c.SessionDir)
 	}
 	// Configuration, project instructions, and trust metadata are application

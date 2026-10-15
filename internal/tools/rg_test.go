@@ -12,10 +12,10 @@ import (
 	"ccdp/internal/sandbox"
 )
 
-// grepFixture lays out a tree that exercises every filter the search backends
+// rgFixture lays out a tree that exercises every filter the search backends
 // claim to honor: ignored files, dependency/build noise, hidden files and a
 // binary blob.
-func grepFixture(t *testing.T) string {
+func rgFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	write := func(rel, body string) {
@@ -40,7 +40,7 @@ func grepFixture(t *testing.T) string {
 	return dir
 }
 
-func grepCtx(dir string) *Context {
+func rgCtx(dir string) *Context {
 	return &Context{
 		Context:    context.Background(),
 		WorkingDir: dir,
@@ -49,9 +49,8 @@ func grepCtx(dir string) *Context {
 	}
 }
 
-// resultLocations renders backend output as "file:line" pairs so the two engines
-// can be compared without depending on their text formatting.
-func resultLocations(lines []grepLine) []string {
+// resultLocations renders backend output as "file:line" pairs without depending on text formatting.
+func resultLocations(lines []rgLine) []string {
 	out := make([]string, 0, len(lines))
 	for _, l := range lines {
 		if !l.match {
@@ -76,12 +75,12 @@ func itoa(n int) string {
 	return string(buf[i:])
 }
 
-func TestInProcessSearchSkipsIgnoredAndNoise(t *testing.T) {
-	dir := grepFixture(t)
-	ctx := grepCtx(dir)
-	lines, _, err := inProcessSearch(ctx, &grepRequest{pattern: "needle", base: dir, ignoreCase: true})
+func TestRgSearchSkipsIgnoredAndNoise(t *testing.T) {
+	dir := rgFixture(t)
+	ctx := rgCtx(dir)
+	lines, _, err := ripgrepSearch(ctx, &rgRequest{pattern: "needle", base: dir, ignoreCase: true})
 	if err != nil {
-		t.Fatalf("inProcessSearch: %v", err)
+		t.Fatalf("ripgrepSearch: %v", err)
 	}
 	got := strings.Join(resultLocations(lines), " ")
 	for _, want := range []string{"main.go:3", "main.go:6", "src/app.ts:1", ".hidden/notes.md:1", "types.go:3"} {
@@ -96,15 +95,15 @@ func TestInProcessSearchSkipsIgnoredAndNoise(t *testing.T) {
 	}
 }
 
-func TestGrepContextRendering(t *testing.T) {
-	dir := grepFixture(t)
-	ctx := grepCtx(dir)
-	req := &grepRequest{pattern: "package main", base: dir, before: 1, after: 1}
-	lines, _, err := inProcessSearch(ctx, req)
+func TestRgContextRendering(t *testing.T) {
+	dir := rgFixture(t)
+	ctx := rgCtx(dir)
+	req := &rgRequest{pattern: "package main", base: dir, before: 1, after: 1}
+	lines, _, err := ripgrepSearch(ctx, req)
 	if err != nil {
-		t.Fatalf("inProcessSearch: %v", err)
+		t.Fatalf("ripgrepSearch: %v", err)
 	}
-	out := formatGrepResult(lines, req, false)
+	out := formatRgResult(lines, req, false)
 	if !strings.Contains(out, "main.go-2-") {
 		t.Errorf("expected a context line rendered with a dash separator:\n%s", out)
 	}
@@ -113,32 +112,32 @@ func TestGrepContextRendering(t *testing.T) {
 	}
 }
 
-func TestGrepOutputModes(t *testing.T) {
-	dir := grepFixture(t)
-	ctx := grepCtx(dir)
+func TestRgOutputModes(t *testing.T) {
+	dir := rgFixture(t)
+	ctx := rgCtx(dir)
 
-	files := &grepRequest{pattern: "needle", base: dir, ignoreCase: true, outputMode: grepModeFiles}
-	lines, _, err := inProcessSearch(ctx, files)
+	files := &rgRequest{pattern: "needle", base: dir, ignoreCase: true, outputMode: rgModeFiles}
+	lines, _, err := ripgrepSearch(ctx, files)
 	if err != nil {
-		t.Fatalf("inProcessSearch: %v", err)
+		t.Fatalf("ripgrepSearch: %v", err)
 	}
-	out := formatGrepResult(lines, files, false)
+	out := formatRgResult(lines, files, false)
 	if !strings.Contains(out, "src/app.ts") || strings.Contains(out, ":1:") {
 		t.Errorf("files_with_matches should list bare paths:\n%s", out)
 	}
 
-	count := &grepRequest{pattern: "needle", base: dir, ignoreCase: true, outputMode: grepModeCount}
-	lines, _, err = inProcessSearch(ctx, count)
+	count := &rgRequest{pattern: "needle", base: dir, ignoreCase: true, outputMode: rgModeCount}
+	lines, _, err = ripgrepSearch(ctx, count)
 	if err != nil {
-		t.Fatalf("inProcessSearch: %v", err)
+		t.Fatalf("ripgrepSearch: %v", err)
 	}
-	out = formatGrepResult(lines, count, false)
+	out = formatRgResult(lines, count, false)
 	if !strings.Contains(out, "main.go:2") {
 		t.Errorf("count mode should report 2 matches in main.go:\n%s", out)
 	}
 }
 
-func TestGrepPaginationAndTruncationNote(t *testing.T) {
+func TestRgPaginationAndTruncationNote(t *testing.T) {
 	dir := t.TempDir()
 	var b strings.Builder
 	for i := 1; i <= 10; i++ {
@@ -147,17 +146,17 @@ func TestGrepPaginationAndTruncationNote(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "many.txt"), []byte(b.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx := grepCtx(dir)
+	ctx := rgCtx(dir)
 
-	req := &grepRequest{pattern: "match line", base: dir, maxLines: 3}
-	lines, truncated, err := inProcessSearch(ctx, req)
+	req := &rgRequest{pattern: "match line", base: dir, maxLines: 3}
+	lines, truncated, err := ripgrepSearch(ctx, req)
 	if err != nil {
-		t.Fatalf("inProcessSearch: %v", err)
+		t.Fatalf("ripgrepSearch: %v", err)
 	}
 	if !truncated {
 		t.Error("expected the backend to report truncation")
 	}
-	out := formatGrepResult(lines, req, truncated)
+	out := formatRgResult(lines, req, truncated)
 	if n := strings.Count(out, "match line"); n != 3 {
 		t.Errorf("expected 3 result lines, got %d:\n%s", n, out)
 	}
@@ -165,33 +164,33 @@ func TestGrepPaginationAndTruncationNote(t *testing.T) {
 		t.Errorf("expected a truncation note:\n%s", out)
 	}
 
-	page := &grepRequest{pattern: "match line", base: dir, maxLines: 3, offset: 3}
-	lines, _, err = inProcessSearch(ctx, page)
+	page := &rgRequest{pattern: "match line", base: dir, maxLines: 3, offset: 3}
+	lines, _, err = ripgrepSearch(ctx, page)
 	if err != nil {
-		t.Fatalf("inProcessSearch: %v", err)
+		t.Fatalf("ripgrepSearch: %v", err)
 	}
-	out = formatGrepResult(lines, page, false)
+	out = formatRgResult(lines, page, false)
 	if !strings.Contains(out, "match line 4") || strings.Contains(out, "match line 1\n") {
 		t.Errorf("offset should skip the first page:\n%s", out)
 	}
 }
 
-func TestGrepToolRun(t *testing.T) {
-	dir := grepFixture(t)
-	tool := NewGrepTool()
+func TestRgToolRun(t *testing.T) {
+	dir := rgFixture(t)
+	tool := NewRgTool()
 
 	run := func(args map[string]any) string {
 		t.Helper()
-		ctx := grepCtx(dir)
+		ctx := rgCtx(dir)
 		ctx.Args = args
 		out, err := tool.Run(ctx)
 		if err != nil {
-			t.Fatalf("Grep.Run(%v): %v", args, err)
+			t.Fatalf("Rg.Run(%v): %v", args, err)
 		}
 		return out
 	}
 
-	out := run(map[string]any{"pattern": "needle", "-i": true, "output_mode": "files_with_matches"})
+	out := run(map[string]any{"pattern": "needle", "ignore_case": true, "mode": "files"})
 	if !strings.Contains(out, "src/app.ts") {
 		t.Errorf("expected src/app.ts in files output:\n%s", out)
 	}
@@ -199,7 +198,7 @@ func TestGrepToolRun(t *testing.T) {
 		t.Errorf("dependency tree leaked into results:\n%s", out)
 	}
 
-	out = run(map[string]any{"pattern": "needle", "-i": true, "type": "go"})
+	out = run(map[string]any{"pattern": "needle", "ignore_case": true, "type": "go"})
 	if strings.Contains(out, "app.ts") {
 		t.Errorf("type filter did not restrict to Go files:\n%s", out)
 	}
@@ -207,12 +206,12 @@ func TestGrepToolRun(t *testing.T) {
 		t.Errorf("expected main.go for type go:\n%s", out)
 	}
 
-	out = run(map[string]any{"pattern": "needle", "-i": true, "-C": 1})
+	out = run(map[string]any{"pattern": "needle", "ignore_case": true, "context": 1})
 	if !strings.Contains(out, "--") && strings.Count(out, "main.go") > 1 {
 		t.Errorf("expected a group separator between non-contiguous context blocks:\n%s", out)
 	}
 
-	if _, err := tool.Run(&Context{Context: context.Background(), WorkingDir: dir, Sandbox: sandbox.New(dir), Args: map[string]any{"pattern": "needle", "output_mode": "bogus"}}); err == nil {
+	if _, err := tool.Run(&Context{Context: context.Background(), WorkingDir: dir, Sandbox: sandbox.New(dir), Args: map[string]any{"pattern": "needle", "mode": "bogus"}}); err == nil {
 		t.Error("expected an error for an unknown output_mode")
 	}
 	if _, err := tool.Run(&Context{Context: context.Background(), WorkingDir: dir, Sandbox: sandbox.New(dir), Args: map[string]any{"pattern": "(["}}); err == nil {
@@ -280,26 +279,26 @@ func TestTranslateFileGlob(t *testing.T) {
 	}
 }
 
-func TestGrepFilePaginationUsesCompleteCounts(t *testing.T) {
+func TestRgFilePaginationUsesCompleteCounts(t *testing.T) {
 	dir := t.TempDir()
 	for name, body := range map[string]string{"a.txt": strings.Repeat("hit\n", 600), "b.txt": "hit\nother\n", "c.txt": "hit\nhit\n"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	backends := map[string]func(*Context, *grepRequest) ([]grepLine, bool, error){"in_process": inProcessSearch}
+	backends := map[string]func(*Context, *rgRequest) ([]rgLine, bool, error){"ripgrep": ripgrepSearch}
 	for name, search := range backends {
 		t.Run(name, func(t *testing.T) {
-			for _, mode := range []string{grepModeCount, grepModeFiles} {
+			for _, mode := range []string{rgModeCount, rgModeFiles} {
 				for _, offset := range []int{0, 1, 2, 3} {
-					req := &grepRequest{pattern: "hit", base: dir, outputMode: mode, maxLines: 2, offset: offset, before: 1, after: 1}
-					lines, truncated, err := search(grepCtx(dir), req)
+					req := &rgRequest{pattern: "hit", base: dir, outputMode: mode, maxLines: 2, offset: offset, before: 1, after: 1}
+					lines, truncated, err := search(rgCtx(dir), req)
 					if err != nil {
 						t.Fatal(err)
 					}
-					out := formatGrepResult(lines, req, truncated)
+					out := formatRgResult(lines, req, truncated)
 					entries := []string{"a.txt", "b.txt", "c.txt"}
-					if mode == grepModeCount {
+					if mode == rgModeCount {
 						entries = []string{"a.txt:600", "b.txt:1", "c.txt:2"}
 					}
 					for i, entry := range entries {
@@ -314,14 +313,14 @@ func TestGrepFilePaginationUsesCompleteCounts(t *testing.T) {
 				}
 			}
 			// A bounded process capture must not turn a prefix into a file count.
-			ctx := grepCtx(dir)
+			ctx := rgCtx(dir)
 			ctx.OutputLimit = 256
-			req := &grepRequest{pattern: "hit", base: dir, outputMode: grepModeCount, maxLines: 2}
+			req := &rgRequest{pattern: "hit", base: dir, outputMode: rgModeCount, maxLines: 2}
 			lines, truncated, err := search(ctx, req)
 			if err != nil {
 				t.Fatal(err)
 			}
-			out := formatGrepResult(lines, req, truncated)
+			out := formatRgResult(lines, req, truncated)
 			if !strings.Contains(out, "a.txt:600\n") || !strings.Contains(out, "b.txt:1\n") {
 				t.Fatalf("partial counts: %s", out)
 			}
@@ -329,7 +328,7 @@ func TestGrepFilePaginationUsesCompleteCounts(t *testing.T) {
 	}
 }
 
-func TestGrepStreamsLargeTextAndFollowsExplicitAlias(t *testing.T) {
+func TestRgStreamsLargeTextAndFollowsExplicitAlias(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "large.txt")
 	if err := os.WriteFile(path, []byte(strings.Repeat("ordinary line\n", 50000)+"needle\n"), 0600); err != nil {
@@ -338,24 +337,24 @@ func TestGrepStreamsLargeTextAndFollowsExplicitAlias(t *testing.T) {
 	if err := os.Symlink("large.txt", filepath.Join(root, "alias.txt")); err != nil {
 		t.Fatal(err)
 	}
-	ctx := grepCtx(root)
+	ctx := rgCtx(root)
 	ctx.ReadRoot = root
 	ctx.Args = map[string]any{"pattern": "needle", "path": "alias.txt", "mode": "count"}
-	output, err := NewGrepTool().Run(ctx)
+	output, err := NewRgTool().Run(ctx)
 	if err != nil || !strings.Contains(output, "alias.txt:1\n") || strings.Contains(output, "incomplete") {
 		t.Fatalf("large alias search: %q %v", output, err)
 	}
 }
 
-func TestGrepRegexContractAndIncompleteMultiline(t *testing.T) {
+func TestRgUnicodeRegexAndIncompleteMultiline(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "unicode.txt"), []byte("中文\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ctx := grepCtx(root)
-	for pattern, want := range map[string]bool{`\w+`: false, `\p{L}+`: true} {
+	ctx := rgCtx(root)
+	for pattern, want := range map[string]bool{`\w+`: true, `\p{L}+`: true} {
 		ctx.Args = map[string]any{"pattern": pattern}
-		output, err := NewGrepTool().Run(ctx)
+		output, err := NewRgTool().Run(ctx)
 		if err != nil || strings.Contains(output, "中文") != want {
 			t.Fatalf("%s: %q %v", pattern, output, err)
 		}
@@ -364,7 +363,7 @@ func TestGrepRegexContractAndIncompleteMultiline(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx.Args = map[string]any{"pattern": "absent", "multiline": true}
-	output, err := NewGrepTool().Run(ctx)
+	output, err := NewRgTool().Run(ctx)
 	if err != nil || !strings.Contains(output, "search incomplete") {
 		t.Fatalf("bounded multiline result: %q %v", output, err)
 	}

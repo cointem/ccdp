@@ -866,6 +866,9 @@ func formatSandboxPolicy(workspace string, policy protocol.SandboxPolicy, runtim
 	network := "not authorized"
 	if policy.NetworkAccess {
 		network = "authorized"
+		if runtime.NetworkProxy != "" {
+			network += " via trusted proxy " + runtime.NetworkProxy
+		}
 	}
 	grants := make([]string, 0, len(runtime.SessionGrants))
 	for _, grant := range runtime.SessionGrants {

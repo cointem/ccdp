@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -175,9 +174,6 @@ func (a *Agent) buildToolContext(tc messages.ToolCall, turnCtx context.Context, 
 		// This branch is only for old hand-built Agent values in package tests.
 		// New sessions always own a Resources container.
 		tctx = &tools.Context{Context: turnCtx, WorkingDir: cfg.Workspace, SessionDir: cfg.SessionDir, Sandbox: sb}
-	}
-	if a.children.childState != nil && a.children.childState.purpose == childPurposeReview {
-		tctx.ReadRoot = filepath.Dir(cfg.Workspace)
 	}
 	tctx.Args = make(map[string]any, len(tc.Arguments))
 	for name, value := range tc.Arguments {

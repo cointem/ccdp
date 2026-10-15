@@ -81,6 +81,7 @@ func TestDelegatedResultsResumeSameParentTurnWithoutReadOrWait(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("parent never reached implicit wait")
 	}
+	waitParentPhase(t, a, protocol.PhaseWaitingAgents)
 	finish("child-a")
 	for {
 		select {
@@ -93,6 +94,7 @@ func TestDelegatedResultsResumeSameParentTurnWithoutReadOrWait(t *testing.T) {
 		}
 	}
 waitingForB:
+	waitParentPhase(t, a, protocol.PhaseWaitingAgents)
 	view, err := a.Snapshot(ctx)
 	if err != nil || !view.Busy {
 		t.Fatalf("parent ended with outstanding work: busy=%v err=%v", view.Busy, err)
@@ -104,6 +106,9 @@ waitingForB:
 	}
 	finish("child-b")
 	view = waitChildRuntimeTestIdle(t, a)
+	if view.Phase != protocol.PhaseIdle {
+		t.Fatalf("completed parent retained wait phase: %s", view.Phase)
+	}
 	records, _, err := a.services.supervisor.readSessionRecords(ctx, protocol.SessionID(a.conversation.sessionID))
 	if err != nil {
 		t.Fatal(err)
@@ -143,6 +148,59 @@ waitingForB:
 	}
 	if a.hasAgentMessage() {
 		t.Fatal("retry redelivered final result")
+	}
+}
+
+func waitParentPhase(t *testing.T, a *Agent, phase protocol.RuntimePhase) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sub, err := a.Watch(ctx, protocol.Cursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	for {
+		select {
+		case update, ok := <-sub.Updates():
+			if !ok {
+				t.Fatalf("watch closed before %s", phase)
+			}
+			if update.Snapshot != nil && update.Snapshot.Phase == phase || update.State != nil && update.State.Phase == phase {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("parent never entered %s", phase)
+		}
+	}
+}
+
+func TestCancelParentWaitingForDelegatedWork(t *testing.T) {
+	p := &childRuntimeTestProvider{name: "cancel-waiting-parent"}
+	p.stream = func(ctx context.Context, req llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
+		hasToolResult := false
+		for _, message := range req.Messages {
+			if message.Role == "user" && message.Content == "blocked-child" {
+				<-ctx.Done()
+				return llm.StreamResult{}, ctx.Err()
+			}
+			hasToolResult = hasToolResult || message.Role == "tool"
+		}
+		if !hasToolResult {
+			return llm.StreamResult{ToolCalls: []llm.ToolCall{{ID: "spawn", Type: "function", Function: llm.Function{
+				Name: "SpawnAgent", Arguments: `{"task":"blocked-child"}`,
+			}}}, FinishReason: "tool_calls"}, nil
+		}
+		return llm.StreamResult{Text: "waiting for child", FinishReason: "stop"}, nil
+	}
+	a, _ := newChildRuntimeTestAgent(t, p)
+	go a.Run()
+	submitChildRuntimeTestInput(t, a, "cancel-wait", "parent-task")
+	waitParentPhase(t, a, protocol.PhaseWaitingAgents)
+	a.interrupt()
+	view := waitChildRuntimeTestIdle(t, a)
+	if view.Phase != protocol.PhaseIdle || view.LastTurn.Status != protocol.TurnCancelled {
+		t.Fatalf("cancelled wait did not settle: phase=%s outcome=%+v", view.Phase, view.LastTurn)
 	}
 }
 

@@ -144,6 +144,9 @@ func (a *Agent) runTurn(input turnInput) {
 			a.reportStoppedGoal()
 			return
 		}
+		// A collaboration wake resumes request preparation in this same turn.
+		// Waiting is a runtime phase, so snapshots must stop advertising it here.
+		a.setPhase(protocol.PhasePreparing)
 		if err := a.consumeAgentMessages(); err != nil {
 			a.failTurnPersistence(err)
 			return
@@ -360,7 +363,11 @@ func (a *Agent) runTurn(input turnInput) {
 				reason, err := a.waitAgentEvent(turnCtx)
 				if err != nil {
 					releaseStep()
-					turnErr = err
+					// Cancellation ends the wait normally; recording it as a
+					// failure would override the turn's cancelled outcome.
+					if turnCtx.Err() == nil || !errors.Is(err, turnCtx.Err()) {
+						turnErr = err
+					}
 					return
 				}
 				if reason != "no_pending_work" {

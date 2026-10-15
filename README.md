@@ -180,7 +180,9 @@ plan 是独立工作流：先以只读工具探索并提出计划，批准后执
 
 所有模型驱动的本地命令、后台进程、Hooks 和 stdio MCP 都经过 macOS Seatbelt。工作区默认可读写，工作区外的主机文件默认可读、不可写；`disallowed_directories` 可明确拒绝读写。审批命令不会自动扩大目录或网络授权。
 
-外网访问默认开启，可用 `network_access: false` 关闭。本机服务连接与监听需要单独授权；Web 工具和远程 MCP 还会检查网络能力。用 `/add-dir <dir>` 增加读写目录，`/add-dir --read-only <dir>` 指定只读目录，`/sandbox` 查看当前状态。
+`sessions` 目录默认可读，包括历史会话和工具保存的完整输出；它保留写保护，避免模型修改会话状态。用户显式配置的禁读目录仍然生效。代码审查复用普通子任务的工作区、工具和审批机制，审查目标及报告格式通过任务指令指定。
+
+外网访问默认开启，可用 `network_access: false` 关闭。若使用 Clash 等本机代理的 Fake-IP DNS，在用户配置 `~/.ccdp/config.json` 中设置 `"network_proxy": "http://127.0.0.1:7897"`（替换为实际 HTTP 代理端口），或设置 `CCDP_NETWORK_PROXY`。此配置由 WebFetch/WebSearch 和命令执行共用；`/sandbox` 显示当前代理。项目设置不能改写可信代理。本机服务连接与监听需要单独授权；Web 工具和远程 MCP 还会检查网络能力。用 `/add-dir <dir>` 增加读写目录，`/add-dir --read-only <dir>` 指定只读目录，`/sandbox` 查看当前状态。
 
 项目配置中的 Hooks、MCP、自定义工具和权限放宽需要用户通过 `/trust` 授权；配置变化后需重新授权，`/trust revoke` 可撤销信任。恢复会话不会重新授予临时 capability。
 
@@ -313,3 +315,5 @@ go vet ./...
 | `internal/tui` | 终端交互与渲染 |
 
 反馈问题请使用 [GitHub Issues](https://github.com/cointem/ccdp/issues)，附上运行命令、错误信息和脱敏后的配置。
+
+搜索工具 `Rg` 直接调用系统安装的 `rg`（ripgrep），普通搜索、多行搜索和代码审查都使用同一原生引擎。支持 rg 的 Unicode 正则语义、固定字符串、大小写选项和结果分页；搜索经过只读 Seatbelt，遵循当前会话的读取策略。不再提供 `Grep` 或 Go 搜索后备实现；缺少 `rg` 时明确报错，macOS 可用 `brew install ripgrep` 安装。

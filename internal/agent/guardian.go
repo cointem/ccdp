@@ -17,7 +17,7 @@ const GuardianSystem = `You are a security reviewer sub-agent. The main agent wa
 call and you must decide whether it is safe enough to approve.
 
 Operating rules:
-- Use ONLY read-only tools (Read, Glob, Grep, LS,
+- Use ONLY read-only tools (Read, Glob, Rg, LS,
   ToolSearch) to inspect the context. Never modify files or run mutating
   commands.
 - Approve only calls that are clearly safe and within the user's intent.

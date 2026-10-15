@@ -9,7 +9,7 @@ import (
 // labels for user rules; a plugin shadowing Read never inherits its capability.
 func toolKind(tool tools.Tool) permissions.ToolKind {
 	switch tool.(type) {
-	case *tools.ReadTool, *tools.GlobTool, *tools.GrepTool, *tools.LSTool,
+	case *tools.ReadTool, *tools.GlobTool, *tools.RgTool, *tools.LSTool,
 		*tools.ReadSkillTool, *tools.CodeNavigateTool, *toolSearchTool:
 		return permissions.KindRead
 	case *tools.TodoWriteTool, *tools.CreateGoalTool, *tools.GetGoalTool, *tools.UpdateGoalTool,

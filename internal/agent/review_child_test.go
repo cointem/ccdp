@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"ccdp/internal/config"
+	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
@@ -28,8 +29,8 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 			unblock := func() { once.Do(func() { close(release) }) }
 			defer unblock()
 			mainModel := &fakeLLM{script: []string{"text:main answer"}}
-			reviewModel := &fakeLLM{script: []string{`text:## 发现
-未发现具体缺陷。`, `text:根据已保存报告解释检查范围。`}}
+			reviewModel := &fakeLLM{script: []string{"tool:Bash|command=printf review-validation", `text:## 发现
+未发现具体缺陷。`, "tool:Read|file_path=a.go", `text:根据已保存报告解释检查范围。`}}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, _ := io.ReadAll(r.Body)
 				r.Body = io.NopCloser(bytes.NewReader(body))
@@ -37,11 +38,11 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 					var request struct {
 						Tools []json.RawMessage `json:"tools"`
 					}
-					if e := json.Unmarshal(body, &request); e != nil || len(request.Tools) != 0 {
-						t.Error("report discussion still exposes tools", e)
+					if e := json.Unmarshal(body, &request); e != nil || len(request.Tools) == 0 {
+						t.Error("review continuation lost ordinary tools", e)
 					}
 				}
-				if bytes.Contains(body, []byte("../changes.patch")) {
+				if bytes.Contains(body, []byte("/changes.patch")) {
 					startOnce.Do(func() { close(started) })
 					select {
 					case <-release:
@@ -108,8 +109,8 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 				t.Fatalf("children: %v %v", rows, err)
 			}
 			snapshotData, err := os.ReadFile(filepath.Join(rows[0].Workspace, "a.go"))
-			if err != nil || !strings.Contains(string(snapshotData), "return 1") {
-				t.Fatal("review snapshot changed with parent workspace", err)
+			if err != nil || rows[0].Workspace != root || !strings.Contains(string(snapshotData), "return 2") {
+				t.Fatal("review does not use ordinary shared workspace", err)
 			}
 			receipt, err := a.Submit(ctx, protocol.NewSubmitInput("main-input", cmd.SessionID, "main-input", "continue main work", protocol.InputSteer))
 			if err != nil || receipt.Rejected() {
@@ -170,8 +171,8 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 				t.Fatal("child has no saved final report")
 			}
 			if !cancelReview {
-				if _, err := os.Stat(rows[0].Workspace); !os.IsNotExist(err) {
-					t.Fatal("review copy not cleaned", err)
+				if _, err := os.Stat(rows[0].Workspace); err != nil {
+					t.Fatal("review removed shared workspace", err)
 				}
 				if _, err = a.Sessions().Control(ctx, protocol.AgentControl{ID: "discuss-review", SessionID: launched.SessionID, RunID: launched.RunID, Action: "continue", Text: "explain saved report"}); err != nil {
 					t.Fatal("cannot discuss cleaned review", err)
@@ -182,6 +183,21 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 				list, err := a.Sessions().ListChildren(ctx)
 				if err != nil || list[0].Run.Status != "succeeded" || list[0].Run.WaitPolicy != "observe" {
 					t.Fatal("review discussion failed", list, err)
+				}
+				saved, err := LoadSession(cfg.SessionDir, string(launched.SessionID))
+				if err != nil {
+					t.Fatal(err)
+				}
+				verified, reread := false, false
+				for _, m := range saved.History {
+					if m.Role != messages.RoleTool {
+						continue
+					}
+					verified = verified || strings.Contains(m.Content, "review-validation")
+					reread = reread || strings.Contains(m.Content, "return 2")
+				}
+				if !verified || !reread {
+					t.Fatalf("review tools did not execute: validation=%v continuedRead=%v", verified, reread)
 				}
 
 			}

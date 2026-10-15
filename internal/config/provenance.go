@@ -73,7 +73,7 @@ var configFieldNames = []string{
 	"keep_after_compact", "bash_timeout_seconds", "max_turns",
 	"fallback_model",
 	"max_tool_output_chars_per_turn", "enable_guardian", "enable_memory",
-	"max_parallel_tools", "sandbox_limits", "network_access",
+	"max_parallel_tools", "sandbox_limits", "network_access", "network_proxy",
 	"additional_directories", "additional_read_only_directories", "disallowed_directories",
 	"hooks", "enable_web_tools", "tools", "mcp_servers", "session_dir",
 	"verbose", "debug", "session_id", "no_session_persistence", "review", "delivery", "automatic_checkpoints", "language_servers",
@@ -288,6 +288,8 @@ func (c *Config) ApplyCLIOverride(field string, value any) error {
 		}
 	case "max_parallel_tools":
 		err = setInt(&c.MaxParallelTools)
+	case "network_proxy":
+		err = setString(&c.NetworkProxy)
 	case "network_access":
 		err = setBool(&c.NetworkAccess)
 	case "additional_directories":
@@ -396,6 +398,8 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			dst.MaxParallelTools = src.MaxParallelTools
 		case "sandbox_limits":
 			dst.SandboxLimits = cloneLimits(src.SandboxLimits)
+		case "network_proxy":
+			dst.NetworkProxy = src.NetworkProxy
 		case "network_access":
 			dst.NetworkAccess = src.NetworkAccess
 		case "additional_directories":

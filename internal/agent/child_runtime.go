@@ -29,13 +29,18 @@ const (
 	defaultChildWorkers  = 4
 )
 
+// Review is a task label, not a separate tool or permission policy.
+func isTaskChild(purpose string) bool {
+	return purpose == childPurposeTask || purpose == childPurposeReview
+}
+
 // guardianReadOnlyTools is an execution allowlist, not merely prompt text.
 // The provider's executeTool path must invoke ChildToolGate before registry
 // lookup, hooks, permission checks, or Tool.Run.
 var guardianReadOnlyTools = map[string]bool{
 	"Read":         true,
 	"Glob":         true,
-	"Grep":         true,
+	"Rg":           true,
 	"LS":           true,
 	"ToolSearch":   true,
 	"ReadSkill":    true,
@@ -47,7 +52,7 @@ func childReadOnlyTools(purpose string) map[string]bool {
 	if purpose != childPurposeGuardian {
 		allowed["WebSearch"], allowed["WebFetch"] = true, true
 	}
-	if purpose == childPurposeTask {
+	if isTaskChild(purpose) {
 		allowed["SendMessage"] = true
 	}
 	return allowed
@@ -223,7 +228,7 @@ func ChildToolGate(a *Agent, tc messages.ToolCall, tool tools.Tool) (bool, strin
 		return false, ""
 	}
 	s := a.children.childState
-	if (s.purpose == childPurposeGuardian || s.purpose == childPurposeReview || s.readOnlyWorkspace) && !childReadOnlyTools(s.purpose)[tc.Name] {
+	if (s.purpose == childPurposeGuardian || s.readOnlyWorkspace) && !childReadOnlyTools(s.purpose)[tc.Name] {
 		return true, fmt.Sprintf("guardian hard deny: tool %q is outside the read-only allowlist", tc.Name)
 	}
 	if s.allowed != nil && !s.allowed[tc.Name] {
@@ -231,12 +236,12 @@ func ChildToolGate(a *Agent, tc messages.ToolCall, tool tools.Tool) (bool, strin
 	}
 	// Delegation is deliberately one level only. This remains a hard
 	// gate even when a caller passed a nil allowlist.
-	if s.purpose == childPurposeTask && childControlTool(tc.Name) {
+	if isTaskChild(s.purpose) && childControlTool(tc.Name) {
 		return true, "child hard deny: nested task is not available"
 	}
-	if s.purpose == childPurposeGuardian || s.purpose == childPurposeReview {
+	if s.purpose == childPurposeGuardian {
 		kind := toolKind(tool)
-		if kind != permissions.KindRead && !(s.purpose == childPurposeReview && kind == permissions.KindNetwork) {
+		if kind != permissions.KindRead {
 			return true, fmt.Sprintf("guardian hard deny: tool %q is not read-only", tc.Name)
 		}
 	}
@@ -335,7 +340,7 @@ func (a *Agent) inheritBorrowedPreHooks(preHooks []plugin.PreToolHook) {
 // pointer; the borrowed implementations remain reachable through the parent
 // step lease until the child finishes.
 func (a *Agent) inheritBorrowedTools(lease *tools.Lease) {
-	if a == nil || lease == nil || a.services.registry == nil || a.children.childState == nil || a.children.childState.purpose != childPurposeTask {
+	if a == nil || lease == nil || a.services.registry == nil || a.children.childState == nil || !isTaskChild(a.children.childState.purpose) {
 		return
 	}
 	for _, name := range lease.Names() {
@@ -474,12 +479,12 @@ func childAllowedTools(purpose string, registryNames []string) map[string]bool {
 	for _, name := range registryNames {
 		allowed[name] = true
 	}
-	if purpose == childPurposeTask {
+	if isTaskChild(purpose) {
 		for _, name := range []string{"SpawnAgent", "FollowupAgent", "StopAgent", "ListAgents", "ReadAgent", "WaitAgent"} {
 			delete(allowed, name)
 		}
 	}
-	if purpose == childPurposeGuardian || purpose == childPurposeReview {
+	if purpose == childPurposeGuardian {
 		allowed = make(map[string]bool, len(guardianReadOnlyTools))
 		for name := range guardianReadOnlyTools {
 			allowed[name] = true

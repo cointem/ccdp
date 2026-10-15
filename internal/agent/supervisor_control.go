@@ -199,19 +199,13 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 			}
 		}()
 	}
-	if row.Workspace != "" && row.Purpose != childPurposeReview {
+	if row.Workspace != "" {
 		if _, statErr := os.Stat(row.Workspace); statErr != nil {
 			lease.Close()
 			return row.Run, fmt.Errorf("child workspace unavailable: %w", statErr)
 		}
 		bindChildWorkspace(&cfg, &opts, row.WorkspaceMode, row.Workspace, cfg.Workspace)
 		applyChildRole(&cfg, &opts, row.Role, row.WorkspaceMode)
-	}
-	if row.Purpose == childPurposeReview {
-		row.Workspace = ""
-		cfg.Hooks, cfg.Tools, cfg.LanguageServers = nil, nil, nil
-		opts.AllowedTools = map[string]bool{}
-		cfg.SystemPrompt += "\nThe review copy was cleaned up. Answer only from the saved report and conversation. Do not claim to read source or rerun tests. For new source inspection ask the user to start a new /review."
 	}
 	opts.memoryResume, opts.memoryBlobs = memory, blobs
 	var initial *SessionSnapshot

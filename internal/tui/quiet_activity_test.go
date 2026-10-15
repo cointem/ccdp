@@ -8,7 +8,7 @@ import (
 )
 
 func TestQuietExecutionIsNotUnresponsive(t *testing.T) {
-	for _, phase := range []ActivityPhase{ActivityRunningTool, ActivityWaitingApproval, ActivityWaitingQuestion, ActivityCompacting, ActivityStopping} {
+	for _, phase := range []ActivityPhase{ActivityWaitingAgents, ActivityRunningTool, ActivityWaitingApproval, ActivityWaitingQuestion, ActivityCompacting, ActivityStopping} {
 		m := astraModel(t, 100, 24)
 		m.busy = true
 		m.activity = Activity{Phase: phase, UpdatedAt: now().Add(-time.Minute)}
@@ -56,5 +56,29 @@ func TestUnchangedSnapshotDoesNotResetModelSilence(t *testing.T) {
 	m.applySnapshot(s)
 	if m.turnStalled() {
 		t.Fatal("new output did not reset silence")
+	}
+}
+
+func TestWaitingAgentsStatusSurvivesSnapshotAndResumes(t *testing.T) {
+	m := astraModel(t, 120, 24)
+	view := protocol.SessionView{SessionID: protocol.SessionID(m.sessionID), Busy: true,
+		Phase: protocol.PhaseWaitingAgents, WorkStartedAt: now().Add(-23 * time.Second)}
+	m.applySnapshot(view)
+	m.activity.UpdatedAt = now().Add(-time.Minute)
+	m.applySnapshot(view)
+	status := sanitizeANSI(m.renderStatus())
+	if !strings.Contains(status, "等待子任务 · 本轮 23s") || strings.Contains(status, "准备请求") || strings.Contains(status, "等待模型响应") {
+		t.Fatalf("incorrect waiting status after resync: %s", status)
+	}
+	if m.turnStalled() {
+		t.Fatal("child wait reported as stalled model")
+	}
+	for _, phase := range []protocol.RuntimePhase{protocol.PhasePreparing, protocol.PhaseStreaming, protocol.PhaseStopping, protocol.PhaseIdle} {
+		view.Phase = phase
+		view.Busy = phase != protocol.PhaseIdle
+		m.applySnapshot(view)
+		if strings.Contains(m.renderStatus(), "等待子任务") {
+			t.Fatalf("waiting status survived %s", phase)
+		}
 	}
 }

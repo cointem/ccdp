@@ -29,7 +29,7 @@ func (a *Agent) hardAdmitTool(tc messages.ToolCall, journal toolJournalContext, 
 		a.emit(toolEvent(tc, "error", "unknown tool "+tc.Name))
 		return nil, fmt.Sprintf("Error: unknown tool %q", tc.Name), false, true
 	}
-	if purpose, _, _, child := ChildRuntime(a); child && (purpose == childPurposeGuardian || purpose == childPurposeReview || a.children.childState.readOnlyWorkspace) && (!readOnlyImplementation(tool) || (purpose == childPurposeGuardian && toolKind(tool) != permissions.KindRead)) && !(purpose == childPurposeTask && childMessageTool(tool)) {
+	if purpose, _, _, child := ChildRuntime(a); child && (purpose == childPurposeGuardian || a.children.childState.readOnlyWorkspace) && (!readOnlyImplementation(tool) || (purpose == childPurposeGuardian && toolKind(tool) != permissions.KindRead)) && !(isTaskChild(purpose) && childMessageTool(tool)) {
 		reason := fmt.Sprintf("guardian hard deny: tool %q is not the built-in read-only implementation", tc.Name)
 		a.emit(toolEvent(tc, "denied", reason))
 		return nil, fmt.Sprintf("permission denied: %s", reason), false, true

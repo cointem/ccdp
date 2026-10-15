@@ -26,6 +26,14 @@ type childFactory struct {
 }
 
 func (f childFactory) Open(ctx context.Context) (supervision.ChildRuntime, error) {
+	child, err := f.openAgent(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return child, nil
+}
+
+func (f childFactory) openAgent(ctx context.Context) (*Agent, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

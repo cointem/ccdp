@@ -41,6 +41,7 @@ type Sandbox struct {
 	// durable path grants and do not change the persisted policy revision.
 	ExecutionScratchDirs []string
 	Limits               *Limits
+	NetworkProxy         string
 	AllowNetwork         bool
 	LocalServices        []LocalService
 	executionGuard       *ExecutionGuard
@@ -151,7 +152,7 @@ func PolicyTightened(current, next *Sandbox) bool {
 	}
 	old := current.Snapshot()
 	newPolicy := next.Snapshot()
-	if old.AllowNetwork && !newPolicy.AllowNetwork {
+	if old.NetworkProxy != newPolicy.NetworkProxy || old.AllowNetwork && !newPolicy.AllowNetwork {
 		return true
 	}
 	oldWrite := append([]string{old.Workspace}, old.AdditionalDirs...)
@@ -271,7 +272,7 @@ func (s *Sandbox) Snapshot() *Sandbox {
 		DisallowedDirs: append([]string(nil), s.DisallowedDirs...), ProtectedDirs: append([]string(nil), s.ProtectedDirs...),
 		ProtectedEntries: append([]string(nil), s.ProtectedEntries...),
 		ScratchDirs:      append([]string(nil), s.ScratchDirs...), ExecutionReadRoots: append([]string(nil), s.ExecutionReadRoots...),
-		ExecutionScratchDirs: append([]string(nil), s.ExecutionScratchDirs...), AllowNetwork: s.AllowNetwork,
+		ExecutionScratchDirs: append([]string(nil), s.ExecutionScratchDirs...), AllowNetwork: s.AllowNetwork, NetworkProxy: s.NetworkProxy,
 		LocalServices: append([]LocalService(nil), s.LocalServices...),
 	}
 	if s.Limits != nil {
@@ -769,6 +770,38 @@ func (s *Sandbox) ReadOnlyCommandProfile(executable string) (string, error) {
 		return "", fmt.Errorf("sandbox: read-only executable must be absolute")
 	}
 	return s.profile(canonicalRoot(executable))
+}
+
+// ReadOnlyCommandProfileWithin adds an OS-enforced snapshot data boundary.
+// Runtime library reads remain possible, but workspace/sibling paths and
+// symlinks escaping the snapshot cannot be read by the query executable.
+func (s *Sandbox) ReadOnlyCommandProfileWithin(executable, root string) (string, error) {
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("sandbox: snapshot root must be absolute")
+	}
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	profile, err := s.ReadOnlyCommandProfile(executable)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	b.WriteString(profile)
+	b.WriteString("(deny file-read-data (require-all")
+	for _, dir := range []string{root, "/usr/lib", "/System/Library", "/System/Volumes/Preboot/Cryptexes/OS/System/Library", "/System/Volumes/Preboot/Cryptexes/OS/usr/lib"} {
+		fmt.Fprintf(&b, " (require-not (subpath %s))", sbplQuote(canonicalRoot(dir)))
+	}
+	// dyld opens exactly / as a directory descriptor for runtime lookup.
+	// This does not grant reads to any descendants of /.
+	for _, file := range []string{executable, "/", "/dev/null", "/dev/random", "/dev/urandom", "/private/etc/localtime"} {
+		fmt.Fprintf(&b, " (require-not (literal %s))", sbplQuote(canonicalRoot(file)))
+	}
+	// Homebrew's optional PCRE2 and other native dependencies are runtime
+	// libraries, not general read grants to the package manager prefix.
+	b.WriteString(` (require-not (regex #"^/(opt/homebrew|usr/local)/(Cellar|opt|lib)/.*\.dylib$"))))` + "\n")
+	return b.String(), nil
 }
 
 func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {

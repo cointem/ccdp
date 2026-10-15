@@ -81,13 +81,13 @@ func TestPartialReviewIsNotAnExecutionError(t *testing.T) {
 	}
 }
 
-func TestReportOnlyDoesNotHaveTools(t *testing.T) {
+func TestReviewKeepsOrdinaryTools(t *testing.T) {
 	a, _ := codingFixture(t)
 	cfg, opts, err := childOptionsFromParent(a, childPurposeReview)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bindReportOnly(&cfg, &opts)
+	bindReviewInstructions(&cfg)
 	child, err := newAgentWithOptions(&cfg, nil, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -98,10 +98,10 @@ func TestReportOnlyDoesNotHaveTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := json.Marshal(view.Catalog)
-	if strings.Contains(string(b), `"name":"Bash"`) {
-		t.Fatal("report-only tool restored", string(b))
+	if !strings.Contains(string(b), `"id":"Bash"`) {
+		t.Fatal("review lost Bash", string(b))
 	}
-	if len(opts.AllowedTools) != 0 || opts.AllowedTools == nil {
-		t.Fatal("missing explicit empty tool set")
+	if !opts.AllowedTools["Bash"] || !opts.AllowedTools["Write"] || !opts.AllowedTools["SendMessage"] {
+		t.Fatal("review lost ordinary task tools")
 	}
 }

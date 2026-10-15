@@ -61,6 +61,7 @@ func (a *Agent) stateLocked() protocol.SessionState {
 		view.WorkLabel = a.turn.workLabel
 	}
 	view.Goal = protocol.CloneGoal(a.conversation.durable.Goal)
+	view.SandboxRuntime.NetworkProxy = a.services.cfg.NetworkProxy
 	view.SandboxRuntime.RevocationPending = a.capabilities.capabilityRevoking
 	if a.services.sandbox != nil {
 		view.SandboxRuntime.ExternalExecutionPossible = a.services.sandbox.ExternalExecutionPossible()

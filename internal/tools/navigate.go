@@ -10,7 +10,7 @@ type CodeNavigateTool struct{}
 func NewCodeNavigateTool() *CodeNavigateTool { return &CodeNavigateTool{} }
 func (*CodeNavigateTool) Name() string       { return "CodeNavigate" }
 func (*CodeNavigateTool) Description() string {
-	return "Ask a configured language server for definitions, references or document symbols. Positions use 1-based lines and zero-based UTF-16 characters. Without a server use Grep and Read. No text candidate is presented as semantic navigation."
+	return "Ask a configured language server for definitions, references or document symbols. Positions use 1-based lines and zero-based UTF-16 characters. Without a server use Rg and Read. No text candidate is presented as semantic navigation."
 }
 func (*CodeNavigateTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{"operation": map[string]any{"type": "string", "enum": []string{"definition", "references", "outline"}}, "path": map[string]any{"type": "string"}, "line": map[string]any{"type": "integer", "minimum": 1}, "character": map[string]any{"type": "integer", "minimum": 0}, "cursor": map[string]any{"type": "integer", "minimum": 0}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 100}}, "required": []string{"operation", "path"}}
@@ -21,7 +21,7 @@ func (*CodeNavigateTool) Run(ctx *Context) (string, error) {
 	}
 	op := StringArg(ctx.Args, "operation", "")
 	if op != "definition" && op != "references" && op != "outline" {
-		return "", fmt.Errorf("unsupported semantic operation; use Glob/Grep for text search")
+		return "", fmt.Errorf("unsupported semantic operation; use Glob/Rg for text search")
 	}
 	path := StringArg(ctx.Args, "path", "")
 	if path == "" {
@@ -39,7 +39,7 @@ func (*CodeNavigateTool) Run(ctx *Context) (string, error) {
 		return "", e
 	}
 	if ctx.NavigateSemantic == nil {
-		return "", fmt.Errorf("no language server; use Grep/Read")
+		return "", fmt.Errorf("no language server; use Rg/Read")
 	}
 	raw, e := ctx.NavigateSemantic(op, path, line, character)
 	if e != nil {

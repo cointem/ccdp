@@ -181,7 +181,7 @@ func buildEffectiveConfig(base config.Config, initial *SessionSnapshot, isolated
 		// the parent. Their tool admission is enforced separately by
 		// ChildToolGate, but startup hooks/MCP/memory must also be disabled so a
 		// child cannot run arbitrary commands merely by being constructed.
-		if opts.Purpose == childPurposeTask {
+		if isTaskChild(opts.Purpose) {
 			// Preserve only the parent's prompt/tool decision hooks. The child
 			// never receives SessionStart/End or SubagentStart/Stop hooks; those
 			// lifecycle events belong to the owning runtime and are not replayed.
@@ -192,7 +192,7 @@ func buildEffectiveConfig(base config.Config, initial *SessionSnapshot, isolated
 		base.MCPServers = map[string]mcp.ServerConfig{}
 		base.EnableGuardian = config.BoolPtr(false)
 		base.EnableMemory = config.BoolPtr(false)
-		if opts.Purpose == childPurposeGuardian || opts.Purpose == childPurposeReview {
+		if opts.Purpose == childPurposeGuardian {
 			// Guardian's read-only gate is name based. Do not let a configured
 			// custom command replace a built-in name such as Read and turn that
 			// allowlisted name into arbitrary shell execution.

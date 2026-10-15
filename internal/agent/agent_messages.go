@@ -160,7 +160,7 @@ func (a *Agent) sendAgentMessage(ctx context.Context, id protocol.CommandID, tar
 		AdmitMessage(protocol.Command) (protocol.Receipt, error)
 	}
 	if a.children.childState != nil {
-		if a.children.childState.purpose != childPurposeTask || target != "parent" {
+		if !isTaskChild(a.children.childState.purpose) || target != "parent" {
 			return errors.New("children may message only parent")
 		}
 		r, err := a.services.supervisor.lookup(protocol.SessionID(a.conversation.sessionID))
@@ -189,7 +189,7 @@ func (a *Agent) sendAgentMessage(ctx context.Context, id protocol.CommandID, tar
 				return ctx.Err()
 			}
 		}
-		if r.parent != a || r.fact.Child.Purpose != childPurposeTask {
+		if r.parent != a || !isTaskChild(r.fact.Child.Purpose) {
 			r.mu.Unlock()
 			a.services.supervisor.publicationMu.Unlock()
 			return errors.New("message target is not your task child")
