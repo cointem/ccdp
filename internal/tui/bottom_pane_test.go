@@ -140,10 +140,11 @@ func TestQuitRunningRequiresExplicitConfirmation(t *testing.T) {
 	}
 }
 
-func TestFollowupUsesProtocolStrategy(t *testing.T) {
+func TestBusyTabQueuesFollowup(t *testing.T) {
 	m := sugModel()
+	m.busy = true
 	m.textarea.SetValue("next turn")
-	_, cmd := m.submitInput(protocol.InputFollowup)
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
 	if cmd == nil {
 		t.Fatal("expected submission")
 	}

@@ -48,6 +48,7 @@ type StreamSegment struct {
 
 // Message is a single entry in the conversation history.
 type Message struct {
+	ToolUpdate       *ToolUpdate       `json:"tool_update,omitempty"`
 	ProviderOrigin   string            `json:"provider_origin,omitempty"`
 	ProviderWire     string            `json:"provider_wire,omitempty"`
 	ProviderContent  []json.RawMessage `json:"provider_content,omitempty"`

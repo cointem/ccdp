@@ -167,8 +167,13 @@ func (m *Model) footerHints() string {
 			return "↑↓ choose · tab · esc"
 		}
 		return "↑↓ choose · tab complete · enter run · esc close"
+	case m.fileMention != nil:
+		if narrow {
+			return "↑↓ choose · tab · esc"
+		}
+		return "↑↓ choose · tab/enter complete · esc close"
 	case m.busy:
-		return "enter steer · esc interrupt"
+		return "enter steer · tab queue · esc interrupt"
 	}
 	if narrow {
 		return "enter send"

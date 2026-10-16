@@ -150,7 +150,8 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 			mainModel.mu.Lock()
 			calls := mainModel.calls
 			mainModel.mu.Unlock()
-			if calls != 1 || len(a.History()) != 2 {
+			// One user, the initial tool catalog, and the single parent reply.
+			if calls != 1 || len(a.History()) != 3 {
 				t.Fatalf("review caused a parent follow-up: requests=%d history=%d", calls, len(a.History()))
 			}
 			reader, err := a.Sessions().OpenReader(ctx, launched.SessionID)

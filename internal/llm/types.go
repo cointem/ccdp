@@ -1,21 +1,26 @@
 package llm
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"ccdp/internal/messages"
+)
 
 // ChatMessage is the wire representation of a message sent to a Chat
 // Completions compatible endpoint. Content is either a plain string or a list
 // of content parts (for tool-bearing messages we always use strings for the
 // tool role, matching the OpenAI convention).
 type ChatMessage struct {
-	ProviderOrigin   string            `json:"provider_origin,omitempty"`
-	ProviderWire     string            `json:"provider_wire,omitempty"`
-	ProviderContent  []json.RawMessage `json:"provider_content,omitempty"`
-	ReasoningContent string            `json:"reasoning_content,omitempty"`
-	Role             string            `json:"role"`
-	Content          any               `json:"content,omitempty"`
-	ToolCalls        []ToolCall        `json:"tool_calls,omitempty"`
-	ToolCallID       string            `json:"tool_call_id,omitempty"`
-	Name             string            `json:"name,omitempty"`
+	ToolUpdate       *messages.ToolUpdate `json:"tool_update,omitempty"`
+	ProviderOrigin   string               `json:"provider_origin,omitempty"`
+	ProviderWire     string               `json:"provider_wire,omitempty"`
+	ProviderContent  []json.RawMessage    `json:"provider_content,omitempty"`
+	ReasoningContent string               `json:"reasoning_content,omitempty"`
+	Role             string               `json:"role"`
+	Content          any                  `json:"content,omitempty"`
+	ToolCalls        []ToolCall           `json:"tool_calls,omitempty"`
+	ToolCallID       string               `json:"tool_call_id,omitempty"`
+	Name             string               `json:"name,omitempty"`
 }
 
 func cloneRawBlocks(src []json.RawMessage) []json.RawMessage {

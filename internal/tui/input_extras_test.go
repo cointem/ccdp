@@ -118,7 +118,10 @@ func TestFileMentionCompletion(t *testing.T) {
 	}
 
 	// Accepting the first (directory) candidate drills in.
-	m.acceptFileMention()
+	m.busy = true
+	if _, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyTab}); cmd != nil {
+		t.Fatal("Tab must complete the path without queueing the draft")
+	}
 	if got := m.textarea.Value(); got != "explain @internal/agent/" {
 		t.Fatalf("drill-in value = %q", got)
 	}

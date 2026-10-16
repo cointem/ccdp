@@ -345,6 +345,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+	case "tab":
+		// Completion menus take priority above. Slash commands still require
+		// Enter so queueing a draft cannot execute a command immediately.
+		if m.busy && !strings.HasPrefix(strings.TrimSpace(m.textarea.Value()), "/") {
+			return m.submitInput(protocol.InputFollowup)
+		}
+
 	case "enter":
 		return m.submit()
 

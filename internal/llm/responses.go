@@ -21,13 +21,14 @@ import (
 // responsesItem is an input item (message or function_call) and also the
 // "item" carried by output_item.added / output_item.done events.
 type responsesItem struct {
-	Type      string `json:"type,omitempty"`
-	Role      string `json:"role,omitempty"`
-	Content   any    `json:"content,omitempty"`
-	CallID    string `json:"call_id,omitempty"`
-	Output    string `json:"output,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
+	Tools     []responsesTool `json:"tools,omitempty"`
+	Type      string          `json:"type,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   any             `json:"content,omitempty"`
+	CallID    string          `json:"call_id,omitempty"`
+	Output    string          `json:"output,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Arguments string          `json:"arguments,omitempty"`
 }
 
 // responsesTool is a Responses function tool declaration.
@@ -127,8 +128,19 @@ func responsesContent(content any) (any, error) {
 
 // responsesBody builds the Responses request payload from a CompletionRequest.
 func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
+	projection := projectTools(req, toolUpdatesAdditions)
 	input := make([]json.RawMessage, 0, len(req.Messages)+8)
-	for _, m := range req.Messages {
+	for i, m := range req.Messages {
+		if update := projection.updates[i]; update != nil && len(update.Added) > 0 {
+			item, err := marshalItem(responsesItem{Type: "additional_tools", Role: "developer", Tools: responsesTools(toolDefs(update.Added))})
+			if err != nil {
+				return nil, err
+			}
+			input = append(input, item)
+		}
+		if m.ToolUpdate != nil && (m.Content == nil || contentString(m.Content) == "") {
+			continue
+		}
 		if m.Role == "tool" {
 			item, err := marshalItem(responsesItem{
 				Type:   "function_call_output",
@@ -195,16 +207,7 @@ func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
 		Input:   input,
 		Stream:  true,
 	}
-	if len(req.Tools) > 0 {
-		for _, t := range req.Tools {
-			br.Tools = append(br.Tools, responsesTool{
-				Type:        "function",
-				Name:        t.Function.Name,
-				Description: t.Function.Description,
-				Parameters:  t.Function.Parameters,
-			})
-		}
-	}
+	br.Tools = responsesTools(projection.tools)
 	if req.Verbosity != "" {
 		br.Text = &responsesText{Verbosity: req.Verbosity}
 	}

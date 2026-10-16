@@ -92,11 +92,11 @@ export DEEPSEEK_API_KEY="你的 API Key"
 | `/review`、`/diff`、`/git` | 审查改动、查看差异和 Git 状态 |
 | `/agents`、`/agent <id>`、`/pending` | 查看子任务、定向控制、处理审批与提问 |
 | `/goal <目标>`、`/tasks` | 持续执行目标、查看工作清单 |
-| `/next <text>`、`/stop-tree` | 排队下一轮输入、停止整棵任务树 |
+| `/stop-tree` | 停止整棵任务树 |
 | `/transcript`、`/export [path]` | 阅读完整消息和工具输出、导出 Markdown |
 | `/sandbox`、`/permissions`、`/trust` | 查看沙箱、管理权限、授权项目配置 |
 
-运行中的普通输入用于补充当前任务，`/next` 留给下一轮。子任务审批会先提示，通过 `/pending` 或 `/agents` 进入处理。
+运行中按 `Enter` 补充当前任务，按 `Tab` 将消息排到下一轮；命令或文件补全菜单打开时，`Tab` 优先补全。子任务审批会先提示，通过 `/pending` 或 `/agents` 进入处理。
 
 `/rewind` 回退对话历史；文件恢复使用检查点和恢复流程。查看子 Agent 会话不会自动授予审批权限。
 
@@ -104,7 +104,8 @@ export DEEPSEEK_API_KEY="你的 API Key"
 
 | 按键 | 用途 |
 | --- | --- |
-| `Enter` | 发送 |
+| `Enter` | 发送；运行中补充当前任务 |
+| `Tab` | 运行中将消息排到下一轮；补全菜单打开时优先补全 |
 | `Option+Enter` / `Ctrl+J` | 换行 |
 | `Ctrl+C` / `Esc` | 中断当前执行；空闲时连续两次 `Ctrl+C` 退出 |
 | `Shift+Tab` | 切换审批模式：manual → edits → bypass |

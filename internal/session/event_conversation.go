@@ -74,6 +74,7 @@ func (b ContentBlock) validate() error {
 }
 
 type Message struct {
+	ToolUpdate       *messages.ToolUpdate     `json:"tool_update,omitempty"`
 	ImagesFrozen     bool                     `json:"images_frozen,omitempty"`
 	ProviderOrigin   string                   `json:"provider_origin,omitempty"`
 	ProviderWire     string                   `json:"provider_wire,omitempty"`

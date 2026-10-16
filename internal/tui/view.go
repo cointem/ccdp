@@ -49,6 +49,7 @@ func (m Model) View() string {
 			for i := bottom; i < len(rows); i++ {
 				rows[i] = strings.ReplaceAll(rows[i], "enter send", "          ")
 				rows[i] = strings.ReplaceAll(rows[i], "enter steer", "           ")
+				rows[i] = strings.ReplaceAll(rows[i], "tab queue", "         ")
 			}
 		}
 		// Retain the top of the menu on tiny screens; command selection itself

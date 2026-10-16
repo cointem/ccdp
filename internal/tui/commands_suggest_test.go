@@ -131,8 +131,12 @@ func TestCmdSuggestKeys(t *testing.T) {
 		t.Errorf("up should wrap to last index, got %d", m.cmdSugIdx)
 	}
 
-	// Tab accepts the highlighted command into the input.
-	m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	// Completion takes priority over queueing while a turn is running.
+	m.busy = true
+	if _, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyTab}); cmd != nil {
+		t.Fatal("Tab must complete the command without submitting it")
+	}
+	m.busy = false
 	if got := m.textarea.Value(); got != "/github" {
 		t.Errorf("tab should fill '/github', got %q", got)
 	}

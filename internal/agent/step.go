@@ -86,6 +86,12 @@ func (a *Agent) captureStepOwned() (stepRuntime, error) {
 	}
 	step, lease := a.captureStepRuntime()
 	step.tools = a.toolDefsSnapshotFromLease(lease)
+	if err := a.recordStepTools(&step); err != nil {
+		releaseStepLease(step)
+		a.clearStepContext(step.turn, step.step)
+		a.settingsCommitMu.Unlock()
+		return stepRuntime{}, err
+	}
 	step.goalPrompt = a.goalPrompt()
 	a.mu.Lock()
 	a.toolsTokensEstimate = estimateToolsTokens(step.tools)
@@ -173,7 +179,7 @@ func (a *Agent) loadStepExternalContext(step *stepRuntime) error {
 		}
 		step.skillsSection = skillStore.SkillsSection()
 	}
-	step.systemBlocks = a.buildSystemBlocks(step.cfg, step.sessionStartAt, step.sessionID, step.plan, step.modelSwitchMsg, step.interruptNote, step.instructions, step.skillsSection, step.tools, step.history, step.policy)
+	step.systemBlocks = a.buildSystemBlocks(step.cfg, step.sessionStartAt, step.sessionID, step.plan, step.modelSwitchMsg, step.interruptNote, step.instructions, step.skillsSection, step.history, step.policy)
 	if step.goalPrompt != "" {
 		step.systemBlocks = append(step.systemBlocks, llm.SystemBlock{Text: step.goalPrompt})
 	}

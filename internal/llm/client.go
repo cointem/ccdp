@@ -304,16 +304,17 @@ func (c *Client) postStream(ctx context.Context, url string, body []byte) (resp 
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
-	if c.cfg.APIKey != "" {
-		if c.isAnthropic() {
+	if c.isAnthropic() {
+		if c.cfg.APIKey != "" {
 			httpReq.Header.Set("x-api-key", c.cfg.APIKey)
-			httpReq.Header.Set("anthropic-version", "2023-06-01")
-			if betas := anthropicBetaHeader(body); betas != "" {
-				httpReq.Header.Set("anthropic-beta", betas)
-			}
-		} else {
-			httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 		}
+		// Protocol headers are required even when a gateway handles authentication.
+		httpReq.Header.Set("anthropic-version", "2023-06-01")
+		if betas := anthropicBetaHeader(body); betas != "" {
+			httpReq.Header.Set("anthropic-beta", betas)
+		}
+	} else if c.cfg.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 	}
 	httpReq.Header.Set("User-Agent", "ccdp/0.1")
 	resp, err = c.httpc.Do(httpReq)

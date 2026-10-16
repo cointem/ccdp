@@ -217,7 +217,7 @@ func (c Catalog) Help() string {
 		b.WriteByte('\n')
 	}
 	b.WriteString("\nCustom commands: markdown files in ~/.ccdp/commands/<name>.md or .ccdp/commands/<name>.md become /name; $ARGUMENTS is replaced by the args.\n")
-	b.WriteString("Keys\n  Enter        send/steer; /next queues      ⌥Enter       newline (⌃J also works)\n  ↑/↓          edit multiline input or browse input history\n  Home/End     move within input\n  ⌃C           interrupt agent; press twice when idle to quit\n  ⌘C           native terminal copy\n  trackpad     native history; PgUp/PgDn or ⌃U/⌃D scroll the view\n  ⌃O           read transcript (review details in approval)\n  ⌃A           browse agents\n  Approval     ↑/↓ choose · Enter confirm · Esc later · /pending reopen\n  esc          dismiss or return; interrupt when running\n  /transcript  read full messages and tool output\n  Reader       / search · n next · o raw · c copy · esc return\n")
+	b.WriteString("Keys\n  Enter        send/steer                    ⌥Enter       newline (⌃J also works)\n  Tab          queue message while running; complete when a menu is open\n  ↑/↓          edit multiline input or browse input history\n  Home/End     move within input\n  ⌃C           interrupt agent; press twice when idle to quit\n  ⌘C           native terminal copy\n  trackpad     native history; PgUp/PgDn or ⌃U/⌃D scroll the view\n  ⌃O           read transcript (review details in approval)\n  ⌃A           browse agents\n  Approval     ↑/↓ choose · Enter confirm · Esc later · /pending reopen\n  esc          dismiss or return; interrupt when running\n  /transcript  read full messages and tool output\n  Reader       / search · n next · o raw · c copy · esc return\n")
 	return b.String()
 }
 
@@ -234,7 +234,6 @@ func prefixed(names []string) []string {
 // from the old help parser, and ? as the documented help alias.
 func Default() Catalog {
 	return New([]Entry{
-		{Name: "next", Help: "<message> queue input for the next turn", Feedback: FeedbackOperation, Busy: BusyAllow, Mutation: true},
 		{Name: "reconnect", Help: "reattach to session updates without resending commands", Feedback: FeedbackNotice, Busy: BusyAllow},
 		{Name: "pending", Help: "reopen a deferred question or approval", Feedback: FeedbackSelector, Busy: BusyAllow},
 		{Name: "goal", Help: "[objective|edit|pause|resume|clear|budget] manage a persistent goal", Feedback: FeedbackReport, Busy: BusyAllow, Mutation: true},

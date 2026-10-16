@@ -55,7 +55,7 @@ func (a *Agent) buildRequestFromConfig(cfg config.Config, model, sys string, his
 	for _, m := range history {
 		switch m.Role {
 		case messages.RoleSystem:
-			msgs = append(msgs, llm.ChatMessage{Role: "system", Content: m.Content})
+			msgs = append(msgs, llm.ChatMessage{Role: "system", Content: m.Content, ToolUpdate: messages.CloneToolUpdate(m.ToolUpdate)})
 		case messages.RoleUser:
 			// Multi-modal: canonical inputs use their frozen attachment blobs;
 			// legacy messages retain path-based compatibility expansion.

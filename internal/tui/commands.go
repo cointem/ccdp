@@ -50,7 +50,7 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	}
 	if m.routing != nil && m.sessionID != m.routing.rootID {
 		switch cmd {
-		case "pending", "tasks", "next", "reconnect", "agents", "agent", "agent-history", "agent-output", "transcript", "parent", "root", "help", "context", "stop-tree", "quit":
+		case "pending", "tasks", "reconnect", "agents", "agent", "agent-history", "agent-output", "transcript", "parent", "root", "help", "context", "stop-tree", "quit":
 		default:
 			m.pushStatus("this command belongs to the main session; use /root first")
 			return m, nil
@@ -64,13 +64,6 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 	switch cmd {
 	case "reconnect":
 		return m, m.reconnect()
-	case "next":
-		if len(args) == 0 {
-			m.pushStatus("usage: /next <message> — send in the next turn")
-			return m, nil
-		}
-		m.textarea.SetValue(strings.Join(args, " "))
-		return m.submitInput(protocol.InputFollowup)
 	case "pending":
 		return m, m.openPendingDecision()
 	case "tasks":

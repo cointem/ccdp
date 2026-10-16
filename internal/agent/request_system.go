@@ -29,12 +29,12 @@ You are in PLAN MODE. Do NOT execute anything yet.
 - End your reply with the plan only. The user will approve it before execution.`
 
 // buildSystemBlocks composes the system prompt as an ordered list of sections.
-// Cacheable sections (core instructions, tools, skills index, project
+// Cacheable sections (core instructions, skills index, project
 // instructions) lead the list; a wire that
 // supports prompt caching (Anthropic cache_control) can hold them across
 // requests. Query-dependent repository layout and other dynamic sections
 // (environment, memory, plan, todo) follow the stable prefix.
-func (a *Agent) buildSystemBlocks(cfg config.Config, sessionStartAt time.Time, sessionID string, plan bool, modelSwitch string, interrupted bool, instructions, skillsSection string, frozenTools []llm.ToolDef, history []messages.Message, policy *sandbox.Sandbox) []llm.SystemBlock {
+func (a *Agent) buildSystemBlocks(cfg config.Config, sessionStartAt time.Time, sessionID string, plan bool, modelSwitch string, interrupted bool, instructions, skillsSection string, history []messages.Message, policy *sandbox.Sandbox) []llm.SystemBlock {
 	blocks := make([]llm.SystemBlock, 0, 11)
 	add := func(cacheable bool, text string) {
 		if text == "" {
@@ -45,7 +45,6 @@ func (a *Agent) buildSystemBlocks(cfg config.Config, sessionStartAt time.Time, s
 
 	// Stable, cacheable prefix.
 	add(true, cfg.SystemPrompt)
-	add(true, availableToolsFromDefs(frozenTools))
 	add(true, skillsSection)
 	if instructions != "" {
 		add(true, "\n\n# Project instructions\n\n"+instructions)
@@ -105,21 +104,6 @@ func joinSystemBlocks(blocks []llm.SystemBlock) string {
 			sb.WriteString("\n\n")
 		}
 		sb.WriteString(b.Text)
-	}
-	return sb.String()
-}
-
-func availableToolsFromDefs(defs []llm.ToolDef) string {
-	names := make([]string, 0, len(defs))
-	for _, def := range defs {
-		if name := strings.TrimSpace(def.Function.Name); name != "" {
-			names = append(names, name)
-		}
-	}
-	var sb strings.Builder
-	sb.WriteString("# Available tools\n")
-	if len(names) > 0 {
-		sb.WriteString("Available directly: " + strings.Join(names, ", ") + "\n")
 	}
 	return sb.String()
 }

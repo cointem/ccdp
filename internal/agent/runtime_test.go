@@ -340,16 +340,16 @@ func TestSteerQueuedMessageInjected(t *testing.T) {
 
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	// Expected shape: [user1, asst(tool), tool, user2(steered), asst(done)]
-	// (the system prompt lives outside history).
+	// Expected shape: [user1, catalog, asst(tool), tool, user2(steered), asst(done)]
+	// The base system prompt lives outside history; catalog deltas are durable.
 	var dump strings.Builder
 	for i, m := range ag.conversation.durable.History {
 		fmt.Fprintf(&dump, "%d:%s:%q ", i, m.Role, truncateForLog(m.Content))
 	}
 	t.Logf("history: %s", dump.String())
 	n := len(ag.conversation.durable.History)
-	if n != 5 {
-		t.Fatalf("steered history should be 5 messages, got %d", n)
+	if n != 6 {
+		t.Fatalf("steered history should be 6 messages including catalog, got %d", n)
 	}
 	last := ag.conversation.durable.History[n-1]
 	prev := ag.conversation.durable.History[n-2]

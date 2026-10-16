@@ -244,6 +244,16 @@ func estimateRequestBudget(req CompletionRequest, contextWindow, imageTokenReser
 		encoded, _ := json.Marshal(tool)
 		b.SchemaTokens += EstimateTokens(string(encoded))
 	}
+	catalogTokens := 0
+	for _, message := range req.Messages {
+		if message.ToolUpdate != nil {
+			encoded, _ := json.Marshal(message.ToolUpdate)
+			catalogTokens += EstimateTokens(string(encoded))
+		}
+	}
+	// Retired/redefined schemas can remain in provider-native tool updates.
+	// Reserve their cost regardless of which projection the adapter selects.
+	b.SchemaTokens = max(b.SchemaTokens, catalogTokens)
 	b.InputTokens = b.SystemTokens + b.SchemaTokens + b.HistoryTokens + b.ImageTokens + b.MessageMetadataTokens + b.EnvelopeTokens
 	if req.MaxTokens != nil && *req.MaxTokens > 0 {
 		b.ReservedOutputTokens = *req.MaxTokens

@@ -14,6 +14,7 @@ func Clone(src []Message) []Message {
 	dst := make([]Message, len(src))
 	for i, m := range src {
 		dst[i] = m
+		dst[i].ToolUpdate = CloneToolUpdate(m.ToolUpdate)
 		dst[i].ProviderContent = CloneProviderBlocks(m.ProviderContent)
 		dst[i].StreamSegments = append([]StreamSegment(nil), m.StreamSegments...)
 		dst[i].ToolCalls = append([]ToolCall(nil), m.ToolCalls...)

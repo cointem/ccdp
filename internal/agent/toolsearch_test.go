@@ -64,8 +64,17 @@ func TestDeferredToolNotInjected(t *testing.T) {
 		t.Fatalf("buildRequestForStepChecked: %v", err)
 	}
 	sys, _ := req.Messages[0].Content.(string)
-	if !strings.Contains(sys, "# Available tools") || !strings.Contains(sys, "ToolSearch") {
-		t.Errorf("frozen availability section missing ToolSearch: %q", sys)
+	if strings.Contains(sys, "# Available tools") {
+		t.Fatal("mutable availability list must not be in base system")
+	}
+	searchDeclared := false
+	for _, tool := range req.Tools {
+		if tool.Function.Name == "ToolSearch" {
+			searchDeclared = true
+		}
+	}
+	if !searchDeclared {
+		t.Fatal("ToolSearch schema missing")
 	}
 	if strings.Contains(sys, "my-fmt") {
 		t.Errorf("deferred tool leaked into frozen availability section: %q", sys)
@@ -98,8 +107,21 @@ func TestDeferredToolNotInjected(t *testing.T) {
 		t.Fatalf("buildRequestForStepChecked after discovery: %v", err)
 	}
 	sys, _ = req.Messages[0].Content.(string)
-	if !strings.Contains(sys, "my-fmt") {
-		t.Errorf("discovered tool missing from frozen availability section: %q", sys)
+	if strings.Contains(sys, "my-fmt") {
+		t.Fatal("discovery changed base system")
+	}
+	found = false
+	for _, tool := range req.Tools {
+		if tool.Function.Name == "my-fmt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("discovered tool schema missing")
+	}
+	update := step.history[len(step.history)-1].ToolUpdate
+	if update == nil || len(update.Added) != 1 || update.Added[0].Name != "my-fmt" {
+		t.Fatalf("missing discovery delta: %+v", update)
 	}
 }
 
@@ -162,7 +184,7 @@ func TestBuildRequestSections(t *testing.T) {
 		t.Fatal("no messages")
 	}
 	sys, _ := req.Messages[0].Content.(string)
-	for _, want := range []string{"# Environment", "- Date:", "- Timezone:", "# Repository layout", "# Available tools", "# Project instructions"} {
+	for _, want := range []string{"# Environment", "- Date:", "- Timezone:", "# Repository layout", "# Project instructions"} {
 		// Project instructions only present when an AGENTS.md exists.
 		if want == "# Project instructions" {
 			continue

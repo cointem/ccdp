@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -33,9 +34,10 @@ type anthropicOutputConfig struct {
 
 // anthropicTool is an Anthropic function tool declaration.
 type anthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	InputSchema map[string]any `json:"input_schema"`
+	DeferLoading bool           `json:"defer_loading,omitempty"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description,omitempty"`
+	InputSchema  map[string]any `json:"input_schema"`
 }
 
 // anthropicMessage is one entry of the top-level `messages` array.
@@ -69,6 +71,8 @@ const anthropicDefaultMaxTokens = 4096
 const (
 	anthropicInterleavedThinkingBeta = "interleaved-thinking-2025-05-14"
 	anthropicEffortBeta              = "effort-2025-11-24"
+	anthropicInlineToolsBeta         = "inline-tools-2026-09-15"
+	anthropicToolPlaceholder         = "__ccdp_deferred_placeholder__"
 )
 
 // anthropicEffort folds ccdp's effort scale into the four values the Messages
@@ -93,9 +97,11 @@ func anthropicEffort(effort string) string {
 
 // anthropicBetaHeader returns the anthropic-beta value the marshaled body
 // requires: adaptive thinking needs the interleaved-thinking beta and
-// output_config.effort needs the effort beta. Empty when neither is present.
+// output_config.effort needs the effort beta. The deferred placeholder marks
+// native catalog requests, which require the inline-tools beta from request one.
 func anthropicBetaHeader(body []byte) string {
 	var doc struct {
+		Tools     []anthropicTool  `json:"tools"`
 		Thinking  *json.RawMessage `json:"thinking"`
 		OutputCfg *json.RawMessage `json:"output_config"`
 	}
@@ -103,6 +109,12 @@ func anthropicBetaHeader(body []byte) string {
 		return ""
 	}
 	var betas []string
+	for _, tool := range doc.Tools {
+		if tool.Name == anthropicToolPlaceholder && tool.DeferLoading {
+			betas = append(betas, anthropicInlineToolsBeta)
+			break
+		}
+	}
 	if doc.Thinking != nil {
 		betas = append(betas, anthropicInterleavedThinkingBeta)
 	}
@@ -206,7 +218,7 @@ func applyAnthropicCacheControl(system []map[string]any, metadata []SystemBlock,
 	}
 	if last, ok := messages[len(messages)-1].Content.([]map[string]any); ok {
 		for i := len(last) - 1; i >= 0; i-- {
-			if last[i]["type"] == "tool_result" {
+			if last[i]["type"] == "tool_result" || last[i]["type"] == "tool_addition" || last[i]["type"] == "tool_removal" {
 				mark(last[i])
 				break
 			}
@@ -222,9 +234,59 @@ func toolUseBlock(tc ToolCall) map[string]any {
 
 // anthropicBody builds the Anthropic Messages request payload.
 func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
+	projection := projectTools(req, toolUpdatesChanges)
+	// Inline tools need an initially active tool, and the placeholder name must
+	// not shadow a real declaration.
+	if len(projection.tools) == 0 {
+		projection = toolProjection{tools: req.Tools}
+	}
+	for _, tool := range slices.Concat(req.Tools, projection.tools) {
+		if tool.Function.Name == anthropicToolPlaceholder {
+			projection = toolProjection{tools: req.Tools}
+			break
+		}
+	}
+	// A real tool may have used the reserved name and then been removed. Its
+	// historical definition would still replace the deferred placeholder.
+	for _, update := range projection.updates {
+		for _, tool := range update.Added {
+			if tool.Name == anthropicToolPlaceholder {
+				projection = toolProjection{tools: req.Tools}
+				break
+			}
+		}
+	}
 	var system strings.Builder
 	messages := make([]anthropicMessage, 0, len(req.Messages)+4)
-	for _, m := range req.Messages {
+	var pending []anthropicMessage
+	flush := func() { messages = append(messages, pending...); pending = nil }
+	for i, m := range req.Messages {
+		if update := projection.updates[i]; update != nil {
+			var blocks []map[string]any
+			redefined := make(map[string]bool)
+			for _, tool := range update.Added {
+				redefined[tool.Name] = true
+			}
+			for _, name := range update.Removed {
+				if !redefined[name] {
+					blocks = append(blocks, map[string]any{"type": "tool_removal", "tool": map[string]any{"type": "tool_reference", "name": name}})
+				}
+			}
+			for _, tool := range update.Added {
+				definition := anthropicTool{Name: tool.Name, Description: tool.Description, InputSchema: tool.Parameters}
+				blocks = append(blocks, map[string]any{"type": "tool_addition", "tool": map[string]any{"type": "tool_definition", "definition": definition}})
+			}
+			if len(blocks) > 0 {
+				pending = append(pending, anthropicMessage{Role: "system", Content: blocks})
+			}
+		}
+		if m.ToolUpdate != nil && (m.Content == nil || contentString(m.Content) == "") {
+			continue
+		}
+		// Do not insert a catalog update between tool_use and tool_result.
+		if m.Role == "assistant" {
+			flush()
+		}
 		switch m.Role {
 		case "system":
 			if system.Len() > 0 {
@@ -274,6 +336,7 @@ func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
 		messages = append(messages, anthropicMessage{Role: m.Role, Content: blocks})
 	}
 
+	flush()
 	maxTokens := anthropicDefaultMaxTokens
 	if req.MaxTokens != nil && *req.MaxTokens > 0 {
 		maxTokens = *req.MaxTokens
@@ -305,8 +368,8 @@ func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
 		Messages:  messages,
 		Stream:    true,
 	}
-	if len(req.Tools) > 0 {
-		for _, t := range req.Tools {
+	if len(projection.tools) > 0 {
+		for _, t := range projection.tools {
 			if t.Function.Name == "" {
 				continue
 			}
@@ -316,6 +379,9 @@ func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
 				InputSchema: t.Function.Parameters,
 			})
 		}
+	}
+	if projection.native {
+		br.Tools = append(br.Tools, anthropicTool{Name: anthropicToolPlaceholder, Description: "Reserved placeholder. Never available. Never call this.", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}, "required": []string{}}, DeferLoading: true})
 	}
 	if effort := anthropicEffort(req.ReasoningEffort); effort != "" {
 		br.Thinking = &anthropicThinking{Type: "adaptive"}

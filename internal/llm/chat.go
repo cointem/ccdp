@@ -49,6 +49,9 @@ func (c *Client) chatBody(req CompletionRequest) ([]byte, error) {
 		messages = make([]chatRequestMessage, 0, len(req.Messages))
 	}
 	for _, message := range req.Messages {
+		if message.ToolUpdate != nil && (message.Content == nil || contentString(message.Content) == "") {
+			continue
+		}
 		wire := chatRequestMessage{ReasoningContent: message.ReasoningContent, Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID, Name: message.Name}
 		for _, call := range message.ToolCalls {
 			wire.ToolCalls = append(wire.ToolCalls, chatRequestToolCall{ID: call.ID, Type: call.Type, Function: call.Function})

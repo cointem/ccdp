@@ -3,6 +3,7 @@ package agent
 import (
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
+	"encoding/json"
 )
 
 // needsCompact reports whether the conversation has grown past the configured
@@ -80,6 +81,10 @@ func (a *Agent) estimateTokens() int {
 // estimateMessageTokens estimates one history message's token footprint.
 func estimateMessageTokens(m messages.Message) int {
 	total := llm.EstimateTokens(m.Content) + llm.EstimateTokens(m.ReasoningContent)
+	if m.ToolUpdate != nil {
+		encoded, _ := json.Marshal(m.ToolUpdate)
+		total += llm.EstimateTokens(string(encoded))
+	}
 	for _, tc := range m.ToolCalls {
 		total += llm.EstimateTokens(tc.Name + messages.MarshalArguments(tc.Arguments))
 	}

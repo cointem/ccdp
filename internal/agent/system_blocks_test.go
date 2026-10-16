@@ -26,7 +26,7 @@ func TestSystemBlockClassification(t *testing.T) {
 
 	blocks := ag.buildSystemBlocks(cfg, time.Now(), "session-x", false, "", false,
 		"PROJECT_RULES_MARKER", "SKILLS_MARKER",
-		[]llm.ToolDef{{Function: llm.FuncDef{Name: "read_file"}}}, ag.History(), ag.currentSandbox().Snapshot())
+		ag.History(), ag.currentSandbox().Snapshot())
 
 	if len(blocks) == 0 {
 		t.Fatal("no system blocks produced")
@@ -80,7 +80,7 @@ func TestSystemBlockStablePrefixSurvivesRepositoryQueryChange(t *testing.T) {
 		ag.conversation.durable.History = []messages.Message{{Role: messages.RoleUser, Content: query}}
 		ag.mu.Unlock()
 		blocks := ag.buildSystemBlocks(cfg, started, "session", false, "", false,
-			"PROJECT_RULES_MARKER", "SKILLS_MARKER", []llm.ToolDef{{Function: llm.FuncDef{Name: "read_file"}}}, ag.History(), ag.currentSandbox().Snapshot())
+			"PROJECT_RULES_MARKER", "SKILLS_MARKER", ag.History(), ag.currentSandbox().Snapshot())
 		var stable []llm.SystemBlock
 		var layout string
 		dynamic := false
@@ -101,10 +101,10 @@ func TestSystemBlockStablePrefixSurvivesRepositoryQueryChange(t *testing.T) {
 	}
 	first, firstLayout := build("file120")
 	second, secondLayout := build("file121")
-	if len(first) != 4 || !reflect.DeepEqual(first, second) {
+	if len(first) != 3 || !reflect.DeepEqual(first, second) {
 		t.Fatalf("stable prefix changed: first=%+v second=%+v", first, second)
 	}
-	if first[0].Text != cfg.SystemPrompt || !strings.Contains(first[1].Text, "read_file") || first[2].Text != "SKILLS_MARKER" || !strings.Contains(first[3].Text, "PROJECT_RULES_MARKER") {
+	if first[0].Text != cfg.SystemPrompt || first[1].Text != "SKILLS_MARKER" || !strings.Contains(first[2].Text, "PROJECT_RULES_MARKER") {
 		t.Fatal("stable instructions changed priority")
 	}
 	if firstLayout == "" || secondLayout == "" || firstLayout == secondLayout {
