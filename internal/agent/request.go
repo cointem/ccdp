@@ -3,11 +3,11 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"ccdp/internal/config"
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
+	"ccdp/internal/sandbox"
 )
 
 // estimateToolsTokens estimates the wire cost of the tool schemas so the
@@ -44,7 +44,7 @@ func filterReadOnlyTools(tools []llm.ToolDef) []llm.ToolDef {
 	return out
 }
 
-func (a *Agent) buildRequestFromConfig(cfg config.Config, model, sys string, history []messages.Message, plan bool, frozenTools []llm.ToolDef) llm.CompletionRequest {
+func (a *Agent) buildRequestFromConfig(cfg config.Config, policy *sandbox.Sandbox, model, sys string, history []messages.Message, plan bool, frozenTools []llm.ToolDef) llm.CompletionRequest {
 	// Hard guarantee: never put an unpaired tool_call / tool message on the
 	// wire, whatever a history rewrite left behind (providers 400).
 	history = sanitizeToolPairs(history)
@@ -59,7 +59,7 @@ func (a *Agent) buildRequestFromConfig(cfg config.Config, model, sys string, his
 		case messages.RoleUser:
 			// Multi-modal: canonical inputs use their frozen attachment blobs;
 			// legacy messages retain path-based compatibility expansion.
-			parts, used, hasImage, _ := a.imageContentPartsForMessage(cfg.Workspace, m, maxAttachmentBytes-imageBytes)
+			parts, used, hasImage, _ := a.imageContentPartsForMessage(cfg.Workspace, m, maxAttachmentBytes-imageBytes, policy.ResolveRead)
 			if hasImage && len(parts) > 0 {
 				imageBytes += used
 				msgs = append(msgs, llm.ChatMessage{Role: "user", Content: parts})
@@ -79,7 +79,7 @@ func (a *Agent) buildRequestFromConfig(cfg config.Config, model, sys string, his
 			msgs = append(msgs, llm.ChatMessage{
 				Role:       "tool",
 				ToolCallID: m.ToolCallID,
-				Content:    m.Content,
+				Content:    renderToolOutput(m),
 			})
 		}
 	}
@@ -130,7 +130,7 @@ func wireToolCalls(calls []messages.ToolCall) []llm.ToolCall {
 // Rules:
 //   - an assistant message keeps only the calls that have results immediately
 //     following it; calls without results are answered with a synthetic tool
-//     result so the protocol stays intact (matching dispatchTools' interrupt
+//     result so the protocol stays intact (matching the scheduler's interrupt
 //     behavior);
 //   - orphan tool results whose caller is gone are dropped;
 //   - prose-only assistant messages survive untouched.
@@ -189,18 +189,4 @@ func truncateResult(s string, maxChars int) string {
 	}
 	cut := messages.TruncateUTF8(s, maxChars-len(marker))
 	return cut + marker
-}
-
-// describeHistory returns a human-readable outline of the conversation
-// (used by the TUI header / session info).
-func (a *Agent) describeHistory() string {
-	var parts []string
-	for _, m := range a.historyLocked() {
-		preview := strings.ReplaceAll(m.Content, "\n", " ")
-		if len(preview) > 40 {
-			preview = preview[:40] + "…"
-		}
-		parts = append(parts, fmt.Sprintf("%s: %s", m.Role, preview))
-	}
-	return strings.Join(parts, "\n")
 }

@@ -158,7 +158,7 @@ func (j *deliveryJob) publishLocal(ctx context.Context) (string, error) {
 		if e != nil {
 			return "", fmt.Errorf("index lock held; delivery requires recovery: %w", e)
 		}
-		defer os.Remove(deliveryIndexOwnerPath(plan.IndexPath, id))
+		defer os.Remove(lock.Name())
 		latestIndex, err := os.ReadFile(plan.IndexPath)
 		if os.IsNotExist(err) && !plan.IndexExists {
 			latestIndex = []byte{}
@@ -205,7 +205,7 @@ func (j *deliveryJob) publishLocal(ctx context.Context) (string, error) {
 				if !ok {
 					expected = changes.File{Kind: "absent"}
 				}
-				if now.Kind != expected.Kind || now.Digest != expected.Digest || now.Mode != expected.Mode {
+				if now.Kind != expected.Kind || now.Digest != expected.Digest || gitFileMode(now.Kind, now.Mode) != expected.Mode {
 					return "candidate commit retained; selected files changed during checks", changes.ErrStale
 				}
 			}

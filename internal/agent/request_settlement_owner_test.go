@@ -18,7 +18,7 @@ func TestRequestSettlementRetryDoesNotChargeOrPublishTwice(t *testing.T) {
 	for _, memory := range []bool{true, false} {
 		t.Run(fmt.Sprint(memory), func(t *testing.T) {
 			a, p, _ := newJournalAgent(t, memory)
-			attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+			attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -62,7 +62,7 @@ func TestRequestSettlementRetryDoesNotChargeOrPublishTwice(t *testing.T) {
 
 func TestRequestOwnerUsageCallbackCanSubmit(t *testing.T) {
 	a := newRuntimeAgent(t)
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestRequestOwnerUsageCallbackCanSubmit(t *testing.T) {
 
 func TestRequestOwnerSettlesConcurrentRetriesAfterCancellation(t *testing.T) {
 	a := newRuntimeAgent(t)
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}

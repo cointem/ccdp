@@ -107,3 +107,29 @@ func TestProcessBoundedBuffer(t *testing.T) {
 		t.Fatal("tail or total incorrect")
 	}
 }
+
+func TestBashConfiguredTimeoutAndExplicitOverride(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		override any
+		want     string
+	}{
+		{name: "configured", want: "timed_out"},
+		{name: "explicit longer", override: 1000, want: "exited"},
+		{name: "explicit unlimited", override: 0, want: "exited"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := freshCtx(t)
+			ctx.Timeout = 20 * time.Millisecond
+			args := map[string]any{"command": "sleep 0.2", "yield_ms": 1000}
+			if test.override != nil {
+				args["timeout_ms"] = test.override
+			}
+			out, err := runTool(t, NewBashTool(), ctx, args)
+			view := decodeProcess(t, out, err)
+			if view.Status != test.want {
+				t.Fatalf("status=%s, want %s: %s", view.Status, test.want, out)
+			}
+		})
+	}
+}

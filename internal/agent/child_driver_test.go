@@ -76,6 +76,10 @@ func (joinChildTestTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{"description": map[string]any{"type": "string"}}}
 }
 
-func (t joinChildTestTool) Run(ctx *tools.Context) (string, error) {
-	return runTestChild(t.parent, tools.StringArg(ctx.Args, "description", ""))
+func (t joinChildTestTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) {
+		return runTestChild(t.parent, tools.StringArg(ctx.Args, "description", ""))
+	}()
+	return tools.Result{Text: text}, err
 }

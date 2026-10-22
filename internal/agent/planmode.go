@@ -26,13 +26,17 @@ func (t *enterPlanModeTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{}}
 }
 
-func (t *enterPlanModeTool) Run(ctx *tools.Context) (string, error) {
-	if err := t.ag.setPlanMode(true); err != nil {
-		return "", err
-	}
-	t.ag.emitStatus("entered plan mode (via EnterPlanMode)")
-	return `Plan mode is now active. Investigate with read-only tools, then call
+func (t *enterPlanModeTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) {
+		if err := t.ag.setPlanMode(true); err != nil {
+			return "", err
+		}
+		t.ag.emitStatus("entered plan mode (via EnterPlanMode)")
+		return `Plan mode is now active. Investigate with read-only tools, then call
 ExitPlanMode with your proposed plan for approval.`, nil
+	}()
+	return tools.Result{Text: text}, err
 }
 
 // ExitPlanModeTool submits a plan for approval (Claude Code's ExitPlanMode
@@ -62,17 +66,21 @@ func (t *exitPlanModeTool) Parameters() map[string]any {
 	}
 }
 
-func (t *exitPlanModeTool) Run(ctx *tools.Context) (string, error) {
-	plan := tools.StringArg(ctx.Args, "plan", "")
-	if plan == "" {
-		return "", fmt.Errorf("ExitPlanMode: plan is required")
-	}
-	t.ag.emitStatus("submitted plan for approval…")
-	if t.ag.requestPlanApproval(plan) {
-		if err := t.ag.setPlanMode(false); err != nil {
-			return "", err
+func (t *exitPlanModeTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) {
+		plan := tools.StringArg(ctx.Args, "plan", "")
+		if plan == "" {
+			return "", fmt.Errorf("ExitPlanMode: plan is required")
 		}
-		return "Plan approved. Plan mode is off — execute the plan now, step by step, and verify each step.", nil
-	}
-	return "Plan not approved. Remain in plan mode: revise the plan based on the feedback, then call ExitPlanMode again.", nil
+		t.ag.emitStatus("submitted plan for approval…")
+		if t.ag.requestPlanApproval(plan) {
+			if err := t.ag.setPlanMode(false); err != nil {
+				return "", err
+			}
+			return "Plan approved. Plan mode is off — execute the plan now, step by step, and verify each step.", nil
+		}
+		return "Plan not approved. Remain in plan mode: revise the plan based on the feedback, then call ExitPlanMode again.", nil
+	}()
+	return tools.Result{Text: text}, err
 }

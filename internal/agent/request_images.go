@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
+	"ccdp/internal/fsops"
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
 	"ccdp/internal/session"
@@ -28,34 +28,19 @@ const (
 	maxAttachmentBytes = 40 * 1024 * 1024
 )
 
-// imageContentParts turns a user message into multi-modal content parts when it
-// references local images via markdown (![alt](path)). Returns nil when there
-// are no images, in which case the caller sends the plain text.
-func (a *Agent) imageContentParts(text string) []llm.ContentPart {
+// freezeImageAttachments captures each authorized local image exactly once at
+// input admission. Later requests use these bytes, not a changed source file.
+func (a *Agent) freezeImageAttachments(text string) ([]messages.ImageAttachment, error) {
 	a.mu.Lock()
 	workspaceDir := a.services.cfg.Workspace
+	policy := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
-	return imageContentPartsAt(workspaceDir, text)
-}
-
-func imageContentPartsAt(workspaceDir, text string) []llm.ContentPart {
-	parts, _, hasImage, _ := imageContentPartsAtBudget(workspaceDir, text, maxAttachmentBytes)
-	if !hasImage {
-		return nil
-	}
-	return parts
-}
-
-// freezeImageAttachmentsAt captures each readable local image exactly once at
-// input admission. Failed references remain ordinary markdown and are not
-// retried from a later, possibly different file version.
-func freezeImageAttachmentsAt(workspaceDir, text string) ([]messages.ImageAttachment, error) {
 	matches := markdownImageRe.FindAllStringSubmatchIndex(text, -1)
 	attachments := make([]messages.ImageAttachment, 0, len(matches))
 	var used int64
 	for _, match := range matches {
 		path := strings.TrimSpace(text[match[2]:match[3]])
-		data, mediaType, err := imageBytesAtBudget(workspaceDir, path, maxAttachmentBytes-used)
+		data, mediaType, err := imageBytesAtBudget(workspaceDir, path, maxAttachmentBytes-used, policy.ResolveRead)
 		if err != nil {
 			return nil, fmt.Errorf("capture image %q: %w", path, err)
 		}
@@ -65,18 +50,11 @@ func freezeImageAttachmentsAt(workspaceDir, text string) ([]messages.ImageAttach
 	return attachments, nil
 }
 
-func (a *Agent) freezeImageAttachments(text string) ([]messages.ImageAttachment, error) {
-	a.mu.Lock()
-	workspaceDir := a.services.cfg.Workspace
-	a.mu.Unlock()
-	return freezeImageAttachmentsAt(workspaceDir, text)
-}
-
 // imageContentPartsAtBudget expands local image references while preserving
 // failed references as ordinary text. The byte budget is checked from stat
 // metadata before reading and io.LimitReader caps the allocation if a file
 // grows between stat and read. used is the number of bytes actually attached.
-func imageContentPartsAtBudget(workspaceDir, text string, budget int64) (parts []llm.ContentPart, used int64, hasImage bool, firstErr error) {
+func imageContentPartsAtBudget(workspaceDir, text string, budget int64, authorize func(string) (string, error)) (parts []llm.ContentPart, used int64, hasImage bool, firstErr error) {
 	matches := markdownImageRe.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {
 		return nil, 0, false, nil
@@ -89,7 +67,7 @@ func imageContentPartsAtBudget(workspaceDir, text string, budget int64) (parts [
 		}
 		marker := text[m[0]:m[1]]
 		path := strings.TrimSpace(text[m[2]:m[3]])
-		part, size, err := imagePartAtBudget(workspaceDir, path, budget-used)
+		part, size, err := imagePartAtBudget(workspaceDir, path, budget-used, authorize)
 		if err == nil && part != nil {
 			parts = append(parts, *part)
 			used += size
@@ -110,24 +88,8 @@ func imageContentPartsAtBudget(workspaceDir, text string, budget int64) (parts [
 	return parts, used, hasImage, firstErr
 }
 
-// imagePart loads a local image into an image_url data part, or nil.
-func (a *Agent) imagePart(path string) *llm.ContentPart {
-	a.mu.Lock()
-	workspaceDir := a.services.cfg.Workspace
-	a.mu.Unlock()
-	return imagePartAt(workspaceDir, path)
-}
-
-func imagePartAt(workspaceDir, path string) *llm.ContentPart {
-	part, _, err := imagePartAtBudget(workspaceDir, path, maxImageBytes)
-	if err != nil {
-		return nil
-	}
-	return part
-}
-
-func imagePartAtBudget(workspaceDir, path string, budget int64) (*llm.ContentPart, int64, error) {
-	data, mime, err := imageBytesAtBudget(workspaceDir, path, budget)
+func imagePartAtBudget(workspaceDir, path string, budget int64, authorize func(string) (string, error)) (*llm.ContentPart, int64, error) {
+	data, mime, err := imageBytesAtBudget(workspaceDir, path, budget, authorize)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -139,7 +101,7 @@ func imagePartAtBudget(workspaceDir, path string, budget int64) (*llm.ContentPar
 	}, int64(len(data)), nil
 }
 
-func imageBytesAtBudget(workspaceDir, path string, budget int64) ([]byte, string, error) {
+func imageBytesAtBudget(workspaceDir, path string, budget int64, authorize func(string) (string, error)) ([]byte, string, error) {
 	ext := strings.ToLower(filepath.Ext(path))
 	if !imageExts[ext] {
 		return nil, "", fmt.Errorf("unsupported image extension %q", ext)
@@ -160,24 +122,14 @@ func imageBytesAtBudget(workspaceDir, path string, budget int64) ([]byte, string
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return nil, "", fmt.Errorf("image path escapes workspace")
 	}
-	root, err = filepath.EvalSymlinks(root)
+	file, err := fsops.OpenAuthorizedRegular(root, abs, authorize)
 	if err != nil {
 		return nil, "", err
 	}
-	abs, err = filepath.EvalSymlinks(abs)
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil {
 		return nil, "", err
-	}
-	rel, err = filepath.Rel(root, abs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, "", fmt.Errorf("image path escapes workspace")
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return nil, "", err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, "", fmt.Errorf("image %q is not a regular file", path)
 	}
 	if info.Size() > maxImageBytes {
 		return nil, "", fmt.Errorf("image %q exceeds per-file limit", path)
@@ -185,11 +137,6 @@ func imageBytesAtBudget(workspaceDir, path string, budget int64) ([]byte, string
 	if budget <= 0 || info.Size() > budget {
 		return nil, "", fmt.Errorf("image %q exceeds total attachment limit", path)
 	}
-	file, err := os.Open(abs)
-	if err != nil {
-		return nil, "", err
-	}
-	defer file.Close()
 	readLimit := int64(maxImageBytes)
 	if budget < readLimit {
 		readLimit = budget
@@ -246,9 +193,9 @@ func imageMediaType(path string) string {
 // imageContentPartsForMessage uses frozen attachment bytes for canonical
 // messages. Legacy messages without ImagesFrozen retain the compatibility
 // path-based expansion behavior.
-func (a *Agent) imageContentPartsForMessage(workspaceDir string, message messages.Message, budget int64) (parts []llm.ContentPart, used int64, hasImage bool, firstErr error) {
+func (a *Agent) imageContentPartsForMessage(workspaceDir string, message messages.Message, budget int64, authorize func(string) (string, error)) (parts []llm.ContentPart, used int64, hasImage bool, firstErr error) {
 	if !message.ImagesFrozen {
-		return imageContentPartsAtBudget(workspaceDir, message.Content, budget)
+		return imageContentPartsAtBudget(workspaceDir, message.Content, budget, authorize)
 	}
 	matches := markdownImageRe.FindAllStringSubmatchIndex(message.Content, -1)
 	if len(matches) == 0 {

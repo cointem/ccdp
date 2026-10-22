@@ -29,7 +29,7 @@ type clickTarget struct {
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	sessionHost
+	*sessionHost
 	composerState
 	transcriptState
 	panelState
@@ -241,6 +241,7 @@ func NewWithClient(client protocol.SessionClient, workspace string, autoResume b
 	sp.Spinner = spinner.Spinner{Frames: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}, FPS: time.Second / 10}
 
 	m := Model{
+		sessionHost:     &sessionHost{},
 		client:          client,
 		viewport:        vp,
 		composerState:   composerState{textarea: ta},
@@ -432,9 +433,23 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.loadAgentCatalog(false)
 	case agentHistoryMsg:
-		return m, m.showAgentHistory(msg)
+		var screen tea.Cmd
+		active := msg.sessionID == m.sessionID
+		m.withSessionView(protocol.SessionID(msg.sessionID), func(view *Model) {
+			if view.applyAgentHistory(msg) && active {
+				screen = view.enterReaderScreen()
+			}
+		})
+		return m, screen
 	case agentOutputMsg:
-		return m, tea.Batch(m.showAgentOutput(msg), m.flushInline())
+		var screen tea.Cmd
+		active := msg.sessionID == m.sessionID
+		m.withSessionView(protocol.SessionID(msg.sessionID), func(view *Model) {
+			if view.applyAgentOutput(msg) && active {
+				screen = view.enterReaderScreen()
+			}
+		})
+		return m, tea.Batch(screen, m.flushInline())
 	case noticeTickMsg:
 		m.expireNotices(msg.at)
 		if len(m.notices) > 0 {
@@ -470,67 +485,29 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case commandReceiptMsg:
 		wasModal := m.question != nil || m.approval != nil || m.picker != nil
-		if msg.sessionID == "" || msg.sessionID.String() == m.sessionID {
-			m.applyReceipt(msg.receipt, msg.purpose)
-		} else if m.routing != nil {
-			if saved, ok := m.routing.views[string(msg.sessionID)]; ok {
-				saved.applyReceipt(msg.receipt, msg.purpose)
-				m.routing.views[string(msg.sessionID)] = saved
-			}
-		}
+		m.withSessionView(msg.sessionID, func(view *Model) {
+			view.applyReceipt(msg.receipt, msg.purpose)
+		})
 		releaseMouse := m.mouseReleasePending
 		m.mouseReleasePending = false
 		return m, tea.Batch(modalMouseTransition(wasModal, &m), boolCmd(releaseMouse, restoreMouseCmd()))
 
+	case operationsRecoveredMsg:
+		m.withSessionView(msg.sessionID, func(view *Model) {
+			view.applyRecoveredOperations(msg)
+		})
+		return m, m.flushInline()
+
 	case queryReportMsg:
-		if msg.sessionID == "" || msg.sessionID.String() == m.sessionID {
-			m.applyQueryReport(msg)
-		}
+		m.withSessionView(msg.sessionID, func(view *Model) {
+			view.applyQueryReport(msg)
+		})
 		return m, m.flushInline()
 
 	case commandErrorMsg:
-		if m.routing != nil && msg.sessionID != "" && string(msg.sessionID) != m.sessionID {
-			if saved, ok := m.routing.views[string(msg.sessionID)]; ok {
-				delete(saved.operationReports, msg.commandID)
-				saved.restoreFailedSubmission(msg.commandID)
-				if msg.err != nil {
-					saved.pushStatus("submit failed: " + msg.err.Error())
-				}
-				m.routing.views[string(msg.sessionID)] = saved
-			}
-		}
-		if msg.sessionID == "" || msg.sessionID.String() == m.sessionID {
-			if op, ok := m.operation(msg.commandID); ok {
-				m.updateOperation(msg.commandID, OperationFailed, protocol.Receipt{CommandID: msg.commandID, SessionID: msg.sessionID,
-					Error: &protocol.CommandError{Code: protocol.ErrorInternal, Message: errorText(msg.err)}})
-				if m.operationOwnsPresentation(msg.commandID) {
-					m.finishActivity(msg.commandID, ActivityFailed, errorText(msg.err))
-					m.clearNotice(msg.commandID)
-					m.addNotice(Notice{CommandID: msg.commandID, Severity: NoticeError, Text: "submit failed: " + errorText(msg.err), Sticky: true})
-				} else if op.Active() {
-					// The failed operation still closes below, but its error is not
-					// promoted over a newer command's activity.
-				}
-			}
-			delete(m.operationReports, msg.commandID)
-			if m.question != nil && m.question.pending == msg.commandID {
-				m.question.pending = ""
-			}
-			// Submit errors have no receipt that can clear the in-flight
-			// marker. Move the draft to the explicit retry slot before deleting
-			// the marker; otherwise resume remains blocked forever after a
-			// transport/session failure.
-			m.restoreFailedSubmission(msg.commandID)
-			if m.approvalPending && msg.commandID == m.pendingApprovalCommand {
-				m.approvalPending = false
-				m.pendingApprovalCommand = ""
-			}
-			if msg.err != nil {
-				if _, ok := m.operation(msg.commandID); !ok {
-					m.pushStatus("submit failed: " + msg.err.Error())
-				}
-			}
-		}
+		m.withSessionView(msg.sessionID, func(view *Model) {
+			view.applyCommandError(msg)
+		})
 		releaseMouse := m.mouseReleasePending
 		m.mouseReleasePending = false
 		return m, boolCmd(releaseMouse, restoreMouseCmd())

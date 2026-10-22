@@ -3,7 +3,6 @@ package tui
 import (
 	"bytes"
 	"container/list"
-	"crypto/sha256"
 	"os"
 	"strings"
 	"sync"
@@ -17,16 +16,24 @@ import (
 )
 
 var (
-	highlightMu    sync.Mutex
-	highlightCache = make(map[string]*list.Element)
-	highlightLRU   = list.New()
+	highlightMu         sync.Mutex
+	highlightCache      = make(map[highlightKey]*list.Element)
+	highlightLRU        = list.New()
+	highlightCacheBytes int
 )
 
 const maxHighlightCacheSize = 256
+const maxHighlightCacheBytes = 8 << 20
+const maxHighlightEntryBytes = 256 << 10
 
 type highlightCacheEntry struct {
-	key   string
+	key   highlightKey
 	lines []string
+	bytes int
+}
+
+type highlightKey struct {
+	source, language, style string
 }
 
 // highlightCode runs chroma syntax highlighting on source code lines.
@@ -64,7 +71,7 @@ func highlightCode(lines []string, language string, dark bool) []string {
 	}
 
 	source := strings.Join(lines, "\n")
-	cacheKey := computeHighlightKey(source, lang, styleName)
+	cacheKey := highlightKey{source: source, language: lang, style: styleName}
 
 	highlightMu.Lock()
 	if elem, ok := highlightCache[cacheKey]; ok {
@@ -96,39 +103,38 @@ func highlightCode(lines []string, language string, dark bool) []string {
 		return nil
 	}
 
+	size := len(source) + len(lang) + len(styleName) + len(formatted) + 16*len(resLines)
+	// Large blocks can be rendered without retaining both source and ANSI text.
+	if size > maxHighlightEntryBytes {
+		return resLines
+	}
 	highlightMu.Lock()
 	if elem, ok := highlightCache[cacheKey]; ok {
 		highlightLRU.MoveToFront(elem)
-		elem.Value.(*highlightCacheEntry).lines = resLines
+		// A competing render already published this immutable entry.
 	} else {
-		if highlightLRU.Len() >= maxHighlightCacheSize {
+		for highlightLRU.Len() >= maxHighlightCacheSize || highlightCacheBytes+size > maxHighlightCacheBytes {
 			oldest := highlightLRU.Back()
 			if oldest != nil {
 				highlightLRU.Remove(oldest)
-				delete(highlightCache, oldest.Value.(*highlightCacheEntry).key)
+				entry := oldest.Value.(*highlightCacheEntry)
+				delete(highlightCache, entry.key)
+				highlightCacheBytes -= entry.bytes
 			}
 		}
 		elem := highlightLRU.PushFront(&highlightCacheEntry{
 			key:   cacheKey,
 			lines: resLines,
+			bytes: size,
 		})
 		highlightCache[cacheKey] = elem
+		highlightCacheBytes += size
 	}
 	highlightMu.Unlock()
 
 	out := make([]string, len(resLines))
 	copy(out, resLines)
 	return out
-}
-
-func computeHighlightKey(source, lang, style string) string {
-	h := sha256.New()
-	h.Write([]byte(lang))
-	h.Write([]byte{0})
-	h.Write([]byte(style))
-	h.Write([]byte{0})
-	h.Write([]byte(source))
-	return string(h.Sum(nil))
 }
 
 func isPlaintextLanguage(lang string) bool {

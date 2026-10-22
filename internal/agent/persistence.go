@@ -6,14 +6,6 @@ import (
 	"ccdp/internal/session/journal"
 )
 
-func (a *Agent) openPersistence() error {
-	return a.openPersistenceMode(false)
-}
-
-func (a *Agent) openPersistenceFresh() error {
-	return a.openPersistenceMode(true)
-}
-
 func (a *Agent) openPersistenceMode(rejectExisting bool, backend ...journal.BackendOptions) error {
 	if a == nil || a.services.cfg == nil {
 		return errors.New("agent: persistence requires an initialized agent")

@@ -149,6 +149,9 @@ func TestDeliveryIndexLockRecoveryPreservesForeignLocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if lock.Name() != index+".ccdp-plan.lock" {
+		t.Fatalf("delivery lock hid the plan id: %s", lock.Name())
+	}
 	if _, err = lock.WriteString("candidate index"); err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +174,15 @@ func TestDeliveryIndexLockRecoveryPreservesForeignLocks(t *testing.T) {
 	b, err := os.ReadFile(index + ".lock")
 	if err != nil || string(b) != "other Git" {
 		t.Fatal("foreign lock changed", err)
+	}
+	for _, id := range []string{"", ".", "..", "../../outside", `..\outside`, "bad\x00id"} {
+		if f, err := createDeliveryIndexLock(index, id); err == nil {
+			f.Close()
+			t.Fatalf("accepted invalid plan id %q", id)
+		}
+		if err := recoverDeliveryIndexLock(index, id); err == nil {
+			t.Fatalf("accepted invalid recovery plan id %q", id)
+		}
 	}
 }
 

@@ -42,6 +42,8 @@ func (a *Agent) sessionSettingsLocked() session.Settings {
 		settings.Endpoint = ""
 	}
 	settings.Workspace = a.services.cfg.Workspace
+	settings.ProjectMemoryEnabled = a.services.cfg.EnableProjectMemory
+	settings.MemoryReadOnly, settings.MemoryHistory = a.services.cfg.MemoryReadOnly, a.services.cfg.MemoryHistory
 	settings.PermissionPolicy = a.services.cfg.PermissionMode
 	settings.AlwaysAllow = append([]string(nil), a.services.cfg.AlwaysAllow...)
 	settings.AlwaysDeny = append([]string(nil), a.services.cfg.AlwaysDeny...)
@@ -52,7 +54,7 @@ func (a *Agent) sessionSettingsLocked() session.Settings {
 	settings.ContextWindow = a.services.cfg.ContextWindow
 	settings.EffectiveContextWindow = a.contextWindowLocked()
 	settings.CompactThreshold = a.services.cfg.CompactThreshold
-	settings.MaxResultSizeChars = a.services.cfg.MaxResultSizeChars
+	settings.MaxResultSizeBytes = a.services.cfg.MaxResultSizeBytes
 	settings.MaxTurns = a.services.cfg.MaxTurns
 
 	maxOutputTokens := a.services.cfg.MaxOutputTokensFor(a.activeModelLocked())
@@ -60,7 +62,7 @@ func (a *Agent) sessionSettingsLocked() session.Settings {
 	settings.ReasoningEffort = a.services.cfg.ReasoningEffort
 	settings.Verbosity = a.services.cfg.Verbosity
 	settings.GenerationOptionsSet = true
-	settings.MaxToolOutputCharsPerTurn = a.services.cfg.MaxToolOutputCharsPerTurn
+	settings.MaxToolOutputBytesPerTurn = a.services.cfg.MaxToolOutputBytesPerTurn
 	if a.plan.planMode {
 		settings.ExecutionMode = "plan"
 	} else {

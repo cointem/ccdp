@@ -62,7 +62,7 @@ func (a *Agent) Query(ctx context.Context, kind protocol.QueryKind) (protocol.Qu
 	case protocol.QueryPermissions:
 		text = formatQueryPermissions(snapshot)
 	case protocol.QueryMemory:
-		text = a.MemoryText()
+		text, err = a.projectMemoryReport(snapshot.cfg)
 	case protocol.QueryMCP:
 		text = formatQueryMap(snapshot.mcpTools)
 	case protocol.QueryPlugins:
@@ -187,6 +187,11 @@ func formatQueryConfig(s *queryRuntimeSnapshot) string {
 	fmt.Fprintf(&b, "context_window:%d\n", s.view.Settings.ContextWindow)
 	fmt.Fprintf(&b, "compact_thr:   %.0f%%\n", cfg.CompactThreshold*100)
 	fmt.Fprintf(&b, "max_turns:     %d\n", cfg.MaxTurns)
+	fmt.Fprintf(&b, "parallel tools per agent: %d\nconcurrent task agents: %d\nguardian concurrency: 1\n", cfg.MaxParallelTools, cfg.MaxConcurrentAgents)
+	fmt.Fprintf(&b, "memory: %v; read-only: %v; automatic history extraction: %v\n", cfg.EnableProjectMemory, cfg.MemoryReadOnly || cfg.NoSessionPersistence, cfg.MemoryHistory)
+	if cfg.EnableProjectMemory && cfg.NoSessionPersistence {
+		b.WriteString("project memory writes: disabled (no session persistence)\n")
+	}
 	fmt.Fprintf(&b, "tools:         %d\n", len(s.view.Catalog.Tools))
 	fmt.Fprintf(&b, "plugins:       %d\n", len(s.plugins))
 	fmt.Fprintf(&b, "mcp servers:   %d\n", len(s.mcpNames))

@@ -36,7 +36,24 @@ drain:
 				t.Fatal("observation ended before final status")
 			}
 			if update.Type == protocol.UpdateResyncRequired {
-				t.Fatal("stream flooded subscriber")
+				// The queue bounds bytes as well as event count. A cropped batch
+				// must end this observation and be replaced by a fresh snapshot.
+				resumed, err := a.Watch(context.Background(), protocol.Cursor{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resumed.Close()
+				initial := <-resumed.Updates()
+				if initial.Snapshot == nil {
+					t.Fatal("missing resync snapshot")
+				}
+				for _, item := range initial.Snapshot.Transcript {
+					if item.Kind == "thinking" {
+						copy := item
+						latest = &copy
+					}
+				}
+				break drain
 			}
 			if update.Event != nil && update.Event.Kind == protocol.EventReasoning {
 				count++

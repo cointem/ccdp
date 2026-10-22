@@ -12,6 +12,10 @@ import (
 // and resource content pieces are surfaced as placeholders so multi-modal
 // output is never silently dropped.
 func (c *Client) Call(ctx context.Context, name string, args map[string]any) (string, error) {
+	return c.call(ctx, name, args, nil)
+}
+
+func (c *Client) call(ctx context.Context, name string, args map[string]any, data *json.RawMessage) (string, error) {
 	params := map[string]any{"name": name, "arguments": args}
 	var resp struct {
 		Content           []json.RawMessage `json:"content"`
@@ -27,6 +31,9 @@ func (c *Client) Call(ctx context.Context, name string, args map[string]any) (st
 	}
 	if err := c.requestJSON(ctx, "tools/call", params, &resp); err != nil {
 		return "", err
+	}
+	if data != nil {
+		*data = append(json.RawMessage(nil), resp.StructuredContent...)
 	}
 	var sb strings.Builder
 	structured := len(resp.StructuredContent) > 0

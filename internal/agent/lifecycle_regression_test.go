@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"ccdp/internal/fsops"
+	"ccdp/internal/llm"
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 )
@@ -21,7 +23,7 @@ func TestLifecycleDeliveredImageCacheReleased(t *testing.T) {
 		t.Fatalf("submit: %+v %v", r, e)
 	}
 	waitJournalRuntimeIdle(t, a)
-	if e := a.clearHistoryCommand("audit-clear"); e != nil {
+	if e := a.clearHistoryCommand(protocol.Command{ID: "audit-clear", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandClearConversation}); e != nil {
 		t.Fatal(e)
 	}
 	a.mu.Lock()
@@ -68,8 +70,8 @@ func TestLifecycleCompactCurrentLongTurn(t *testing.T) {
 		a.conversation.durable.History = append(a.conversation.durable.History, messages.AssistantWithTools("inspect next file", []messages.ToolCall{call}), messages.NewToolResult(call, strings.Repeat("large step output ", 10000), false))
 	}
 	before := len(a.conversation.durable.History)
+	_, summarized, tail, _, ok := compactHistorySpans(a.historyLocked(), a.services.cfg.KeepAfterCompact, a.contextWindowLocked()/3)
 	a.mu.Unlock()
-	_, summarized, tail, _, _, ok, _ := a.compactSpans()
 	if !ok {
 		t.Fatal("no compaction available")
 	}
@@ -78,36 +80,36 @@ func TestLifecycleCompactCurrentLongTurn(t *testing.T) {
 	}
 }
 
-func TestLifecycleCompactFIFO(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "named-pipe")
-	if e := syscall.Mkfifo(path, 0600); e != nil {
-		t.Fatal(e)
+func TestLifecycleCompactDoesNotReopenTrackedFIFO(t *testing.T) {
+	provider := &childRuntimeTestProvider{name: "compact-without-file-reads", stream: func(context.Context, llm.CompletionRequest, func(string)) (llm.StreamResult, error) {
+		return llm.StreamResult{Text: "Earlier work was completed.", FinishReason: "stop"}, nil
+	}}
+	a := newJournalRuntimeAgent(t, provider)
+	path := filepath.Join(a.services.cfg.Workspace, "changed-file")
+	if err := os.WriteFile(path, []byte("old tracked file"), 0600); err != nil {
+		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() {
-		_, e := readBoundedRegularFile(path, 100, func(p string) (string, error) { return p, nil })
-		done <- e
-	}()
-	select {
-	case e := <-done:
-		if e == nil {
-			t.Fatal("FIFO accepted")
+	version, err := fsops.Observe(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.services.resources.Files.MarkVersion(path, version)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if err := a.appendHistory(messages.Message{Role: messages.RoleUser, Content: strings.Repeat("earlier conversation ", 100)}); err != nil {
+			t.Fatal(err)
 		}
-		return
-	case <-time.After(150 * time.Millisecond):
 	}
-	// Release the blocked reader, so this reproduction leaves no leaked goroutine.
-	writer, e := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0)
-	if e != nil {
-		t.Fatal(e)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := a.compactContext(ctx); err != nil {
+		t.Fatal(err)
 	}
-	_ = writer.Close()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("cleanup failed")
-	}
-	t.Fatal("regular-file helper blocked opening FIFO before checking its type")
 }
 
 func TestLifecycleCheckpointFailureIsFailedTurn(t *testing.T) {

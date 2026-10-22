@@ -61,7 +61,7 @@ func TestHeadlessWaitsForBackgroundDeliveryAndEmitsTypedChildEvents(t *testing.T
 			cfg.SessionDir = filepath.Join(cfg.Workspace, "sessions")
 			cfg.Model = "background-model"
 			cfg.PermissionMode = "bypassPermissions"
-			cfg.EnableMemory = config.BoolPtr(false)
+			cfg.EnableProjectMemory = false
 			registry := plugin.NewModelRegistry()
 			registry.Register(p)
 			registry.Route(cfg.Model, p.Name())

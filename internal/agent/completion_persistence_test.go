@@ -65,28 +65,32 @@ func (*formalAuditEffect) Description() string { return "formal persistence fixt
 
 func (*formalAuditEffect) Parameters() map[string]any { return map[string]any{"type": "object"} }
 
-func (tool *formalAuditEffect) Run(*tools.Context) (string, error) {
-	count := tool.count.Add(1)
-	records, err := tool.a.persistenceHandle().Read(session.Beginning)
-	if err != nil {
-		return "", err
-	}
-	starts, finishes := 0, 0
-	for _, record := range records {
-		switch record.Event.Type() {
-		case session.EventTypeToolStarted:
-			starts++
-		case session.EventTypeToolFinished:
-			finishes++
+func (tool *formalAuditEffect) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) {
+		count := tool.count.Add(1)
+		records, err := tool.a.persistenceHandle().Read(session.Beginning)
+		if err != nil {
+			return "", err
 		}
-	}
-	if starts < int(count) {
-		tool.t.Errorf("tool side effect ran before durable ToolStarted: starts=%d calls=%d", starts, count)
-	}
-	if count == 2 && finishes != 1 {
-		tool.t.Errorf("second exclusive effect ran before first ToolFinished: finishes=%d", finishes)
-	}
-	return "formal effect outcome", nil
+		starts, finishes := 0, 0
+		for _, record := range records {
+			switch record.Event.Type() {
+			case session.EventTypeToolStarted:
+				starts++
+			case session.EventTypeToolFinished:
+				finishes++
+			}
+		}
+		if starts < int(count) {
+			tool.t.Errorf("tool side effect ran before durable ToolStarted: starts=%d calls=%d", starts, count)
+		}
+		if count == 2 && finishes != 1 {
+			tool.t.Errorf("second exclusive effect ran before first ToolFinished: finishes=%d", finishes)
+		}
+		return "formal effect outcome", nil
+	}()
+	return tools.Result{Text: text}, err
 }
 
 func TestFormalToolFactsGateRealLoop(t *testing.T) {
@@ -434,7 +438,7 @@ func TestFormalOversizedInstructionsAreRetryableInputFailure(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("mandatory instruction ", 18000)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := workspace.LoadInstructionsChecked(cfg.Workspace); err == nil {
+	if _, err := workspace.LoadInstructionsChecked(cfg.Workspace, a.services.sandbox.ResolveRead); err == nil {
 		t.Fatal("checked instruction reader accepted an oversized AGENTS.md")
 	}
 	formalCompletionTurn(t, a, "formal-oversized-input", "input with oversized instructions")

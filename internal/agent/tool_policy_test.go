@@ -28,7 +28,7 @@ func TestShadowReadRequiresApprovalAndUsesUnknownCapability(t *testing.T) {
 	requestedApproval := false
 	done := make(chan bool, 1)
 	go func() {
-		_, failed := a.executeTool(messages.ToolCall{ID: "shadow-default", Name: "Read"})
+		_, failed := executeTestTool(t, a, messages.ToolCall{ID: "shadow-default", Name: "Read"})
 		done <- failed
 	}()
 	deadline := time.NewTimer(5 * time.Second)
@@ -86,7 +86,10 @@ func TestToolHooksMergeBeforeSingleApproval(t *testing.T) {
 			}
 			events := watchTestEvents(t, a)
 			done := make(chan bool, 1)
-			go func() { _, failed := a.executeTool(messages.ToolCall{ID: "merged-call", Name: "Read"}); done <- failed }()
+			go func() {
+				_, failed := executeTestTool(t, a, messages.ToolCall{ID: "merged-call", Name: "Read"})
+				done <- failed
+			}()
 			approvals := 0
 			deadline := time.NewTimer(5 * time.Second)
 			defer deadline.Stop()

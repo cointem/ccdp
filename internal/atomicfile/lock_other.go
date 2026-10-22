@@ -2,7 +2,10 @@
 
 package atomicfile
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 // Lock is a placeholder on platforms without a supported advisory lock.
 type Lock struct{}
@@ -11,6 +14,11 @@ type Lock struct{}
 // exists on an unsupported platform.
 func AcquireLock(path string) (*Lock, error) {
 	return nil, fmt.Errorf("%w: %s", ErrUnsupportedLock, path)
+}
+
+func AcquireOpenedLock(f *os.File) (*Lock, error) {
+	_ = f.Close()
+	return nil, fmt.Errorf("%w: %s", ErrUnsupportedLock, f.Name())
 }
 
 func (l *Lock) Close() error { return nil }

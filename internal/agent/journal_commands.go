@@ -59,6 +59,23 @@ func (a *Agent) persistCommandScheduled(cmd protocol.Command, name string, sourc
 	return nil
 }
 
+func (a *Agent) persistHistoryCommand(history []messages.Message, cmd protocol.Command) error {
+	p := a.persistenceHandle()
+	if p == nil {
+		return errors.New("agent: session persistence is unavailable")
+	}
+	digest, err := commandInputDigest(cmd)
+	if err != nil {
+		return err
+	}
+	if err := a.persistenceFailure(); err != nil {
+		return err
+	}
+	return p.PersistHistoryCommand(history, session.CommandScheduled{
+		CommandID: string(cmd.ID), Name: string(cmd.Type), InputDigest: digest,
+	})
+}
+
 // durableCommandState is read directly from the incremental raw projection.
 // A scheduled command with no completion is an admitted operation whose
 // external outcome is unknown; a completed command is terminal and can be

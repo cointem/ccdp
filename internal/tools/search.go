@@ -25,9 +25,9 @@ Returns up to limit matches (default 100, maximum 1000) in lexical path order. U
 
 func (t *GlobTool) Parameters() map[string]any {
 	return map[string]any{
-		"type": "object",
+		"type": "object", "additionalProperties": false,
 		"properties": map[string]any{
-			"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 1000},
+			"limit": map[string]any{"default": 100, "type": "integer", "minimum": 1, "maximum": 1000},
 			"pattern": map[string]any{
 				"type":        "string",
 				"description": "The glob pattern to match.",
@@ -41,77 +41,81 @@ func (t *GlobTool) Parameters() map[string]any {
 	}
 }
 
-func (t *GlobTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
-	}
-	if ctx.Sandbox == nil {
-		return "", fmt.Errorf("Glob: sandbox policy is unavailable")
-	}
-	pattern := StringArg(ctx.Args, "pattern", "")
-	if pattern == "" {
-		return "", fmt.Errorf("Glob: missing pattern")
-	}
-	base := ctx.WorkingDir
-	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
-		var err error
-		base, err = ctx.ResolveRead(rawPath)
+func (t *GlobTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
+		if err := ctx.checkResources(); err != nil {
+			return "", err
+		}
+		if ctx.Sandbox == nil {
+			return "", fmt.Errorf("Glob: sandbox policy is unavailable")
+		}
+		pattern := StringArg(ctx.Args, "pattern", "")
+		if pattern == "" {
+			return "", fmt.Errorf("Glob: missing pattern")
+		}
+		base := ctx.WorkingDir
+		if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
+			var err error
+			base, err = ctx.ResolveRead(rawPath)
+			if err != nil {
+				return "", err
+			}
+		}
+		// Even the default working directory must be admitted by the same policy as
+		// an explicit path. In particular, it may have become disallowed after the
+		// tool context was created.
+		base, err := ctx.ResolveRead(base)
+		if err != nil {
+			return "", fmt.Errorf("Glob: %w", err)
+		}
+		fullPattern := pattern
+		if !filepath.IsAbs(fullPattern) {
+			fullPattern = filepath.Join(base, fullPattern)
+		}
+		fullPattern = filepath.Clean(fullPattern)
+		anchor, parts, err := globPatternAnchor(fullPattern)
+		if err != nil {
+			return "", fmt.Errorf("Glob: bad pattern: %w", err)
+		}
+		// Match only below the literal prefix before the first wildcard. Requiring
+		// that prefix to be readable prevents filepath.Glob from probing arbitrary
+		// parent directories while expanding an absolute or ../ pattern.
+		if _, err := ctx.ResolveRead(anchor); err != nil {
+			return "", fmt.Errorf("Glob: %w", err)
+		}
+		matches, err := scopedGlob(ctx, anchor, parts)
+		if err != nil {
+			return "", fmt.Errorf("Glob: %w", err)
+		}
+
+		sort.Strings(matches)
+		limit, err := boundedInt(ctx.Args, "limit", 100, 1, 1000)
 		if err != nil {
 			return "", err
 		}
-	}
-	// Even the default working directory must be admitted by the same policy as
-	// an explicit path. In particular, it may have become disallowed after the
-	// tool context was created.
-	base, err := ctx.ResolveRead(base)
-	if err != nil {
-		return "", fmt.Errorf("Glob: %w", err)
-	}
-	fullPattern := pattern
-	if !filepath.IsAbs(fullPattern) {
-		fullPattern = filepath.Join(base, fullPattern)
-	}
-	fullPattern = filepath.Clean(fullPattern)
-	anchor, parts, err := globPatternAnchor(fullPattern)
-	if err != nil {
-		return "", fmt.Errorf("Glob: bad pattern: %w", err)
-	}
-	// Match only below the literal prefix before the first wildcard. Requiring
-	// that prefix to be readable prevents filepath.Glob from probing arbitrary
-	// parent directories while expanding an absolute or ../ pattern.
-	if _, err := ctx.ResolveRead(anchor); err != nil {
-		return "", fmt.Errorf("Glob: %w", err)
-	}
-	matches, err := scopedGlob(ctx, anchor, parts)
-	if err != nil {
-		return "", fmt.Errorf("Glob: %w", err)
-	}
-
-	sort.Strings(matches)
-	limit, err := boundedInt(ctx.Args, "limit", 100, 1, 1000)
-	if err != nil {
-		return "", err
-	}
-	total := len(matches)
-	if len(matches) > limit {
-		matches = matches[:limit]
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Found %d matching path(s):\n", len(matches))
-	shown := 0
-	for _, m := range matches {
-		row := fmt.Sprintf("  %s\n", m)
-		if sb.Len()+len(row) > min(50<<10, ctx.outputLimit())-120 {
-			break
+		total := len(matches)
+		if len(matches) > limit {
+			matches = matches[:limit]
 		}
-		sb.WriteString(row)
-		shown++
-	}
-	if shown < total {
-		fmt.Fprintf(&sb, "[incomplete: showing %d of %d paths; narrow pattern/path or increase limit]", shown, total)
-	}
-	return boundedToolString(ctx, sb.String()), nil
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "Found %d matching path(s):\n", len(matches))
+		shown := 0
+		for _, m := range matches {
+			row := fmt.Sprintf("  %s\n", m)
+			if sb.Len()+len(row) > min(50<<10, ctx.outputLimit())-120 {
+				break
+			}
+			sb.WriteString(row)
+			shown++
+		}
+		if shown < total {
+			fmt.Fprintf(&sb, "[incomplete: showing %d of %d paths; narrow pattern/path or increase limit]", shown, total)
+		}
+		paths := append([]string{}, matches[:shown]...)
+		ctx.recordData(map[string]any{"paths": paths, "total": total, "truncated": shown < total}, shown < total)
+		return boundedToolString(ctx, sb.String()), nil
+	})
 }
 
 // globPatternAnchor returns the literal directory prefix before the first
@@ -298,111 +302,113 @@ mode="content" returns matching lines, "files" returns paths, "count" returns ma
 }
 
 func (t *RgTool) Parameters() map[string]any {
-	return map[string]any{"type": "object", "properties": map[string]any{
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
 		"pattern": map[string]any{"type": "string"}, "path": map[string]any{"type": "string"},
-		"mode":    map[string]any{"type": "string", "enum": []string{"content", "files", "count"}},
-		"literal": map[string]any{"type": "boolean"}, "ignore_case": map[string]any{"type": "boolean"},
-		"multiline": map[string]any{"type": "boolean"}, "only_matching": map[string]any{"type": "boolean"},
+		"mode":    map[string]any{"default": "content", "type": "string", "enum": []string{"content", "files", "count"}},
+		"literal": map[string]any{"default": false, "type": "boolean"}, "ignore_case": map[string]any{"default": false, "type": "boolean"},
+		"multiline": map[string]any{"default": false, "type": "boolean"}, "only_matching": map[string]any{"default": false, "type": "boolean"},
 		"glob": map[string]any{"type": "string"}, "type": map[string]any{"type": "string"},
-		"context": map[string]any{"type": "integer", "minimum": 0, "maximum": 20},
+		"context": map[string]any{"default": 0, "type": "integer", "minimum": 0, "maximum": 20},
 		"before":  map[string]any{"type": "integer", "minimum": 0, "maximum": 20},
 		"after":   map[string]any{"type": "integer", "minimum": 0, "maximum": 20},
-		"offset":  map[string]any{"type": "integer", "minimum": 0, "maximum": 100000},
-		"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 1000},
+		"offset":  map[string]any{"default": 0, "type": "integer", "minimum": 0, "maximum": 100000},
+		"limit":   map[string]any{"default": 100, "type": "integer", "minimum": 1, "maximum": 1000},
 	}, "required": []string{"pattern"}}
 }
 
-func (t *RgTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
-	}
-	pattern := StringArg(ctx.Args, "pattern", "")
-	if strings.TrimSpace(pattern) == "" {
-		return "", fmt.Errorf("Rg: missing pattern")
-	}
-	base := ctx.WorkingDir
-	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
-		base = rawPath
-	}
-	base, err := ctx.ResolveRead(base)
-	if err != nil {
-		return "", fmt.Errorf("Rg: %w", err)
-	}
-	info, err := os.Stat(base)
-	if err != nil {
-		return "", fmt.Errorf("Rg: %w", err)
-	}
-	singleFile := ""
-	if !info.IsDir() {
-		if !info.Mode().IsRegular() {
-			return "", fmt.Errorf("Rg: path %q is not a regular file or directory", base)
+func (t *RgTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
+		if err := ctx.checkResources(); err != nil {
+			return "", err
 		}
-		singleFile, base = filepath.Base(base), filepath.Dir(base)
-	}
+		pattern := StringArg(ctx.Args, "pattern", "")
+		if strings.TrimSpace(pattern) == "" {
+			return "", fmt.Errorf("Rg: missing pattern")
+		}
+		base := ctx.WorkingDir
+		if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
+			base = rawPath
+		}
+		base, err := ctx.ResolveRead(base)
+		if err != nil {
+			return "", fmt.Errorf("Rg: %w", err)
+		}
+		info, err := os.Stat(base)
+		if err != nil {
+			return "", fmt.Errorf("Rg: %w", err)
+		}
+		singleFile := ""
+		if !info.IsDir() {
+			if !info.Mode().IsRegular() {
+				return "", fmt.Errorf("Rg: path %q is not a regular file or directory", base)
+			}
+			singleFile, base = filepath.Base(base), filepath.Dir(base)
+		}
 
-	mode := StringArg(ctx.Args, "mode", rgModeContent)
-	switch mode {
-	case rgModeContent, rgModeFiles, rgModeCount:
-	default:
-		return "", fmt.Errorf("Rg: unknown mode %q", mode)
-	}
-	headLimit, err := IntArgChecked(ctx.Args, "limit", 100)
-	if err != nil {
-		return "", fmt.Errorf("Rg: %w", err)
-	}
-	offset, err := boundedInt(ctx.Args, "offset", 0, 0, 100000)
-	if err != nil {
-		return "", fmt.Errorf("Rg: %w", err)
-	}
-	if headLimit < 1 || headLimit > 1000 {
-		return "", fmt.Errorf("Rg: limit must be 1..1000")
-	}
-	contextLines, err := boundedInt(ctx.Args, "context", 0, 0, 20)
-	if err != nil {
-		return "", err
-	}
-	before, err := boundedInt(ctx.Args, "before", contextLines, 0, 20)
-	if err != nil {
-		return "", err
-	}
-	after, err := boundedInt(ctx.Args, "after", contextLines, 0, 20)
-	if err != nil {
-		return "", err
-	}
+		mode := StringArg(ctx.Args, "mode", rgModeContent)
+		switch mode {
+		case rgModeContent, rgModeFiles, rgModeCount:
+		default:
+			return "", fmt.Errorf("Rg: unknown mode %q", mode)
+		}
+		headLimit, err := IntArgChecked(ctx.Args, "limit", 100)
+		if err != nil {
+			return "", fmt.Errorf("Rg: %w", err)
+		}
+		offset, err := boundedInt(ctx.Args, "offset", 0, 0, 100000)
+		if err != nil {
+			return "", fmt.Errorf("Rg: %w", err)
+		}
+		if headLimit < 1 || headLimit > 1000 {
+			return "", fmt.Errorf("Rg: limit must be 1..1000")
+		}
+		contextLines, err := boundedInt(ctx.Args, "context", 0, 0, 20)
+		if err != nil {
+			return "", err
+		}
+		before, err := boundedInt(ctx.Args, "before", contextLines, 0, 20)
+		if err != nil {
+			return "", err
+		}
+		after, err := boundedInt(ctx.Args, "after", contextLines, 0, 20)
+		if err != nil {
+			return "", err
+		}
 
-	req := &rgRequest{
-		singleFile: singleFile,
-		pattern:    pattern,
-		literal:    BoolArg(ctx.Args, "literal", false),
-		base:       base,
-		outputMode: mode,
-		ignoreCase: BoolArg(ctx.Args, "ignore_case", false),
-		multiline:  BoolArg(ctx.Args, "multiline", false),
-		onlyMatch:  BoolArg(ctx.Args, "only_matching", false),
-		before:     before,
-		after:      after,
-		maxLines:   headLimit,
-		offset:     offset,
-	}
-	if glob := StringArg(ctx.Args, "glob", ""); glob != "" {
-		req.globs = []string{glob}
-	}
-	if typ := StringArg(ctx.Args, "type", ""); typ != "" {
-		for _, part := range strings.Split(typ, ",") {
-			if part = strings.TrimSpace(part); part != "" {
-				req.types = append(req.types, part)
+		req := &rgRequest{
+			singleFile: singleFile,
+			pattern:    pattern,
+			literal:    BoolArg(ctx.Args, "literal", false),
+			base:       base,
+			outputMode: mode,
+			ignoreCase: BoolArg(ctx.Args, "ignore_case", false),
+			multiline:  BoolArg(ctx.Args, "multiline", false),
+			onlyMatch:  BoolArg(ctx.Args, "only_matching", false),
+			before:     before,
+			after:      after,
+			maxLines:   headLimit,
+			offset:     offset,
+		}
+		if glob := StringArg(ctx.Args, "glob", ""); glob != "" {
+			req.globs = []string{glob}
+		}
+		if typ := StringArg(ctx.Args, "type", ""); typ != "" {
+			for _, part := range strings.Split(typ, ",") {
+				if part = strings.TrimSpace(part); part != "" {
+					req.types = append(req.types, part)
+				}
 			}
 		}
-	}
 
-	copy := *ctx
-	copy.OutputLimit = min(50<<10, ctx.outputLimit())
-	ctx = &copy
-	out, err := searchRg(ctx, req)
-	if err != nil {
-		return "", err
-	}
-	return boundedToolString(ctx, out), nil
+		copy := *ctx
+		copy.OutputLimit = min(50<<10, ctx.outputLimit())
+		ctx = &copy
+		out, err := searchRg(ctx, req)
+		if err != nil {
+			return "", err
+		}
+		return boundedToolString(ctx, out), nil
+	})
 }
 
 // ---------- LS ----------
@@ -422,8 +428,8 @@ Directories are listed first.`
 
 func (t *LSTool) Parameters() map[string]any {
 	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 1000},
+		"type": "object", "additionalProperties": false,
+		"properties": map[string]any{"limit": map[string]any{"default": 100, "type": "integer", "minimum": 1, "maximum": 1000},
 			"path": map[string]any{
 				"type":        "string",
 				"description": "Directory to list (default: current working directory).",
@@ -432,71 +438,76 @@ func (t *LSTool) Parameters() map[string]any {
 	}
 }
 
-func (t *LSTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
-	}
-	dir := ctx.WorkingDir
-	if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
-		dir = rawPath
-	}
-	dir, err := ctx.ResolveRead(dir)
-	if err != nil {
-		return "", fmt.Errorf("LS: %w", err)
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return "", fmt.Errorf("LS: %w", err)
-	}
-	visible := entries[:0]
-	for _, entry := range entries {
+func (t *LSTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
 		if err := ctx.checkResources(); err != nil {
 			return "", err
 		}
-		if _, err := ctx.ResolveRead(filepath.Join(dir, entry.Name())); err == nil {
-			visible = append(visible, entry)
+		dir := ctx.WorkingDir
+		if rawPath := StringArg(ctx.Args, "path", ""); rawPath != "" {
+			dir = rawPath
 		}
-	}
-	entries = visible
-	sort.Slice(entries, func(i, j int) bool {
-		ei, ej := entries[i], entries[j]
-		if ei.IsDir() != ej.IsDir() {
-			return ei.IsDir()
-		}
-		return ei.Name() < ej.Name()
-	})
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Contents of %s (%d entries):\n", dir, len(entries))
-	limit, err := boundedInt(ctx.Args, "limit", 100, 1, 1000)
-	if err != nil {
-		return "", err
-	}
-	shown := 0
-	for _, e := range entries {
-		if err := ctx.checkResources(); err != nil {
-			return "", err
-		}
-		if shown >= limit || sb.Len() > min(50<<10, ctx.outputLimit())-400 {
-			break
-		}
-		info, err := e.Info()
+		dir, err := ctx.ResolveRead(dir)
 		if err != nil {
-			continue
+			return "", fmt.Errorf("LS: %w", err)
 		}
-		marker := " "
-		if e.IsDir() {
-			marker = "d"
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return "", fmt.Errorf("LS: %w", err)
 		}
-		row := fmt.Sprintf("%s %10d  %s  %s\n", marker, info.Size(), info.ModTime().Format("2006-01-02 15:04"), e.Name())
-		if sb.Len()+len(row) > min(50<<10, ctx.outputLimit())-120 {
-			break
+		visible := entries[:0]
+		for _, entry := range entries {
+			if err := ctx.checkResources(); err != nil {
+				return "", err
+			}
+			if _, err := ctx.ResolveRead(filepath.Join(dir, entry.Name())); err == nil {
+				visible = append(visible, entry)
+			}
 		}
-		sb.WriteString(row)
-		shown++
-	}
-	if shown < len(entries) {
-		fmt.Fprintf(&sb, "[incomplete: showing %d of %d entries; increase limit or narrow directory]", shown, len(entries))
-	}
-	return boundedToolString(ctx, sb.String()), nil
+		entries = visible
+		sort.Slice(entries, func(i, j int) bool {
+			ei, ej := entries[i], entries[j]
+			if ei.IsDir() != ej.IsDir() {
+				return ei.IsDir()
+			}
+			return ei.Name() < ej.Name()
+		})
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "Contents of %s (%d entries):\n", dir, len(entries))
+		dataEntries := make([]map[string]any, 0)
+		limit, err := boundedInt(ctx.Args, "limit", 100, 1, 1000)
+		if err != nil {
+			return "", err
+		}
+		shown := 0
+		for _, e := range entries {
+			if err := ctx.checkResources(); err != nil {
+				return "", err
+			}
+			if shown >= limit || sb.Len() > min(50<<10, ctx.outputLimit())-400 {
+				break
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			marker := " "
+			if e.IsDir() {
+				marker = "d"
+			}
+			row := fmt.Sprintf("%s %10d  %s  %s\n", marker, info.Size(), info.ModTime().Format("2006-01-02 15:04"), e.Name())
+			if sb.Len()+len(row) > min(50<<10, ctx.outputLimit())-120 {
+				break
+			}
+			sb.WriteString(row)
+			dataEntries = append(dataEntries, map[string]any{"name": e.Name(), "is_dir": e.IsDir(), "size": info.Size()})
+			shown++
+		}
+		if shown < len(entries) {
+			fmt.Fprintf(&sb, "[incomplete: showing %d of %d entries; increase limit or narrow directory]", shown, len(entries))
+		}
+		ctx.recordData(map[string]any{"path": dir, "entries": dataEntries, "total": len(entries), "truncated": shown < len(entries)}, shown < len(entries))
+		return boundedToolString(ctx, sb.String()), nil
+	})
 }

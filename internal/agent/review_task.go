@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"ccdp/internal/config"
@@ -190,11 +191,14 @@ func (a *Agent) prepareReviewCopy(ctx context.Context, cmd protocol.Command) (r 
 			}
 
 			info, e := source.Lstat(path)
-			if os.IsNotExist(e) {
+			if os.IsNotExist(e) || errors.Is(e, syscall.ENOTDIR) {
 				continue
 			}
 			if e != nil {
 				return nil, e
+			}
+			if info.IsDir() {
+				continue
 			}
 			v := reviewFile{Path: path, Mode: gitFileMode("regular", uint32(info.Mode().Perm())), Kind: "regular"}
 			if info.Mode()&os.ModeSymlink != 0 {
@@ -274,24 +278,32 @@ func (r *reviewCopy) task(ctx context.Context, w *protocol.WorkflowCommand) (str
 		if _, skip := r.excluded[p]; skip {
 			continue
 		}
-		old, oe := os.ReadFile(filepath.Join(r.dir, "before", p))
-		next, ne := os.ReadFile(filepath.Join(r.dir, "after", p))
-		if oe != nil && !os.IsNotExist(oe) {
-			return "", 0, oe
+		_, beforeExists := r.before[p]
+		_, afterExists := r.after[p]
+		var old, next []byte
+		var err error
+		if beforeExists {
+			old, err = os.ReadFile(filepath.Join(r.dir, "before", p))
+			if err != nil {
+				return "", 0, err
+			}
 		}
-		if ne != nil && !os.IsNotExist(ne) {
-			return "", 0, ne
+		if afterExists {
+			next, err = os.ReadFile(filepath.Join(r.dir, "after", p))
+			if err != nil {
+				return "", 0, err
+			}
 		}
-		if oe == nil && ne == nil && bytes.Equal(old, next) && r.before[p].Mode == r.after[p].Mode {
+		if beforeExists && afterExists && bytes.Equal(old, next) && r.before[p].Mode == r.after[p].Mode {
 			continue
 		}
 		status := "modified"
 		left, right := filepath.Join("before", p), filepath.Join("after", p)
-		if os.IsNotExist(oe) {
+		if !beforeExists {
 			status = "added"
 			left = "/dev/null"
 		}
-		if os.IsNotExist(ne) {
+		if !afterExists {
 			status = "deleted"
 			right = "/dev/null"
 		}

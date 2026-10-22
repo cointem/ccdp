@@ -49,8 +49,8 @@ func (a *Agent) admitToolStartOwned(tc messages.ToolCall, tool tools.Tool, execu
 	if a.discovery.customPerms[tc.Name] == "deny" {
 		return fmt.Errorf("permission denied: %s is denied by tool config", tc.Name)
 	}
-	if execution != nil {
-		return execution.start(a, tc)
+	if ctx := execution.ctx.context; ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
 	}
-	return nil
+	return execution.start(a, tc)
 }

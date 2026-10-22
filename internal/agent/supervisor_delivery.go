@@ -52,11 +52,14 @@ func (s *SessionSupervisor) deliver(r *managedRun) {
 	if err == nil && !receipt.Rejected() {
 		r.mu.Lock()
 		r.fact.Delivered = true
-		err = s.persist(r, "delivered")
-		if err != nil {
-			r.fact.Delivered = false
-		}
+		reply := enqueueRunRecordLocked(r, "delivered")
 		r.mu.Unlock()
+		err = r.parent.waitChildRecord(reply)
+		if err != nil {
+			r.mu.Lock()
+			r.fact.Delivered = false
+			r.mu.Unlock()
+		}
 		s.publishChildOutcome(r)
 	}
 }

@@ -10,6 +10,9 @@ import (
 )
 
 type Settings struct {
+	MemoryReadOnly                bool     `json:"memory_read_only"`
+	MemoryHistory                 bool     `json:"memory_history"`
+	ProjectMemoryEnabled          bool     `json:"project_memory_enabled"`
 	ReasoningEffort               string   `json:"reasoning_effort,omitempty"`
 	Verbosity                     string   `json:"verbosity,omitempty"`
 	GenerationOptionsSet          bool     `json:"generation_options_set,omitempty"`
@@ -29,9 +32,9 @@ type Settings struct {
 	ContextWindow                 int      `json:"context_window,omitempty"`
 	EffectiveContextWindow        int      `json:"effective_context_window,omitempty"`
 	CompactThreshold              float64  `json:"compact_threshold,omitempty"`
-	MaxResultSizeChars            int      `json:"max_result_size_chars,omitempty"`
+	MaxResultSizeBytes            int      `json:"max_result_size_bytes,omitempty"`
 	MaxTurns                      int      `json:"max_turns,omitempty"`
-	MaxToolOutputCharsPerTurn     int      `json:"max_tool_output_chars_per_turn,omitempty"`
+	MaxToolOutputBytesPerTurn     int      `json:"max_tool_output_bytes_per_turn,omitempty"`
 	Workspace                     string   `json:"workspace,omitempty"`
 }
 
@@ -59,7 +62,7 @@ func (s Settings) validate() error {
 	if s.MaxOutputTokens != nil && *s.MaxOutputTokens < 0 {
 		return errors.New("max_output_tokens must not be negative")
 	}
-	if s.EffectiveContextWindow < 0 || s.ContextWindow < 0 || s.MaxResultSizeChars < 0 || s.MaxTurns < 0 || s.MaxToolOutputCharsPerTurn < 0 {
+	if s.EffectiveContextWindow < 0 || s.ContextWindow < 0 || s.MaxResultSizeBytes < 0 || s.MaxTurns < 0 || s.MaxToolOutputBytesPerTurn < 0 {
 		return errors.New("settings limits must not be negative")
 	}
 	if s.CompactThreshold < 0 || s.CompactThreshold > 1 {

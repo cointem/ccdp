@@ -6,9 +6,10 @@ import (
 	"encoding/json"
 	"net"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	"ccdp/internal/tools"
 )
 
 type wirePeer struct {
@@ -77,26 +78,24 @@ func newWireClient(t *testing.T) (*Client, *wirePeer) {
 }
 func TestToolsListChangedStormUsesOneRefreshWorkerAndCloses(t *testing.T) {
 	c, peer := newWireClient(t)
-	var changes atomic.Int32
-	c.SetChangeListener(func() { changes.Add(1) })
 	c.scheduleRefresh()
 	first := peer.next(t)
 	for i := 0; i < 1000; i++ {
 		c.scheduleRefresh()
 	}
-	if err := peer.reply(first, map[string]any{"tools": []any{}}); err != nil {
+	if err := peer.reply(first, testTools("first")); err != nil {
 		t.Fatal(err)
 	}
 	second := peer.next(t)
 	if first.Method != "tools/list" || second.Method != "tools/list" || string(first.ID) == string(second.ID) {
 		t.Fatal("invalid refresh requests")
 	}
-	if err := peer.reply(second, map[string]any{"tools": []any{}}); err != nil {
+	if err := peer.reply(second, testTools("second")); err != nil {
 		t.Fatal(err)
 	}
 	waitRefreshIdle(t, c)
-	if changes.Load() != 2 {
-		t.Fatalf("callbacks=%d, want 2", changes.Load())
+	if defs := c.Tools(); len(defs) != 1 || defs[0].Name != "second" {
+		t.Fatalf("latest tool list was not accepted: %+v", defs)
 	}
 	c.scheduleRefresh()
 	_ = peer.next(t)
@@ -107,8 +106,14 @@ func TestToolsListChangedStormUsesOneRefreshWorkerAndCloses(t *testing.T) {
 }
 func TestSDKStdioNotificationsRefreshTools(t *testing.T) {
 	c, peer := newWireClient(t)
-	changed := make(chan struct{}, 1)
-	c.SetChangeListener(func() { changed <- struct{}{} })
+	m := NewManager()
+	defer m.Close()
+	m.clients["wire"] = c
+	m.names = []string{"wire"}
+	reg := tools.NewRegistry()
+	if err := m.RegisterTools(reg); err != nil {
+		t.Fatal(err)
+	}
 	if err := peer.send(map[string]any{"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}); err != nil {
 		t.Fatal(err)
 	}
@@ -116,14 +121,15 @@ func TestSDKStdioNotificationsRefreshTools(t *testing.T) {
 	if request.Method != "tools/list" {
 		t.Fatalf("request=%s", request.Method)
 	}
-	_ = peer.reply(request, map[string]any{"tools": []any{map[string]any{"name": "new", "inputSchema": map[string]any{"type": "object"}}}})
-	select {
-	case <-changed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("refresh callback missing")
+	if err := peer.reply(request, testTools("new")); err != nil {
+		t.Fatal(err)
 	}
+	waitRefreshIdle(t, c)
 	if defs := c.Tools(); len(defs) != 1 || defs[0].Name != "new" {
 		t.Fatalf("tools=%+v", defs)
+	}
+	if binding, ok := reg.Get("mcp__wire__new"); !ok || binding.(*mcpTool).client != c {
+		t.Fatal("notification did not publish the new tool binding")
 	}
 }
 func TestSDKPendingCallsSettleOnServerExit(t *testing.T) {

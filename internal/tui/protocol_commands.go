@@ -98,7 +98,7 @@ func commandProducesReport(kind protocol.CommandType) bool {
 	switch kind {
 	case protocol.CommandExternal, protocol.CommandApply, protocol.CommandCheckpoint,
 		protocol.CommandExport, protocol.CommandInit, protocol.CommandQuery,
-		protocol.CommandRunWorkflow:
+		protocol.CommandRunWorkflow, protocol.CommandFork:
 		return true
 	default:
 		return false
@@ -169,7 +169,11 @@ func (m *Model) applyReceipt(receipt protocol.Receipt, purpose string) {
 		if knownOperation {
 			m.updateOperation(receipt.CommandID, OperationRejected, receipt)
 		}
-		delete(m.operationReports, receipt.CommandID)
+		// Scheduled operations publish their diagnostic output after this
+		// terminal receipt. Admission failures have no report to wait for.
+		if receipt.OperationID == "" {
+			delete(m.operationReports, receipt.CommandID)
+		}
 		// A rejected receipt is terminal for this submission attempt. Keep the
 		// draft in the explicit retry slot, but do not leave it in the
 		// in-flight map: resume and session switching must be available after a
@@ -271,6 +275,34 @@ func receiptKey(receipt protocol.Receipt) string {
 		errorText = receipt.Error.Error()
 	}
 	return fmt.Sprintf("%s|%d|%d|%s", receipt.Status, receipt.Revision.LogSeq, receipt.Revision.ViewGeneration, errorText)
+}
+
+func (m *Model) applyCommandError(msg commandErrorMsg) {
+	if _, ok := m.operation(msg.commandID); ok {
+		m.updateOperation(msg.commandID, OperationFailed, protocol.Receipt{CommandID: msg.commandID, SessionID: msg.sessionID,
+			Error: &protocol.CommandError{Code: protocol.ErrorInternal, Message: errorText(msg.err)}})
+		if m.operationOwnsPresentation(msg.commandID) {
+			m.finishActivity(msg.commandID, ActivityFailed, errorText(msg.err))
+			m.clearNotice(msg.commandID)
+			m.addNotice(Notice{CommandID: msg.commandID, Severity: NoticeError, Text: "submit failed: " + errorText(msg.err), Sticky: true})
+		}
+	}
+	delete(m.operationReports, msg.commandID)
+	if m.question != nil && m.question.pending == msg.commandID {
+		m.question.pending = ""
+	}
+	// Submit errors have no receipt that can clear the in-flight marker.
+	// Preserve the original command for an explicit idempotent retry.
+	m.restoreFailedSubmission(msg.commandID)
+	if m.approvalPending && msg.commandID == m.pendingApprovalCommand {
+		m.approvalPending = false
+		m.pendingApprovalCommand = ""
+	}
+	if msg.err != nil {
+		if _, ok := m.operation(msg.commandID); !ok {
+			m.pushStatus("submit failed: " + msg.err.Error())
+		}
+	}
 }
 
 // A transport failure does not establish whether the input was accepted. Keep

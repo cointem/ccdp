@@ -40,12 +40,18 @@ func removeDeliveryCandidate(dir string) error {
 
 // The extra hard link proves ownership without putting metadata in Git's
 // binary index.lock. Callers must hold changes.LockWorkspace throughout.
-func deliveryIndexOwnerPath(index, id string) string {
-	return index + ".ccdp-" + hashBytes([]byte(id)) + ".lock"
+func deliveryIndexOwnerPath(index, id string) (string, error) {
+	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, "/\\\x00") {
+		return "", errors.New("invalid delivery plan id")
+	}
+	return index + ".ccdp-" + id + ".lock", nil
 }
 
 func recoverDeliveryIndexLock(index, id string) error {
-	owner := deliveryIndexOwnerPath(index, id)
+	owner, err := deliveryIndexOwnerPath(index, id)
+	if err != nil {
+		return err
+	}
 	owned, err := os.Lstat(owner)
 	if os.IsNotExist(err) {
 		return nil
@@ -74,7 +80,10 @@ func recoverDeliveryIndexLock(index, id string) error {
 }
 
 func createDeliveryIndexLock(index, id string) (*os.File, error) {
-	owner := deliveryIndexOwnerPath(index, id)
+	owner, err := deliveryIndexOwnerPath(index, id)
+	if err != nil {
+		return nil, err
+	}
 	f, err := os.OpenFile(owner, os.O_CREATE|os.O_EXCL|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, err

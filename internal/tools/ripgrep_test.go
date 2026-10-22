@@ -84,7 +84,7 @@ func TestRgMissingDependencyFailsWithoutFallback(t *testing.T) {
 	}
 	ctx := rgCtx(root)
 	ctx.Args = map[string]any{"pattern": "needle"}
-	output, err := NewRgTool().Run(ctx)
+	output, err := executeToolText(NewRgTool(), ctx)
 	if err == nil || !strings.Contains(err.Error(), "ripgrep (rg) is required") || output != "" {
 		t.Fatalf("missing native dependency silently fell back: %q %v", output, err)
 	}
@@ -94,7 +94,7 @@ func TestRgNativeOptionsAndEmptyDirectoryValidation(t *testing.T) {
 	root := t.TempDir()
 	ctx := rgCtx(root)
 	ctx.Args = map[string]any{"pattern": "["}
-	if _, err := NewRgTool().Run(ctx); err == nil {
+	if _, err := executeToolText(NewRgTool(), ctx); err == nil {
 		t.Fatal("invalid regex accepted in empty directory")
 	}
 	reviewRgWrite(t, root, "text.txt", "a.b\naxb\nFIRST\nSECOND\n")
@@ -106,7 +106,7 @@ func TestRgNativeOptionsAndEmptyDirectoryValidation(t *testing.T) {
 		{map[string]any{"pattern": "first.*second", "ignore_case": true, "multiline": true}, "text.txt:3:FIRST", "0 match(es)"},
 	} {
 		ctx.Args = tc.args
-		output, err := NewRgTool().Run(ctx)
+		output, err := executeToolText(NewRgTool(), ctx)
 		if err != nil || !strings.Contains(output, tc.want) || strings.Contains(output, tc.absent) {
 			t.Fatalf("native options %v: %q %v", tc.args, output, err)
 		}

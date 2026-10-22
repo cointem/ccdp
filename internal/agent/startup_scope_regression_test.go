@@ -11,7 +11,7 @@ import (
 
 func TestReviewRound3ResumeHonorsCLISettings(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.EnableGuardian = config.BoolPtr(false)
 	cfg.PermissionMode = string(permissions.ModeBypass)
 	cfg.AlwaysDeny = []string{"Bash:rm"}
@@ -58,7 +58,7 @@ func TestReviewRound3ResumeHonorsCLISettings(t *testing.T) {
 
 func TestReviewRound3OpenSessionDropsPreviousProjectTools(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.EnableGuardian = config.BoolPtr(false)
 	trust := config.NewTrustStore(filepath.Join(t.TempDir(), "trust.json"))
 	cfg.TrustStore = trust

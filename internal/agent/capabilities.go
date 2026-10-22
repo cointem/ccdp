@@ -311,8 +311,8 @@ func (a *Agent) addSessionCapabilitiesOwned(version capabilityPolicyVersion, req
 	return candidate, version, nil
 }
 
-func (a *Agent) approveToolWithCapabilities(tc messages.ToolCall, reason string, base *sandbox.Sandbox, version capabilityPolicyVersion, requests []protocol.CapabilityRequest) (*sandbox.Sandbox, capabilityPolicyVersion, bool, bool) {
-	answer := a.requestApprovalDetailed(tc, reason, requests)
+func (a *Agent) approveToolWithCapabilities(tc messages.ToolCall, reason string, base *sandbox.Sandbox, version capabilityPolicyVersion, requests []protocol.CapabilityRequest, contexts ...context.Context) (*sandbox.Sandbox, capabilityPolicyVersion, bool, bool) {
+	answer := a.requestApprovalDetailed(tc, reason, requests, contexts...)
 	if !answer.approve {
 		if !a.capabilityApprovalCurrent(version) {
 			return base, version, false, false

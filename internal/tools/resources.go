@@ -23,7 +23,6 @@ type Resources struct {
 
 	// Exactly one owner-owned instance of each mutable session resource.
 	Processes *ProcessManager
-	Todos     *TodoStore
 	Files     *FileState
 
 	mu       sync.RWMutex
@@ -33,8 +32,8 @@ type Resources struct {
 }
 
 // NewResources creates an owner-scoped resource container. The session ID is
-// an identity boundary and sessionDir is the durable directory for scratch
-// state (todos, etc.). Both values are explicit to prevent accidental reuse
+// an identity boundary and sessionDir is the durable directory for retained
+// tool artifacts. Both values are explicit to prevent accidental reuse
 // of a parent/root directory as a session scope.
 func NewResources(owner, sessionDir string) *Resources {
 	return NewResourcesWithContext(owner, sessionDir, context.Background())
@@ -60,7 +59,6 @@ func NewResourcesWithContext(owner, sessionDir string, ownerCtx context.Context)
 	} else {
 		r.Processes.logDir = scratch
 	}
-	r.Todos = NewTodoStore(owner, sessionDir)
 	r.Files = NewFileState(owner)
 	return r
 }
@@ -154,9 +152,6 @@ func (r *Resources) Close() error {
 		if r.Processes != nil {
 			closeErr = r.Processes.Close()
 		}
-		if r.Todos != nil {
-			r.Todos.Close()
-		}
 		if r.Files != nil {
 			r.Files.Close()
 		}
@@ -175,7 +170,7 @@ func (r *Resources) Close() error {
 }
 
 // Context returns a tool context bound to this resource owner.  Runtime code
-// may further set Args, Timeout, Sandbox and Notify on the returned value.
+// may further set Args, Timeout and Sandbox on the returned value.
 func (r *Resources) Context(parent context.Context, workingDir string, sb *sandbox.Sandbox) *Context {
 	if parent == nil {
 		parent = context.Background()

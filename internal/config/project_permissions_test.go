@@ -25,6 +25,18 @@ func TestProjectPermissionsRememberAndIsolate(t *testing.T) {
 	if err := cfg.SaveProjectPermission("manual"); err != nil {
 		t.Fatal(err)
 	}
+	canonical, err := NormalizeProjectRoot(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(string(filepath.Separator), canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(cfg.ProjectPermissionsDir(), relative, "permission.json")
+	if _, err := os.Stat(record); err != nil {
+		t.Fatalf("readable project permission record missing: %v", err)
+	}
 	cfg.Workspace = sub
 	if err := cfg.ApplyProjectPermission(); err != nil {
 		t.Fatal(err)
@@ -60,5 +72,38 @@ func TestPermissionNamesRemainCompatible(t *testing.T) {
 		if cfg.PermissionMode != want {
 			t.Fatalf("%s normalized to %s", name, cfg.PermissionMode)
 		}
+	}
+}
+
+func TestSandboxProtectsProjectPermissionRecords(t *testing.T) {
+	cfg := Default()
+	cfg.Workspace = t.TempDir()
+	cfg.SessionDir = filepath.Join(cfg.Workspace, "state", "sessions")
+	record, _, err := cfg.projectPermissionPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, existing := range []bool{false, true} {
+		if existing {
+			if err := cfg.SaveProjectPermission("manual"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		policy := cfg.Sandbox()
+		if _, err := policy.ResolveWrite(record); err == nil {
+			t.Fatalf("permission record writable (existing=%v): %s", existing, record)
+		}
+		if _, err := policy.ResolveWriteEntry(record); err == nil {
+			t.Fatalf("permission record replaceable (existing=%v)", existing)
+		}
+		if _, err := policy.ResolveWrite(filepath.Join(cfg.Workspace, "ordinary.txt")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cfg.ApplyProjectPermission(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PermissionMode != "default" {
+		t.Fatalf("host permission persistence broken: %s", cfg.PermissionMode)
 	}
 }

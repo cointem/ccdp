@@ -12,6 +12,7 @@ type StreamQueue struct {
 	pending   map[streamKey]protocol.EventView
 	order     []streamKey
 	lastFlush time.Time
+	lost      bool
 }
 
 type streamKey struct {
@@ -38,13 +39,14 @@ func (q *StreamQueue) Add(view protocol.EventView, now time.Time) time.Duration 
 	}
 	if len(view.Text) > TextLimit {
 		view.Text, _ = Tail(view.Text, TextLimit)
+		q.lost = true
 	}
 	q.pending[key] = view
 	return max(time.Duration(0), 50*time.Millisecond-now.Sub(q.lastFlush))
 }
-func (q *StreamQueue) Drain(now time.Time) []protocol.EventView {
+func (q *StreamQueue) Drain(now time.Time) ([]protocol.EventView, bool) {
 	if len(q.order) == 0 {
-		return nil
+		return nil, false
 	}
 	q.lastFlush = now
 	out := make([]protocol.EventView, 0, len(q.order))
@@ -53,5 +55,7 @@ func (q *StreamQueue) Drain(now time.Time) []protocol.EventView {
 	}
 	q.order = nil
 	q.pending = nil
-	return out
+	lost := q.lost
+	q.lost = false
+	return out, lost
 }

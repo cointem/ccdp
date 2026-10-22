@@ -65,6 +65,22 @@ func (s *SessionSupervisor) Control(ctx context.Context, c protocol.AgentControl
 		return protocol.RunView{}, err
 	}
 	if c.Action == "continue" {
+		if c.Input != nil {
+			cmd := protocol.Command{ID: c.ID, SessionID: c.SessionID, Type: protocol.CommandSubmitInput, Input: c.Input}
+			receipt, found, err := s.priorChildInputReceipt(ctx, r, cmd)
+			if err != nil {
+				return protocol.RunView{}, err
+			}
+			if found {
+				r.mu.Lock()
+				run := r.fact.Child.Run
+				r.mu.Unlock()
+				if receipt.Rejected() {
+					return run, receipt.Error
+				}
+				return run, nil
+			}
+		}
 		return s.continueRun(ctx, r, c)
 	}
 	r.mu.Lock()
@@ -175,10 +191,13 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 	}
 	r.mu.Lock()
 	if r.fact.DeliveryID != "" && !r.fact.UsageAccounted {
-		if err := s.recordOutcome(r); err != nil {
-			r.mu.Unlock()
+		reply := enqueueRunOutcomeLocked(r)
+		r.mu.Unlock()
+		if err := r.parent.waitChildRecord(reply); err != nil {
 			return row.Run, err
 		}
+		r.mu.Lock()
+		r.fact.UsageAccounted = true
 	}
 	r.mu.Unlock()
 	cfg, opts, lease, catalog, hooks, err := s.prepare(r.parent, row.Purpose, system)
@@ -248,8 +267,9 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 	next.fact.PendingMessages = append([]protocol.InputView(nil), r.fact.PendingMessages...)
 	r.mu.Unlock()
 	next.mu.Lock()
-	err = s.persist(next, "queued")
+	reply := enqueueRunRecordLocked(next, "queued")
 	next.mu.Unlock()
+	err = next.parent.waitChildRecord(reply)
 	s.finishRunAdmission(next, err)
 	if err != nil {
 		cancel()

@@ -26,24 +26,19 @@ type SpawnAgentRequest struct {
 
 // Context carries per-invocation state into a tool.
 type Context struct {
+	dataResult *Result
+	RunCode    func(string, time.Duration) (protocol.CodeResult, error)
 	context.Context
 	ReadRoot   string         // optional strict snapshot-only read boundary
 	WorkingDir string         // directory the tool should operate in
-	SessionDir string         // directory where the session persists (todos, etc.)
+	SessionDir string         // session directory for retained tool artifacts
 	Args       map[string]any // parsed JSON arguments from the model
 	Timeout    time.Duration  // per-tool timeout (0 = default)
-	// Resources is the session-owned resource container. Runtime code must set
-	// this field for stateful tools; narrow capability fields below are only for
-	// explicit adapters that own the corresponding resource themselves.
+	// Resources owns the session's file state and process handles.
 	Resources *Resources
-	// ProcessManager is an optional narrow injection for callers that only
-	// provide process capabilities.  When Resources is non-nil its manager
-	// takes precedence and this field is ignored.
-	ProcessManager *ProcessManager
-	// FileState and TodoStore are optional narrow injections.  They are useful
-	// to adapters migrating one tool at a time; Resources remains preferred.
-	FileState *FileState
-	TodoStore *TodoStore
+	// ReplaceTodos commits a validated task replacement through the session owner.
+	// It must publish the new list only after its durable commit succeeds.
+	ReplaceTodos func([]TodoState) error
 	// Goals is scoped by the runtime to this invocation's session and goal.
 	// Child adapters may observe the parent's goal but cannot mutate it.
 	Goals GoalControl
@@ -63,9 +58,6 @@ type Context struct {
 	// HostNetworkAllowed authorizes this invocation's in-process network
 	// adapters. Seatbelt does not constrain the harness process itself.
 	HostNetworkAllowed bool
-	// Notify is called with transient progress updates (e.g. command output)
-	// that the UI can stream live for long-running tools.
-	Notify func(line string)
 	// SpawnAgent admits one independent assignment and returns its stable identity.
 	SpawnAgent       func(SpawnAgentRequest) (protocol.AgentReceipt, error)
 	Sessions         protocol.SessionDirectory
@@ -73,6 +65,7 @@ type Context struct {
 	SendAgentMessage func(target, text string) error
 	WaitAgentEvent   func(context.Context) (string, error)
 	ReadAgent        func(context.Context, protocol.AgentReadRequest, int) (string, error)
+	ReadOutput       func(context.Context, string, int64, int) (protocol.OutputPage, error)
 	// Skills exposes the loaded skill store for ReadSkill lookups.
 	Skills skills.Provider
 	// BeforeWrite durably captures a directly attributed mutation. The returned
@@ -82,6 +75,17 @@ type Context struct {
 	// nil means the recorder must capture the old file itself (Write).
 	BeforeWrite      func(path string, knownBefore []byte) (func() error, error)
 	NavigateSemantic func(operation, path string, line, character int) (string, error)
+}
+
+// WithArgs gives an invocation its own context fields while retaining the
+// explicitly shared session resources. Arguments are prepared by the registry.
+func (c *Context) WithArgs(args map[string]any) *Context {
+	if c == nil {
+		return &Context{Args: args}
+	}
+	local := *c
+	local.Args = args
+	return &local
 }
 
 const (
@@ -115,25 +119,6 @@ func (c *Context) processInputLimit() int {
 	return DefaultProcessInputLimit
 }
 
-// notifyContext adapts the runtime's short, synchronous event callback to the
-// execution package's cancellable observer contract. Runtime callbacks should
-// publish to their bounded event bus and return promptly; callers that may
-// block should provide execution.Request.Progress instead.
-func (c *Context) notifyContext() func(context.Context, string) error {
-	if c == nil || c.Notify == nil {
-		return nil
-	}
-	return func(ctx context.Context, line string) error {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		c.Notify(line)
-		return nil
-	}
-}
-
 // checkResources verifies that the invocation is still attached to its
 // session owner. Runtime code can call this before dispatching a tool; the
 // built-in tools also call their specific owner accessors.
@@ -158,33 +143,9 @@ func (c *Context) checkResources() error {
 	return nil
 }
 
-func (c *Context) todoStore() *TodoStore {
-	if c != nil && c.Resources != nil {
-		return c.Resources.Todos
-	}
-	if c != nil && c.TodoStore != nil {
-		return c.TodoStore
-	}
-	return nil
-}
-
-func (c *Context) todoStoreForUse() (*TodoStore, error) {
-	store := c.todoStore()
-	if store == nil {
-		return nil, fmt.Errorf("tools: no session TodoStore injected")
-	}
-	if err := store.CheckOpen(); err != nil {
-		return nil, err
-	}
-	return store, nil
-}
-
 func (c *Context) fileState() *FileState {
 	if c != nil && c.Resources != nil {
 		return c.Resources.Files
-	}
-	if c != nil && c.FileState != nil {
-		return c.FileState
 	}
 	return nil
 }
@@ -209,12 +170,6 @@ func (c *Context) processManager() (*ProcessManager, error) {
 			return nil, fmt.Errorf("tools: resource owner %q has no process manager", c.Resources.Owner())
 		}
 		return c.Resources.Processes, nil
-	}
-	if c.ProcessManager != nil {
-		if err := c.ProcessManager.CheckOpen(); err != nil {
-			return nil, err
-		}
-		return c.ProcessManager, nil
 	}
 	return nil, fmt.Errorf("tools: no session ProcessManager injected")
 }

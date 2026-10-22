@@ -13,7 +13,12 @@ import (
 // Reconcile the child's durable outbox with the parent's catalog. This is a
 // read-only pass: constructing an observer never wakes a model or runs a tool.
 func (s *SessionSupervisor) readChildOutboxes() {
+	ctx := s.root.rootContext()
 	for _, r := range s.directory.Runs() {
+		if err := ctx.Err(); err != nil {
+			s.recoveryErr = err
+			return
+		}
 		if r.fact.UsageAccounted {
 			continue
 		}
@@ -22,19 +27,17 @@ func (s *SessionSupervisor) readChildOutboxes() {
 		if r.fact.Child.Run.Status == "unknown" {
 			r.fact.DeliveryID = "child-result-" + string(r.fact.Child.Run.ID)
 		}
-		store, err := session.OpenJSONLReadOnly(s.sessionDir, string(r.fact.Child.SessionID))
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				r.fact.Child.Run.Error = fmt.Sprintf("child history unavailable: %v", err)
-				r.err = err
-			}
-			continue
-		} // a queued child may never have been constructed
-		records, err := store.Read(session.Beginning)
-		_ = store.Close()
-		if err != nil {
-			r.fact.Child.Run.Error = fmt.Sprintf("child history unavailable: %v", err)
-			continue
+		records := r.memory
+		if records == nil {
+			var err error
+			records, _, err = s.readRecordedSessionRecords(ctx, r.fact.Child.SessionID)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					r.fact.Child.Run.Error = fmt.Sprintf("child history unavailable: %v", err)
+					r.err = err
+				}
+				continue
+			} // a queued child may never have been constructed
 		}
 		found := false
 		for _, record := range records {
@@ -83,8 +86,14 @@ func (s *SessionSupervisor) startRecovery() {
 					}
 					r.mu.Lock()
 					if r.fact.DeliveryID != "" && !r.fact.UsageAccounted {
-						if err := s.recordOutcome(r); err != nil {
+						reply := enqueueRunOutcomeLocked(r)
+						r.mu.Unlock()
+						err := r.parent.waitChildRecord(reply)
+						r.mu.Lock()
+						if err != nil {
 							r.err = err
+						} else {
+							r.fact.UsageAccounted = true
 						}
 					}
 					r.mu.Unlock()

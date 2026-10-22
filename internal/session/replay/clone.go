@@ -79,6 +79,12 @@ func cloneStarted(v session.ToolStarted) session.ToolStarted {
 }
 
 func cloneFinished(v session.ToolFinished) session.ToolFinished {
+	if v.Call != nil {
+		call := *v.Call
+		call.Arguments = slices.Clone(call.Arguments)
+		v.Call = &call
+	}
+	v.Data = cloneRef(v.Data)
 	v.RawOutput = cloneRef(v.RawOutput)
 	v.Result.Blob = cloneRef(v.Result.Blob)
 	return v

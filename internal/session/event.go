@@ -41,7 +41,6 @@ const (
 	EventTypeConversationReset    EventType = "ConversationReset"
 	EventTypeConversationRewound  EventType = "ConversationRewound"
 	EventTypeTasksChanged         EventType = "TasksChanged"
-	EventTypeMemoryChanged        EventType = "MemoryChanged"
 	EventTypeToolsDiscovered      EventType = "ToolsDiscovered"
 	EventTypeUsageChanged         EventType = "UsageChanged"
 )

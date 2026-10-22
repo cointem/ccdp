@@ -580,11 +580,57 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		if len(args) == 0 {
 			return m, m.runQuery(protocol.QueryMemory, "memory report requested")
 		}
-		if len(args) == 1 && strings.EqualFold(args[0], "clear") {
-			return m, m.submitCommand(protocol.Command{Type: protocol.CommandClearMemory,
-				ClearMemory: &protocol.ClearMemoryCommand{}}, "memory clear submitted")
+		p := &protocol.ProjectMemoryCommand{}
+		switch strings.ToLower(args[0]) {
+		case "on", "off", "readonly", "tidy":
+			if len(args) == 1 {
+				p.Action = map[string]string{"on": "enable", "off": "disable", "readonly": "readonly", "tidy": "tidy"}[strings.ToLower(args[0])]
+			}
+		case "history":
+			if len(args) == 2 && (args[1] == "on" || args[1] == "off") {
+				p.Action = "history-" + args[1]
+			}
+		case "extract":
+			if len(args) <= 2 {
+				p.Action = "extract"
+				if len(args) == 2 {
+					p.ID = args[1]
+				}
+			}
+		case "read", "delete":
+			if len(args) == 2 {
+				p.Action, p.ID = strings.ToLower(args[0]), args[1]
+			}
+		case "search":
+			if len(args) > 1 {
+				p.Action, p.Query = "search", strings.Join(args[1:], " ")
+			}
+		case "save":
+			rest := args[1:]
+			if len(rest) > 0 && rest[0] == "--user" {
+				p.Scope = "user"
+				rest = rest[1:]
+			}
+			if len(rest) > 0 {
+				p.Action, p.Body = "save", strings.Join(rest, " ")
+			}
+		case "edit":
+			if len(args) > 2 {
+				old, replacement, ok := strings.Cut(strings.Join(args[2:], " "), "|")
+				if ok {
+					p.Action, p.ID, p.OldText, p.NewText = "edit", args[1], strings.TrimSpace(old), strings.TrimSpace(replacement)
+				}
+			}
 		}
-		m.pushLog("error", "usage: /memory [clear]")
+		if p.Action != "extract" {
+			if scope, id, ok := strings.Cut(p.ID, ":"); ok {
+				p.Scope, p.ID = scope, id
+			}
+		}
+		if p.Action != "" {
+			return m, m.submitCommand(protocol.Command{Type: protocol.CommandProjectMemory, ProjectMemory: p}, "memory command submitted")
+		}
+		m.pushLog("error", "usage: /memory [on|readonly|off|read <id>|search <text>|save [--user] <text>|edit <id> <old> | <new>|delete <id>|tidy|history on|off|extract [session-id]]")
 		return m, nil
 
 	case "github":
@@ -789,53 +835,6 @@ func contextBar(used, window int) string {
 	}
 	filled = min(cells, filled)
 	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", cells-filled) + "]"
-}
-
-// exportMarkdown serializes the retained protocol snapshot without reaching
-// through the Agent adapter. Export is a client-side report, so it must remain
-// stable across session swaps and cannot observe a later mutable runtime.
-func exportMarkdown(snapshot protocol.SessionView, workspace string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "# ccdp session %s\n\n", snapshot.SessionID)
-	fmt.Fprintf(&b, "- Model: %s\n- Workspace: `%s`\n\n---\n\n",
-		snapshot.Settings.Model.Model, workspace)
-	for _, message := range snapshot.History {
-		role := strings.ToLower(message.Role)
-		switch role {
-		case "user":
-			fmt.Fprintf(&b, "## User\n\n%s\n\n", message.Content)
-		case "assistant":
-			fmt.Fprintf(&b, "## Assistant\n\n%s\n", message.Content)
-			for _, callID := range message.ToolCallIDs {
-				fmt.Fprintf(&b, "\n_→ tool(%s)_\n", callID)
-			}
-			b.WriteString("\n")
-		case "tool":
-			fmt.Fprintf(&b, "### Tool result\n\n```text\n%s\n```\n\n", message.Content)
-		default:
-			if message.Content != "" {
-				fmt.Fprintf(&b, "### %s\n\n%s\n\n", message.Role, message.Content)
-			}
-		}
-	}
-	return strings.TrimRight(b.String(), "\n") + "\n"
-}
-
-// renderPlugins formats the loaded plugins and providers for /plugins.
-func renderPlugins(plugins, providers []string) string {
-	var sb strings.Builder
-	sb.WriteString("Plugins (load order):\n")
-	for _, p := range plugins {
-		sb.WriteString("  - " + p + "\n")
-	}
-	sb.WriteString("LLM providers:\n")
-	if len(providers) == 0 {
-		sb.WriteString("  (none)\n")
-	}
-	for _, p := range providers {
-		sb.WriteString("  - " + p + "\n")
-	}
-	return strings.TrimRight(sb.String(), "\n")
 }
 
 // pushLog appends a message from the local UI (not the agent).

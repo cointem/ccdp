@@ -83,13 +83,6 @@ func (a *Agent) publishTerminal(turnID protocol.TurnID) bool {
 	return canDrain
 }
 
-func (a *Agent) publishReceipt(receipt protocol.Receipt) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	update := protocol.Update{Type: protocol.UpdateReceipt, Cursor: protocol.Cursor{LogSeq: receipt.Revision.LogSeq, ViewGeneration: receipt.Revision.ViewGeneration}, Revision: receipt.Revision, Receipt: &receipt}
-	a.enqueueViewsLocked(update)
-}
-
 func (a *Agent) publishEvent(ev Event) {
 	view := a.eventView(ev)
 	a.mu.Lock()
@@ -140,9 +133,17 @@ func (a *Agent) flushStreamsLocked() {
 		a.publications.streamTimer.Stop()
 		a.publications.streamTimer = nil
 	}
-	pending := a.publications.streamQueue.Drain(time.Now())
+	pending, lost := a.publications.streamQueue.Drain(time.Now())
 	if len(pending) > 0 {
 		a.publishTranscriptPreviewLocked()
+	}
+	if lost {
+		// A bounded preview is still useful in the next snapshot, but its
+		// cropped text is no longer a complete delta for existing observers.
+		rev := a.revisionLocked()
+		a.enqueueViewsLocked(protocol.Update{Type: protocol.UpdateResyncRequired,
+			Cursor: protocol.Cursor{LogSeq: rev.LogSeq, ViewGeneration: rev.ViewGeneration}, Revision: rev})
+		return
 	}
 	for _, view := range pending {
 		a.publishViewLocked(view)
@@ -205,7 +206,7 @@ func (a *Agent) eventView(ev Event) protocol.EventView {
 	}
 	if ev.Tool != nil {
 		args, _ := json.Marshal(ev.Tool.Args)
-		view.Tool = &protocol.ToolView{ID: protocol.CallID(ev.Tool.ID), Name: ev.Tool.Name, Status: ev.Tool.Status, Args: args, Output: ev.Tool.Output}
+		view.Tool = &protocol.ToolView{ID: protocol.CallID(ev.Tool.ID), Name: ev.Tool.Name, Status: ev.Tool.Status, Args: args, Output: ev.Tool.Output, ParentCallID: protocol.CallID(ev.Tool.ParentCallID), ChildIndex: ev.Tool.ChildIndex}
 		view.CallID = protocol.CallID(ev.Tool.ID)
 	}
 	if ev.Approval != nil {

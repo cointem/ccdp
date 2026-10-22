@@ -10,19 +10,6 @@ import (
 	"ccdp/internal/session"
 )
 
-func (p *Writer) MemoryText() (string, bool, error) {
-	if p == nil {
-		return "", false, errors.New("agent: nil session persistence")
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	projection, err := p.projectionLocked()
-	if err != nil {
-		return "", false, err
-	}
-	return projection.MemoryText, projection.MemorySeen, nil
-}
-
 func (p *Writer) PersistSettingsWorkflow(settings session.Settings, revision uint64, workflow *session.WorkflowState) error {
 	p.mu.Lock()
 	if p.store == nil {

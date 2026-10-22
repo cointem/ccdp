@@ -70,31 +70,6 @@ func (a *Agent) takeGuardianSlot() bool {
 	}
 }
 
-type toolOutputRequested struct {
-	text   string
-	result chan string
-}
-
-func (toolOutputRequested) ownerControlMessage() {}
-func (a *Agent) clipAggregate(out string) string {
-	if a.owner == nil {
-		return a.clipAggregateOwned(out)
-	}
-	a.ensureRun()
-	request := toolOutputRequested{text: out, result: make(chan string, 1)}
-	select {
-	case a.owner.control <- request:
-	case <-a.owner.done:
-		return "session closed before tool output projection"
-	}
-	select {
-	case text := <-request.result:
-		return text
-	case <-a.owner.done:
-		return "session closed before tool output projection"
-	}
-}
-
 type toolsDiscoveredPrepared struct {
 	version uint64
 	schemas []session.ToolSchema

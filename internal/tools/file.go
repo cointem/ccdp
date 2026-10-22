@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"ccdp/internal/execution"
 	"ccdp/internal/fsops"
 )
 
@@ -19,149 +20,183 @@ type ReadTool struct{}
 func NewReadTool() *ReadTool   { return &ReadTool{} }
 func (*ReadTool) Name() string { return "Read" }
 func (*ReadTool) Description() string {
-	return "Read UTF-8 text with line numbers. offset is a 1-based LINE number, limit a LINE count (maximum 2000). Results include actual range and next_offset. Use Glob/LS for paths and Rg for text search."
+	return "Read UTF-8 text with line numbers. Relative paths start at the session workspace, not a previous Bash command's cwd; use absolute paths for Bash-created files and log_path. Paths are literal: shell variables and ~ are not expanded. offset is a 1-based LINE number, limit a LINE count (maximum 2000); do not pass Process byte offsets here. Results include actual range and next_offset. Use Glob/LS for paths and Rg for text search."
 }
 func (*ReadTool) Parameters() map[string]any {
-	return map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "offset": map[string]any{"type": "integer", "minimum": 1}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 2000}}, "required": []string{"file_path"}}
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "offset": map[string]any{"default": 1, "type": "integer", "minimum": 1}, "limit": map[string]any{"default": 2000, "type": "integer", "minimum": 1, "maximum": 2000}}, "required": []string{"file_path"}}
 }
-func (*ReadTool) Run(ctx *Context) (string, error) {
-	if e := ctx.checkResources(); e != nil {
-		return "", e
-	}
-	if _, ok := ctx.Args["unit"]; ok {
-		return "", fmt.Errorf("Read: unit is no longer supported; offset and limit always use lines")
-	}
-	raw := StringArg(ctx.Args, "file_path", "")
-	if raw == "" {
-		return "", fmt.Errorf("Read: missing file_path")
-	}
-	path, e := ctx.ResolveRead(raw)
-	if e != nil {
-		return "", e
-	}
-	offset, e := IntArgChecked(ctx.Args, "offset", 1)
-	if e != nil || offset < 1 {
-		return "", fmt.Errorf("Read: offset must be a positive line number")
-	}
-	limit, e := IntArgChecked(ctx.Args, "limit", 2000)
-	if e != nil || limit < 1 || limit > 2000 {
-		return "", fmt.Errorf("Read: limit must be 1..2000 lines")
-	}
-	state, e := ctx.fileStateForUse()
-	if e != nil {
-		return "", e
-	}
-	f, e := fsops.OpenAuthorizedRegular(ctx.ReadRoot, path, ctx.ResolveRead)
-	if e != nil {
-		return "", e
-	}
-	defer f.Close()
-	info, e := f.Stat()
-	if e != nil {
-		return "", e
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("Read: not a regular file; use LS for directories")
-	}
-	budget := min(50*1024, ctx.readLimit(), ctx.outputLimit())
-	if budget < 256 {
-		return "", fmt.Errorf("Read: output budget too small (minimum 256 bytes)")
-	}
-	r := bufio.NewReaderSize(f, budget)
-	line := 1
-	for line < offset {
-		if err := ctx.checkResources(); err != nil {
-			return "", err
+func (*ReadTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
+		if e := ctx.checkResources(); e != nil {
+			return "", e
 		}
-		_, e = r.ReadSlice('\n')
-		if e == bufio.ErrBufferFull {
-			continue
+		if _, ok := ctx.Args["unit"]; ok {
+			return "", fmt.Errorf("Read: unit is no longer supported; offset and limit always use lines")
 		}
-		if e == io.EOF {
-			return "", fmt.Errorf("Read: offset %d is beyond EOF", offset)
+		raw := StringArg(ctx.Args, "file_path", "")
+		if raw == "" {
+			return "", fmt.Errorf("Read: missing file_path")
 		}
+		path, e := ctx.ResolveRead(raw)
 		if e != nil {
 			return "", e
 		}
-		line++
-	}
-	var out strings.Builder
-	count := 0
-	eof := false
-	longLine := false
-	budgetStopped := false
-	for count < limit {
+		offset, e := IntArgChecked(ctx.Args, "offset", 1)
+		if e != nil || offset < 1 {
+			return "", fmt.Errorf("Read: offset must be a positive line number")
+		}
+		limit, e := IntArgChecked(ctx.Args, "limit", 2000)
+		if e != nil || limit < 1 || limit > 2000 {
+			return "", fmt.Errorf("Read: limit must be 1..2000 lines")
+		}
+		state, e := ctx.fileStateForUse()
+		if e != nil {
+			return "", e
+		}
+		f, e := fsops.OpenAuthorizedRegular(ctx.ReadRoot, path, ctx.ResolveRead)
+		if e != nil {
+			return "", e
+		}
+		defer f.Close()
+		info, e := f.Stat()
+		if e != nil {
+			return "", e
+		}
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("Read: not a regular file; use LS for directories")
+		}
+		budget := min(50*1024, ctx.readLimit(), ctx.outputLimit())
+		if budget < 256 {
+			return "", fmt.Errorf("Read: output budget too small (minimum 256 bytes)")
+		}
+		r := bufio.NewReaderSize(f, budget)
+		line := 1
+		for line < offset {
+			if err := ctx.checkResources(); err != nil {
+				return "", err
+			}
+			_, e = r.ReadSlice('\n')
+			if e == bufio.ErrBufferFull {
+				continue
+			}
+			if e == io.EOF {
+				return "", fmt.Errorf("Read: offset %d is beyond EOF", offset)
+			}
+			if e != nil {
+				return "", e
+			}
+			line++
+		}
+		var out strings.Builder
+		lines := make([]map[string]any, 0)
+		count := 0
+		eof := false
+		longLine := false
+		var preview string
+		budgetStopped := false
+		for count < limit {
+			if err := ctx.checkResources(); err != nil {
+				return "", err
+			}
+			part, err := r.ReadSlice('\n')
+			if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
+				return "", err
+			}
+			if err == bufio.ErrBufferFull {
+				if count == 0 {
+					longLine = true
+					preview = string(part)
+				} else {
+					budgetStopped = true
+				}
+				break
+			}
+			if len(part) == 0 && err == io.EOF {
+				eof = true
+				break
+			}
+			if !utf8.Valid(part) || bytes.IndexByte(part, 0) >= 0 {
+				return "", fmt.Errorf("Read: binary or unsupported text encoding; use an appropriate binary tool")
+			}
+			decorated := fmt.Sprintf("%d\t%s", line, part)
+			if !strings.HasSuffix(decorated, "\n") {
+				decorated += "\n"
+			}
+			if out.Len()+len(decorated) > budget-180 {
+				budgetStopped = true
+				if count == 0 {
+					longLine = true
+					preview = string(part)
+				}
+				break
+			}
+			out.WriteString(decorated)
+			lines = append(lines, map[string]any{"number": line, "text": strings.TrimSuffix(string(part), "\n")})
+			count++
+			line++
+			if err == io.EOF {
+				eof = true
+				break
+			}
+		}
+		if !eof && !longLine && !budgetStopped {
+			_, err := r.Peek(1)
+			eof = err == io.EOF
+			if err != nil && err != io.EOF {
+				return "", err
+			}
+		}
+		if count == 0 && eof && offset > 1 {
+			return "", fmt.Errorf("Read: offset %d is beyond EOF", offset)
+		}
 		if err := ctx.checkResources(); err != nil {
 			return "", err
 		}
-		part, err := r.ReadSlice('\n')
-		if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
-			return "", err
+		after, e := f.Stat()
+		if e != nil {
+			return "", e
 		}
-		if err == bufio.ErrBufferFull {
-			longLine = true
-			break
+		if fsops.FromInfo(info) != fsops.FromInfo(after) {
+			return "", fmt.Errorf("Read: file changed while reading; retry the requested region")
 		}
-		if len(part) == 0 && err == io.EOF {
-			eof = true
-			break
+		if count > 0 || eof {
+			state.MarkVersion(path, fsops.FromInfo(after))
 		}
-		if !utf8.Valid(part) || bytes.IndexByte(part, 0) >= 0 {
-			return "", fmt.Errorf("Read: binary or unsupported text encoding; use an appropriate binary tool")
+		data := map[string]any{"path": path, "lines": lines, "offset": offset, "end": line - 1, "next_offset": line, "eof": eof, "truncated": !eof}
+		if count == 0 && eof {
+			ctx.recordData(data, false)
+			return "[empty file; EOF]", nil
 		}
-		decorated := fmt.Sprintf("%d\t%s", line, part)
-		if !strings.HasSuffix(decorated, "\n") {
-			decorated += "\n"
-		}
-		if out.Len()+len(decorated) > budget-180 {
-			budgetStopped = true
-			if count == 0 {
-				longLine = true
+		if longLine {
+			// Preview is separate from complete lines and does not advance the
+			// line cursor or mark the file as successfully observed for editing.
+			note := fmt.Sprintf("[line %d exceeds output budget; preview only. Use Bash for bounded extraction: sed -n '%dp' %s | head -c 4096. Read offset=%d skips this line.]", line, line, execution.QuoteArg(path), line+1)
+			if len(note)+32 > budget {
+				note = fmt.Sprintf("[line %d exceeds output budget; preview only. Use Bash to extract this line in bounded chunks; Read offset=%d skips it.]", line, line+1)
 			}
-			break
+			preview = preview[:min(len(preview), 2000, max(0, budget-len(note)-32))]
+			valid := 0
+			for valid < len(preview) && utf8.FullRuneInString(preview[valid:]) {
+				r, width := utf8.DecodeRuneInString(preview[valid:])
+				if r == 0 || r == utf8.RuneError && width == 1 {
+					return "", fmt.Errorf("Read: binary or unsupported text encoding; use an appropriate binary tool")
+				}
+				valid += width
+			}
+			preview = preview[:valid]
+			data["preview"] = preview
+			if preview != "" {
+				fmt.Fprintf(&out, "%d\t%s\n", line, preview)
+			}
+			out.WriteString(note)
+		} else if eof {
+			fmt.Fprintf(&out, "[lines %d-%d; EOF]", offset, line-1)
+		} else {
+			fmt.Fprintf(&out, "[lines %d-%d; more content; next_offset=%d; continue with Read offset=%d (lines)]", offset, line-1, line, line)
 		}
-		out.WriteString(decorated)
-		count++
-		line++
-		if err == io.EOF {
-			eof = true
-			break
-		}
-	}
-	if !eof && !longLine && !budgetStopped {
-		_, err := r.Peek(1)
-		eof = err == io.EOF
-		if err != nil && err != io.EOF {
-			return "", err
-		}
-	}
-	if count == 0 && eof && offset > 1 {
-		return "", fmt.Errorf("Read: offset %d is beyond EOF", offset)
-	}
-	if err := ctx.checkResources(); err != nil {
-		return "", err
-	}
-	after, e := f.Stat()
-	if e != nil {
-		return "", e
-	}
-	if fsops.FromInfo(info) != fsops.FromInfo(after) {
-		return "", fmt.Errorf("Read: file changed while reading; retry the requested region")
-	}
-	if count > 0 || eof {
-		state.MarkVersion(path, fsops.FromInfo(after))
-	}
-	if count == 0 && eof {
-		return "[empty file; EOF]", nil
-	}
-	if longLine {
-		fmt.Fprintf(&out, "[line %d exceeds output budget; content incomplete. Use Bash for targeted extraction; this Read cannot advance through that line.]", line)
-	} else if eof {
-		fmt.Fprintf(&out, "[lines %d-%d; EOF]", offset, line-1)
-	} else {
-		fmt.Fprintf(&out, "[lines %d-%d; more content; next_offset=%d]", offset, line-1, line)
-	}
-	return out.String(), nil
+		ctx.recordData(data, !eof)
+		return out.String(), nil
+	})
 }
 
 type WriteTool struct{}
@@ -172,73 +207,75 @@ func (*WriteTool) Description() string {
 	return "Create a file (mode=create, default), or explicitly replace an existing file (mode=replace). Replacement requires a successful recent Read of the current file version; a partial Read is sufficient. For local changes use Edit."
 }
 func (*WriteTool) Parameters() map[string]any {
-	return map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}, "mode": map[string]any{"type": "string", "enum": []string{"create", "replace"}}}, "required": []string{"file_path", "content"}}
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}, "mode": map[string]any{"default": "create", "type": "string", "enum": []string{"create", "replace"}}}, "required": []string{"file_path", "content"}}
 }
-func (*WriteTool) Run(ctx *Context) (output string, runErr error) {
-	if e := ctx.checkResources(); e != nil {
-		return "", e
-	}
-	raw := StringArg(ctx.Args, "file_path", "")
-	if raw == "" {
-		return "", fmt.Errorf("Write: missing file_path")
-	}
-	content, ok := ctx.Args["content"].(string)
-	if !ok {
-		return "", fmt.Errorf("Write: content must be explicitly supplied")
-	}
-	mode := StringArg(ctx.Args, "mode", "create")
-	if mode != "create" && mode != "replace" {
-		return "", fmt.Errorf("Write: mode must be create or replace")
-	}
-	path, e := ctx.ResolveWrite(raw)
-	if e != nil {
-		return "", e
-	}
-	state, e := ctx.fileStateForUse()
-	if e != nil {
-		return "", e
-	}
-	lock, e := fsops.LockPath(path)
-	if e != nil {
-		return "", e
-	}
-	defer lock.Close()
-	root, relative, e := ctx.openWriteRoot(path)
-	if e != nil {
-		return "", e
-	}
-	defer root.Close()
-	var expected *fsops.Version
-	if mode == "create" {
-		if _, e = root.Lstat(relative); e == nil {
-			return "", fmt.Errorf("Write: file exists; use mode=replace after Read, or Edit")
-		} else if !os.IsNotExist(e) {
+func (*WriteTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (output string, runErr error) {
+		if e := ctx.checkResources(); e != nil {
 			return "", e
 		}
-	} else {
-		v, e := state.ObservedVersion(path)
+		raw := StringArg(ctx.Args, "file_path", "")
+		if raw == "" {
+			return "", fmt.Errorf("Write: missing file_path")
+		}
+		content, ok := ctx.Args["content"].(string)
+		if !ok {
+			return "", fmt.Errorf("Write: content must be explicitly supplied")
+		}
+		mode := StringArg(ctx.Args, "mode", "create")
+		if mode != "create" && mode != "replace" {
+			return "", fmt.Errorf("Write: mode must be create or replace")
+		}
+		path, e := ctx.ResolveWrite(raw)
 		if e != nil {
 			return "", e
 		}
-		expected = &v
-	}
-	if ctx.BeforeWrite != nil {
-		finish, e := ctx.BeforeWrite(path, nil)
+		state, e := ctx.fileStateForUse()
 		if e != nil {
 			return "", e
 		}
-		defer func() {
-			if runErr == nil {
-				runErr = finish()
+		lock, e := fsops.LockPath(path)
+		if e != nil {
+			return "", e
+		}
+		defer lock.Close()
+		root, relative, e := ctx.openWriteRoot(path)
+		if e != nil {
+			return "", e
+		}
+		defer root.Close()
+		var expected *fsops.Version
+		if mode == "create" {
+			if _, e = root.Lstat(relative); e == nil {
+				return "", fmt.Errorf("Write: file exists; use mode=replace after Read, or Edit")
+			} else if !os.IsNotExist(e) {
+				return "", e
 			}
-		}()
-	}
-	version, e := fsops.PublishAt(ctx.Context, root, relative, []byte(content), 0644, expected)
-	if e != nil {
-		return "", e
-	}
-	state.MarkVersion(path, version)
-	return fmt.Sprintf("%s: wrote %d bytes (%s)", path, len(content), mode), nil
+		} else {
+			v, e := state.ObservedVersion(path)
+			if e != nil {
+				return "", e
+			}
+			expected = &v
+		}
+		if ctx.BeforeWrite != nil {
+			finish, e := ctx.BeforeWrite(path, nil)
+			if e != nil {
+				return "", e
+			}
+			defer func() {
+				if runErr == nil {
+					runErr = finish()
+				}
+			}()
+		}
+		version, e := fsops.PublishAt(ctx.Context, root, relative, []byte(content), 0644, expected)
+		if e != nil {
+			return "", e
+		}
+		state.MarkVersion(path, version)
+		return fmt.Sprintf("%s: wrote %d bytes (%s)", path, len(content), mode), nil
+	})
 }
 
 type EditTool struct{}
@@ -251,105 +288,107 @@ func (*EditTool) Description() string {
 func (*EditTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "edits": map[string]any{"type": "array", "minItems": 1, "items": map[string]any{"type": "object", "properties": map[string]any{"old_text": map[string]any{"type": "string", "minLength": 1}, "new_text": map[string]any{"type": "string"}}, "required": []string{"old_text", "new_text"}}}}, "required": []string{"file_path", "edits"}}
 }
-func (*EditTool) Run(ctx *Context) (output string, runErr error) {
-	if e := ctx.checkResources(); e != nil {
-		return "", e
-	}
-	raw := StringArg(ctx.Args, "file_path", "")
-	if raw == "" {
-		return "", fmt.Errorf("Edit: missing file_path")
-	}
-	path, e := ctx.ResolveWrite(raw)
-	if e != nil {
-		return "", e
-	}
-	edits, ok := ctx.Args["edits"].([]any)
-	if !ok || len(edits) == 0 {
-		return "", fmt.Errorf("Edit: supply edits=[{old_text,new_text}]; legacy old_string/new_string parameters are unsupported")
-	}
-	state, e := ctx.fileStateForUse()
-	if e != nil {
-		return "", e
-	}
-	lock, e := fsops.LockPath(path)
-	if e != nil {
-		return "", e
-	}
-	defer lock.Close()
-	root, relative, e := ctx.openWriteRoot(path)
-	if e != nil {
-		return "", e
-	}
-	defer root.Close()
-	data, version, e := fsops.ReadAt(root, relative, 32<<20)
-	if e != nil {
-		return "", e
-	}
-	if !utf8.Valid(data) {
-		return "", fmt.Errorf("Edit: unsupported text encoding")
-	}
-	content := string(data)
-	type replacement struct {
-		start, end int
-		old, next  string
-	}
-	var replacements []replacement
-	for i, item := range edits {
-		m, ok := item.(map[string]any)
-		if !ok {
-			return "", fmt.Errorf("Edit: invalid entry %d", i+1)
+func (*EditTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (output string, runErr error) {
+		if e := ctx.checkResources(); e != nil {
+			return "", e
 		}
-		old, ok := m["old_text"].(string)
-		next, nok := m["new_text"].(string)
-		if !ok || old == "" || !nok {
-			return "", fmt.Errorf("Edit: entry %d requires nonempty old_text and explicit new_text", i+1)
+		raw := StringArg(ctx.Args, "file_path", "")
+		if raw == "" {
+			return "", fmt.Errorf("Edit: missing file_path")
 		}
-		at := strings.Index(content, old)
-		if at < 0 {
-			return "", fmt.Errorf("Edit: old_text in entry %d not found; read the current region", i+1)
-		}
-		if strings.Contains(content[at+1:], old) {
-			return "", fmt.Errorf("Edit: old_text in entry %d is not unique; include more context", i+1)
-		}
-		replacements = append(replacements, replacement{at, at + len(old), old, next})
-	}
-	sort.Slice(replacements, func(i, j int) bool { return replacements[i].start < replacements[j].start })
-	for i := 1; i < len(replacements); i++ {
-		if replacements[i].start < replacements[i-1].end {
-			return "", fmt.Errorf("Edit: overlapping replacements; merge them into one")
-		}
-	}
-	var b strings.Builder
-	pos := 0
-	var summary strings.Builder
-	for _, r := range replacements {
-		b.WriteString(content[pos:r.start])
-		b.WriteString(r.next)
-		pos = r.end
-		fmt.Fprintf(&summary, "%s:%d\n%s\n", path, 1+strings.Count(content[:r.start], "\n"), diffSummary(r.old, r.next))
-	}
-	b.WriteString(content[pos:])
-	updated := b.String()
-	if updated == content {
-		return "No changes.", nil
-	}
-	if ctx.BeforeWrite != nil {
-		finish, e := ctx.BeforeWrite(path, data)
+		path, e := ctx.ResolveWrite(raw)
 		if e != nil {
 			return "", e
 		}
-		defer func() {
-			if runErr == nil {
-				runErr = finish()
+		edits, ok := ctx.Args["edits"].([]any)
+		if !ok || len(edits) == 0 {
+			return "", fmt.Errorf("Edit: supply edits=[{old_text,new_text}]; legacy old_string/new_string parameters are unsupported")
+		}
+		state, e := ctx.fileStateForUse()
+		if e != nil {
+			return "", e
+		}
+		lock, e := fsops.LockPath(path)
+		if e != nil {
+			return "", e
+		}
+		defer lock.Close()
+		root, relative, e := ctx.openWriteRoot(path)
+		if e != nil {
+			return "", e
+		}
+		defer root.Close()
+		data, version, e := fsops.ReadAt(root, relative, 32<<20)
+		if e != nil {
+			return "", e
+		}
+		if !utf8.Valid(data) {
+			return "", fmt.Errorf("Edit: unsupported text encoding")
+		}
+		content := string(data)
+		type replacement struct {
+			start, end int
+			old, next  string
+		}
+		var replacements []replacement
+		for i, item := range edits {
+			m, ok := item.(map[string]any)
+			if !ok {
+				return "", fmt.Errorf("Edit: invalid entry %d", i+1)
 			}
-		}()
-	}
-	version, e = fsops.PublishAt(ctx.Context, root, relative, []byte(updated), 0644, &version)
-	if e != nil {
-		return "", e
-	}
-	state.MarkVersion(path, version)
-	return boundedToolString(ctx, summary.String()), nil
+			old, ok := m["old_text"].(string)
+			next, nok := m["new_text"].(string)
+			if !ok || old == "" || !nok {
+				return "", fmt.Errorf("Edit: entry %d requires nonempty old_text and explicit new_text", i+1)
+			}
+			at := strings.Index(content, old)
+			if at < 0 {
+				return "", fmt.Errorf("Edit: old_text in entry %d not found; read the current region", i+1)
+			}
+			if strings.Contains(content[at+1:], old) {
+				return "", fmt.Errorf("Edit: old_text in entry %d is not unique; include more context", i+1)
+			}
+			replacements = append(replacements, replacement{at, at + len(old), old, next})
+		}
+		sort.Slice(replacements, func(i, j int) bool { return replacements[i].start < replacements[j].start })
+		for i := 1; i < len(replacements); i++ {
+			if replacements[i].start < replacements[i-1].end {
+				return "", fmt.Errorf("Edit: overlapping replacements; merge them into one")
+			}
+		}
+		var b strings.Builder
+		pos := 0
+		var summary strings.Builder
+		for _, r := range replacements {
+			b.WriteString(content[pos:r.start])
+			b.WriteString(r.next)
+			pos = r.end
+			fmt.Fprintf(&summary, "%s:%d\n%s\n", path, 1+strings.Count(content[:r.start], "\n"), diffSummary(r.old, r.next))
+		}
+		b.WriteString(content[pos:])
+		updated := b.String()
+		if updated == content {
+			return "No changes.", nil
+		}
+		if ctx.BeforeWrite != nil {
+			finish, e := ctx.BeforeWrite(path, data)
+			if e != nil {
+				return "", e
+			}
+			defer func() {
+				if runErr == nil {
+					runErr = finish()
+				}
+			}()
+		}
+		version, e = fsops.PublishAt(ctx.Context, root, relative, []byte(updated), 0644, &version)
+		if e != nil {
+			return "", e
+		}
+		state.MarkVersion(path, version)
+		return boundedToolString(ctx, summary.String()), nil
+	})
 }
 
 func appendBounded(sb *strings.Builder, value string, limit int) {

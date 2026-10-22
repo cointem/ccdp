@@ -31,8 +31,6 @@ type State struct {
 	Workflow          session.WorkflowState
 	GoalAccountingIDs map[string]bool
 	Goal              *protocol.Goal
-	MemoryText        string
-	MemorySeen        bool
 	Tasks             []session.Task
 	CatalogVersion    uint64
 	History           []messages.Message
@@ -213,6 +211,9 @@ func (p *State) FinalizeRecovery() {
 	// unknown.  It is never automatically re-run by this layer.
 	for _, key := range p.orderedStartedIDs() {
 		started := p.startedTools[key]
+		if started.ResultTarget == "program" {
+			continue
+		}
 		if _, finished := p.finishedTools[key]; finished {
 			continue
 		}
@@ -225,8 +226,27 @@ func (p *State) FinalizeRecovery() {
 		if started.Call.CallID == "" {
 			continue
 		}
-		unknown := messages.Message{Role: messages.RoleTool, ToolCallID: key.CallID,
+		unknown := messages.Message{Role: messages.RoleTool, ToolCallID: key.CallID, ToolStatus: "unknown",
 			Content: "Error: tool result unknown (the tool may have executed before the session stopped); it will not be re-run automatically"}
+		var children []string
+		for childKey, child := range p.startedTools {
+			if childKey.TurnID == key.TurnID && childKey.StepID == key.StepID && child.ParentCallID == key.CallID {
+				status := "unknown"
+				if finished, ok := p.finishedTools[childKey]; ok {
+					status = finished.Status
+				}
+				children = append(children, childKey.CallID+"="+status)
+			}
+		}
+		for childKey, child := range p.finishedTools {
+			if _, started := p.startedTools[childKey]; !started && childKey.TurnID == key.TurnID && childKey.StepID == key.StepID && child.ParentCallID == key.CallID {
+				children = append(children, childKey.CallID+"="+child.Status)
+			}
+		}
+		if len(children) > 0 {
+			sort.Strings(children)
+			unknown.Content += "\nInternal calls (inspect the transcript before retrying): " + strings.Join(children, ", ")
+		}
 		unknown.ID = messages.StableID("unknown-tool-result", key)
 		p.insertRecoveredToolResult(key, unknown)
 	}
@@ -242,14 +262,33 @@ func (p *State) FinalizeRecovery() {
 		if !ok {
 			continue
 		}
+		if finished.ResultTarget == "program" {
+			continue
+		}
 		result := finished.Result
 		content := result.Text
 		if result.Status != "success" && result.Status != "ok" && !strings.HasPrefix(content, "Error: ") {
 			content = "Error: " + content
 		}
-		message := messages.Message{Role: messages.RoleTool, ToolCallID: key.CallID, Content: content}
+		message := messages.Message{Role: messages.RoleTool, ToolCallID: key.CallID, ToolStatus: result.Status, Content: content, OutputRef: outputReference(finished)}
+		message.DisplayTruncated = result.DisplayTruncated || finished.DisplayTruncated
+		message.DataError = result.DataError
+		if message.DataError == "" {
+			message.DataError = finished.DataError
+		}
 		message.ID = toolResultMessageID(key, result.Text, result.Status)
 		p.insertRecoveredToolResult(key, message)
 		p.projected[key] = true
 	}
+}
+
+func outputReference(finished session.ToolFinished) *messages.OutputReference {
+	ref := finished.RawOutput
+	if ref == nil {
+		ref = finished.Result.Blob
+	}
+	if ref == nil {
+		return nil
+	}
+	return &messages.OutputReference{Hash: ref.Hash, Size: ref.Size, MediaType: ref.MediaType}
 }

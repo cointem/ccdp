@@ -97,7 +97,22 @@ func searchRg(ctx *Context, r *rgRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return formatRgResult(lines, r, truncated), nil
+	page := newRgPage(lines, r, truncated)
+	text := formatRgPage(page, r)
+	if ctx.dataResult != nil {
+		entries := make([]map[string]any, 0, len(page.lines))
+		for _, l := range page.lines {
+			entry := map[string]any{"path": l.file, "line": l.line, "text": l.text, "match": l.match}
+			if r.outputMode == rgModeCount {
+				entry["count"] = l.line
+				delete(entry, "line")
+			}
+			entries = append(entries, entry)
+		}
+		incomplete := page.truncated || len(text) > ctx.outputLimit()
+		ctx.recordData(map[string]any{"mode": r.outputMode, "entries": entries, "offset": r.offset, "next_offset": page.nextOffset, "truncated": incomplete}, incomplete)
+	}
+	return text, nil
 }
 
 func clipLine(s string) string {
@@ -349,17 +364,29 @@ func translateFileGlob(g string) string {
 	anchored := strings.Contains(strings.TrimSuffix(g, "/"), "/")
 	var parts []string
 	for _, alt := range expandBraces(g) {
-		parts = append(parts, regexp.QuoteMeta(alt))
+		var branch strings.Builder
+		segments := strings.Split(alt, "/")
+		for i, segment := range segments {
+			if segment == "**" && i < len(segments)-1 {
+				// A complete **/ component includes zero directory levels.
+				branch.WriteString("(?:[^/]+/)*")
+				continue
+			}
+			body := regexp.QuoteMeta(segment)
+			body = strings.ReplaceAll(body, regexp.QuoteMeta("**"), "\x00")
+			body = strings.ReplaceAll(body, regexp.QuoteMeta("*"), "[^/]*")
+			body = strings.ReplaceAll(body, regexp.QuoteMeta("?"), "[^/]")
+			branch.WriteString(strings.ReplaceAll(body, "\x00", ".*"))
+			if i < len(segments)-1 {
+				branch.WriteByte('/')
+			}
+		}
+		parts = append(parts, branch.String())
 	}
 	body := strings.Join(parts, "|")
 	if len(parts) > 1 {
 		body = "(?:" + body + ")"
 	}
-	// Ordered: `**` spans separators, `*` and `?` do not.
-	body = strings.ReplaceAll(body, regexp.QuoteMeta("**"), "\x00")
-	body = strings.ReplaceAll(body, regexp.QuoteMeta("*"), "[^/]*")
-	body = strings.ReplaceAll(body, regexp.QuoteMeta("?"), "[^/]")
-	body = strings.ReplaceAll(body, "\x00", ".*")
 	if anchored {
 		return "^" + body + "$"
 	}
@@ -432,44 +459,75 @@ func rgTypeNames() []string {
 
 // ---------- rendering ----------
 
-func formatRgResult(lines []rgLine, r *rgRequest, truncated bool) string {
+// rgPage is shared by text and program results. Content offsets count matching
+// source lines, so context and multiple submatches on one line do not advance it.
+type rgPage struct {
+	lines      []rgLine
+	matches    int
+	nextOffset int
+	truncated  bool
+	remaining  int
+}
+
+func newRgPage(lines []rgLine, r *rgRequest, truncated bool) rgPage {
+	page := rgPage{truncated: truncated}
+	var total int
+	switch r.outputMode {
+	case rgModeFiles, rgModeCount:
+		entries := rgFileEntries(lines)
+		if r.outputMode == rgModeCount {
+			entries = rgCountEntries(lines)
+		}
+		page.lines = applyRgWindow(entries, r)
+		page.matches = len(page.lines)
+		total = len(entries)
+		page.truncated = page.truncated || total > r.fetchLines()
+	default:
+		var omitted bool
+		page.lines, omitted = rgContentWindow(lines, r)
+		page.matches = rgMatchedLineCount(page.lines)
+		total = rgMatchedLineCount(lines)
+		page.truncated = page.truncated || omitted
+	}
+	page.nextOffset = r.offset + page.matches
+	page.remaining = max(0, total-page.nextOffset)
+	return page
+}
+
+func rgMatchedLineCount(lines []rgLine) int {
+	count := 0
+	var previous rgLine
+	for _, line := range lines {
+		if !line.match {
+			continue
+		}
+		if count == 0 || line.file != previous.file || line.line != previous.line {
+			count++
+		}
+		previous = line
+	}
+	return count
+}
+
+func formatRgPage(page rgPage, r *rgRequest) string {
 	var sb strings.Builder
 	switch r.outputMode {
 	case rgModeFiles:
-		entries := rgFileEntries(lines)
-		windowed := applyRgWindow(entries, r)
-		fmt.Fprintf(&sb, "Found %d file(s):\n", len(windowed))
-		for _, l := range windowed {
+		fmt.Fprintf(&sb, "Found %d file(s):\n", len(page.lines))
+		for _, l := range page.lines {
 			fmt.Fprintf(&sb, "%s\n", l.file)
 		}
-		truncated = truncated || len(entries) > r.fetchLines()
-		if truncated {
-			writeTruncationNote(&sb, max(0, len(entries)-r.offset-len(windowed)))
-		}
 	case rgModeCount:
-		entries := rgCountEntries(lines)
-		windowed := applyRgWindow(entries, r)
-		fmt.Fprintf(&sb, "Matches in %d file(s):\n", len(windowed))
-		for _, l := range windowed {
+		fmt.Fprintf(&sb, "Matches in %d file(s):\n", len(page.lines))
+		for _, l := range page.lines {
 			fmt.Fprintf(&sb, "%s:%d\n", l.file, l.line)
 		}
-		truncated = truncated || len(entries) > r.fetchLines()
-		if truncated {
-			writeTruncationNote(&sb, max(0, len(entries)-r.offset-len(windowed)))
-		}
 	default:
-		windowed, omitted := rgContentWindow(lines, r)
-		matches := 0
-		for _, l := range windowed {
-			if l.match {
-				matches++
-			}
-		}
-		fmt.Fprintf(&sb, "%d match(es):\n", matches)
+		fmt.Fprintf(&sb, "%d match(es):\n", page.matches)
 		withContext := r.contextLines() > 0
 		prevFile, prevLine := "", -1
-		for _, l := range windowed {
-			if withContext && prevLine >= 0 && (l.file != prevFile || l.line != prevLine+1) {
+		for _, l := range page.lines {
+			if withContext && prevLine >= 0 && (l.file != prevFile || (l.line != prevLine && l.line != prevLine+1)) {
 				sb.WriteString("--\n")
 			}
 			sep := ":"
@@ -479,10 +537,9 @@ func formatRgResult(lines []rgLine, r *rgRequest, truncated bool) string {
 			fmt.Fprintf(&sb, "%s%s%d%s%s\n", l.file, sep, l.line, sep, l.text)
 			prevFile, prevLine = l.file, l.line
 		}
-		truncated = truncated || omitted
-		if truncated {
-			writeTruncationNote(&sb, max(0, len(lines)-r.offset-len(windowed)))
-		}
+	}
+	if page.truncated {
+		writeTruncationNote(&sb, page.remaining)
 	}
 	return sb.String()
 }
@@ -550,13 +607,17 @@ func rgContentWindow(lines []rgLine, r *rgRequest) ([]rgLine, bool) {
 		limit = rgDefaultMaxLines
 	}
 	seen := 0
+	var previous rgLine
 	first, last := -1, -1
 	omitted := false
 	for i, l := range lines {
 		if !l.match {
 			continue
 		}
-		seen++
+		if seen == 0 || l.file != previous.file || l.line != previous.line {
+			seen++
+		}
+		previous = l
 		if seen <= r.offset {
 			continue
 		}

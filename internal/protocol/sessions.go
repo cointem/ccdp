@@ -2,8 +2,6 @@ package protocol
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"time"
 )
@@ -69,19 +67,21 @@ func (r RunView) Active() bool {
 
 // Item identity is session-local and stable across deltas and final commit.
 type TranscriptItem struct {
-	ID         string          `json:"id"`
-	PreviousID string          `json:"previous_id,omitempty"`
-	Kind       string          `json:"kind"`
-	TurnID     TurnID          `json:"turn_id,omitempty"`
-	StepID     StepID          `json:"step_id,omitempty"`
-	CallID     CallID          `json:"call_id,omitempty"`
-	Text       string          `json:"text,omitempty"`
-	TextOffset int64           `json:"text_offset,omitempty"`
-	Tool       string          `json:"tool,omitempty"`
-	Args       json.RawMessage `json:"args,omitempty"`
-	Status     string          `json:"status,omitempty"`
-	DurationMs int64           `json:"duration_ms,omitempty"`
-	Truncated  bool            `json:"truncated,omitempty"`
+	ParentCallID CallID          `json:"parent_call_id,omitempty"`
+	ChildIndex   int             `json:"child_index,omitempty"`
+	ID           string          `json:"id"`
+	PreviousID   string          `json:"previous_id,omitempty"`
+	Kind         string          `json:"kind"`
+	TurnID       TurnID          `json:"turn_id,omitempty"`
+	StepID       StepID          `json:"step_id,omitempty"`
+	CallID       CallID          `json:"call_id,omitempty"`
+	Text         string          `json:"text,omitempty"`
+	TextOffset   int64           `json:"text_offset,omitempty"`
+	Tool         string          `json:"tool,omitempty"`
+	Args         json.RawMessage `json:"args,omitempty"`
+	Status       string          `json:"status,omitempty"`
+	DurationMs   int64           `json:"duration_ms,omitempty"`
+	Truncated    bool            `json:"truncated,omitempty"`
 }
 
 type TranscriptPage struct {
@@ -132,7 +132,5 @@ type SessionDirectory interface {
 
 // InputMessageID is the stable transcript identity of an admitted input.
 func InputMessageID(id InputID) string {
-	data, _ := json.Marshal(string(id))
-	sum := sha256.Sum256(data)
-	return "input-message-" + hex.EncodeToString(sum[:12])
+	return "input-message-" + string(id)
 }

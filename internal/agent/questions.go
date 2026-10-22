@@ -22,32 +22,36 @@ func (*askUserQuestionTool) Parameters() map[string]any {
 	return schema
 }
 
-func (t *askUserQuestionTool) Run(ctx *tools.Context) (string, error) {
-	raw, err := json.Marshal(ctx.Args)
-	if err != nil {
-		return "", err
-	}
-	var request protocol.QuestionRequest
-	if err := json.Unmarshal(raw, &request); err != nil {
-		return "", err
-	}
-	if err := protocol.ValidateQuestions(request.Questions); err != nil {
-		return "", err
-	}
-	if t.ag.children.childState != nil && t.ag.children.childState.nonInteractive {
-		return "", errors.New("AskUserQuestion is unavailable in a non-interactive child; report the clarification needed to the parent")
-	}
-	request.ID = nextRuntimeID("question")
-	result := t.ag.awaitDecision(&decisionRequest{kind: decisionQuestion, ctx: ctx.Context, question: protocol.CloneQuestionRequest(&request)})
-	if result.err != nil {
-		return "", result.err
-	}
-	data, err := json.Marshal(struct {
-		Questions []protocol.Question       `json:"questions"`
-		Answers   []protocol.QuestionAnswer `json:"answers,omitempty"`
-		Cancelled bool                      `json:"cancelled,omitempty"`
-	}{request.Questions, result.answer.Answers, result.answer.Cancelled})
-	return string(data), err
+func (t *askUserQuestionTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) {
+		raw, err := json.Marshal(ctx.Args)
+		if err != nil {
+			return "", err
+		}
+		var request protocol.QuestionRequest
+		if err := json.Unmarshal(raw, &request); err != nil {
+			return "", err
+		}
+		if err := protocol.ValidateQuestions(request.Questions); err != nil {
+			return "", err
+		}
+		if t.ag.children.childState != nil && t.ag.children.childState.nonInteractive {
+			return "", errors.New("AskUserQuestion is unavailable in a non-interactive child; report the clarification needed to the parent")
+		}
+		request.ID = nextRuntimeID("question")
+		result := t.ag.awaitDecision(&decisionRequest{kind: decisionQuestion, ctx: ctx.Context, question: protocol.CloneQuestionRequest(&request)})
+		if result.err != nil {
+			return "", result.err
+		}
+		data, err := json.Marshal(struct {
+			Questions []protocol.Question       `json:"questions"`
+			Answers   []protocol.QuestionAnswer `json:"answers,omitempty"`
+			Cancelled bool                      `json:"cancelled,omitempty"`
+		}{request.Questions, result.answer.Answers, result.answer.Cancelled})
+		return string(data), err
+	}()
+	return tools.Result{Text: text}, err
 }
 
 func (a *Agent) applyAnswerQuestion(cmd protocol.Command) protocol.Receipt {

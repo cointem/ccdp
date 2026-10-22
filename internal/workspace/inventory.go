@@ -2,11 +2,13 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"ccdp/internal/execution"
@@ -70,7 +72,7 @@ func Inventory(ctx context.Context, root string, policy *sandbox.Sandbox) ([]str
 			continue
 		}
 		fi, e := os.Lstat(filepath.Join(root, rel))
-		if os.IsNotExist(e) {
+		if os.IsNotExist(e) || errors.Is(e, syscall.ENOTDIR) {
 			continue
 		}
 		if e != nil {

@@ -3,44 +3,45 @@ package agent
 import (
 	"ccdp/internal/messages"
 	"ccdp/internal/tooling"
+	"fmt"
 )
 
-// executeTool runs one tool call, handling Go hooks, shell hooks, permission
-// and approval.
-func (a *Agent) executeTool(tc messages.ToolCall) (string, bool) {
-	return a.executeToolWithJournal(tc, toolJournalContext{})
-}
-
-// executeToolWithJournal is the canonical dispatch path. The compatibility
-// wrapper above keeps direct package callers on the pre-typed event behavior.
-func (a *Agent) executeToolWithJournal(tc messages.ToolCall, journal toolJournalContext) (output string, isErr bool) {
-	var execution *toolJournalExecution
-	if journal.enabled {
-		execution = &toolJournalExecution{ctx: journal}
-		defer func() {
-			if execution.finished {
-				return
+// executeToolResultWithJournal runs one call through admission, hooks and
+// execution, recording its outcome before returning the structured result.
+func (a *Agent) executeToolResultWithJournal(tc messages.ToolCall, journal toolJournalContext) (result tooling.Result) {
+	execution := &toolJournalExecution{ctx: journal}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = tooling.Result{Output: fmt.Sprintf("tool execution panicked; outcome unknown: %v", recovered), IsError: true}
+			if !execution.finished {
+				execution.setStatus("unknown")
 			}
-			// No tool crosses the durable start boundary on a gate/approval
-			// rejection. Derive that state from the control path, never from
-			// the tool's human-readable output (which may legitimately contain
-			// words such as "blocked" after a real execution). A cancelled
-			// turn is distinct from a denied call for recovery/UI purposes.
-			if execution.status == "" && !execution.started {
-				if a.interrupted() {
-					execution.setStatus("cancelled")
-				} else {
-					execution.setStatus("denied")
-				}
+		}
+		if execution.finished {
+			result.Status = execution.status
+			result.OutputID = execution.outputID
+			return
+		}
+		// A rejected call never crossed the durable start boundary. Its
+		// status follows the control path rather than the output text.
+		if execution.status == "" && !execution.started {
+			if a.interrupted() {
+				execution.setStatus("cancelled")
+			} else {
+				execution.setStatus("denied")
 			}
-			if err := execution.finish(a, tc, output, isErr); err != nil {
-				execution.setStatus("error")
-				output = "session persistence failed: " + err.Error()
-				isErr = true
-			}
-			output = a.toolOutputPreview(output, 0)
-		}()
-	}
-	result := (tooling.Executor{}).Run(&toolAuthority{agent: a, call: tc, journal: journal, execution: execution})
-	return result.Output, result.IsError
+		}
+		if err := execution.finish(a, tc, result.Output, result.IsError); err != nil {
+			execution.setStatus("error")
+			result = tooling.Result{Output: "session persistence failed: " + err.Error(), IsError: true}
+		}
+		result.Status = execution.status
+		result.OutputID = execution.outputID
+		if !journal.program && result.Code == nil {
+			preview := a.toolOutputPreview(result.Output, 0, execution.outputID)
+			result.DisplayTruncated = result.DisplayTruncated || preview != result.Output
+			result.Output = preview
+		}
+	}()
+	return (tooling.Executor{}).Run(&toolAuthority{agent: a, call: tc, journal: journal, execution: execution})
 }

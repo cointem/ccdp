@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"ccdp/internal/changes"
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
@@ -15,6 +16,8 @@ import (
 type SessionSnapshot struct {
 	resumeRecords     []session.Record
 	resumeArtifacts   journal.ArtifactReader
+	resumeChildren    map[protocol.RunID]memoryRunRecords
+	resumeCoding      *changes.Store
 	GoalAccountingIDs map[string]bool    `json:"goal_accounting_ids,omitempty"`
 	Goal              *protocol.Goal     `json:"goal,omitempty"`
 	ID                string             `json:"id"`
@@ -33,7 +36,6 @@ type SessionSnapshot struct {
 	// completion yet. Resume exposes them as unknown; it never re-runs them.
 	PendingCommands []session.CommandScheduled `json:"pending_commands,omitempty"`
 	Workflow        *session.WorkflowState     `json:"workflow,omitempty"`
-	Memory          string                     `json:"memory,omitempty"`
 	Tasks           []session.Task             `json:"tasks,omitempty"`
 	// PendingInputs is the durable typed inbox.
 	PendingInputs []protocol.InputView `json:"pending_inputs,omitempty"`

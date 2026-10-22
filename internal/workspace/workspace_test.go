@@ -7,6 +7,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"ccdp/internal/sandbox"
 )
 
 func TestGitignoreMatch(t *testing.T) {
@@ -130,8 +132,7 @@ func indexOf(s, sub string) int {
 func TestLoadInstructionsIncludesUserLevel(t *testing.T) {
 	home := t.TempDir()
 	ws := t.TempDir()
-	os.Setenv("HOME", home)
-	t.Cleanup(func() { os.Unsetenv("HOME") })
+	t.Setenv("HOME", home)
 
 	// User-level instruction.
 	os.MkdirAll(filepath.Join(home, ".ccdp"), 0o755)
@@ -139,7 +140,10 @@ func TestLoadInstructionsIncludesUserLevel(t *testing.T) {
 	// Project-level instruction.
 	os.WriteFile(filepath.Join(ws, "AGENTS.md"), []byte("project rules\n"), 0o644)
 
-	out := LoadInstructions(ws)
+	out, err := LoadInstructionsChecked(ws, sandbox.New(ws).ResolveRead)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if out == "" {
 		t.Fatal("expected instructions")
 	}
@@ -157,7 +161,7 @@ func TestReadBoundedRejectsFIFOWithoutBlocking(t *testing.T) {
 	done := make(chan struct{})
 	var err error
 	go func() {
-		_, _, err = readBounded(path, 32)
+		_, _, err = readBounded(path, 32, sandbox.New(filepath.Dir(path)).ResolveRead)
 		close(done)
 	}()
 	select {
@@ -175,7 +179,7 @@ func TestReadBoundedReportsOversizedInstructions(t *testing.T) {
 	if err := os.WriteFile(path, []byte("0123456789"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	data, truncated, err := readBounded(path, 4)
+	data, truncated, err := readBounded(path, 4, sandbox.New(filepath.Dir(path)).ResolveRead)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +200,7 @@ func TestLoadInstructionsCheckedSurfacesPresentFIFO(t *testing.T) {
 	done := make(chan struct{})
 	var err error
 	go func() {
-		_, err = LoadInstructionsChecked(workspaceRoot)
+		_, err = LoadInstructionsChecked(workspaceRoot, sandbox.New(workspaceRoot).ResolveRead)
 		close(done)
 	}()
 	select {
@@ -217,7 +221,7 @@ func TestLoadInstructionsCheckedRejectsOversizedFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("x", DefaultMaxInstructionFileBytes+1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := LoadInstructionsChecked(workspaceRoot)
+	_, err := LoadInstructionsChecked(workspaceRoot, sandbox.New(workspaceRoot).ResolveRead)
 	if err == nil || !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), path) {
 		t.Fatalf("oversized instruction error = %v, want path and limit", err)
 	}
@@ -231,14 +235,15 @@ func TestLoadInstructionsCheckedRejectsAggregateOverflow(t *testing.T) {
 	if err := os.WriteFile(path, []byte("required instructions"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := LoadInstructionsBoundedChecked(workspaceRoot, 8)
+	_, err := LoadInstructionsBoundedChecked(workspaceRoot, 8, sandbox.New(workspaceRoot).ResolveRead)
 	if err == nil || !strings.Contains(err.Error(), "aggregate limit") || !strings.Contains(err.Error(), path) {
 		t.Fatalf("aggregate overflow error = %v, want path and limit", err)
 	}
 }
 
 func TestLoadInstructionsCheckedSurfacesMissingRoot(t *testing.T) {
-	_, err := LoadInstructionsChecked(filepath.Join(t.TempDir(), "missing-workspace"))
+	root := filepath.Join(t.TempDir(), "missing-workspace")
+	_, err := LoadInstructionsChecked(root, sandbox.New(root).ResolveRead)
 	if err == nil || !strings.Contains(err.Error(), "stat root") {
 		t.Fatalf("missing root error = %v, want stat-root error", err)
 	}

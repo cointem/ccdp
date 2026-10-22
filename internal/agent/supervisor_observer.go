@@ -129,6 +129,22 @@ func (c *managedClient) Watch(ctx context.Context, cursor protocol.Cursor) (prot
 	return supervision.Watch(ctx, c.supervisor.root.rootContext(), c)
 }
 
+func (c *managedClient) ReadOperation(ctx context.Context, id protocol.CommandID) (protocol.OperationResult, error) {
+	records, blobs, err := c.supervisor.readSessionRecords(ctx, c.id)
+	if err != nil {
+		return protocol.OperationResult{ID: id}, err
+	}
+	return readOperationResult(ctx, records, blobs, id)
+}
+
+func (c *managedClient) ReadInput(ctx context.Context, id protocol.InputID) (protocol.InputResult, error) {
+	records, _, err := c.supervisor.readSessionRecords(ctx, c.id)
+	if err != nil {
+		return protocol.InputResult{ID: id}, err
+	}
+	return readInputResult(ctx, records, id)
+}
+
 func (c *managedClient) AttachedRun() supervision.ObservedRun {
 	r := c.current()
 	r.mu.Lock()
@@ -150,11 +166,24 @@ func (c *managedClient) Submit(ctx context.Context, cmd protocol.Command) (proto
 	}
 	r := c.current()
 	if cmd.Type == protocol.CommandSubmitInput {
+		// A continuation command is also durable before its InputQueued fact.
+		// Preserve that identity and digest check even if a later run replaced it.
+		priorContinuation := c.supervisor.directory.Run(protocol.RunID("continue-" + string(cmd.ID)))
+		if priorContinuation != nil {
+			// Check the continuation identity before returning its input receipt.
+			// A different ExpectedRunID must not reuse the command identity.
+			if _, err := c.supervisor.Control(ctx, protocol.AgentControl{ID: cmd.ID, SessionID: cmd.SessionID, RunID: cmd.ExpectedRunID, Action: "continue", Text: cmd.Input.Text, Input: cmd.Input}); err != nil {
+				return protocol.Receipt{}, err
+			}
+		}
+		receipt, found, err := c.supervisor.priorChildInputReceipt(ctx, r, cmd)
+		if err != nil || found {
+			return receipt, err
+		}
 		r.mu.Lock()
 		settled := !r.fact.Child.Run.Active()
-		ownContinuation := r.fact.CommandID == string(cmd.ID)
 		r.mu.Unlock()
-		if settled || ownContinuation {
+		if settled || priorContinuation != nil {
 			_, err := c.supervisor.Control(ctx, protocol.AgentControl{ID: cmd.ID, SessionID: cmd.SessionID, RunID: cmd.ExpectedRunID, Action: "continue", Text: cmd.Input.Text, Input: cmd.Input})
 			if err != nil {
 				return protocol.Receipt{}, err
@@ -210,4 +239,54 @@ func (c *managedClient) Submit(ctx context.Context, cmd protocol.Command) (proto
 	locked = false
 	defer r.finishRuntimeCommand()
 	return child.Submit(ctx, cmd)
+}
+
+// priorChildInputReceipt runs before continuation admission, so a duplicate
+// cannot create a run which has no new input to execute.
+func (s *SessionSupervisor) priorChildInputReceipt(ctx context.Context, r *managedRun, cmd protocol.Command) (protocol.Receipt, bool, error) {
+	r.mu.Lock()
+	stopped, done := !r.fact.Child.Run.Active(), r.done
+	r.mu.Unlock()
+	if stopped {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return protocol.Receipt{}, false, ctx.Err()
+		}
+	}
+	records, _, err := s.readSessionRecords(ctx, cmd.SessionID)
+	if errors.Is(err, os.ErrNotExist) {
+		return protocol.Receipt{}, false, nil // queued child not constructed yet
+	}
+	if err != nil {
+		return protocol.Receipt{}, false, err
+	}
+	body := *cmd.Input
+	if body.ID == "" {
+		body.ID = protocol.InputID(cmd.ID)
+	}
+	input := durableInputs(records)[body.ID]
+	if input == nil {
+		return protocol.Receipt{}, false, nil
+	}
+	digest, err := submitInputDigest(body)
+	if err != nil {
+		return protocol.Receipt{}, false, err
+	}
+	priorDigest, err := input.inputDigest()
+	if err != nil {
+		return protocol.Receipt{}, false, err
+	}
+	receipt := input.receipt(cmd.ID, cmd.SessionID)
+	if len(records) > 0 {
+		receipt.Revision.LogSeq = records[len(records)-1].Seq
+	}
+	if digest != priorDigest {
+		receipt.Status = protocol.ReceiptRejected
+		receipt.Error = &protocol.CommandError{Code: protocol.ErrorInvalidCommand, Message: "input id was already used for different text, strategy or images"}
+	} else if stopped && receipt.Status == protocol.ReceiptScheduled && body.Strategy != protocol.InputMessage {
+		receipt.Status = protocol.ReceiptRejected
+		receipt.Error = &protocol.CommandError{Code: protocol.ErrorInvalidState, Message: "input was already accepted but not delivered before the run stopped; use a new input id to continue"}
+	}
+	return receipt, true, nil
 }

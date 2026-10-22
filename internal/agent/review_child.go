@@ -51,7 +51,7 @@ func (a *Agent) launchReview(cmd protocol.Command) (string, error) {
 	w.Paths = append([]string(nil), w.Paths...)
 	cmd.Workflow = &w
 	r, err := a.services.supervisor.launchWithReview(a, a.lifecycle.rootCtx, childTask{
-		Description: "代码审查 · " + w.Scope, Role: "worker", WaitPolicy: "observe",
+		Description: "代码审查 · " + w.Scope, Role: "worker", WorkspaceMode: "shared", WaitPolicy: "observe",
 		SystemPrompt: SubagentDefaultSystem + "\n" + reviewInstructions,
 	}, childPurposeReview, "", &cmd)
 	if err != nil {
@@ -86,11 +86,13 @@ func (s *SessionSupervisor) executeReview(r *managedRun, ctx context.Context) (*
 		r.agent = child
 		r.fact.Child.Workspace = cfg.Workspace
 		r.fact.Child.Run.Status = "running"
-		err = s.persist(r, "running")
+		reply := enqueueRunRecordLocked(r, "running")
 		r.mu.Unlock()
+		err = r.parent.waitChildRecord(reply)
 		if err != nil {
 			return "", err
 		}
+		s.publishChildOutcome(r)
 		if err := s.flushChildMessages(r, child); err != nil {
 			return "", err
 		}

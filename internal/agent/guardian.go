@@ -29,7 +29,7 @@ Operating rules:
 // nil when approved (or when the guardian budget is exhausted). Rejections
 // come back as an error carrying the guardian's reason. Uses a circuit breaker
 // of 3 reviews per turn.
-func (a *Agent) guardianCheck(tc messages.ToolCall) error {
+func (a *Agent) guardianCheck(tc messages.ToolCall, contexts ...context.Context) error {
 	if !a.takeGuardianSlot() {
 		return nil
 	}
@@ -42,7 +42,7 @@ func (a *Agent) guardianCheck(tc messages.ToolCall) error {
 	// Guardian is a distinct child purpose. Do not route this through the Task
 	// callback: the child constructor applies a strict read-only allowlist and
 	// disables recursive guardian/Task execution.
-	out, err := a.runGuardianChild(prompt)
+	out, err := a.runGuardianChild(prompt, contexts...)
 	if executionErr := a.toolExecutionError(); executionErr != nil {
 		return executionErr
 	}

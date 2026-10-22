@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -164,7 +165,7 @@ func (a *Agent) captureStepRuntime() (stepRuntime, *tools.Lease) {
 // cannot change the request after admission. An input-load failure releases the
 // frozen state and is reported as a user-retryable stepInputError.
 func (a *Agent) loadStepExternalContext(step *stepRuntime) error {
-	instructions, inputErr := workspace.LoadInstructionsChecked(step.cfg.Workspace)
+	instructions, inputErr := workspace.LoadInstructionsChecked(step.cfg.Workspace, step.policy.ResolveRead)
 	if inputErr != nil {
 		a.releaseStepContext(*step)
 		return &stepInputError{err: fmt.Errorf("load project instructions: %w", inputErr)}
@@ -173,13 +174,21 @@ func (a *Agent) loadStepExternalContext(step *stepRuntime) error {
 	skillStore := step.skillStore
 	if skillStore != nil && !step.isolated {
 		home, _ := os.UserHomeDir()
-		if inputErr := skillStore.LoadChecked(filepath.Join(home, ".ccdp", "skills"), filepath.Join(step.cfg.Workspace, ".ccdp", "skills")); inputErr != nil {
+		if inputErr := skillStore.LoadChecked(step.policy.ResolveRead, filepath.Join(home, ".ccdp", "skills"), filepath.Join(step.cfg.Workspace, ".ccdp", "skills")); inputErr != nil {
 			a.releaseStepContext(*step)
 			return &stepInputError{err: fmt.Errorf("load skills: %w", inputErr)}
 		}
 		step.skillsSection = skillStore.SkillsSection()
 	}
 	step.systemBlocks = a.buildSystemBlocks(step.cfg, step.sessionStartAt, step.sessionID, step.plan, step.modelSwitchMsg, step.interruptNote, step.instructions, step.skillsSection, step.history, step.policy)
+	memory, inputErr := projectMemorySection(step.cfg)
+	if inputErr != nil {
+		a.releaseStepContext(*step)
+		return &stepInputError{err: fmt.Errorf("load project memory: %w", inputErr)}
+	}
+	if memory != "" {
+		step.systemBlocks = append(step.systemBlocks, llm.SystemBlock{Text: memory})
+	}
 	if step.goalPrompt != "" {
 		step.systemBlocks = append(step.systemBlocks, llm.SystemBlock{Text: step.goalPrompt})
 	}
@@ -187,7 +196,7 @@ func (a *Agent) loadStepExternalContext(step *stepRuntime) error {
 }
 
 // releaseStepContext releases a step's frozen lease and clears its child-session
-// snapshot on a failed step admission.
+// snapshot once the request has finished or preparation must be rebuilt.
 func (a *Agent) releaseStepContext(step stepRuntime) {
 	releaseStepLease(step)
 	if a.owner == nil {
@@ -257,7 +266,7 @@ func (e *stepInputError) Unwrap() error {
 // buildRequestForStep forces the request model to the binding captured before
 // context construction.
 func (a *Agent) buildRequestForStep(step stepRuntime) llm.CompletionRequest {
-	req := a.buildRequestFromConfig(step.cfg, step.binding.model, joinSystemBlocks(step.systemBlocks), step.history, step.plan, step.tools)
+	req := a.buildRequestFromConfig(step.cfg, step.policy, step.binding.model, joinSystemBlocks(step.systemBlocks), step.history, step.plan, step.tools)
 	req.SystemBlocks = append([]llm.SystemBlock(nil), step.systemBlocks...)
 	return req
 }
@@ -267,15 +276,12 @@ func (a *Agent) buildRequestForStep(step stepRuntime) llm.CompletionRequest {
 // is a durable-integrity failure, not a reason to silently send the markdown
 // marker and pretend the model saw the image.
 func (a *Agent) buildRequestForStepChecked(step stepRuntime) (llm.CompletionRequest, error) {
-	if _, err := a.todoSectionChecked(); err != nil {
-		return llm.CompletionRequest{}, &stepInputError{err: fmt.Errorf("load task state: %w", err)}
-	}
 	var imageBytes int64
 	for _, message := range step.history {
 		if message.Role != messages.RoleUser || !message.ImagesFrozen {
 			continue
 		}
-		_, used, _, err := a.imageContentPartsForMessage(step.cfg.Workspace, message, maxAttachmentBytes-imageBytes)
+		_, used, _, err := a.imageContentPartsForMessage(step.cfg.Workspace, message, maxAttachmentBytes-imageBytes, step.policy.ResolveRead)
 		if err != nil {
 			return llm.CompletionRequest{}, &stepInputError{err: fmt.Errorf("frozen input image: %w", err)}
 		}
@@ -291,7 +297,9 @@ func (a *Agent) toolDefsSnapshot() []llm.ToolDef {
 	if a.services.registry == nil {
 		return nil
 	}
-	return a.toolDefsSnapshotFromLease(a.services.registry.Acquire())
+	lease := a.services.registry.Acquire()
+	defer lease.Close()
+	return a.toolDefsSnapshotFromLease(lease)
 }
 
 func (a *Agent) toolDefsSnapshotFromLease(lease *tools.Lease) []llm.ToolDef {
@@ -327,6 +335,12 @@ func (a *Agent) toolDefsSnapshotFromLease(lease *tools.Lease) []llm.ToolDef {
 			continue
 		}
 		tool, _ := lease.Get(name)
+		if _, codeEnabled := lease.Get("RunCode"); codeEnabled {
+			if def, ok := lease.Definition(name); ok && def.OutputSchema != nil {
+				dataSchema, _ := json.Marshal(def.OutputSchema)
+				description += "\nRunCode result.data schema: " + string(dataSchema)
+			}
+		}
 		defs = append(defs, llm.ToolDef{Type: "function", PlanAllowed: planAllowedImplementation(tool), Function: llm.FuncDef{
 			Name: name, Description: description, Parameters: cloneMap(parameters),
 		}})

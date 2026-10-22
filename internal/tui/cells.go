@@ -7,12 +7,14 @@ import (
 
 // historyCell is one rendered entry in the conversation viewport.
 type historyCell struct {
-	revision   uint64
-	kind       string // user | command | assistant | system | welcome | tool | status | error | thinking
-	text       string
-	textOffset int // byte offset of text in the original message
-	toolID     string
-	status     string // running | success | error | denied
+	revision     uint64
+	kind         string // user | command | assistant | system | welcome | tool | status | error | thinking
+	text         string
+	textOffset   int // byte offset of text in the original message
+	toolID       string
+	parentCallID string
+	childIndex   int
+	status       string // running | success | error | denied
 	// messageID is set for confirmed history entries. Local report entries use
 	// reportAnchor/reportIndex to retain their position when a later snapshot
 	// rebuilds the confirmed transcript.

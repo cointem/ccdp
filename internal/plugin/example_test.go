@@ -34,9 +34,13 @@ func (ExampleTool) Parameters() map[string]any {
 		"required": []string{"text"},
 	}
 }
-func (ExampleTool) Run(ctx *tools.Context) (string, error) {
-	txt, _ := ctx.Args["text"].(string)
-	return "echo: " + txt, nil
+func (ExampleTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) {
+		txt, _ := ctx.Args["text"].(string)
+		return "echo: " + txt, nil
+	}()
+	return tools.Result{Text: text}, err
 }
 
 // ExamplePlugin implements the plugin.Plugin contract. It stores the disposers
@@ -120,9 +124,9 @@ func TestExternalPluginExtension(t *testing.T) {
 	if !ok {
 		t.Fatal("ExampleEcho not visible through the merged registry")
 	}
-	out, err := tool.Run(&tools.Context{Context: context.Background(), Args: map[string]any{"text": "hi"}})
-	if err != nil || !strings.Contains(out, "echo: hi") {
-		t.Fatalf("external tool run: %q, %v", out, err)
+	out, err := tool.Execute(&tools.Context{Context: context.Background()}, map[string]any{"text": "hi"})
+	if err != nil || !strings.Contains(out.Text, "echo: hi") {
+		t.Fatalf("external tool run: %q, %v", out.Text, err)
 	}
 
 	// The provider is resolvable through an explicit model route.

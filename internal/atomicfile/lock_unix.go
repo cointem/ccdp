@@ -24,6 +24,13 @@ func AcquireLock(path string) (*Lock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("atomicfile: open lock %s: %w", path, err)
 	}
+	return AcquireOpenedLock(f)
+}
+
+// AcquireOpenedLock takes ownership of f, including on failure. It allows
+// callers to open the lock through an os.Root without following outside links.
+func AcquireOpenedLock(f *os.File) (*Lock, error) {
+	path := f.Name()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {

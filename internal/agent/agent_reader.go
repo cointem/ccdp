@@ -10,7 +10,6 @@ import (
 
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
-	"ccdp/internal/session"
 	"ccdp/internal/sessionview"
 )
 
@@ -161,16 +160,13 @@ func encodeAgentTextPage(page protocol.AgentReadPage, c agentReadCursor, text st
 }
 
 func (s *SessionSupervisor) readAgentTranscript(ctx context.Context, page protocol.AgentReadPage, c agentReadCursor, budget int) (string, error) {
-	records, _, err := s.readSessionRecords(ctx, c.Agent)
+	records, _, recoveredThrough, err := s.readSessionRecordsWithRecovery(ctx, c.Agent)
 	if err != nil {
 		return "", err
 	}
 	t := sessionview.NewTranscript(c.Before, 64)
-	for _, record := range records {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-		t.Facts([]session.Event{record.Event})
+	if err := t.ReplayRecords(ctx, records, recoveredThrough); err != nil {
+		return "", err
 	}
 	items, _ := t.Snapshot()
 	page.Items = []protocol.TranscriptItem{}

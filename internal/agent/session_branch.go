@@ -152,6 +152,13 @@ func (a *Agent) Fork(keep int) (string, error) {
 	// an assistant tool_calls message and its results); sanitize the frozen
 	// child history so its first provider request is valid.
 	branch := buildForkBranch(prefix, summary, oldID, keep, newCreatedAt)
+	if summary != "" {
+		index := 0
+		if len(prefix) > 0 && prefix[0].Role == messages.RoleSystem {
+			index = 1
+		}
+		branch[index].SourceOutputs = collectOutputReferences(suffix)
+	}
 	branch, err = copyHistory(rootCtx, a.persistenceHandle(), childPersistence, branch)
 	if err != nil {
 		return "", closeChild(err)

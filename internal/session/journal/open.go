@@ -14,6 +14,8 @@ type OpenOptions struct {
 	SessionID, SessionDir, Source, ParentID, Workspace, Model string
 	CreatedAt                                                 time.Time
 	NoSessionPersistence, RejectExisting                      bool
+	ProjectMemoryEnabled                                      bool
+	MemoryReadOnly, MemoryHistory                             bool
 	Backend                                                   BackendOptions
 }
 
@@ -85,8 +87,10 @@ func Open(o OpenOptions) (*Writer, error) {
 		}}
 		if cfg.Workspace != "" || cfg.Model != "" {
 			initialEvents = append(initialEvents, session.SettingsChanged{Revision: 1, Settings: session.Settings{
-				Workspace: cfg.Workspace,
-				Model:     cfg.Model,
+				Workspace:            cfg.Workspace,
+				Model:                cfg.Model,
+				ProjectMemoryEnabled: cfg.ProjectMemoryEnabled,
+				MemoryReadOnly:       cfg.MemoryReadOnly, MemoryHistory: cfg.MemoryHistory,
 			}})
 		}
 		_, err := p.commitLocked(session.Batch{
@@ -104,6 +108,7 @@ func Open(o OpenOptions) (*Writer, error) {
 		return nil, readErr
 	}
 	p.transcript = sessionview.FromRecords(records)
+	p.openedAtCursor = p.store.CurrentCursor()
 	p.requests = RequestIndex{}
 	for _, record := range records {
 		p.requests.Apply(record.Event, false)

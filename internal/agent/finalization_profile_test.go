@@ -22,7 +22,8 @@ func TestProfileFinalization(t *testing.T) {
 	cfg.Workspace, cfg.SessionDir = root, t.TempDir()
 	cfg.PermissionMode = "bypass"
 	cfg.EnableGuardian = config.BoolPtr(false)
-	cfg.EnableMemory = config.BoolPtr(true)
+	cfg.EnableProjectMemory = true
+	cfg.ProjectMemoryDir = t.TempDir()
 	cfg.MCPServers = nil
 	a, err := testNew(t, &cfg)
 	if err != nil {
@@ -49,6 +50,5 @@ func TestProfileFinalization(t *testing.T) {
 	})
 	measure("checkpoint_after_unchanged", func() error { return a.sealRecoveryPoint(context.Background(), point) })
 	measure("turn_finished_fact", func() error { return a.persistTurnFinished("profile-turn", "success", "", time.Second) })
-	a.turnMemory.turnUserMsg, a.turnMemory.turnSummary = "profile", "profile completed"
-	measure("memory", a.recordMemory)
+	measure("project_memory", func() error { _, err := projectMemorySection(cfg); return err })
 }

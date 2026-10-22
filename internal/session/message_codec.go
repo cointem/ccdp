@@ -15,6 +15,9 @@ import (
 func EncodeMessage(message messages.Message) (Message, error) {
 	result := Message{ToolUpdate: messages.CloneToolUpdate(message.ToolUpdate), ProviderOrigin: message.ProviderOrigin, ProviderWire: message.ProviderWire, ProviderContent: messages.CloneProviderBlocks(message.ProviderContent), InternalSource: message.InternalSource, StreamSegments: append([]messages.StreamSegment(nil), message.StreamSegments...), ReasoningContent: message.ReasoningContent, MessageID: message.ID, Role: string(message.Role), CreatedAt: message.CreatedAt}
 	result.ImagesFrozen = message.ImagesFrozen
+	for _, ref := range message.SourceOutputs {
+		result.SourceOutputs = append(result.SourceOutputs, BlobRef{Hash: ref.Hash, Size: ref.Size, MediaType: ref.MediaType})
+	}
 	if result.Role == "" {
 		result.Role = string(messages.RoleAssistant)
 	}
@@ -42,16 +45,19 @@ func EncodeMessage(message messages.Message) (Message, error) {
 		}})
 	}
 	if message.Role == messages.RoleTool {
-		// A tool result is represented as a typed result block, not free-form
-		// assistant text.  The legacy message model carries only an error prefix.
-		status := "success"
-		text := message.Content
-		if strings.HasPrefix(text, "Error: ") {
-			status = "error"
-			text = strings.TrimPrefix(text, "Error: ")
+		// Display text is not execution state. In particular successful output
+		// may legitimately begin with "Error:".
+		status := message.ToolStatus
+		if status == "" {
+			status = "unknown"
+		}
+		var ref *BlobRef
+		if message.OutputRef != nil {
+			ref = &BlobRef{Hash: message.OutputRef.Hash, Size: message.OutputRef.Size, MediaType: message.OutputRef.MediaType}
 		}
 		result.Content = []ContentBlock{{Kind: ContentToolResult, ToolResult: &ToolResult{
-			CallID: message.ToolCallID, Status: status, Text: text, CreatedAt: message.CreatedAt,
+			CallID: message.ToolCallID, Status: status, Text: message.Content, Blob: ref, CreatedAt: message.CreatedAt,
+			DisplayTruncated: message.DisplayTruncated, DataError: message.DataError,
 		}}}
 	}
 	if len(result.Content) == 0 {
@@ -63,6 +69,9 @@ func EncodeMessage(message messages.Message) (Message, error) {
 func DecodeMessage(message Message) (messages.Message, error) {
 	result := messages.Message{ToolUpdate: messages.CloneToolUpdate(message.ToolUpdate), ProviderOrigin: message.ProviderOrigin, ProviderWire: message.ProviderWire, ProviderContent: messages.CloneProviderBlocks(message.ProviderContent), InternalSource: message.InternalSource, StreamSegments: append([]messages.StreamSegment(nil), message.StreamSegments...), ReasoningContent: message.ReasoningContent, ID: message.MessageID, Role: messages.Role(message.Role), CreatedAt: message.CreatedAt}
 	result.ImagesFrozen = message.ImagesFrozen
+	for _, ref := range message.SourceOutputs {
+		result.SourceOutputs = append(result.SourceOutputs, messages.OutputReference{Hash: ref.Hash, Size: ref.Size, MediaType: ref.MediaType})
+	}
 	if result.Role == "" {
 		return messages.Message{}, errors.New("agent: replayed message has no role")
 	}
@@ -98,8 +107,10 @@ func DecodeMessage(message Message) (messages.Message, error) {
 			}
 			result.ToolCallID = block.ToolResult.CallID
 			result.Content = block.ToolResult.Text
-			if block.ToolResult.Status != "success" && block.ToolResult.Status != "ok" && !strings.HasPrefix(result.Content, "Error: ") {
-				result.Content = "Error: " + result.Content
+			result.ToolStatus = block.ToolResult.Status
+			result.DisplayTruncated, result.DataError = block.ToolResult.DisplayTruncated, block.ToolResult.DataError
+			if ref := block.ToolResult.Blob; ref != nil {
+				result.OutputRef = &messages.OutputReference{Hash: ref.Hash, Size: ref.Size, MediaType: ref.MediaType}
 			}
 			result.CreatedAt = block.ToolResult.CreatedAt
 		case ContentImage:

@@ -32,10 +32,12 @@ func (c ToolCall) validate() error {
 }
 
 type ToolResult struct {
-	CallID string   `json:"call_id"`
-	Status string   `json:"status"`
-	Text   string   `json:"text,omitempty"`
-	Blob   *BlobRef `json:"blob,omitempty"`
+	DisplayTruncated bool     `json:"display_truncated,omitempty"`
+	DataError        string   `json:"data_error,omitempty"`
+	CallID           string   `json:"call_id"`
+	Status           string   `json:"status"`
+	Text             string   `json:"text,omitempty"`
+	Blob             *BlobRef `json:"blob,omitempty"`
 	// CreatedAt preserves the time at which a result became part of the
 	// conversation projection.  It is optional for newly emitted facts whose
 	// lifecycle is represented by the surrounding transaction.
@@ -84,9 +86,11 @@ func (t ToolSchema) validate() error {
 }
 
 type ProjectedToolResult struct {
-	CallID string `json:"call_id"`
-	Status string `json:"status"`
-	Text   string `json:"text,omitempty"`
+	DisplayTruncated bool   `json:"display_truncated,omitempty"`
+	DataError        string `json:"data_error,omitempty"`
+	CallID           string `json:"call_id"`
+	Status           string `json:"status"`
+	Text             string `json:"text,omitempty"`
 }
 
 func (r ProjectedToolResult) validate() error {
@@ -152,7 +156,10 @@ func (a ApprovalResolution) validate() error {
 }
 
 type ToolStarted struct {
-	TurnID string `json:"turn_id"`
+	ParentCallID string `json:"parent_call_id,omitempty"`
+	ChildIndex   int    `json:"child_index,omitempty"`
+	ResultTarget string `json:"result_target,omitempty"`
+	TurnID       string `json:"turn_id"`
 	// StepID and CallIndex make the original model step/call order explicit.
 	// They are optional for old logs, whose turn/call identity remains valid.
 	StepID         string   `json:"step_id,omitempty"`
@@ -163,15 +170,23 @@ type ToolStarted struct {
 }
 
 type ToolFinished struct {
-	TurnID     string     `json:"turn_id"`
-	StepID     string     `json:"step_id,omitempty"`
-	CallID     string     `json:"call_id"`
-	EffectID   string     `json:"effect_id,omitempty"`
-	Status     string     `json:"status"`
-	Error      string     `json:"error,omitempty"`
-	SideEffect string     `json:"side_effect,omitempty"`
-	RawOutput  *BlobRef   `json:"raw_output,omitempty"`
-	Result     ToolResult `json:"result"`
+	DisplayTruncated bool       `json:"display_truncated,omitempty"`
+	DataError        string     `json:"data_error,omitempty"`
+	Call             *ToolCall  `json:"call,omitempty"`
+	ParentCallID     string     `json:"parent_call_id,omitempty"`
+	ChildIndex       int        `json:"child_index,omitempty"`
+	ResultTarget     string     `json:"result_target,omitempty"`
+	Data             *BlobRef   `json:"data,omitempty"`
+	DataTruncated    bool       `json:"data_truncated,omitempty"`
+	TurnID           string     `json:"turn_id"`
+	StepID           string     `json:"step_id,omitempty"`
+	CallID           string     `json:"call_id"`
+	EffectID         string     `json:"effect_id,omitempty"`
+	Status           string     `json:"status"`
+	Error            string     `json:"error,omitempty"`
+	SideEffect       string     `json:"side_effect,omitempty"`
+	RawOutput        *BlobRef   `json:"raw_output,omitempty"`
+	Result           ToolResult `json:"result"`
 }
 
 type ToolResultsProjected struct {
@@ -242,6 +257,9 @@ func (e ToolsDiscovered) Type() EventType { return EventTypeToolsDiscovered }
 func (e ToolsDiscovered) seal() {}
 
 func (e ToolStarted) validate() error {
+	if err := validateToolTarget(e.ParentCallID, e.ChildIndex, e.ResultTarget); err != nil {
+		return err
+	}
 	if err := requireID("turn_id", e.TurnID); err != nil {
 		return err
 	}
@@ -255,6 +273,22 @@ func (e ToolStarted) validate() error {
 }
 
 func (e ToolFinished) validate() error {
+	if e.Call != nil {
+		if err := e.Call.validate(); err != nil {
+			return err
+		}
+		if e.Call.CallID != e.CallID {
+			return errors.New("finished call identity mismatch")
+		}
+	}
+	if err := validateToolTarget(e.ParentCallID, e.ChildIndex, e.ResultTarget); err != nil {
+		return err
+	}
+	if e.Data != nil {
+		if err := e.Data.validate(); err != nil {
+			return err
+		}
+	}
 	if err := requireID("turn_id", e.TurnID); err != nil {
 		return err
 	}
@@ -274,6 +308,20 @@ func (e ToolFinished) validate() error {
 	}
 	if e.Result.CallID != e.CallID {
 		return errors.New("tool result call_id does not match call_id")
+	}
+	return nil
+}
+
+func validateToolTarget(parent string, index int, target string) error {
+	if target != "" && target != "model" && target != "program" {
+		return errors.New("invalid tool result target")
+	}
+	if target == "program" {
+		if parent == "" || index < 1 {
+			return errors.New("program result requires parent_call_id and positive child_index")
+		}
+	} else if parent != "" || index != 0 {
+		return errors.New("model result cannot have a parent or child index")
 	}
 	return nil
 }

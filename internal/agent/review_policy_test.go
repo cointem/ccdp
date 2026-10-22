@@ -43,15 +43,17 @@ func TestReviewUsesTaskPolicyAndAdmission(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer child.Close()
+		toolLease := child.services.registry.Acquire()
+		defer toolLease.Close()
 		for _, name := range []string{"Read", "Bash", "Write", "WebFetch", "SendMessage"} {
 			call := messages.ToolCall{Name: name}
-			if _, reason, _, denied := child.hardAdmitTool(call, toolJournalContext{}, nil); denied {
+			if _, reason, _, denied := child.hardAdmitTool(call, toolJournalContext{toolLease: toolLease}); denied {
 				t.Fatalf("%s denied %s: %s", purpose, name, reason)
 			}
 		}
 		call := messages.ToolCall{Name: "Read", Arguments: map[string]any{"file_path": path}}
 		tctx := child.buildToolContext(call, context.Background(), *child.services.cfg, child.services.sandbox, child.services.resources, nil)
-		if out, err := tools.NewReadTool().Run(tctx); err != nil || !strings.Contains(out, "external context") {
+		if out, err := executeToolText(tools.NewReadTool(), tctx); err != nil || !strings.Contains(out, "external context") {
 			t.Fatalf("%s cannot read ordinary external context: %q %v", purpose, out, err)
 		}
 		// Interactive reviews may request additional authority through the same
@@ -71,7 +73,7 @@ func TestReviewUsesTaskPolicyAndAdmission(t *testing.T) {
 		}
 		child.services.sandbox.AddDisallowedDir(external)
 		tctx.Sandbox = child.services.sandbox.Snapshot()
-		if _, err := tools.NewReadTool().Run(tctx); err == nil {
+		if _, err := executeToolText(tools.NewReadTool(), tctx); err == nil {
 			t.Fatal("explicit read denial was bypassed")
 		}
 	}

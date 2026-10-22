@@ -41,11 +41,6 @@ func (a *Agent) dispatchCommandForTurn(cmd protocol.Command, owned bool, cancell
 		a.mu.Unlock()
 		return a.rejectedReceipt(normalized, protocol.ErrorClosed, "session is closed")
 	}
-	current := a.revisionLocked()
-	if normalized.ExpectedRevision != 0 && normalized.ExpectedRevision != current.LogSeq {
-		a.mu.Unlock()
-		return a.rejectedReceipt(normalized, protocol.ErrorStaleRevision, fmt.Sprintf("expected revision %d, current %d", normalized.ExpectedRevision, current.LogSeq))
-	}
 	a.mu.Unlock()
 	// A resumed runtime has no in-memory command table.  Consult the typed
 	// admission/completion projection before recording this body as a new
@@ -63,6 +58,13 @@ func (a *Agent) dispatchCommandForTurn(cmd protocol.Command, owned bool, cancell
 		return a.restoredCommandReceipt(normalized, state)
 	}
 	a.mu.Lock()
+	// The original precondition belongs to first admission. A committed
+	// command retry returns its durable receipt even after later log writes.
+	current := a.revisionLocked()
+	if normalized.ExpectedRevision != 0 && normalized.ExpectedRevision != current.LogSeq {
+		a.mu.Unlock()
+		return a.rejectedReceipt(normalized, protocol.ErrorStaleRevision, fmt.Sprintf("expected revision %d, current %d", normalized.ExpectedRevision, current.LogSeq))
+	}
 	a.inbox.seenCommands[normalized.ID] = digest
 	a.mu.Unlock()
 
@@ -104,26 +106,29 @@ func (a *Agent) dispatchCommandForTurn(cmd protocol.Command, owned bool, cancell
 			return a.rejectedReceipt(normalized, protocol.ErrorBusy, "cannot clear while a turn is running")
 		}
 		a.pauseGoal("conversation cleared")
-		if err := a.clearHistoryCommand(string(normalized.ID)); err != nil {
+		if err := a.clearHistoryCommand(normalized); err != nil {
 			return a.rejectedReceipt(normalized, protocol.ErrorInternal, fmt.Sprintf("persist cleared history: %v", err))
 		}
-		return a.receipt(normalized, protocol.ReceiptApplied, "", nil)
+		receipt, _ := a.publishCommandReceipt(normalized, protocol.ReceiptApplied, "", nil, nil)
+		return receipt
 	case protocol.CommandRemoveMessages:
 		if a.isBusy() {
 			return a.rejectedReceipt(normalized, protocol.ErrorBusy, "cannot remove messages while a turn is running")
 		}
-		if err := a.removeMessagesCommand(normalized.Remove.Count, string(normalized.ID)); err != nil {
+		if err := a.removeMessagesCommand(normalized); err != nil {
 			return a.rejectedReceipt(normalized, protocol.ErrorInternal, fmt.Sprintf("persist removed messages: %v", err))
 		}
-		return a.receipt(normalized, protocol.ReceiptApplied, "", nil)
+		receipt, _ := a.publishCommandReceipt(normalized, protocol.ReceiptApplied, "", nil, nil)
+		return receipt
 	case protocol.CommandRewindConversation:
 		if a.isBusy() {
 			return a.rejectedReceipt(normalized, protocol.ErrorBusy, "cannot rewind while a turn is running")
 		}
-		if err := a.rewindMessagesCommand(normalized.Rewind.Count, string(normalized.ID)); err != nil {
+		if err := a.rewindMessagesCommand(normalized); err != nil {
 			return a.rejectedReceipt(normalized, protocol.ErrorInternal, fmt.Sprintf("persist rewound history: %v", err))
 		}
-		return a.receipt(normalized, protocol.ReceiptApplied, "", nil)
+		receipt, _ := a.publishCommandReceipt(normalized, protocol.ReceiptApplied, "", nil, nil)
+		return receipt
 	case protocol.CommandCompact:
 		if a.isBusy() {
 			return a.rejectedReceipt(normalized, protocol.ErrorBusy, "cannot compact while a turn is running")
@@ -154,8 +159,8 @@ func (a *Agent) dispatchCommandForTurn(cmd protocol.Command, owned bool, cancell
 		return a.applyReloadSettingsCommand(normalized)
 	case protocol.CommandTrustProject:
 		return a.applyTrustProjectCommand(normalized)
-	case protocol.CommandClearMemory:
-		return a.applyClearMemoryCommand(normalized)
+	case protocol.CommandProjectMemory:
+		return a.applyProjectMemoryCommand(normalized, owned)
 	default:
 		return a.rejectedReceipt(normalized, protocol.ErrorInvalidCommand, "unhandled command")
 	}
@@ -164,11 +169,11 @@ func (a *Agent) dispatchCommandForTurn(cmd protocol.Command, owned bool, cancell
 // History commands persist a candidate projection before swapping it into
 // the live Agent state, so a
 // failed durable commit leaves both history and its token baseline untouched.
-func (a *Agent) clearHistoryCommand(turnID string) error {
+func (a *Agent) clearHistoryCommand(cmd protocol.Command) error {
 	a.mu.Lock()
 	candidate := make([]messages.Message, 0, len(a.historyLocked()))
 	a.mu.Unlock()
-	if err := a.persistHistory(candidate, turnID); err != nil {
+	if err := a.persistHistoryCommand(candidate, cmd); err != nil {
 		return err
 	}
 	a.mu.Lock()
@@ -182,7 +187,8 @@ func (a *Agent) clearHistoryCommand(turnID string) error {
 	return nil
 }
 
-func (a *Agent) removeMessagesCommand(n int, turnID string) error {
+func (a *Agent) removeMessagesCommand(cmd protocol.Command) error {
+	n := cmd.Remove.Count
 	a.mu.Lock()
 	candidate := messages.Clone(a.historyLocked())
 	if n > 0 && len(a.historyLocked()) > 0 {
@@ -192,7 +198,7 @@ func (a *Agent) removeMessagesCommand(n int, turnID string) error {
 		candidate = sanitizeToolPairs(candidate[:len(candidate)-n])
 	}
 	a.mu.Unlock()
-	if err := a.persistHistory(candidate, turnID); err != nil {
+	if err := a.persistHistoryCommand(candidate, cmd); err != nil {
 		return err
 	}
 	a.mu.Lock()
@@ -205,7 +211,8 @@ func (a *Agent) removeMessagesCommand(n int, turnID string) error {
 	return nil
 }
 
-func (a *Agent) rewindMessagesCommand(n int, turnID string) error {
+func (a *Agent) rewindMessagesCommand(cmd protocol.Command) error {
+	n := cmd.Rewind.Count
 	a.mu.Lock()
 	candidate := messages.Clone(a.historyLocked())
 	if n < 0 {
@@ -216,7 +223,7 @@ func (a *Agent) rewindMessagesCommand(n int, turnID string) error {
 	}
 	candidate = sanitizeToolPairs(candidate[:n])
 	a.mu.Unlock()
-	if err := a.persistHistory(candidate, turnID); err != nil {
+	if err := a.persistHistoryCommand(candidate, cmd); err != nil {
 		return err
 	}
 	a.mu.Lock()

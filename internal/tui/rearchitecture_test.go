@@ -7,7 +7,7 @@ import (
 )
 
 func TestHistoryToolCommitsOnlyTerminalStatus(t *testing.T) {
-	for _, status := range []string{"", "queued", "pending", "starting", "running", "awaiting_approval", "unknown"} {
+	for _, status := range []string{"", "queued", "pending", "starting", "running", "awaiting_approval"} {
 		m := inlineTestModel()
 		m.items = []historyCell{{kind: "tool", messageID: "edit-1", toolName: "Edit", status: status}}
 		m.inline.prime(m.items)
@@ -22,10 +22,38 @@ func TestHistoryToolCommitsOnlyTerminalStatus(t *testing.T) {
 			t.Fatalf("completed tool never reached history after %q", status)
 		}
 	}
-	for _, status := range []string{"success", "error", "denied", "cancelled", "interrupted"} {
+	for _, status := range []string{"success", "error", "denied", "cancelled", "interrupted", "unknown", "resource_limit"} {
 		if !inlineItemComplete(historyCell{kind: "tool", status: status}, false) {
 			t.Fatalf("terminal tool not complete: %q", status)
 		}
+	}
+}
+
+func TestHistoryUnknownToolDoesNotBlockFollowingAssistant(t *testing.T) {
+	for _, status := range []string{"unknown", "resource_limit"} {
+		t.Run(status, func(t *testing.T) {
+			m := inlineTestModel()
+			m.items = []historyCell{
+				{kind: "tool", messageID: "tool-1", toolName: "Write", status: status},
+				{kind: "assistant", messageID: "answer-1", status: "completed", text: "The next answer"},
+			}
+			m.inline.prime(m.items)
+			if planTestHistory(m) == nil {
+				t.Fatal("terminal tool prevented history from being emitted")
+			}
+			for i, item := range m.items {
+				if !m.inline.seen(item, i) {
+					t.Fatalf("terminal tool blocked history item %q", item.messageID)
+				}
+			}
+		})
+	}
+	if toolStatusComplete("unknown") {
+		t.Fatal("unknown outcome must not be treated as successful dispatch")
+	}
+	view := renderAgentSingle(toolPresentation{Name: "SpawnAgent", Status: "unknown"}, nil, 80)
+	if strings.Contains(view, "已派出") {
+		t.Fatalf("unknown dispatch rendered as successful: %s", view)
 	}
 }
 

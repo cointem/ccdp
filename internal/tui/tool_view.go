@@ -15,13 +15,15 @@ import (
 // the complete sanitized output; the renderer chooses a bounded preview while
 // readers and copy/export paths can still use the original historyCell.text.
 type toolPresentation struct {
-	ID        string
-	Name      string
-	Status    string
-	Args      map[string]any
-	Arguments string
-	Output    string
-	Truncated bool
+	ParentCallID string
+	ChildIndex   int
+	ID           string
+	Name         string
+	Status       string
+	Args         map[string]any
+	Arguments    string
+	Output       string
+	Truncated    bool
 	// Agent holds the child session spawned by a SpawnAgent call, resolved by
 	// ParentCallID. It drives the compact agent marker so the child's final
 	// answer never floods the parent transcript as ordinary tool output.
@@ -40,6 +42,7 @@ func toolPresentationFromItem(item *historyCell) toolPresentation {
 		}
 	}
 	return toolPresentation{ID: sanitizeANSI(item.toolID), Name: sanitizeANSI(item.toolName),
+		ParentCallID: item.parentCallID, ChildIndex: item.childIndex,
 		Status: sanitizeANSI(item.status), Args: args, Arguments: sanitizeANSI(item.toolArgsRaw),
 		Output: item.cleanText(), Truncated: item.toolTruncated, Agent: item.agent}
 }
@@ -71,13 +74,19 @@ func (m *Model) renderToolView(item *historyCell, width int) string {
 		}
 	}
 	view := renderToolPresentation(p, width)
-	if m.animateWork() && !toolStatusComplete(p.Status) && !toolStatusIsFailure(p.Status) && !isAgentTool(p.Name) {
+	if m.animateWork() && !protocol.ToolTerminal(p.Status) && !isAgentTool(p.Name) {
 		view = strings.Replace(view, styleToolRun.Render("●"), m.spinner.View(), 1)
 	}
 	return view
 }
 
 func renderToolPresentation(p toolPresentation, width int) string {
+	if p.ParentCallID != "" {
+		index := p.ChildIndex
+		p.ParentCallID = ""
+		view := renderToolPresentation(p, max(1, width-4))
+		return fmt.Sprintf("  ↳ %d ", index) + strings.ReplaceAll(view, "\n", "\n    ")
+	}
 	if quietAgentWait(p) {
 		return ""
 	}
@@ -99,7 +108,7 @@ func renderToolPresentation(p toolPresentation, width int) string {
 	switch strings.ToLower(p.Name) {
 	case "bash":
 		name = "Ran"
-		if !toolStatusComplete(p.Status) && !toolStatusIsFailure(p.Status) {
+		if !protocol.ToolTerminal(p.Status) {
 			name = "Running"
 		}
 		meta = strings.TrimPrefix(meta, "$ ")
@@ -113,12 +122,14 @@ func renderToolPresentation(p toolPresentation, width int) string {
 	switch status {
 	case "success", "done", "completed", "complete":
 		mark, stateStyle, stateText = "•", styleToolOK, "done"
-	case "error", "failed", "failure":
+	case "error", "failed", "failure", "resource_limit":
 		mark, stateStyle, stateText = "✗", styleToolErr, "error"
 	case "denied", "rejected":
 		mark, stateStyle, stateText = "✗", styleToolErr, "denied"
-	case "cancelled", "canceled", "stopped":
+	case "cancelled", "canceled", "stopped", "interrupted":
 		mark, stateStyle, stateText = "■", styleStatus, "stopped"
+	case "unknown":
+		mark, stateStyle, stateText = "?", styleToolErr, "outcome unknown"
 	}
 	first := stateStyle.Render(mark) + " " + styleAssistant.Bold(true).Render(name)
 	if stateText != "done" && stateText != "" && !(name == "Running" && stateText == "running") {
@@ -259,6 +270,11 @@ func toolArgumentSummary(name string, args map[string]any, raw string) string {
 		return ""
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "runcode":
+		if description := value("description"); description != "" {
+			return description
+		}
+		return "JavaScript"
 	case "bash", "shell", "exec", "git":
 		if command := value("command"); command != "" {
 			return "$ " + command
@@ -405,7 +421,7 @@ func isReadOnlyTool(name string) bool {
 // rendered inline. Failures and denials keep their diagnostic preview.
 func toolStatusIsFailure(status string) bool {
 	switch status {
-	case "error", "failed", "failure", "denied", "rejected":
+	case "error", "failed", "failure", "denied", "rejected", "resource_limit":
 		return true
 	}
 	return false

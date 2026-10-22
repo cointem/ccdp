@@ -95,24 +95,15 @@ func (a *Agent) stateLocked() protocol.SessionState {
 	return view
 }
 
-// tasksViewLocked projects the session's working task list for rendering. The
-// store keeps its own mutex, so Snapshot is safe under a.mu. It returns nil
-// before resources are acquired or once the store is closed, leaving Tasks
-// omitted from the view.
+// tasksViewLocked projects the same committed task list used by replay and prompts.
 func (a *Agent) tasksViewLocked() []protocol.TaskView {
-	if a.services.resources == nil || a.services.resources.Todos == nil {
-		return nil
-	}
-	states, err := a.services.resources.Todos.Snapshot()
-	if err != nil {
-		return nil
-	}
+	states := a.conversation.durable.Tasks
 	if len(states) == 0 {
 		return nil
 	}
 	tasks := make([]protocol.TaskView, 0, len(states))
 	for _, st := range states {
-		tasks = append(tasks, protocol.TaskView{ID: st.ID, Title: st.Content, Status: st.Status})
+		tasks = append(tasks, protocol.TaskView{ID: st.TaskID, Title: st.Title, Status: st.Status})
 	}
 	return tasks
 }
@@ -265,15 +256,6 @@ func containsModel(models []string, want string) bool {
 	}
 	return false
 }
-
-func marshalSchema(v map[string]any) []byte {
-	b, _ := jsonMarshal(v)
-	return b
-}
-
-// jsonMarshal is a variable-sized helper kept here so snapshot construction
-// never stores a map owned by the registry. (The actual encoding is local.)
-func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 
 // Called with mu held. Catalog replacement is independent of the
 // frequent state payload and only travels when settings or registered tools change.

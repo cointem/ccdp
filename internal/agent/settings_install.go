@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"ccdp/internal/codemode"
 	"ccdp/internal/mcp"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
@@ -98,10 +99,16 @@ func (a *Agent) installSettingsCandidate(input settingsCandidateInstall) error {
 	if candidate.webTools {
 		webTools = append(webTools, tools.NewWebFetchTool(), tools.NewWebSearchTool())
 	}
-	a.services.registry.ReplaceScopes(map[string][]tools.Tool{"custom": customTools, "web": webTools})
+	var codeTools []tools.Tool
+	if candidate.cfg.CodeModeEnabled && codemode.Available {
+		codeTools = []tools.Tool{&tools.RunCodeTool{}}
+	}
+	a.services.registry.ReplaceScopes(map[string][]tools.Tool{"custom": customTools, "web": webTools, "code": codeTools})
 	a.mu.Lock()
 	a.discovery.customPerms = customPerms
 	*a.services.cfg = candidate.cfg
+	a.cancelDisabledMemoryHistoryLocked()
+	a.children.childSlots.setLimit(candidate.cfg.MaxConcurrentAgents)
 	if candidate.workspaceChange {
 		a.services.baseCfg.Workspace = candidate.cfg.Workspace
 	}
@@ -129,14 +136,9 @@ func (a *Agent) installSettingsCandidate(input settingsCandidateInstall) error {
 	if policyTightened && resources != nil && resources.Processes != nil {
 		resources.Processes.ResumeAfterRevocation()
 	}
-	a.services.perms.SetMode(permissionMode)
-	a.services.perms.SetPolicy(candidate.cfg.PermissionPolicy())
 	a.services.hooks.Update(cloneHookConfig(candidate.hooks))
-	a.services.hooks.SetSandbox(candidate.sandbox)
-	// Keep checkpoint git operations on the newly published boundary after a
-	// reload or /cd. Typed operations still pass their own cancellable context
-	// through CreateContext/RestoreContext below.
-	a.syncHookContext()
+	policy := candidate.cfg.PermissionPolicy()
+	a.syncSettingsPolicy(permissionMode, &policy)
 
 	return nil
 }

@@ -8,26 +8,28 @@ import (
 	"ccdp/internal/session"
 )
 
-type OperationResult struct {
-	ID       protocol.CommandID `json:"id"`
-	Complete bool               `json:"complete"`
-	Status   string             `json:"status"`
-	Output   string             `json:"output"`
-	Error    string             `json:"error,omitempty"`
-}
+type OperationResult = protocol.OperationResult
 
 func (a *Agent) ReadOperation(ctx context.Context, id protocol.CommandID) (OperationResult, error) {
+	rows, blobs, err := a.ReadRunRecords(ctx)
+	if err != nil {
+		return OperationResult{ID: id}, err
+	}
+	return readOperationResult(ctx, rows, blobs, id)
+}
+
+func (a *Agent) ReadInput(ctx context.Context, id protocol.InputID) (protocol.InputResult, error) {
+	rows, _, err := a.ReadRunRecords(ctx)
+	if err != nil {
+		return protocol.InputResult{ID: id}, err
+	}
+	return readInputResult(ctx, rows, id)
+}
+
+func readOperationResult(ctx context.Context, rows []session.Record, blobs outputReader, id protocol.CommandID) (OperationResult, error) {
 	out := OperationResult{ID: id}
-	if e := ctx.Err(); e != nil {
-		return out, e
-	}
-	p := a.persistenceHandle()
-	if p == nil {
-		return out, errors.New("session unavailable")
-	}
-	rows, e := p.Read(session.Beginning)
-	if e != nil {
-		return out, e
+	if err := ctx.Err(); err != nil {
+		return out, err
 	}
 	for _, row := range rows {
 		var done *session.CommandCompleted
@@ -43,10 +45,10 @@ func (a *Agent) ReadOperation(ctx context.Context, id protocol.CommandID) (Opera
 		out.Complete = true
 		out.Status = done.Outcome
 		out.Error = done.Report
+		out.Code = protocol.ErrorCode(done.Code)
 		if done.Output != nil {
-			blobs, e := p.RequestArtifacts()
-			if e != nil {
-				return out, e
+			if blobs == nil {
+				return out, errors.New("operation output unavailable")
 			}
 			b, e := blobs.Read(*done.Output, session.DefaultMaxBlobBytes)
 			if e != nil {
@@ -55,6 +57,47 @@ func (a *Agent) ReadOperation(ctx context.Context, id protocol.CommandID) (Opera
 			out.Output = string(b)
 		}
 		return out, nil
+	}
+	return out, nil
+}
+
+func readInputResult(ctx context.Context, rows []session.Record, id protocol.InputID) (protocol.InputResult, error) {
+	out := protocol.InputResult{ID: id}
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		event := row.Event
+		switch value := event.(type) {
+		case session.InputDelivered:
+			event = &value
+		case session.InputCancelled:
+			event = &value
+		case session.TurnFinished:
+			event = &value
+		}
+		switch value := event.(type) {
+		case *session.InputDelivered:
+			if value.InputID == string(id) {
+				out.Delivered, out.TurnID = true, protocol.TurnID(value.TurnID)
+			}
+		case *session.InputCancelled:
+			if value.InputID == string(id) {
+				out.Status, out.Error = protocol.TurnCancelled, value.Reason
+			}
+		case *session.TurnFinished:
+			if out.Delivered && value.TurnID == string(out.TurnID) {
+				switch value.Outcome {
+				case "success":
+					out.Status = protocol.TurnSucceeded
+				case "cancelled":
+					out.Status = protocol.TurnCancelled
+				default:
+					out.Status = protocol.TurnFailed
+				}
+				out.Error = value.Error
+			}
+		}
 	}
 	return out, nil
 }

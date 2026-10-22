@@ -28,30 +28,22 @@ func childMessageTool(tool tools.Tool) bool {
 
 // The supervisor's durable run record temporarily owns mail while no child
 // runtime owns its inbox. Admission on startup transfers it using the same ID.
-// Caller holds r.mu.
-func (s *SessionSupervisor) queueDormantMessage(r *managedRun, id protocol.CommandID, text string) error {
+// Caller holds r.mu and must unlock before waiting on the returned reply.
+// A nil reply means the message was already queued.
+func enqueueDormantMessageLocked(r *managedRun, id protocol.CommandID, text string) (<-chan error, error) {
 	for _, input := range r.fact.PendingMessages {
 		if input.ID == protocol.InputID(id) {
 			if input.Text != text {
-				return errors.New("message id reused")
+				return nil, errors.New("message id reused")
 			}
-			return nil
+			return nil, nil
 		}
 	}
 	if len(r.fact.PendingMessages) >= 64 {
-		return errors.New("child mailbox full; continue the child before sending more")
+		return nil, errors.New("child mailbox full; continue the child before sending more")
 	}
 	r.fact.PendingMessages = append(r.fact.PendingMessages, protocol.InputView{ID: protocol.InputID(id), Text: text, Strategy: protocol.InputMessage, State: "queued", CreatedAt: time.Now().UTC()})
-	if err := s.persist(r, "mail-"+string(id)); err != nil {
-		for i, input := range r.fact.PendingMessages {
-			if input.ID == protocol.InputID(id) {
-				r.fact.PendingMessages = append(r.fact.PendingMessages[:i:i], r.fact.PendingMessages[i+1:]...)
-				break
-			}
-		}
-		return err
-	}
-	return nil
+	return enqueueRunRecordLocked(r, "mail-"+string(id)), nil
 }
 
 func (s *SessionSupervisor) flushChildMessages(r *managedRun, child supervision.ChildRuntime) error {
@@ -80,14 +72,15 @@ func (s *SessionSupervisor) flushChildMessages(r *managedRun, child supervision.
 		}
 		pending := r.fact.PendingMessages
 		r.fact.PendingMessages = pending[1:]
-		err := s.persist(r, "mail-delivered-"+string(input.ID))
-		if err != nil {
-			r.fact.PendingMessages = append([]protocol.InputView{input}, r.fact.PendingMessages...)
-		}
+		reply := enqueueRunRecordLocked(r, "mail-delivered-"+string(input.ID))
 		r.mu.Unlock()
-		if err != nil {
+		if err := r.parent.waitChildRecord(reply); err != nil {
+			r.mu.Lock()
+			r.fact.PendingMessages = append([]protocol.InputView{input}, r.fact.PendingMessages...)
+			r.mu.Unlock()
 			return err
 		}
+		s.publishChildOutcome(r)
 	}
 }
 
@@ -195,15 +188,30 @@ func (a *Agent) sendAgentMessage(ctx context.Context, id protocol.CommandID, tar
 			return errors.New("message target is not your task child")
 		}
 		a.services.supervisor.publicationMu.Unlock()
-		err := a.services.supervisor.queueDormantMessage(r, id, body)
-		recipient = r.agent
-		child := r.agent
-		running := r.fact.Child.Run.Status == "running"
+		reply, err := enqueueDormantMessageLocked(r, id, body)
 		r.mu.Unlock()
 		if err != nil {
 			return err
 		}
-		if recipient != nil && running {
+		if reply != nil {
+			if err := r.parent.waitChildRecord(reply); err != nil {
+				r.mu.Lock()
+				for i, input := range r.fact.PendingMessages {
+					if input.ID == protocol.InputID(id) {
+						r.fact.PendingMessages = append(r.fact.PendingMessages[:i:i], r.fact.PendingMessages[i+1:]...)
+						break
+					}
+				}
+				r.mu.Unlock()
+				return err
+			}
+			a.services.supervisor.publishChildOutcome(r)
+		}
+		r.mu.Lock()
+		child := r.agent
+		running := r.fact.Child.Run.Status == "running"
+		r.mu.Unlock()
+		if child != nil && running {
 			// A concurrent finish may close the child's inbox. The durable
 			// parent outbox retains the message for its next continuation.
 			_ = a.services.supervisor.flushChildMessages(r, child)

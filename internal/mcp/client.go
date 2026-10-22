@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,9 +34,10 @@ type ServerConfig struct {
 
 // ToolDef is the schema of one tool advertised by an MCP server (tools/list).
 type ToolDef struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"inputSchema"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	InputSchema  map[string]any `json:"inputSchema"`
+	OutputSchema map[string]any `json:"outputSchema,omitempty"`
 }
 
 // ProtocolVersion is the MCP protocol version we advertise.
@@ -87,9 +89,9 @@ type Client struct {
 
 	tools []ToolDef // cached after a successful tools/list
 
-	// onChange fires after the tool list changes at runtime
-	// (notifications/tools/list_changed), so the manager can re-register.
-	onChange func()
+	// A managed client lets the manager validate and publish the entire
+	// catalog before changing this client's accepted tool list.
+	publishTools func([]ToolDef) error
 
 	// refreshMu coalesces a burst of tools/list_changed notifications into one
 	// in-flight refresh plus at most one follow-up. A server must not be able
@@ -98,14 +100,7 @@ type Client struct {
 	refreshMu      sync.Mutex
 	refreshRunning bool
 	refreshPending bool
-}
-
-// SetChangeListener registers a callback invoked when the server's tool list
-// changes at runtime.
-func (c *Client) SetChangeListener(fn func()) {
-	c.mu.Lock()
-	c.onChange = fn
-	c.mu.Unlock()
+	refreshPaused  bool
 }
 
 // SetCloseListener registers a callback invoked exactly once when the
@@ -219,8 +214,8 @@ func (c *Client) Start(ctx context.Context) error {
 // deadline (Claude Code's MCP_TOOL_TIMEOUT, shortened for tool use).
 const callTimeout = 5 * time.Minute
 
-// refreshTools re-fetches tools/list and fires the change listener. It runs
-// on notifications/tools/list_changed from the read loops.
+// refreshTools re-fetches tools/list and publishes accepted definitions.
+// It runs on notifications/tools/list_changed from the read loops.
 func (c *Client) refreshTools() {
 	select {
 	case <-c.closed:
@@ -236,11 +231,36 @@ func (c *Client) refreshTools() {
 		return
 	}
 	c.mu.Lock()
-	c.tools = list.Tools
-	fn := c.onChange
+	publish := c.publishTools
 	c.mu.Unlock()
-	if fn != nil {
-		fn()
+	if publish != nil {
+		if err := publish(list.Tools); err != nil {
+			log.Printf("mcp: server %q tool list rejected: %v", c.name, err)
+			return
+		}
+	} else {
+		c.mu.Lock()
+		c.tools = list.Tools
+		c.mu.Unlock()
+	}
+}
+
+// A prepared client's initial tool list stays fixed until publication. Any
+// notifications received meanwhile collapse into the existing pending bit.
+func (c *Client) pauseToolRefresh() {
+	c.refreshMu.Lock()
+	c.refreshPaused = true
+	c.refreshMu.Unlock()
+}
+
+func (c *Client) resumeToolRefresh() {
+	c.refreshMu.Lock()
+	c.refreshPaused = false
+	pending := c.refreshPending
+	c.refreshPending = false
+	c.refreshMu.Unlock()
+	if pending {
+		c.scheduleRefresh()
 	}
 }
 
@@ -253,6 +273,11 @@ func (c *Client) scheduleRefresh() {
 		return
 	}
 	c.refreshMu.Lock()
+	if c.refreshPaused {
+		c.refreshPending = true
+		c.refreshMu.Unlock()
+		return
+	}
 	if c.refreshRunning {
 		c.refreshPending = true
 		c.refreshMu.Unlock()

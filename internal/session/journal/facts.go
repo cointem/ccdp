@@ -120,38 +120,8 @@ func (p *Writer) PersistWorkflow(workflow session.WorkflowState) error {
 	return err
 }
 
-// persistMemory stores the bounded, complete memory projection as a typed
-// fact. clear is explicit because an empty MemoryChanged payload is invalid;
-// no-session mode therefore remains wholly in MemoryStore/artifacts and never
-// falls back to the configured session directory.
-func (p *Writer) PersistMemory(text string, clear bool) error {
-	if p == nil {
-		return errors.New("agent: nil session persistence")
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.store == nil {
-		return session.ErrClosed
-	}
-	projection, err := p.projectionLocked()
-	if err != nil {
-		return err
-	}
-	if projection.MemorySeen && ((clear && projection.MemoryText == "") || (!clear && projection.MemoryText == text)) {
-		return nil
-	}
-	event := session.MemoryChanged{Revision: p.store.CurrentCursor() + 1, Text: text, Cleared: clear}
-	_, err = p.commitLocked(session.Batch{TransactionID: messages.StableID("memory", struct {
-		Text   string
-		Clear  bool
-		Cursor session.Cursor
-	}{text, clear, p.store.CurrentCursor()}), Events: []session.Event{event}})
-	return err
-}
-
-// persistTasks records the full task-list replacement after TodoWrite has
-// durably changed its resource. The typed event is the recovery authority;
-// todos.json remains only a compatibility/cache representation.
+// PersistTasks commits the full task-list replacement. Only a successful
+// commit updates the bound session projection used by views and prompts.
 func (p *Writer) PersistTasks(tasks []session.Task) error {
 	if p == nil {
 		return errors.New("agent: nil session persistence")

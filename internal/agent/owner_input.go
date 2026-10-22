@@ -48,6 +48,7 @@ func (a *Agent) applySubmitInput(cmd protocol.Command) protocol.Receipt {
 			return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "input id was already used for different text or strategy")
 		}
 		a.mu.Unlock()
+		old.CommandID = cmd.ID
 		return old
 	}
 	turnSeq := a.sequences.turnSeq

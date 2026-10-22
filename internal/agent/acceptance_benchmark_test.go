@@ -18,7 +18,7 @@ func acceptanceAgent(b testing.TB, memory bool) *Agent {
 	cfg.Workspace = b.TempDir()
 	cfg.SessionDir = cfg.Workspace + "/sessions"
 	cfg.NoSessionPersistence = memory
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	a, err := NewWithOptions(&cfg, Options{EffectiveConfigFrozen: true})
 	if err != nil {
 		b.Fatal(err)
@@ -67,7 +67,11 @@ func (t acceptanceCatalogTool) Description() string { return "benchmark tool" }
 func (t acceptanceCatalogTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string"}}}
 }
-func (acceptanceCatalogTool) Run(*tools.Context) (string, error) { return "", nil }
+func (acceptanceCatalogTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) { return "", nil }()
+	return tools.Result{Text: text}, err
+}
 func BenchmarkAcceptanceCatalogRefresh(b *testing.B) {
 	for _, count := range []int{100, 1000} {
 		b.Run(fmt.Sprint(count), func(b *testing.B) {

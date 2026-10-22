@@ -1,8 +1,6 @@
 package config
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -34,11 +32,9 @@ func PermissionProjectRoot(workspace string) (string, error) {
 	return root, nil
 }
 
-func (c Config) projectPermissionPath() (string, string, error) {
-	root, err := PermissionProjectRoot(c.Workspace)
-	if err != nil {
-		return "", "", err
-	}
+// ProjectPermissionsDir holds permission decisions for all projects. Keep the
+// entire directory protected even before a project's record has been created.
+func (c Config) ProjectPermissionsDir() string {
 	home := filepath.Dir(c.SessionDir)
 	if c.SessionDir == "" && c.sourcePath != "" {
 		home = filepath.Dir(c.sourcePath)
@@ -46,8 +42,19 @@ func (c Config) projectPermissionPath() (string, string, error) {
 	if home == "." {
 		home = filepath.Dir(ConfigPath())
 	}
-	digest := sha256.Sum256([]byte(root))
-	return filepath.Join(home, "project-permissions", hex.EncodeToString(digest[:])+".json"), root, nil
+	return filepath.Join(home, "project-permissions")
+}
+
+func (c Config) projectPermissionPath() (string, string, error) {
+	root, err := PermissionProjectRoot(c.Workspace)
+	if err != nil {
+		return "", "", err
+	}
+	projectPath, err := filepath.Rel(string(filepath.Separator), root)
+	if err != nil || !filepath.IsLocal(projectPath) {
+		return "", "", fmt.Errorf("invalid project permission path: %s", root)
+	}
+	return filepath.Join(c.ProjectPermissionsDir(), projectPath, "permission.json"), root, nil
 }
 
 func (c Config) SaveProjectPermission(mode string) error {

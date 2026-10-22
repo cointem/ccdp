@@ -9,13 +9,14 @@ import (
 // returns them in call order with any events deferred while they were in
 // flight. A reply cut off by the token limit never executes its "salvaged" but
 // incomplete calls; those are returned as errors so the model re-issues them.
-func (a *Agent) executeToolCallsForStep(calls []messages.ToolCall, step stepRuntime, res llm.StreamResult) ([]toolRunResult, []Event) {
+func (a *Agent) executeToolCallsForStep(calls []messages.ToolCall, step stepRuntime, res llm.StreamResult) ([]toolRunResult, []Event, error) {
 	a.mu.Lock()
 	a.publications.deferToolEvents = true
 	a.publications.deferredToolEvents = nil
 	a.mu.Unlock()
 	journal := toolJournalContextForStep(step)
 	var results []toolRunResult
+	var err error
 	if res.FinishReason == "length" && len(calls) > 0 {
 		a.emitStatus("reply truncated by the token limit — voiding %d incomplete tool call(s)", len(calls))
 		results = make([]toolRunResult, len(calls))
@@ -29,16 +30,14 @@ func (a *Agent) executeToolCallsForStep(calls []messages.ToolCall, step stepRunt
 			results[i].status = "denied"
 			a.emit(toolEvent(tc, "denied", "voided (message truncated)"))
 		}
-		if journal.enabled {
-			_, _ = a.projectToolResults(journal, calls, results)
-		}
+		_, err = a.projectToolResults(journal, calls, results)
 	} else {
-		results = a.dispatchToolsForContext(calls, journal)
+		results, err = a.dispatchToolsForContext(calls, journal)
 	}
 	a.mu.Lock()
 	a.publications.deferToolEvents = false
 	deferredToolEvents := append([]Event(nil), a.publications.deferredToolEvents...)
 	a.publications.deferredToolEvents = nil
 	a.mu.Unlock()
-	return results, deferredToolEvents
+	return results, deferredToolEvents, err
 }

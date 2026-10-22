@@ -1,8 +1,6 @@
 package tui
 
 import (
-	"crypto/sha256"
-
 	"encoding/json"
 	"fmt"
 
@@ -103,7 +101,7 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 		if !m.hasTurnError(ev.TurnID, text) {
 			id := ""
 			if ev.TurnID != "" {
-				id = fmt.Sprintf("error-event:%s:%x", canonicalUITurn(ev.TurnID), sha256.Sum256([]byte(text)))
+				id = fmt.Sprintf("error-event:%q:%q", canonicalUITurn(ev.TurnID), text)
 			}
 			m.addReport(historyCell{kind: "error", text: text, turnID: ev.TurnID, reportID: id})
 		}

@@ -16,7 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"ccdp/internal/agent"
 	"ccdp/internal/protocol"
 )
 
@@ -37,10 +36,12 @@ var maxStreamJSONLineBytes = 4 << 20
 // writes on the caller goroutine avoids races and makes cancellation close
 // deterministic even when a subscriber is slow.
 type turnSink struct {
-	text         strings.Builder
-	err          error
-	usage        protocol.UsageSnapshot
-	previousTurn protocol.TurnID
+	text           strings.Builder
+	err            error
+	usage          protocol.UsageSnapshot
+	previousTurn   protocol.TurnID
+	historyAnchor  string
+	resynchronized bool
 }
 
 var headlessCommandSeq uint64
@@ -173,24 +174,9 @@ func (w *headlessWatch) resync(lifetimeCtx, startupCtx context.Context, marker p
 	return w.openWithDeadline(lifetimeCtx, startupCtx)
 }
 
-// runHeadless drives the protocol client for one or more prompts without the
-// TUI. Input, approval, plan decisions, and cancellation all use
-// SessionClient.Submit.
-//
+// runHeadlessClient drives one or more prompts through SessionClient without
+// the TUI. Input, approval, plan decisions, and cancellation use Submit.
 // Returns process exit code (0 success, 1 runtime/LLM error, 2 timeout, 130 signal).
-func runHeadless(ag *agent.Agent, prompts []string, format outputFormat, timeoutSec int) int {
-	if len(prompts) == 0 {
-		return 0
-	}
-	if ag == nil {
-		return headlessOutputSnapshot(protocol.SessionView{}, format, "", protocol.UsageSnapshot{}, errors.New("session protocol is unavailable"), 1)
-	}
-	return runHeadlessClient(ag, prompts, format, timeoutSec)
-}
-
-// runHeadlessClient is the protocol-only entry point. The Agent wrapper above
-// preserves the CLI surface while tests can exercise the same Watch/Submit
-// lifecycle with a small SessionClient implementation.
 func runHeadlessClient(client protocol.SessionClient, prompts []string, format outputFormat, timeoutSec int) int {
 	return runHeadlessClientWithGoal(client, prompts, format, timeoutSec, nil)
 }
@@ -285,6 +271,11 @@ func runHeadlessClientWithGoal(client protocol.SessionClient, prompts []string, 
 			protocol.InputID(nextHeadlessCommandID("input-id")), prompt, protocol.InputSteer)
 		if goal != nil {
 			cmd = protocol.Command{ID: nextHeadlessCommandID("goal"), SessionID: sessionID, Type: protocol.CommandGoal, Goal: goal}
+		}
+		if cmd.Input != nil {
+			sink.historyAnchor = protocol.InputMessageID(cmd.Input.ID)
+		} else if len(watch.snapshot.History) > 0 {
+			sink.historyAnchor = watch.snapshot.History[len(watch.snapshot.History)-1].ID
 		}
 		receipt, submitErr := client.Submit(turnCtx, cmd)
 		if submitErr != nil {
@@ -388,8 +379,55 @@ func stopHeadlessTurn(client protocol.SessionClient, sessionID protocol.SessionI
 	}
 }
 
-func consumeHeadlessTurn(ctx, lifetimeCtx context.Context, watch *headlessWatch, sessionID protocol.SessionID, format outputFormat, sink *turnSink, baseline int, client protocol.SessionClient) error {
+func restoreHeadlessOutput(view protocol.SessionView, sink *turnSink, baseline int) error {
+	start := 0
+	if sink.historyAnchor != "" {
+		start = -1
+		for i, message := range view.History {
+			if message.ID == sink.historyAnchor {
+				start = i + 1
+				break
+			}
+		}
+	} else if baseline != 0 {
+		start = -1
+	}
+	if start < 0 {
+		return errors.New("headless: cannot recover output after resync: input history boundary is no longer available")
+	}
+	sink.text.Reset()
+	for _, message := range view.History[start:] {
+		if strings.EqualFold(message.Role, "assistant") {
+			sink.text.WriteString(message.Content)
+		}
+	}
+	sink.usage = view.Usage
+	return nil
+}
+
+func consumeHeadlessTurn(ctx, lifetimeCtx context.Context, watch *headlessWatch, sessionID protocol.SessionID, format outputFormat, sink *turnSink, baseline int, client protocol.SessionClient) (resultErr error) {
 	decisions := watch.decisionHandler(client, sessionID, format)
+	var completedSnapshot *protocol.SessionView
+	defer func() {
+		if resultErr != nil || !sink.resynchronized {
+			return
+		}
+		if completedSnapshot != nil && restoreHeadlessOutput(*completedSnapshot, sink, baseline) == nil {
+			return
+		}
+		// Stream previews are bounded and may have a gap after resync. At
+		// completion, recover from the full committed history, never a bounded
+		// transcript tail or the deltas collected across that gap.
+		view, err := client.Snapshot(ctx)
+		if err != nil {
+			resultErr = fmt.Errorf("headless: recover output after resync: %w", err)
+			return
+		}
+		resultErr = restoreHeadlessOutput(view, sink, baseline)
+		if resultErr == nil {
+			watch.snapshot = view
+		}
+	}()
 
 	for {
 		update, err := watch.next(ctx)
@@ -439,6 +477,7 @@ func consumeHeadlessTurn(ctx, lifetimeCtx context.Context, watch *headlessWatch,
 			if format == outStreamJSON {
 				return errors.New("headless: stream resynchronized before turn completion")
 			}
+			sink.resynchronized = true
 			if err := watch.resync(lifetimeCtx, ctx, update); err != nil {
 				return err
 			}
@@ -465,6 +504,7 @@ func consumeHeadlessTurn(ctx, lifetimeCtx context.Context, watch *headlessWatch,
 				}
 			}
 			if watch.goalRun && !watch.snapshot.Busy && !headlessGoalActive(watch.snapshot.Goal) {
+				completedSnapshot = &watch.snapshot
 				sink.text.Reset()
 				sink.text.WriteString(latestAssistant(watch.snapshot.History, baseline))
 				return nil
@@ -474,6 +514,7 @@ func consumeHeadlessTurn(ctx, lifetimeCtx context.Context, watch *headlessWatch,
 			// a terminal event rather than treating an idle snapshot as success.
 			if !headlessGoalActive(watch.snapshot.Goal) && !watch.snapshot.Busy && watch.snapshot.OutstandingWork == 0 && len(watch.snapshot.PendingInputs) == 0 && len(watch.snapshot.History) > baseline {
 				if text := latestAssistant(watch.snapshot.History, baseline); text != "" {
+					completedSnapshot = &watch.snapshot
 					sink.text.Reset()
 					sink.text.WriteString(text)
 					return nil

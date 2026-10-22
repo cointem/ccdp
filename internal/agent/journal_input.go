@@ -40,30 +40,20 @@ func (a *Agent) persistHistory(history []messages.Message, turnID string) error 
 	return p.PersistHistoryMessages(history, turnID)
 }
 
-// restoreInputDedup rebuilds command-level input identity from durable queue
-// facts. A restarted runtime must not execute a previously delivered input a
-// second time merely because its in-memory seenInputs map was empty.
-func (a *Agent) restoreInputDedup() error {
-	if a == nil {
-		return errors.New("agent: nil agent")
-	}
-	p := a.persistenceHandle()
-	if p == nil {
-		return errors.New("agent: session persistence is unavailable")
-	}
-	records, err := p.Read(session.Beginning)
-	if err != nil {
-		return err
-	}
-	type durableInput struct {
-		digest    string
-		body      protocol.SubmitInput
-		delivered bool
-		cancelled bool
-	}
+type durableInput struct {
+	digest       string
+	body         protocol.SubmitInput
+	delivered    bool
+	cancelled    bool
+	cancelReason string
+}
+
+// Input identity belongs to the session, including after its consuming run
+// finishes or cancels. Both cold admission and child continuation use these facts.
+func durableInputs(records []session.Record) map[protocol.InputID]*durableInput {
 	inputs := make(map[protocol.InputID]*durableInput)
 	for _, record := range records {
-		switch event := record.Event.(type) {
+		switch event := session.EventPointer(record.Event).(type) {
 		case *session.InputQueued:
 			strategy := protocol.InputStrategy(event.Strategy)
 			if strategy != protocol.InputSteer && strategy != protocol.InputFollowup && strategy != protocol.InputMessage {
@@ -78,28 +68,59 @@ func (a *Agent) restoreInputDedup() error {
 		case *session.InputCancelled:
 			if input := inputs[protocol.InputID(event.InputID)]; input != nil {
 				input.cancelled = true
+				input.cancelReason = event.Reason
 			}
 		}
 	}
+	return inputs
+}
+
+func (input *durableInput) inputDigest() (string, error) {
+	if input.digest != "" {
+		// This is the digest before clipboard locators were appended to Text.
+		return input.digest, nil
+	}
+	return submitInputDigest(input.body)
+}
+
+func (input *durableInput) receipt(commandID protocol.CommandID, sessionID protocol.SessionID) protocol.Receipt {
+	receipt := protocol.Receipt{CommandID: commandID, SessionID: sessionID, Status: protocol.ReceiptScheduled}
+	if input.cancelled {
+		reason := input.cancelReason
+		if reason == "" {
+			reason = "input was cancelled"
+		}
+		receipt.Status = protocol.ReceiptRejected
+		receipt.Error = &protocol.CommandError{Code: protocol.ErrorInvalidState, Message: reason}
+	} else if input.delivered {
+		receipt.Status = protocol.ReceiptApplied
+	}
+	return receipt
+}
+
+// restoreInputDedup rebuilds input identity from durable queue facts. Cancelled
+// identities remain terminal instead of being admitted under the same ID again.
+func (a *Agent) restoreInputDedup() error {
+	p := a.persistenceHandle()
+	if p == nil {
+		return errors.New("agent: session persistence is unavailable")
+	}
+	records, err := p.Read(session.Beginning)
+	if err != nil {
+		return err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for id, input := range inputs {
-		if id == "" || input.cancelled {
+	for id, input := range durableInputs(records) {
+		if id == "" {
 			continue
 		}
-		status := protocol.ReceiptScheduled
-		if input.delivered {
-			status = protocol.ReceiptApplied
-		}
-		a.inbox.seenInputs[id] = protocol.Receipt{CommandID: protocol.CommandID(id), SessionID: protocol.SessionID(a.conversation.sessionID), Status: status, OperationID: protocol.OperationID("resume-input-" + string(id))}
-		digest, digestErr := submitInputDigest(input.body)
+		a.inbox.seenInputs[id] = input.receipt(protocol.CommandID(id), protocol.SessionID(a.conversation.sessionID))
+		digest, digestErr := input.inputDigest()
 		if digestErr != nil {
 			return fmt.Errorf("encode resumed input identity: %w", digestErr)
 		}
 		a.inbox.seenInputBody[id] = digest
-		if input.digest != "" {
-			a.inbox.seenInputBody[id] = input.digest
-		}
 	}
 	return nil
 }

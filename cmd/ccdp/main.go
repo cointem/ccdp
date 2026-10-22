@@ -18,6 +18,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"ccdp/internal/agent"
+	"ccdp/internal/codemode"
 	"ccdp/internal/config"
 	"ccdp/internal/permissions"
 	"ccdp/internal/tui"
@@ -31,6 +32,9 @@ const version = "0.2.0"
 const maxCLIPromptBytes = 4 << 20
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == codemode.WorkerArgument {
+		os.Exit(codemode.WorkerMain(os.Stdin, os.Stdout))
+	}
 	if len(os.Args) > 1 && isCodingCommand(os.Args[1]) {
 		os.Exit(runCodingCLI(os.Args[1:], os.Stdout, os.Stderr))
 	}

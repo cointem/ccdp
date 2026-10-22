@@ -16,6 +16,7 @@ import (
 	"ccdp/internal/fsops"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
+	"ccdp/internal/sandbox"
 )
 
 // bindChildWorkspace changes file authority only. Role restrictions are applied separately.
@@ -27,7 +28,7 @@ func bindChildWorkspace(cfg *config.Config, opts *Options, mode, root, parent st
 	cfg.AdditionalDirectories = nil
 	opts.InheritedCapabilities = withoutDirectoryGrants(opts.InheritedCapabilities)
 	cfg.AdditionalReadOnlyDirectories = append(cfg.AdditionalReadOnlyDirectories, parent)
-	if common := gitCommonDirectory(parent); common != "" {
+	if common := sandbox.GitCommonDirectory(parent); common != "" {
 		cfg.AdditionalReadOnlyDirectories = append(cfg.AdditionalReadOnlyDirectories, common)
 	}
 }
@@ -69,7 +70,10 @@ func resolveChildTask(task childTask) (childTask, error) {
 		task.Role = "worker"
 	}
 	if task.WorkspaceMode == "" {
-		task.WorkspaceMode = "shared"
+		task.WorkspaceMode = "isolated"
+		if task.Role == "explorer" {
+			task.WorkspaceMode = "shared"
+		}
 	}
 	if task.ContextMode == "" {
 		task.ContextMode = "fresh"
@@ -87,33 +91,6 @@ func resolveChildTask(task childTask) (childTask, error) {
 		return task, errors.New("name must be a single line of at most 80 bytes")
 	}
 	return task, nil
-}
-
-func gitCommonDirectory(root string) string {
-	p := filepath.Join(root, ".git")
-	fi, e := os.Stat(p)
-	if e != nil {
-		return ""
-	}
-	if fi.IsDir() {
-		return p
-	}
-	b, e := os.ReadFile(p)
-	if e != nil {
-		return ""
-	}
-	v := strings.TrimSpace(strings.TrimPrefix(string(b), "gitdir:"))
-	if !filepath.IsAbs(v) {
-		v = filepath.Join(root, v)
-	}
-	if c, e := os.ReadFile(filepath.Join(v, "commondir")); e == nil {
-		d := strings.TrimSpace(string(c))
-		if !filepath.IsAbs(d) {
-			d = filepath.Join(v, d)
-		}
-		return filepath.Clean(d)
-	}
-	return v
 }
 
 func (a *Agent) prepareChildWorkspace(ctx context.Context, task childTask, cfg *config.Config, opts *Options) (string, string, error) {
@@ -221,7 +198,7 @@ func (a *Agent) removeChildWorkspace(ctx context.Context, dir string) error {
 	}
 	registered := false
 	if missing {
-		if gitCommonDirectory(cfg.Workspace) == "" {
+		if sandbox.GitCommonDirectory(cfg.Workspace) == "" {
 			return nil
 		}
 		// A crash can remove the directory before Git removes its registration.
@@ -247,8 +224,8 @@ func (a *Agent) removeChildWorkspace(ctx context.Context, dir string) error {
 			return nil
 		}
 	} else if _, err = os.Lstat(filepath.Join(dir, ".git")); err == nil {
-		childCommon, childErr := filepath.EvalSymlinks(gitCommonDirectory(dir))
-		parentCommon, parentErr := filepath.EvalSymlinks(gitCommonDirectory(cfg.Workspace))
+		childCommon, childErr := filepath.EvalSymlinks(sandbox.GitCommonDirectory(dir))
+		parentCommon, parentErr := filepath.EvalSymlinks(sandbox.GitCommonDirectory(cfg.Workspace))
 		if childErr != nil || parentErr != nil || childCommon != parentCommon {
 			return errors.New("child workspace belongs to another repository")
 		}
@@ -297,7 +274,14 @@ func (a *Agent) finishChildMerge(ctx context.Context, r *managedRun, binding chi
 		return "\nChild workspace has newer changes; retained.", nil
 	}
 	r.fact.Child.MergeStatus = "merged"
-	if err = a.services.supervisor.persist(r, "merged-"+id); err != nil {
+	reply := enqueueRunRecordLocked(r, "merged-"+id)
+	r.mu.Unlock()
+	err = r.parent.waitChildRecord(reply)
+	if err == nil {
+		a.services.supervisor.publishChildOutcome(r)
+	}
+	r.mu.Lock()
+	if err != nil {
 		return "", err
 	}
 	return childCleanupResult("", a.removeChildWorkspace(ctx, row.Workspace))

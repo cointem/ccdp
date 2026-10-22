@@ -13,9 +13,13 @@ import (
 
 // sessionHost is the desktop runtime lifecycle adapter. SessionClient remains
 // the only interaction boundary; runtime handles stay here for open/close and
-// the CLI shutdown handoff.
+// the CLI shutdown handoff. All cached session views share one host, so
+// navigation cannot copy or restore stale lifecycle state.
 type sessionHost struct {
 	ag *agent.Agent
+	// Changes only when the root runtime handle is replaced. Navigation and
+	// workspace updates keep pending draft edits attached to their source.
+	attachmentGeneration uint64
 	// resumePending gates new submissions while an independent session handle
 	// is being opened. This prevents a late successful open from closing the
 	// handle that accepted a newly submitted turn.
@@ -282,6 +286,11 @@ func (m *Model) handleResumeOpened(msg resumeOpenedMsg) (tea.Model, tea.Cmd) {
 	}
 
 	m.ag = msg.candidate
+	m.attachmentGeneration++
+	readerScreen := m.reader != nil && m.reader.screenEntered && !m.childDetailScreen()
+	m.reader = nil
+	m.readerSeq++
+	m.readerRequest = m.readerSeq
 	m.client = msg.candidate
 	m.watchCtx, m.watchCancel = context.WithCancel(context.Background())
 	// A resumed handle is a new UI attachment even when the persisted session
@@ -329,7 +338,11 @@ func (m *Model) handleResumeOpened(msg resumeOpenedMsg) (tea.Model, tea.Cmd) {
 	m.pushStatus("resumed session " + m.sessionID)
 	m.ag.SetChildInteraction(true)
 	m.installSessionRouting(m.ag.Sessions())
-	return m, tea.Batch(cleanup, m.openWatchCmd(), m.loadAgentCatalog(false))
+	commands := tea.Batch(cleanup, m.openWatchCmd(), m.loadAgentCatalog(false))
+	if readerScreen {
+		return m, tea.Sequence(tea.ExitAltScreen, commands)
+	}
+	return m, commands
 }
 
 func closeResumeCandidateCmd(candidate *agent.Agent) tea.Cmd {

@@ -38,42 +38,35 @@ func (a *Agent) settleTurnLocked(turnID protocol.TurnID, saveErr error) {
 // handleStreamError classifies a provider-stream failure and resolves it. It
 // returns true when the caller should retry the step against the fallback model
 // (the primary client failed once and the fallback budget for this turn is
-// unused); false ends the turn, having released the step lease and emitted the
+// unused); false ends the turn, having emitted the
 // appropriate error/interruption signal.
-func (a *Agent) handleStreamError(streamErr error, releaseStep func(), allowFallback bool) bool {
+func (a *Agent) handleStreamError(streamErr error, allowFallback bool) bool {
 	if errors.Is(streamErr, errGoalStopped) {
-		releaseStep()
 		a.reportStoppedGoal()
 		return false
 	}
 	if isRequestJournalFailure(streamErr) {
-		releaseStep()
 		a.emit(Event{Type: EventError, Text: "request journal error: " + streamErr.Error()})
 		return false
 	}
 	if a.interrupted() {
-		releaseStep()
 		a.postTurnNote(turnNoteRecorded{interrupted: true})
 		a.emitStatus("stream interrupted")
 		return false
 	}
-	// Fallback model (Claude's --fallback-model): one retry on the backup client,
-	// then give up. activeModel follows so the request builder sends the fallback
-	// model name to the fallback
-	// endpoint (req.Model comes from activeModelSnapshot).
+	// Retry once with the fallback binding. The next step captures its model
+	// and client together for request construction.
 	if allowFallback {
 		if model := a.requestFallback(); model != "" {
-			releaseStep()
 			a.emitStatus("primary model failed (%v) — falling back to %s", streamErr, model)
 			return true
 		}
 	}
-	releaseStep()
 	a.emit(Event{Type: EventError, Text: "LLM error: " + streamErr.Error()})
 	return false
 }
 
-// turnFinished settles worker-owned memory and goal work, then transfers the
+// turnFinished settles worker-owned goal work, then transfers the
 // terminal boundary to the owner without depending on the execution context.
 func (a *Agent) turnFinished() {
 	request := turnCleanupRequested{result: make(chan turnCleanupResult, 1)}

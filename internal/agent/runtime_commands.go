@@ -74,20 +74,3 @@ func (a *Agent) applyTrustProjectCommand(cmd protocol.Command) protocol.Receipt 
 		return "project trusted and executable settings reloaded", nil
 	})
 }
-
-func (a *Agent) applyClearMemoryCommand(cmd protocol.Command) protocol.Receipt {
-	if cmd.ClearMemory == nil {
-		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "clear memory payload is required")
-	}
-	return a.scheduleCommandOperation(cmd, "memory", func(ctx context.Context) (string, error) {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		default:
-		}
-		if err := a.ClearMemory(); err != nil {
-			return "", err
-		}
-		return "memory cleared", nil
-	})
-}

@@ -83,6 +83,10 @@ func newAgentWithOptions(cfg *config.Config, initial *SessionSnapshot, opts Opti
 	if err != nil {
 		return nil, err
 	}
+	// A restored session's memory switch must survive later reload/cd
+	// candidates, which are rebuilt from the launch baseline.
+	baseCfg.EnableProjectMemory = effectiveCfg.EnableProjectMemory
+	baseCfg.MemoryReadOnly, baseCfg.MemoryHistory = effectiveCfg.MemoryReadOnly, effectiveCfg.MemoryHistory
 	cfg = &effectiveCfg
 	if err := validateResumeSession(cfg, initial); err != nil {
 		return nil, err
@@ -180,11 +184,15 @@ func newAgentWithOptions(cfg *config.Config, initial *SessionSnapshot, opts Opti
 			workflow:   protocol.WorkflowOff,
 		},
 	}
+	if cfg.NoSessionPersistence && initial != nil && initial.resumeCoding != nil {
+		a.services.coding = &codingState{sessionID: sid, store: initial.resumeCoding.Clone()}
+	}
 	if err := a.finalizeConstruction(initial, opts, isolated, rootCancel); err != nil {
 		return nil, err
 	}
 	a.constructionComplete = true
 	a.startCatalogNotifications()
+	a.startMemoryHistoryWorker()
 	return a, nil
 }
 
@@ -224,7 +232,10 @@ func (a *Agent) finalizeConstruction(initial *SessionSnapshot, opts Options, iso
 		return err
 	}
 	a.finalizeToolsAndSkills(isolated)
-	a.openTraceAndSupervisor(opts)
+	if err := a.openTraceAndSupervisor(opts); err != nil {
+		a.abortConstruction(rootCancel, true)
+		return err
+	}
 	if initial != nil && a.conversation.durable.Goal != nil {
 		if err := a.recoverGoalAccounting(); err != nil {
 			a.abortConstruction(rootCancel, true)
@@ -251,7 +262,8 @@ func (a *Agent) applySessionLineage(opts Options, isolated bool) {
 	if opts.Permissions != nil {
 		a.services.perms = opts.Permissions.Clone()
 	}
-	a.children.childSlots = newChildSlots(a.services.cfg.MaxParallelTools)
+	a.children.childSlots = newChildSlots(a.services.cfg.MaxConcurrentAgents)
+	a.children.guardianSlots = newChildSlots(1)
 	if isolated {
 		a.children.childState = &childRuntimeState{
 			readOnlyWorkspace: opts.ReadOnlyWorkspace,

@@ -65,7 +65,7 @@ func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 		t.Fatalf("continuation: %+v %v", next.fact.Child.Run, next.err)
 	}
 	repeated, err := reader.Submit(context.Background(), cmd)
-	if err != nil || repeated.Status != protocol.ReceiptScheduled {
+	if err != nil || repeated.Status != protocol.ReceiptApplied || repeated.Revision.LogSeq == 0 {
 		t.Fatalf("retry: %+v %v", repeated, err)
 	}
 	current, _ := a.services.supervisor.lookup(view.SessionID)
@@ -113,7 +113,7 @@ func TestReasoningOnlyChildCompletesAndRestoresThinking(t *testing.T) {
 	if !found {
 		t.Fatal("settled child lost saved reasoning")
 	}
-	output, err := tools.NewAgentTool("ReadAgent").Run(&tools.Context{
+	output, err := executeToolText(tools.NewAgentTool("ReadAgent"), &tools.Context{
 		Context: context.Background(), Sessions: a.Sessions(), ReadAgent: a.services.supervisor.readAgent,
 		Args: map[string]any{"view": "transcript", "agent_id": string(view.SessionID)},
 	})

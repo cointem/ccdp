@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
@@ -43,6 +44,11 @@ type Agent struct {
 	configuredModel          string // launch model, independent of the active selection
 	catalogNotificationsDone <-chan struct{}
 	memorySessions           *memorySessionCatalog
+	memoryHistoryDone        chan struct{}
+	memoryHistoryCancel      context.CancelFunc
+	memoryHistoryAutomatic   bool
+	memoryHistoryRunning     bool
+	memoryHistoryAttempt     time.Time
 	finalization             *childFinalization // admission shares the close boundary under mu
 	streamEpoch              string
 	transcript               *sessionview.Transcript
@@ -134,12 +140,14 @@ func (a *Agent) MCPPrompts() map[string][]string {
 // PermissionMode returns the current permission mode.
 func (a *Agent) PermissionMode() permissions.Mode { return a.services.perms.CurrentMode() }
 
-// syncHookContext keeps lifecycle and tool hook payloads aligned with mutable
-// agent state after mode, workspace or session changes.
+// syncHookContext keeps hook payloads and execution policy aligned with the
+// published agent state after mode, workspace, sandbox or session changes.
 func (a *Agent) syncHookContext() {
 	a.mu.Lock()
 	sessionID, ws := a.conversation.sessionID, a.services.cfg.Workspace
+	policy := a.services.sandbox.Snapshot()
 	a.mu.Unlock()
+	a.services.hooks.SetSandbox(policy)
 	a.services.hooks.SetContext(sessionID, ws, string(a.services.perms.CurrentMode()))
 }
 

@@ -1,19 +1,11 @@
 package tools
 
 import (
-	"encoding/json"
-	"errors"
-
-	"ccdp/internal/atomicfile"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
 )
 
-// TodoState tracks a task item.
+// TodoState is a validated task replacement handed to the session owner.
 type TodoState struct {
 	ID       string
 	Content  string
@@ -21,200 +13,22 @@ type TodoState struct {
 	Priority string // high | medium | low
 }
 
-// TodoStore owns one session's task list. It intentionally does not use a
-// package-level cache: two sessions may use the same process concurrently and
-// must never observe or overwrite each other's in-memory state.
-type TodoStore struct {
-	owner      string
-	sessionDir string
-
-	mu         sync.Mutex
-	state      map[string]TodoState
-	loaded     bool
-	closed     bool
-	persistErr error
-}
-
-// NewTodoStore creates a task-list store. The owner is only an identity used
-// in diagnostics; sessionDir is the durable directory for todos.json.
-func NewTodoStore(owner, sessionDir string) *TodoStore {
-	return &TodoStore{owner: owner, sessionDir: sessionDir, state: map[string]TodoState{}}
-}
-
-// Owner returns the immutable scope identifier.
-func (s *TodoStore) Owner() string {
-	if s == nil {
+// TodoSection renders the committed task list for system-prompt injection.
+func TodoSection(states []TodoState) string {
+	if len(states) == 0 {
 		return ""
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.owner
-}
-
-// SessionDir returns the durable directory used by this store.
-func (s *TodoStore) SessionDir() string {
-	if s == nil {
-		return ""
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sessionDir
-}
-
-func (s *TodoStore) checkOpenLocked() error {
-	if s == nil {
-		return fmt.Errorf("todo: nil store")
-	}
-	if s.closed {
-		return fmt.Errorf("todo: store for %q is closed", s.owner)
-	}
-	return nil
-}
-
-// CheckOpen verifies that this owner can still accept a tool update.
-func (s *TodoStore) CheckOpen() error {
-	if s == nil {
-		return fmt.Errorf("todo: nil store")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.checkOpenLocked()
-}
-
-// Close makes the store unavailable to subsequent tool calls. Durable data is
-// left intact for the next explicit session open.
-func (s *TodoStore) Close() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	s.closed = true
-	s.mu.Unlock()
-}
-
-func (s *TodoStore) loadLocked() (map[string]TodoState, error) {
-	if s.persistErr != nil {
-		return nil, s.persistErr
-	}
-	if s.loaded {
-		return s.state, nil
-	}
-	if s.sessionDir != "" {
-		data, err := os.ReadFile(filepath.Join(s.sessionDir, "todos.json"))
-		if err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("todo: read state: %w", err)
-		}
-		if err == nil {
-			var loaded map[string]TodoState
-			if err := json.Unmarshal(data, &loaded); err != nil {
-				return nil, fmt.Errorf("todo: decode state: %w", err)
-			}
-			if loaded == nil {
-				return nil, fmt.Errorf("todo: persisted state must be an object")
-			}
-			s.state = loaded
-		}
-	}
-	if s.state == nil {
-		s.state = map[string]TodoState{}
-	}
-	s.loaded = true
-	return s.state, nil
-}
-
-func cloneTodoMap(in map[string]TodoState) map[string]TodoState {
-	out := make(map[string]TodoState, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-// Load returns an independent copy of the current task map.
-func (s *TodoStore) Load() (map[string]TodoState, error) {
-	if s == nil {
-		return nil, fmt.Errorf("todo: nil store")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkOpenLocked(); err != nil {
-		return nil, err
-	}
-	state, err := s.loadLocked()
-	if err != nil {
-		return nil, err
-	}
-	return cloneTodoMap(state), nil
-}
-
-// Store replaces the task map and durably persists it before returning. The
-// caller retains no mutable alias to the stored map.
-func (s *TodoStore) Store(m map[string]TodoState) error {
-	if s == nil {
-		return fmt.Errorf("todo: nil store")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkOpenLocked(); err != nil {
-		return err
-	}
-	if _, err := s.loadLocked(); err != nil {
-		return err
-	}
-	next := cloneTodoMap(m)
-	if s.sessionDir != "" {
-		data, err := json.MarshalIndent(next, "", "  ")
-		if err != nil {
-			return fmt.Errorf("todo: encode state: %w", err)
-		}
-		if err := atomicfile.WriteFile(filepath.Join(s.sessionDir, "todos.json"), data, 0o600); err != nil {
-			var published *atomicfile.PublishedError
-			if errors.As(err, &published) {
-				s.persistErr = fmt.Errorf("todo: publication durability failed; reopen store: %w", err)
-			}
-			return fmt.Errorf("todo: persist state: %w", err)
-		}
-	}
-	s.state = next
-	s.loaded = true
-	return nil
-}
-
-// Section renders the current task list for system-prompt injection. Empty
-// when there are no todos (so the prompt stays stable and cheap).
-func (s *TodoStore) Section() (string, error) {
-	m, err := s.Load()
-	if err != nil {
-		return "", err
-	}
-	if len(m) == 0 {
-		return "", nil
-	}
-	states := sortedStates(m)
 	var sb strings.Builder
 	sb.WriteString("# Task list\n")
 	for _, st := range states {
-		fmt.Fprintf(&sb, "- %s (%s) %s\n", todoMark(st.Status), st.Priority, st.Content)
+		priority := st.Priority
+		if priority == "" {
+			// Older journal records had no priority.
+			priority = "medium"
+		}
+		fmt.Fprintf(&sb, "- %s (%s) %s\n", todoMark(st.Status), priority, st.Content)
 	}
-	return sb.String(), nil
-}
-
-// Snapshot returns a copy of the current task list for rendering.
-func (s *TodoStore) Snapshot() ([]TodoState, error) {
-	m, err := s.Load()
-	if err != nil {
-		return nil, err
-	}
-	return sortedStates(m), nil
-}
-
-func sortedStates(m map[string]TodoState) []TodoState {
-	out := make([]TodoState, 0, len(m))
-	for _, st := range m {
-		out = append(out, st)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
+	return sb.String()
 }
 
 func todoMark(status string) string {
@@ -251,11 +65,11 @@ func (t *TodoWriteTool) Parameters() map[string]any {
 				"type":        "array",
 				"description": "The full list of tasks, each with content, status (pending/in_progress/completed) and priority (high/medium/low).",
 				"items": map[string]any{
-					"type": "object",
+					"type": "object", "required": []string{"content"}, "additionalProperties": false,
 					"properties": map[string]any{
 						"content":  map[string]any{"type": "string"},
-						"status":   map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}},
-						"priority": map[string]any{"type": "string", "enum": []string{"high", "medium", "low"}},
+						"status":   map[string]any{"default": "pending", "type": "string", "enum": []string{"pending", "in_progress", "completed"}},
+						"priority": map[string]any{"default": "medium", "type": "string", "enum": []string{"high", "medium", "low"}},
 					},
 				},
 			},
@@ -264,54 +78,50 @@ func (t *TodoWriteTool) Parameters() map[string]any {
 	}
 }
 
-func (t *TodoWriteTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
-	}
-	raw, ok := ctx.Args["todos"].([]any)
-	if !ok {
-		return "", fmt.Errorf("TodoWrite: todos must be a list")
-	}
-	store, err := ctx.todoStoreForUse()
-	if err != nil {
-		return "", err
-	}
-	if err := store.CheckOpen(); err != nil {
-		return "", err
-	}
-	newState := map[string]TodoState{}
-	var states []TodoState
-	for i, item := range raw {
-		m, ok := item.(map[string]any)
+func (t *TodoWriteTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
+		if err := ctx.checkResources(); err != nil {
+			return "", err
+		}
+		raw, ok := ctx.Args["todos"].([]any)
 		if !ok {
-			return "", fmt.Errorf("TodoWrite: item %d must be an object", i+1)
+			return "", fmt.Errorf("TodoWrite: todos must be a list")
 		}
-		st := TodoState{
-			ID:       fmt.Sprintf("%d", i+1),
-			Content:  StringArg(m, "content", ""),
-			Status:   StringArg(m, "status", "pending"),
-			Priority: StringArg(m, "priority", "medium"),
+		if ctx.ReplaceTodos == nil {
+			return "", fmt.Errorf("TodoWrite: session task writer is unavailable")
 		}
-		if strings.TrimSpace(st.Content) == "" {
-			return "", fmt.Errorf("TodoWrite: item %d has empty content", i+1)
+		var states []TodoState
+		for i, item := range raw {
+			m, ok := item.(map[string]any)
+			if !ok {
+				return "", fmt.Errorf("TodoWrite: item %d must be an object", i+1)
+			}
+			st := TodoState{
+				ID:       fmt.Sprintf("%d", i+1),
+				Content:  StringArg(m, "content", ""),
+				Status:   StringArg(m, "status", "pending"),
+				Priority: StringArg(m, "priority", "medium"),
+			}
+			if strings.TrimSpace(st.Content) == "" {
+				return "", fmt.Errorf("TodoWrite: item %d has empty content", i+1)
+			}
+			if st.Status != "pending" && st.Status != "in_progress" && st.Status != "completed" {
+				return "", fmt.Errorf("TodoWrite: invalid status in item %d", i+1)
+			}
+			if st.Priority != "high" && st.Priority != "medium" && st.Priority != "low" {
+				return "", fmt.Errorf("TodoWrite: invalid priority in item %d", i+1)
+			}
+			states = append(states, st)
 		}
-		if st.Status != "pending" && st.Status != "in_progress" && st.Status != "completed" {
-			return "", fmt.Errorf("TodoWrite: invalid status in item %d", i+1)
+		if err := ctx.ReplaceTodos(states); err != nil {
+			return "", err
 		}
-		if st.Priority != "high" && st.Priority != "medium" && st.Priority != "low" {
-			return "", fmt.Errorf("TodoWrite: invalid priority in item %d", i+1)
-		}
-		newState[st.ID] = st
-		states = append(states, st)
-	}
-	if err := store.Store(newState); err != nil {
-		return "", err
-	}
 
-	var sb strings.Builder
-	sb.WriteString("Task list updated:\n")
-	for _, st := range states {
-		fmt.Fprintf(&sb, "  %s %s (%s) %s\n", todoMark(st.Status), st.ID, st.Priority, st.Content)
-	}
-	return sb.String(), nil
+		var sb strings.Builder
+		sb.WriteString("Task list updated:\n")
+		for _, st := range states {
+			fmt.Fprintf(&sb, "  %s %s (%s) %s\n", todoMark(st.Status), st.ID, st.Priority, st.Content)
+		}
+		return sb.String(), nil
+	})
 }

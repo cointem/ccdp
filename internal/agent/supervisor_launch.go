@@ -82,13 +82,13 @@ func (s *SessionSupervisor) launchWithReview(parent *Agent, ctx context.Context,
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if purpose == childPurposeGuardian {
+		task.Role, task.WorkspaceMode, task.ContextMode = "explorer", "shared", "fresh"
+	}
 	var taskErr error
 	task, taskErr = resolveChildTask(task)
 	if taskErr != nil {
 		return nil, taskErr
-	}
-	if purpose == childPurposeGuardian {
-		task.Role = "explorer"
 	}
 	if strings.TrimSpace(task.Description) == "" {
 		return nil, errors.New("child: description is required")
@@ -151,8 +151,9 @@ func (s *SessionSupervisor) launchWithReview(parent *Agent, ctx context.Context,
 		return nil, err
 	}
 	r.mu.Lock()
-	err = s.persist(r, "queued")
+	reply := enqueueRunRecordLocked(r, "queued")
 	r.mu.Unlock()
+	err = r.parent.waitChildRecord(reply)
 	s.finishRunAdmission(r, err)
 	if err != nil {
 		cancel()

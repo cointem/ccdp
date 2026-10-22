@@ -225,20 +225,34 @@ func estimateRequestBudget(req CompletionRequest, contextWindow, imageTokenReser
 	for _, message := range req.Messages {
 		var textTokens, imageTokens int
 		textTokens, imageTokens = estimateContentWithReserve(message.Content, imageTokenReserve)
+		genericTokens := textTokens + EstimateTokens(message.ReasoningContent)
+		if len(message.ToolCalls) > 0 {
+			encoded, _ := json.Marshal(message.ToolCalls)
+			genericTokens += EstimateTokens(string(encoded))
+		}
+		// Native assistant blocks replace generic content on their own wire.
+		// Count the larger representation, never both copies of the same text.
+		textTokens = max(genericTokens, EstimateProviderContentTokens(message.ProviderContent))
 		if strings.EqualFold(message.Role, "system") {
 			b.SystemTokens += textTokens
 		} else {
 			b.HistoryTokens += textTokens
 		}
 		b.ImageTokens += imageTokens
-		b.HistoryTokens += EstimateTokens(message.ReasoningContent)
 		b.MessageMetadataTokens += EstimateTokens(message.Role)
 		b.MessageMetadataTokens += EstimateTokens(message.Name)
 		b.MessageMetadataTokens += EstimateTokens(message.ToolCallID)
-		if len(message.ToolCalls) > 0 {
-			encoded, _ := json.Marshal(message.ToolCalls)
-			b.HistoryTokens += EstimateTokens(string(encoded))
+	}
+	if len(req.SystemBlocks) > 0 {
+		blocks := 0
+		for _, block := range req.SystemBlocks {
+			blocks += EstimateTokens(block.Text)
 		}
+		leading := 0
+		if len(req.Messages) > 0 && strings.EqualFold(req.Messages[0].Role, "system") {
+			leading, _ = estimateContentWithReserve(req.Messages[0].Content, imageTokenReserve)
+		}
+		b.SystemTokens += max(0, blocks-leading)
 	}
 	for _, tool := range req.Tools {
 		encoded, _ := json.Marshal(tool)
@@ -260,6 +274,31 @@ func estimateRequestBudget(req CompletionRequest, contextWindow, imageTokenReser
 	}
 	b.TotalTokens = b.InputTokens + b.ReservedOutputTokens
 	return b
+}
+
+// EstimateProviderContentTokens accounts for visible native reasoning and
+// tool blocks without pretending opaque signatures/ciphertext are text tokens.
+// Actual usage remains authoritative; ciphertext alone cannot reveal its
+// provider-side token cost.
+func EstimateProviderContentTokens(blocks []json.RawMessage) int {
+	total := 0
+	for _, raw := range blocks {
+		var block map[string]json.RawMessage
+		if json.Unmarshal(raw, &block) != nil {
+			total += EstimateTokens(string(raw))
+			continue
+		}
+		delete(block, "signature")
+		delete(block, "encrypted_content")
+		var kind string
+		_ = json.Unmarshal(block["type"], &kind)
+		if kind == "redacted_thinking" {
+			delete(block, "data")
+		}
+		text, _ := json.Marshal(block)
+		total += EstimateTokens(string(text))
+	}
+	return total
 }
 
 func estimateContentWithReserve(content any, imageTokenReserve int) (textTokens, imageTokens int) {

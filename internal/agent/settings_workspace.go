@@ -59,46 +59,24 @@ func (a *Agent) setWorkspaceContext(ctx context.Context, abs string) error {
 	return a.commitSettingsCandidateContext(ctx, candidate)
 }
 
-// buildSandbox assembles the runtime sandbox for dir from config (mirrors
-// config.Config.Sandbox but for an arbitrary workspace, without touching the
-// config package).
+// buildSandbox uses the same policy assembly for a candidate workspace and a
+// fresh session, including all application control paths.
 func buildSandbox(cfg *config.Config, dir string) *sandbox.Sandbox {
-	s := sandbox.New(dir)
-	if cfg.SandboxLimits != nil {
-		lim := *cfg.SandboxLimits
-		s.Limits = &lim
-	}
-	s.AllowNetwork = cfg.NetworkAccess
-	s.NetworkProxy = cfg.NetworkProxy
-	for _, d := range cfg.AdditionalDirectories {
-		s.AddDir(d)
-	}
-	for _, d := range cfg.AdditionalReadOnlyDirectories {
-		s.AddReadOnlyDir(d)
-	}
-	for _, d := range cfg.DisallowedDirectories {
-		s.AddDisallowedDir(d)
-	}
-	gitRoots := append([]string{s.Workspace}, s.AdditionalDirs...)
-	for _, root := range gitRoots {
-		for _, path := range sandbox.GitControlPaths(root) {
-			if s.InWorkspace(path) {
-				s.AddProtectedDir(path)
-			}
-		}
-		for _, path := range sandbox.GitControlEntryPaths(root) {
-			s.AddProtectedEntry(path)
+	candidate := cfg.Clone()
+	candidate.Workspace = dir
+	return candidate.Sandbox()
+}
+
+// The session owns scratch lifetime, independently of configuration generations.
+// Losing these roots makes execution fall back to per-command scratch, which
+// disappears before Read (or the next Bash invocation) can use its files.
+func rebuildSandbox(cfg *config.Config, dir string, previous *sandbox.Sandbox) *sandbox.Sandbox {
+	next := buildSandbox(cfg, dir)
+	next.ShareExecutionGuard(previous)
+	if previous != nil {
+		for _, root := range previous.Snapshot().ScratchDirs {
+			next.AddScratchDir(root)
 		}
 	}
-	if cfg.SessionDir != "" {
-		s.AddProtectedDir(cfg.SessionDir)
-	}
-	s.AddProtectedDir(config.ProjectSettingsDir(dir))
-	if source := cfg.SourcePath(); source != "" {
-		s.AddProtectedDir(source)
-	}
-	if cfg.TrustStore != nil && cfg.TrustStore.Path != "" {
-		s.AddProtectedDir(cfg.TrustStore.Path)
-	}
-	return s
+	return next
 }

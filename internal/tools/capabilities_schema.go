@@ -1,5 +1,15 @@
 package tools
 
+import "ccdp/internal/toolschema"
+
+var capabilityArguments = func() *toolschema.Schema {
+	schema, err := toolschema.Compile(map[string]any{"type": "object", "properties": map[string]any{"requested_capabilities": capabilityRequestSchema()}})
+	if err != nil {
+		panic(err)
+	}
+	return schema
+}()
+
 // WithCapabilityRequest adds the harness-owned authorization field to an
 // external tool schema without mutating the extension's schema value.
 func WithCapabilityRequest(schema map[string]any) map[string]any {

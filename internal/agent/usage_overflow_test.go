@@ -19,7 +19,7 @@ func TestAttemptUsageOverflowDoesNotCommitOrChangeState(t *testing.T) {
 		{Cache: protocol.CacheStats{ReportedInputTokens: math.MaxInt}},
 	} {
 		a, p, _ := newJournalAgent(t, true)
-		attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+		attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 		if err != nil {
 			t.Fatal(err)
 		}

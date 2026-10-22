@@ -170,6 +170,13 @@ func (a *Agent) completeCommand(cmd protocol.Command, status protocol.ReceiptSta
 			op = ""
 		}
 	}
+	return a.publishCommandReceipt(cmd, status, op, err, owner)
+}
+
+// publishCommandReceipt publishes an already settled command. History commands
+// use this after their atomic edit/completion transaction; ordinary commands
+// reach it through completeCommand.
+func (a *Agent) publishCommandReceipt(cmd protocol.Command, status protocol.ReceiptStatus, op protocol.OperationID, err *protocol.CommandError, owner context.Context) (protocol.Receipt, bool) {
 	a.mu.Lock()
 	a.flushStreamsLocked()
 	drain := false

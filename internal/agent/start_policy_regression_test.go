@@ -1,9 +1,6 @@
 package agent
 
 import (
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -11,32 +8,6 @@ import (
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 )
-
-func TestCompactionRechecksCurrentReadPolicy(t *testing.T) {
-	a := newRuntimeAgent(t)
-	dir := filepath.Join(a.services.cfg.Workspace, "blocked-later")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, "secret.txt")
-	if err := os.WriteFile(path, []byte("old public content"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	out, failed := a.executeTool(messages.ToolCall{ID: "read-before-deny", Name: "Read", Arguments: map[string]any{"file_path": path}})
-	if failed {
-		t.Fatalf("initial read: %s", out)
-	}
-	a.AddDisallowedDirectory(dir)
-	if _, err := a.services.sandbox.ResolveRead(path); err == nil {
-		t.Fatal("deny fixture failed")
-	}
-	if err := os.WriteFile(path, []byte("NEW_DENIED_SECRET"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if out := a.postCompactFileAttachments(nil); strings.Contains(out, "NEW_DENIED_SECRET") {
-		t.Fatalf("post-compaction attachment reads denied content: %s", out)
-	}
-}
 
 func TestApprovedToolRechecksCurrentHardDeny(t *testing.T) {
 	a := capabilityTestAgent(t)
@@ -46,7 +17,7 @@ func TestApprovedToolRechecksCurrentHardDeny(t *testing.T) {
 	events := watchTestEvents(t, a)
 	done := make(chan bool, 1)
 	go func() {
-		_, failed := a.executeTool(messages.ToolCall{ID: "pending-deny", Name: "Read", Arguments: map[string]any{}})
+		_, failed := executeTestTool(t, a, messages.ToolCall{ID: "pending-deny", Name: "Read", Arguments: map[string]any{}})
 		done <- failed
 	}()
 	seen := drainUntil(t, events, 5*time.Second, func(ev protocol.EventView) bool { return ev.Kind == protocol.EventApprovalRequest })

@@ -82,7 +82,7 @@ func isolatedTestConfig(t *testing.T, model string) config.Config {
 	cfg.PermissionMode = string(permissions.ModeBypass)
 	cfg.NoSessionPersistence = true
 	cfg.EnableGuardian = config.BoolPtr(false)
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	return cfg
 }
 
@@ -195,7 +195,7 @@ func TestNewWithOptionsChildPoliciesAreHardGates(t *testing.T) {
 			defer a.Close()
 			sentinel := filepath.Join(cfg.Workspace, "must-not-exist")
 			args := map[string]any{"file_path": sentinel, "content": "forbidden"}
-			_, handled := a.executeTool(messages.ToolCall{Name: "Write", Arguments: args})
+			_, handled := executeTestTool(t, a, messages.ToolCall{Name: "Write", Arguments: args})
 			if !handled {
 				t.Fatal("hard-denied tool was reported as executable")
 			}
@@ -307,7 +307,7 @@ func TestTaskRetainsConfiguredCustomTool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer task.Close()
-	if _, toolErr := task.executeTool(messages.ToolCall{Name: "Read"}); toolErr {
+	if _, toolErr := executeTestTool(t, task, messages.ToolCall{Name: "Read"}); toolErr {
 		t.Fatal("configured Task tool was unexpectedly rejected")
 	}
 	if _, err := os.Stat(sentinel); err != nil {

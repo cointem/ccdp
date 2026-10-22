@@ -103,14 +103,8 @@ func (a *Agent) hydrateInput(input *turnInput) error {
 	return nil
 }
 
-// appendHistoryLocked commits a candidate history before swapping the live
-// projection. The caller must own the session transition. It is deliberately shared by
-// input delivery, model results, and Save so a failed store never becomes a
-// confirmed in-memory message.
-func (a *Agent) appendHistoryLocked(msgs ...messages.Message) error {
-	return a.appendHistoryLockedForStep("", msgs...)
-}
-
+// appendHistoryLockedForStep commits a candidate history before swapping the
+// live projection. The caller must own the session transition.
 func (a *Agent) appendHistoryLockedForStep(stepID string, msgs ...messages.Message) error {
 	if len(msgs) == 0 {
 		return nil

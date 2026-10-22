@@ -16,7 +16,7 @@ func TestCommandToolRunsWithArgsOnStdin(t *testing.T) {
 	)
 	ctx := scopedTestContext(t, dir)
 	ctx.Args = map[string]any{"name": "world"}
-	out, err := tool.Run(ctx)
+	out, err := executeToolText(tool, ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestCommandToolFailureReported(t *testing.T) {
 	tool := NewCommandTool("fail", "always fails", "exit 3", nil)
 	ctx := scopedTestContext(t, dir)
 	ctx.Args = map[string]any{}
-	out, err := tool.Run(ctx)
+	out, err := executeToolText(tool, ctx)
 	if err == nil {
 		t.Fatalf("nonzero exit must be a tool error")
 	}
@@ -45,7 +45,7 @@ func TestCommandToolTimeout(t *testing.T) {
 	ctx := scopedTestContext(t, dir)
 	ctx.Args = map[string]any{}
 	ctx.Timeout = 50 * time.Millisecond // much shorter than the 5s sleep
-	out, err := tool.Run(ctx)
+	out, err := executeToolText(tool, ctx)
 	if err == nil {
 		t.Fatalf("timeout must be a tool error")
 	}

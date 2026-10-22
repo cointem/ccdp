@@ -15,7 +15,7 @@ func globContext(workspace string, policy *sandbox.Sandbox, args map[string]any)
 		Context:    context.Background(),
 		WorkingDir: workspace,
 		Sandbox:    policy,
-		FileState:  NewFileState("search-sandbox-test"),
+		Resources:  &Resources{Files: NewFileState("search-sandbox-test")},
 		Args:       args,
 	}
 }
@@ -28,11 +28,11 @@ func TestReadOutsideWorkspaceHonorsExplicitDeny(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := sandbox.New(workspace)
-	if out, err := NewReadTool().Run(globContext(workspace, policy, map[string]any{"file_path": file})); err != nil || !strings.Contains(out, "external reference") {
+	if out, err := executeToolText(NewReadTool(), globContext(workspace, policy, map[string]any{"file_path": file})); err != nil || !strings.Contains(out, "external reference") {
 		t.Fatalf("external Read: output=%q error=%v", out, err)
 	}
 	policy.AddDisallowedDir(outside)
-	if out, err := NewReadTool().Run(globContext(workspace, policy, map[string]any{"file_path": file})); err == nil || strings.Contains(out, "external reference") {
+	if out, err := executeToolText(NewReadTool(), globContext(workspace, policy, map[string]any{"file_path": file})); err == nil || strings.Contains(out, "external reference") {
 		t.Fatalf("Read bypassed explicit deny: output=%q error=%v", out, err)
 	}
 }
@@ -48,14 +48,14 @@ func TestLSFiltersDeniedEntries(t *testing.T) {
 	}
 	policy := sandbox.New(workspace)
 	policy.AddDisallowedDir(denied)
-	out, err := NewLSTool().Run(globContext(workspace, policy, map[string]any{}))
+	out, err := executeToolText(NewLSTool(), globContext(workspace, policy, map[string]any{}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(out, "secret-dir") || !strings.Contains(out, "visible.txt") || !strings.Contains(out, "(1 entries)") {
 		t.Fatalf("LS exposed denied entry or omitted authorized entry: %q", out)
 	}
-	if _, err := NewLSTool().Run(globContext(workspace, policy, map[string]any{"path": denied})); err == nil {
+	if _, err := executeToolText(NewLSTool(), globContext(workspace, policy, map[string]any{"path": denied})); err == nil {
 		t.Fatal("LS accepted denied explicit directory")
 	}
 }
@@ -64,7 +64,7 @@ func TestRgDefaultBaseRechecksReadPolicy(t *testing.T) {
 	workspace := t.TempDir()
 	policy := sandbox.New(workspace)
 	policy.AddDisallowedDir(workspace)
-	if _, err := NewRgTool().Run(globContext(workspace, policy, map[string]any{"pattern": "needle"})); err == nil {
+	if _, err := executeToolText(NewRgTool(), globContext(workspace, policy, map[string]any{"pattern": "needle"})); err == nil {
 		t.Fatal("Rg searched a newly denied default working directory")
 	}
 }
@@ -94,7 +94,7 @@ func TestGlobAllowsAbsoluteAndParentPatternsOutsideWorkspace(t *testing.T) {
 		filepath.Join(outside, "*.txt"),
 		filepath.Join("..", "outside", "*.txt"),
 	} {
-		out, err := tool.Run(globContext(workspace, policy, map[string]any{"pattern": pattern}))
+		out, err := executeToolText(tool, globContext(workspace, policy, map[string]any{"pattern": pattern}))
 		if err != nil || !strings.Contains(out, secret) {
 			t.Errorf("Glob(%q) did not find readable external file: output=%q error=%v", pattern, out, err)
 		}
@@ -104,7 +104,7 @@ func TestGlobAllowsAbsoluteAndParentPatternsOutsideWorkspace(t *testing.T) {
 	// the workspace; authorization follows the resolved path rather than
 	// banning the syntax itself.
 	pattern := filepath.Join("..", filepath.Base(workspace), "*.go")
-	out, err := tool.Run(globContext(workspace, policy, map[string]any{"pattern": pattern}))
+	out, err := executeToolText(tool, globContext(workspace, policy, map[string]any{"pattern": pattern}))
 	if err != nil {
 		t.Fatalf("Glob(%q): %v", pattern, err)
 	}
@@ -123,7 +123,7 @@ func TestGlobAbsolutePatternWithinReadGrant(t *testing.T) {
 	policy := sandbox.New(workspace)
 	policy.AddReadOnlyDir(readonly)
 
-	out, err := NewGlobTool().Run(globContext(workspace, policy, map[string]any{
+	out, err := executeToolText(NewGlobTool(), globContext(workspace, policy, map[string]any{
 		"pattern": filepath.Join(readonly, "*.txt"),
 	}))
 	if err != nil {
@@ -154,7 +154,7 @@ func TestGlobRecursivePrunesDisallowedDirectories(t *testing.T) {
 	policy := sandbox.New(workspace)
 	policy.AddDisallowedDir(deniedDir)
 
-	out, err := NewGlobTool().Run(globContext(workspace, policy, map[string]any{"pattern": "**/*.txt"}))
+	out, err := executeToolText(NewGlobTool(), globContext(workspace, policy, map[string]any{"pattern": "**/*.txt"}))
 	if err != nil {
 		t.Fatalf("recursive Glob: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestGlobFiltersDisallowedMatchesAndRejectsDisallowedAnchor(t *testing.T) {
 	policy.AddDisallowedDir(deniedDir)
 	tool := NewGlobTool()
 
-	out, err := tool.Run(globContext(workspace, policy, map[string]any{"pattern": "*.txt"}))
+	out, err := executeToolText(tool, globContext(workspace, policy, map[string]any{"pattern": "*.txt"}))
 	if err != nil {
 		t.Fatalf("Glob with a denied sibling: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestGlobFiltersDisallowedMatchesAndRejectsDisallowedAnchor(t *testing.T) {
 		t.Fatalf("Glob returned an invalid result set: %s", out)
 	}
 
-	out, err = tool.Run(globContext(workspace, policy, map[string]any{"pattern": "private/**/*.txt"}))
+	out, err = executeToolText(tool, globContext(workspace, policy, map[string]any{"pattern": "private/**/*.txt"}))
 	if err == nil {
 		t.Fatalf("Glob under an explicitly denied anchor unexpectedly succeeded: %s", out)
 	}
@@ -215,7 +215,7 @@ func TestGlobPreservesSimpleAndRecursivePatterns(t *testing.T) {
 	tool := NewGlobTool()
 	policy := sandbox.New(workspace)
 
-	rootOut, err := tool.Run(globContext(workspace, policy, map[string]any{"pattern": "*.go"}))
+	rootOut, err := executeToolText(tool, globContext(workspace, policy, map[string]any{"pattern": "*.go"}))
 	if err != nil {
 		t.Fatalf("root Glob: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestGlobPreservesSimpleAndRecursivePatterns(t *testing.T) {
 		t.Fatalf("simple Glob should match only the root file: %s", rootOut)
 	}
 
-	recursiveOut, err := tool.Run(globContext(workspace, policy, map[string]any{"pattern": "**/*.go"}))
+	recursiveOut, err := executeToolText(tool, globContext(workspace, policy, map[string]any{"pattern": "**/*.go"}))
 	if err != nil {
 		t.Fatalf("recursive Glob: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestGlobPreservesSimpleAndRecursivePatterns(t *testing.T) {
 		t.Fatalf("recursive Glob missed expected paths: %s", recursiveOut)
 	}
 
-	dotOut, err := tool.Run(globContext(workspace, policy, map[string]any{"pattern": "."}))
+	dotOut, err := executeToolText(tool, globContext(workspace, policy, map[string]any{"pattern": "."}))
 	if err != nil {
 		t.Fatalf("literal directory Glob: %v", err)
 	}

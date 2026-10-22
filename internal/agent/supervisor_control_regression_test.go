@@ -47,7 +47,7 @@ func TestSupervisorTypedContinuationRetry(t *testing.T) {
 	}
 	// Rebuild the directory from durable records: retries must use the same
 	// normalized identity even when the original in-memory run is gone.
-	restored := newSessionSupervisor(a)
+	restored := newSessionSupervisor(a, nil)
 	again, err = restored.Control(context.Background(), cmd)
 	if err != nil || again.ID != first.ID {
 		t.Fatalf("restored continuation retry rejected: %v", err)

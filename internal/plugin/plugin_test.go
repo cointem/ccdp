@@ -171,7 +171,11 @@ func (s *stubTool) Description() string { return "stub " + s.name }
 func (s *stubTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{}}
 }
-func (s *stubTool) Run(*tools.Context) (string, error) { return "ran " + s.name, nil }
+func (s *stubTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) { return "ran " + s.name, nil }()
+	return tools.Result{Text: text}, err
+}
 
 func TestScopedToolRegistry(t *testing.T) {
 	reg := tools.NewRegistry()

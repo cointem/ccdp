@@ -152,15 +152,17 @@ func (j *deliveryJob) prepareAndCommitCandidate(ctx context.Context) (string, er
 	if e != nil {
 		return "", e
 	}
-	state.Commit = strings.TrimSpace(commit.Stdout)
+	committed := *state
+	committed.Commit = strings.TrimSpace(commit.Stdout)
 	// Import the immutable candidate objects; no user branch is updated yet.
-	if _, e = j.exec(ctx, root, policy, []string{"git", "-c", "maintenance.auto=false", "fetch", "--no-tags", "--no-write-fetch-head", dir, state.Commit}, nil, nil); e != nil {
+	if _, e = j.exec(ctx, root, policy, []string{"git", "-c", "maintenance.auto=false", "fetch", "--no-tags", "--no-write-fetch-head", dir, committed.Commit}, nil, nil); e != nil {
 		return "", e
 	}
-	state.Stage = "candidate_committed"
-	if e = j.record(*state); e != nil {
+	committed.Stage = "candidate_committed"
+	if e = j.record(committed); e != nil {
 		return "", e
 	}
+	*state = committed
 
 	return "", nil
 }

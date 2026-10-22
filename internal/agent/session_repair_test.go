@@ -23,7 +23,7 @@ func sessionRepairAgent(t *testing.T, memory bool) (*Agent, config.Config) {
 	t.Helper()
 	cfg := testPersistenceConfig(t)
 	cfg.NoSessionPersistence = memory
-	cfg.EnableGuardian, cfg.EnableMemory = config.BoolPtr(false), config.BoolPtr(false)
+	cfg.EnableGuardian, cfg.EnableProjectMemory = config.BoolPtr(false), false
 	cfg.MCPServers = nil
 	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true})
 	if err != nil {
@@ -102,7 +102,7 @@ func TestSessionRepairLongHistoryRestoreAndRemove(t *testing.T) {
 	if err := a.appendHistory(messages.Message{ID: "repair-remove", Role: messages.RoleAssistant, Content: "remove this answer"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.removeMessagesCommand(1, "repair-remove-command"); err != nil {
+	if err := a.removeMessagesCommand(protocol.Command{ID: "repair-remove-command", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandRemoveMessages, Remove: &protocol.RemoveMessages{Count: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	assertHistory()
@@ -119,7 +119,7 @@ func TestSessionRepairOversizedRestoreLeavesFilesUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.clearHistoryCommand("repair-clear"); err != nil {
+	if err := a.clearHistoryCommand(protocol.Command{ID: "repair-clear", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandClearConversation}); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "chosen.txt")
@@ -193,7 +193,7 @@ func sessionRepairAssertImage(t *testing.T, a *Agent, message messages.Message, 
 	if err != nil || !bytes.Equal(got, image) {
 		t.Fatalf("frozen image bytes changed: %v", err)
 	}
-	parts, _, found, err := a.imageContentPartsForMessage(a.services.cfg.Workspace, message, maxAttachmentBytes)
+	parts, _, found, err := a.imageContentPartsForMessage(a.services.cfg.Workspace, message, maxAttachmentBytes, a.currentSandbox().ResolveRead)
 	if err != nil || !found {
 		t.Fatalf("cannot construct provider image: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestSessionRepairReplacementDiscardsOldToolRecovery(t *testing.T) {
 	if _, err := a.persistenceHandle().CommitEvents("repair-uncertain-start", session.ToolStarted{TurnID: "turn-0", Call: session.ToolCall{CallID: call.ID, ToolID: call.Name, Arguments: []byte(`{"file_path":"x"}`)}, Fingerprint: "repair-fingerprint"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.clearHistoryCommand("repair-discard-tools"); err != nil {
+	if err := a.clearHistoryCommand(protocol.Command{ID: "repair-discard-tools", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandClearConversation}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := LoadSession(a.services.cfg.SessionDir, a.SessionID())

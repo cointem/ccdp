@@ -91,7 +91,10 @@ func TestUnifiedProcessStopRemovesHandle(t *testing.T) {
 	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "yield_ms": 0})
 	v := decodeProcess(t, out, err)
 	out, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "stop"})
-	decodeProcess(t, out, err)
+	stopped := decodeProcess(t, out, err)
+	if stopped.Log != "" || !strings.Contains(stopped.Warning, "released") || strings.Contains(stopped.Warning, "use Process") {
+		t.Fatal("stop advertised an unavailable log/continuation", stopped)
+	}
 	if ctx.Resources.Processes.Count() != 0 {
 		t.Fatal("stopped process remains active")
 	}

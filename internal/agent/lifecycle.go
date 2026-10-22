@@ -71,6 +71,9 @@ func (a *Agent) closeAsync() {
 	<-ready
 	a.lifecycle.turnWG.Wait()
 	a.lifecycle.operationWG.Wait()
+	if a.memoryHistoryDone != nil {
+		<-a.memoryHistoryDone
+	}
 	// Every worker enqueues completion before releasing its reservation. A
 	// second FIFO barrier drains those messages, including terminal publication,
 	// while closing prevents them from admitting replacement work.

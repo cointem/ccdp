@@ -38,12 +38,12 @@ func TestWebProxyUsesUpstreamDNSAndChecksRedirects(t *testing.T) {
 	ctx.HostNetworkAllowed = true
 	ctx.Sandbox.NetworkProxy = proxy.URL
 	ctx.Args = map[string]any{"url": "http://public.invalid/"}
-	out, err := NewWebFetchTool().Run(ctx)
+	out, err := executeToolText(NewWebFetchTool(), ctx)
 	if err != nil || !strings.Contains(out, "resolved upstream") {
 		t.Fatalf("WebFetch proxy wiring: %q %v", out, err)
 	}
 	ctx.HostNetworkAllowed = false
-	if _, err := NewWebFetchTool().Run(ctx); err == nil {
+	if _, err := executeToolText(NewWebFetchTool(), ctx); err == nil {
 		t.Fatal("proxy bypassed network permission")
 	}
 }

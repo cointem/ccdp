@@ -14,7 +14,7 @@ import (
 	"ccdp/internal/session/journal"
 )
 
-// copyHistory materializes source-owned image references before transferring
+// copyHistory materializes source-owned image and output references before transferring
 // history. Destination persistence then creates its own immutable artifacts.
 func copyHistory(ctx context.Context, source historyArtifactSource, destination *sessionPersistence, history []messages.Message) ([]messages.Message, error) {
 	if ctx == nil {
@@ -23,7 +23,49 @@ func copyHistory(ctx context.Context, source historyArtifactSource, destination 
 	copied := messages.Clone(history)
 	var sourceBlobs journal.ArtifactReader
 	var targetBlobs journal.ArtifactAccess
+	transferred := make(map[string]bool)
+	copyArtifact := func(ref session.BlobRef) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if transferred[ref.Hash] {
+			return nil
+		}
+		if sourceBlobs == nil {
+			var err error
+			sourceBlobs, err = source.historyArtifacts()
+			if err != nil {
+				return err
+			}
+			targetBlobs, err = destination.RequestArtifacts()
+			if err != nil {
+				return err
+			}
+		}
+		data, err := sourceBlobs.Read(ref, session.DefaultMaxBlobBytes)
+		if err != nil {
+			return fmt.Errorf("copy history artifact: %w", err)
+		}
+		targetRef, err := targetBlobs.PutContext(ctx, data)
+		if err != nil {
+			return err
+		}
+		if targetRef.Hash != ref.Hash || targetRef.Size != ref.Size {
+			return errors.New("history artifact copy changed identity")
+		}
+		transferred[ref.Hash] = true
+		return nil
+	}
 	for i := range copied {
+		refs := append([]messages.OutputReference(nil), copied[i].SourceOutputs...)
+		if copied[i].OutputRef != nil {
+			refs = append(refs, *copied[i].OutputRef)
+		}
+		for _, ref := range refs {
+			if err := copyArtifact(session.BlobRef{Hash: ref.Hash, Size: ref.Size, MediaType: ref.MediaType}); err != nil {
+				return nil, err
+			}
+		}
 		for j := range copied[i].ImageAttachments {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -32,28 +74,9 @@ func copyHistory(ctx context.Context, source historyArtifactSource, destination 
 			if image.BlobHash == "" {
 				continue
 			}
-			if sourceBlobs == nil {
-				var err error
-				sourceBlobs, err = source.historyArtifacts()
-				if err != nil {
-					return nil, err
-				}
-				targetBlobs, err = destination.RequestArtifacts()
-				if err != nil {
-					return nil, err
-				}
-			}
 			ref := session.BlobRef{Hash: image.BlobHash, Size: image.BlobSize, MediaType: image.MediaType}
-			data, err := sourceBlobs.Read(ref, session.DefaultMaxBlobBytes)
-			if err != nil {
-				return nil, fmt.Errorf("copy history image: %w", err)
-			}
-			targetRef, err := targetBlobs.PutContext(ctx, data)
-			if err != nil {
+			if err := copyArtifact(ref); err != nil {
 				return nil, err
-			}
-			if targetRef.Hash != ref.Hash || targetRef.Size != ref.Size {
-				return nil, errors.New("history artifact copy changed identity")
 			}
 			image.Data = nil
 		}

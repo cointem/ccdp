@@ -65,16 +65,6 @@ func (m *Model) cyclePermissionMode() tea.Cmd {
 		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+next.Label())
 }
 
-// modeActive reports whether a non-default permission mode is confirmed, so the
-// footer can advertise the shift+tab cycle hint only when it is relevant.
-func (m *Model) modeActive() bool {
-	mode := m.mode
-	if m.hasSnapshot && m.snapshot.Settings.Permission.Mode != "" {
-		mode = permissions.Mode(m.snapshot.Settings.Permission.Mode)
-	}
-	return mode != "" && mode != permissions.ModeDefault
-}
-
 func (m Model) availableModels() []string {
 	if m.hasSnapshot {
 		seen := make(map[string]bool)

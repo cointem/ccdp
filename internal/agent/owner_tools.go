@@ -24,11 +24,7 @@ func (toolStartRequested) ownerControlMessage() {}
 
 func (a *Agent) admitToolStart(tc messages.ToolCall, tool tools.Tool, execution *toolJournalExecution) error {
 	tc.Arguments = jsonvalue.Clone(tc.Arguments)
-	request := toolStartRequested{call: tc, tool: tool, result: make(chan error, 1)}
-	if execution != nil {
-		request.journal, request.started = execution.ctx, execution.started
-		request.journal.statusSink = nil
-	}
+	request := toolStartRequested{call: tc, tool: tool, journal: execution.ctx, started: execution.started, result: make(chan error, 1)}
 	var err error
 	if a.owner == nil {
 		err = a.acceptToolStart(request)
@@ -45,7 +41,7 @@ func (a *Agent) admitToolStart(tc messages.ToolCall, tool tools.Tool, execution 
 			return session.ErrClosed
 		}
 	}
-	if err == nil && execution != nil && execution.ctx.enabled {
+	if err == nil {
 		execution.started = true
 	}
 	return err
@@ -124,15 +120,30 @@ type toolProjectionResult struct {
 func (a *Agent) projectToolsOwned(request toolProjectionRequested) toolProjectionResult {
 	a.mu.Lock()
 	used := a.budget.outputBudget
+	perResultLimit := a.services.cfg.MaxResultSizeBytes
 	a.mu.Unlock()
+	if request.journal.config != nil {
+		perResultLimit = request.journal.config.MaxResultSizeBytes
+	}
 	raw := make([]tooling.Result, len(request.results))
 	for i, r := range request.results {
-		raw[i] = tooling.Result{Output: r.output, IsError: r.isErr, Status: r.status}
+		raw[i] = tooling.Result{Output: r.output, Code: r.code, IsError: r.isErr, Status: r.status, DisplayTruncated: r.displayTruncated, DataError: r.dataError, OutputID: r.outputID}
 	}
-	projected, budget := tooling.ApplyOutputBudget(request.calls, raw, int64(request.journal.maxOutputChars), int64(used))
+	projected, budget, err := tooling.ApplyOutputBudget(request.calls, raw, perResultLimit, int64(request.journal.maxOutputBytes), int64(used))
+	if err != nil {
+		// The turn stops before another model request. Reuse the recovery
+		// view for completed, unprojected calls so the next explicit input
+		// can commit a legal history without rerunning their side effects.
+		a.mu.Lock()
+		a.conversation.recoveryHistory = a.conversation.durable.Recovered().History
+		a.conversation.recoveryBase = len(a.conversation.durable.History)
+		a.conversation.recoveryView = nil
+		a.mu.Unlock()
+		return toolProjectionResult{err: err}
+	}
 	results := make([]toolRunResult, len(projected))
 	for i, result := range projected {
-		results[i] = toolRunResult{output: result.Output, isErr: result.IsError, status: result.Status}
+		results[i] = toolRunResult{output: result.Output, code: result.Code, isErr: result.IsError, status: result.Status, displayTruncated: result.DisplayTruncated, dataError: result.DataError, outputID: result.OutputID}
 	}
 	if err := a.persistToolResultsProjected(request.journal, request.calls, results, budget); err != nil {
 		return toolProjectionResult{results: results, budget: budget, err: err}
@@ -145,7 +156,6 @@ func (a *Agent) projectToolsOwned(request toolProjectionRequested) toolProjectio
 
 func (a *Agent) projectToolsFromWorker(journal toolJournalContext, calls []messages.ToolCall, results []toolRunResult) toolProjectionResult {
 	frozenCalls := messages.Clone([]messages.Message{{ToolCalls: calls}})[0].ToolCalls
-	journal.statusSink = nil
 	request := toolProjectionRequested{journal: journal, calls: frozenCalls, results: append([]toolRunResult(nil), results...), result: make(chan toolProjectionResult, 1)}
 	if a.owner == nil {
 		return a.projectToolsOwned(request)

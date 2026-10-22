@@ -543,7 +543,10 @@ func TestAstraAcceptanceReaderLongEntryCopyAndReturn(t *testing.T) {
 func TestAstraAcceptanceOutputSearchAndDisplaySanitization(t *testing.T) {
 	m := astraModel(t, 80, 24)
 	source := strings.Repeat("filler line\n", 25) + "needle target\n\x1b[3Jafter control"
-	m.openOutputReader(agentOutputMsg{sessionID: m.sessionID, itemID: "output-1", page: protocol.OutputPage{Text: source, Next: int64(len(source)), Total: int64(len(source))}})
+	{
+		next, _ := m.Update(agentOutputMsg{sessionID: m.sessionID, itemID: "output-1", page: protocol.OutputPage{Text: source, Next: int64(len(source)), Total: int64(len(source))}})
+		m = modelValue(t, next)
+	}
 	_ = m.readerBody(76, 6)
 	m.handleReaderKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
 	m.handleReaderKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("needle")})
@@ -561,9 +564,15 @@ func TestAstraAcceptanceClosedReaderRejectsLatePage(t *testing.T) {
 	m := astraModel(t, 80, 24)
 	m.readerSeq, m.readerRequest = 7, 7
 	msg := agentOutputMsg{sessionID: m.sessionID, itemID: "saved-output", request: 7, page: protocol.OutputPage{Text: "old output"}}
-	m.openOutputReader(msg)
+	{
+		next, _ := m.Update(msg)
+		m = modelValue(t, next)
+	}
 	m.closeReader()
-	m.openOutputReader(msg)
+	{
+		next, _ := m.Update(msg)
+		m = modelValue(t, next)
+	}
 	if m.reader != nil {
 		t.Fatal("late page reopened a reader after Esc")
 	}

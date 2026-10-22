@@ -38,9 +38,8 @@ type fallbackRequested struct{ result chan string }
 func (fallbackRequested) ownerControlMessage() {}
 
 type turnNoteRecorded struct {
-	interrupted      bool
-	summary, touched string
-	done             chan struct{}
+	interrupted bool
+	done        chan struct{}
 }
 
 func (turnNoteRecorded) ownerControlMessage() {}
@@ -103,11 +102,7 @@ func (a *Agent) prepareTurnCleanup() turnCleanupResult {
 	}
 	a.mu.Unlock()
 	a.finishGoalTurnOwned()
-	err := a.recordMemory()
-	if err != nil {
-		a.markPersistenceFailure(err)
-	}
-	return turnCleanupResult{sequence: sequence, err: err}
+	return turnCleanupResult{sequence: sequence}
 }
 
 func (a *Agent) selectFallback() string {
@@ -146,18 +141,6 @@ func (a *Agent) recordTurnNote(request turnNoteRecorded) {
 	a.mu.Lock()
 	if request.interrupted {
 		a.turnMemory.interruptNote = true
-	}
-	if request.summary != "" {
-		a.turnMemory.turnSummary = request.summary
-	}
-	if request.touched != "" {
-		found := false
-		for _, path := range a.turnMemory.turnTouched {
-			found = found || path == request.touched
-		}
-		if !found {
-			a.turnMemory.turnTouched = append(a.turnMemory.turnTouched, request.touched)
-		}
 	}
 	a.mu.Unlock()
 }

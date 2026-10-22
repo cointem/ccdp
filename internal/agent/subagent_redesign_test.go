@@ -15,19 +15,22 @@ import (
 	"ccdp/internal/protocol"
 )
 
-func TestSharedWorkerDefaultCanWriteWithoutGit(t *testing.T) {
+func TestIsolatedWorkerDefaultCanWriteWithoutGit(t *testing.T) {
 	f := &fakeLLM{script: []string{"tool:Write|file_path=child.txt;mode=create;content=created", "tool:Bash|command=printf verified", "text:done"}}
 	a, _ := newTestAgent(t, f)
 	rows, err := runTestChildren(a, []childTask{{Description: "write and verify"}}, "worker")
 	if err != nil || len(rows) != 1 || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}
-	data, err := os.ReadFile(filepath.Join(a.services.cfg.Workspace, "child.txt"))
+	data, err := os.ReadFile(filepath.Join(rows[0].Workspace, "child.txt"))
 	if err != nil || string(data) != "created" {
 		t.Fatalf("write=%q %v", data, err)
 	}
-	if rows[0].Role != "worker" || rows[0].WorkspaceMode != "shared" || rows[0].Workspace != a.services.cfg.Workspace {
+	if rows[0].Role != "worker" || rows[0].WorkspaceMode != "isolated" || rows[0].Workspace == a.services.cfg.Workspace {
 		t.Fatalf("wrong defaults: %+v", rows)
+	}
+	if _, err := os.Stat(filepath.Join(a.services.cfg.Workspace, "child.txt")); !os.IsNotExist(err) {
+		t.Fatal("default worker modified parent workspace")
 	}
 	saved, err := LoadSession(a.services.cfg.SessionDir, rows[0].SessionID)
 	if err != nil {
@@ -197,7 +200,7 @@ func TestSharedWorkerRetainsParentDeny(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, _ := resolveChildTask(childTask{})
+	task, _ := resolveChildTask(childTask{WorkspaceMode: "shared"})
 	_, _, err = a.prepareChildWorkspace(context.Background(), task, &cfg, &opts)
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +218,7 @@ func TestSharedWorkerCannotEscapeParentPlan(t *testing.T) {
 	if err := a.setExecutionMode(true); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := runTestChildren(a, []childTask{{Description: "try writing"}}, "plan-child")
+	rows, err := runTestChildren(a, []childTask{{Description: "try writing", WorkspaceMode: "shared"}}, "plan-child")
 	if err != nil || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}
@@ -295,12 +298,12 @@ func TestWorkspaceMutationBlocksSharedWorkerAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := runTestChildren(a, []childTask{{Description: "blocked"}}, "blocked")
+	rows, err := runTestChildren(a, []childTask{{Description: "blocked", WorkspaceMode: "shared"}}, "blocked")
 	if err != nil || rows[0].Error == "" {
 		t.Fatalf("shared worker admitted during mutation: %+v %v", rows, err)
 	}
 	release()
-	rows, err = runTestChildren(a, []childTask{{Description: "allowed"}}, "allowed")
+	rows, err = runTestChildren(a, []childTask{{Description: "allowed", WorkspaceMode: "shared"}}, "allowed")
 	if err != nil || rows[0].Error != "" {
 		t.Fatalf("reservation not released: %+v %v", rows, err)
 	}
@@ -320,7 +323,7 @@ func TestSharedWorkerBlocksWorkspaceMutationUntilSettled(t *testing.T) {
 	a, _ := newChildRuntimeTestAgent(t, p)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r, err := a.services.supervisor.launch(a, ctx, childTask{Description: "wait"}, childPurposeTask, "busy")
+	r, err := a.services.supervisor.launch(a, ctx, childTask{Description: "wait", WorkspaceMode: "shared"}, childPurposeTask, "busy")
 	if err != nil {
 		t.Fatal(err)
 	}

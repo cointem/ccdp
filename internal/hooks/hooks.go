@@ -284,6 +284,7 @@ func baseInputFrom(opts Options, transcriptPath, event string) Input {
 func cloneHookOptions(opts Options) Options {
 	clone := opts
 	clone.Env = append([]string(nil), opts.Env...)
+	clone.Sandbox = opts.Sandbox.Snapshot()
 	return clone
 }
 

@@ -61,7 +61,7 @@ func TestNewConcurrentAgentsHaveUniqueSessionIDs(t *testing.T) {
 	cfg.BaseURL = "http://127.0.0.1:1/unreachable"
 	cfg.NoSessionPersistence = true
 	cfg.EnableGuardian = config.BoolPtr(false)
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	models := plugin.NewModelRegistry()
 	provider := sessionIDTestProvider{}
 	models.Register(provider)

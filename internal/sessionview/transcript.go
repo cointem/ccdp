@@ -1,6 +1,7 @@
 package sessionview
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -49,6 +50,7 @@ func toolEventTranscriptID(ev protocol.EventView) string {
 // Its mutex never calls back into Agent or persistence.
 type Transcript struct {
 	buffers           map[string]*transcriptBuffer
+	pendingInputs     map[string]protocol.TranscriptItem
 	index             map[string]uint64
 	before            uint64
 	window            int
@@ -237,6 +239,8 @@ func (t *Transcript) Facts(events []session.Event) {
 			}
 		case session.EventTypeInputQueued:
 			t.applyInputQueued(b)
+		case session.EventTypeInputDelivered:
+			t.applyInputDelivered(b)
 		case session.EventTypeInputCancelled:
 			t.applyInputCancelled(b)
 		case session.EventTypeAssistantCommitted:
@@ -255,7 +259,7 @@ func (t *Transcript) Facts(events []session.Event) {
 // transcript projection.
 func transcriptRelevantEvent(typ session.EventType) bool {
 	switch typ {
-	case session.EventTypeInputQueued, session.EventTypeInputCancelled, session.EventTypeAssistantCommitted,
+	case session.EventTypeInputQueued, session.EventTypeInputDelivered, session.EventTypeInputCancelled, session.EventTypeAssistantCommitted,
 		session.EventTypeToolStarted, session.EventTypeToolFinished, session.EventTypeTurnFinished,
 		session.EventTypeConversationReset:
 		return true
@@ -282,11 +286,32 @@ func (t *Transcript) applyInputQueued(b []byte) {
 	if id == "" {
 		id = protocol.InputMessageID(protocol.InputID(e.InputID))
 	}
-	kind := "user"
-	if e.Strategy == string(protocol.InputMessage) {
-		kind = "collaboration"
+	// User inputs belong to PendingInputs until consumed. Inserting them here
+	// fixes their transcript (and pagination) position before the running turn
+	// finishes. InputDelivered assigns their position and consuming turn.
+	if e.Strategy != string(protocol.InputMessage) {
+		if t.pendingInputs == nil {
+			t.pendingInputs = make(map[string]protocol.TranscriptItem)
+		}
+		text, truncated := Clip(e.Text)
+		t.pendingInputs[e.InputID] = protocol.TranscriptItem{ID: id, Kind: "user", Text: text, Truncated: truncated}
+		return
 	}
-	t.put(protocol.TranscriptItem{ID: id, Kind: kind, Text: e.Text, Status: "queued"})
+	t.put(protocol.TranscriptItem{ID: id, Kind: "collaboration", Text: e.Text, Status: "queued"})
+}
+
+func (t *Transcript) applyInputDelivered(b []byte) {
+	var e session.InputDelivered
+	if json.Unmarshal(b, &e) != nil {
+		return
+	}
+	item, ok := t.pendingInputs[e.InputID]
+	if !ok {
+		return
+	}
+	delete(t.pendingInputs, e.InputID)
+	item.TurnID, item.Status = protocol.TurnID(e.TurnID), "completed"
+	t.put(item)
 }
 
 func (t *Transcript) applyInputCancelled(b []byte) {
@@ -294,6 +319,7 @@ func (t *Transcript) applyInputCancelled(b []byte) {
 	if json.Unmarshal(b, &e) != nil {
 		return
 	}
+	delete(t.pendingInputs, e.InputID)
 	for _, item := range t.items {
 		if item.ID == protocol.InputMessageID(protocol.InputID(e.InputID)) {
 			item.Status = "cancelled"
@@ -390,7 +416,7 @@ func (t *Transcript) applyToolStarted(b []byte) {
 	if json.Unmarshal(b, &e) != nil {
 		return
 	}
-	t.put(protocol.TranscriptItem{ID: ToolID(e.TurnID, e.StepID, e.Call.CallID), Kind: "tool", TurnID: protocol.TurnID(e.TurnID), StepID: protocol.StepID(e.StepID), CallID: protocol.CallID(e.Call.CallID), Tool: e.Call.ToolID, Args: e.Call.Arguments, Status: "running"})
+	t.put(protocol.TranscriptItem{ID: ToolID(e.TurnID, e.StepID, e.Call.CallID), Kind: "tool", TurnID: protocol.TurnID(e.TurnID), StepID: protocol.StepID(e.StepID), CallID: protocol.CallID(e.Call.CallID), Tool: e.Call.ToolID, Args: e.Call.Arguments, Status: "running", ParentCallID: protocol.CallID(e.ParentCallID), ChildIndex: e.ChildIndex})
 }
 
 func (t *Transcript) applyToolFinished(b []byte) {
@@ -407,6 +433,13 @@ func (t *Transcript) applyToolFinished(b []byte) {
 		}
 	}
 	item.Text, item.Status = e.Result.Text, e.Status
+	if e.Call != nil {
+		item.Tool = e.Call.ToolID
+		item.Args = e.Call.Arguments
+	}
+	item.ParentCallID = protocol.CallID(e.ParentCallID)
+	item.ChildIndex = e.ChildIndex
+	item.StepID = protocol.StepID(e.StepID)
 	item.Truncated = e.RawOutput != nil && e.RawOutput.Size > int64(len(item.Text)) || e.Result.Blob != nil
 	if item.Text == "" {
 		item.Text = e.Error
@@ -573,7 +606,45 @@ func FromRecords(records []session.Record) *Transcript {
 	for _, record := range records {
 		t.Facts([]session.Event{record.Event})
 	}
+	t.FinalizeRecoveredTools()
 	return t
+}
+
+// FinalizeRecoveredTools is a presentation boundary, not a completion fact.
+// No tool from a previous writer can still be running in the reopened one.
+func (t *Transcript) FinalizeRecoveredTools() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range t.items {
+		item := &t.items[i]
+		if item.Kind == "tool" && (item.Status == "running" || item.Status == "queued") {
+			item.Status = "unknown"
+			if item.Text == "" {
+				item.Text = "Result unknown after session stopped; inspect the recorded output before retrying."
+			}
+		}
+	}
+}
+
+// ReplayRecords shares the writer's recovery boundary with bounded history
+// pages. Facts from the current writer remain live; older unfinished tools do
+// not become running again just because a reader reconstructs an older page.
+func (t *Transcript) ReplayRecords(ctx context.Context, records []session.Record, recoveredThrough session.Cursor) error {
+	finalized := recoveredThrough == session.Beginning
+	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !finalized && record.Seq > recoveredThrough {
+			t.FinalizeRecoveredTools()
+			finalized = true
+		}
+		t.Facts([]session.Event{record.Event})
+	}
+	if !finalized {
+		t.FinalizeRecoveredTools()
+	}
+	return nil
 }
 
 // NewTranscript constructs a bounded projection. Zero values use the live defaults.

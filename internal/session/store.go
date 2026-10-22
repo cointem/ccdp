@@ -19,7 +19,7 @@ import (
 
 const (
 	// SchemaVersion is the only JSONL format this implementation writes.
-	SchemaVersion uint32 = 2
+	SchemaVersion uint32 = 3
 	// DefaultMaxTransactionBytes prevents a JSONL line from becoming an
 	// accidental unbounded allocation.
 	DefaultMaxTransactionBytes int64 = 8 << 20
@@ -42,18 +42,19 @@ const (
 )
 
 var (
-	ErrClosed            = errors.New("session: store is closed")
-	ErrReadOnly          = errors.New("session: store is read-only")
-	ErrWriterLocked      = errors.New("session: another writer owns this session")
-	ErrCursorConflict    = errors.New("session: expected cursor does not match")
-	ErrDuplicateID       = errors.New("session: duplicate id has different content")
-	ErrFutureVersion     = errors.New("session: future storage version")
-	ErrCorrupt           = errors.New("session: corrupt event log")
-	ErrTorn              = errors.New("session: incomplete event-log tail")
-	ErrTooLarge          = errors.New("session: content exceeds configured limit")
-	ErrPersistenceFailed = errors.New("session: persistence failed")
-	ErrUnknownEventType  = errors.New("session: unknown event type")
-	ErrInvalidSessionID  = errors.New("session: invalid session id")
+	ErrClosed             = errors.New("session: store is closed")
+	ErrReadOnly           = errors.New("session: store is read-only")
+	ErrWriterLocked       = errors.New("session: another writer owns this session")
+	ErrCursorConflict     = errors.New("session: expected cursor does not match")
+	ErrDuplicateID        = errors.New("session: duplicate id has different content")
+	ErrFutureVersion      = errors.New("session: future storage version")
+	ErrUnsupportedVersion = errors.New("session: unsupported storage version")
+	ErrCorrupt            = errors.New("session: corrupt event log")
+	ErrTorn               = errors.New("session: incomplete event-log tail")
+	ErrTooLarge           = errors.New("session: content exceeds configured limit")
+	ErrPersistenceFailed  = errors.New("session: persistence failed")
+	ErrUnknownEventType   = errors.New("session: unknown event type")
+	ErrInvalidSessionID   = errors.New("session: invalid session id")
 )
 
 // CursorConflictError preserves both values for a structured command
@@ -280,7 +281,7 @@ func parseTransaction(data []byte) (parsedTransaction, error) {
 		return parsedTransaction{}, fmt.Errorf("%w: transaction schema_version %d", ErrFutureVersion, envelope.SchemaVersion)
 	}
 	if envelope.SchemaVersion != SchemaVersion {
-		return parsedTransaction{}, fmt.Errorf("%w: unsupported transaction schema_version %d", ErrCorrupt, envelope.SchemaVersion)
+		return parsedTransaction{}, fmt.Errorf("%w: schema_version %d cannot be resumed by this build (requires %d); existing files have not been migrated or deleted", ErrUnsupportedVersion, envelope.SchemaVersion, SchemaVersion)
 	}
 	if envelope.TransactionID == "" || envelope.FirstSeq == 0 || envelope.LastSeq < envelope.FirstSeq || len(envelope.Events) == 0 || envelope.InputFingerprint == "" {
 		return parsedTransaction{}, fmt.Errorf("%w: invalid transaction bounds or ID", ErrCorrupt)
@@ -605,13 +606,6 @@ func cloneRecords(records []Record) ([]Record, error) {
 		result = append(result, Record{Seq: record.Seq, TransactionID: record.TransactionID, Event: event})
 	}
 	return result, nil
-}
-
-func copyBytes(data []byte) []byte {
-	if data == nil {
-		return nil
-	}
-	return append([]byte(nil), data...)
 }
 
 func validateSessionID(id string) error {

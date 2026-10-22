@@ -161,13 +161,15 @@ func TestManagerRegisterTools(t *testing.T) {
 
 	m := NewManager()
 	m.SetSandbox(sandbox.New(t.TempDir()))
-	m.Start(context.Background(), map[string]ServerConfig{
+	if err := m.StartChecked(context.Background(), map[string]ServerConfig{
 		"fake": {
 			Command: os.Args[0],
 			Args:    []string{"-test.run=TestManagerRegisterTools"},
 			Env:     map[string]string{fakeServerEnv: "1"},
 		},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	defer m.Close()
 
 	if len(m.Names()) != 1 || m.Names()[0] != "fake" {
@@ -184,7 +186,7 @@ func TestManagerRegisterTools(t *testing.T) {
 	if tool.Name() != "mcp__fake__echo" {
 		t.Fatalf("tool name = %q, want qualified MCP name", tool.Name())
 	}
-	out, err := tool.Run(&tools.Context{
+	out, err := executeToolText(tool, &tools.Context{
 		Context: context.Background(),
 		Args:    map[string]any{"text": "from-registry"},
 	})
@@ -231,18 +233,24 @@ func TestManagerRefreshKeepsOldStepBindingAlive(t *testing.T) {
 	if !ok {
 		t.Fatal("old step lost echo binding")
 	}
-	if err := m.Refresh(context.Background(), map[string]ServerConfig{"fake": server}); err != nil {
+	candidate, err := m.PrepareRefresh(context.Background(), map[string]ServerConfig{"fake": server}, nil, false)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer candidate.Abort()
+	if err := candidate.Publish(); err != nil {
+		t.Fatal(err)
+	}
+	candidate.FinishRetirement()
 	current, ok := reg.Get("mcp__fake__echo")
 	if !ok || current == old {
 		t.Fatal("refresh did not publish a new binding")
 	}
-	if out, err := old.Run(&tools.Context{Context: context.Background(), Args: map[string]any{"text": "old"}}); err != nil || out != "echo:old" {
+	if out, err := executeToolText(old, &tools.Context{Context: context.Background(), Args: map[string]any{"text": "old"}}); err != nil || out != "echo:old" {
 		t.Fatalf("old binding failed before step close: out=%q err=%v", out, err)
 	}
 	step.Close()
-	if _, err := old.Run(&tools.Context{Context: context.Background(), Args: map[string]any{"text": "closed"}}); err == nil {
+	if _, err := executeToolText(old, &tools.Context{Context: context.Background(), Args: map[string]any{"text": "closed"}}); err == nil {
 		t.Fatal("retired MCP client remained usable after step lease close")
 	}
 }
@@ -289,9 +297,11 @@ func TestManagerStartsSSEWithoutCommand(t *testing.T) {
 	sb.SetAllowNetwork(true)
 	m := NewManager()
 	m.SetSandbox(sb)
-	m.Start(context.Background(), map[string]ServerConfig{
+	if err := m.StartChecked(context.Background(), map[string]ServerConfig{
 		"remote": {Transport: "sse", BaseURL: srv.URL, NetworkAuthorized: true},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	defer m.Close()
 	if names := m.Names(); len(names) != 1 || names[0] != "remote" {
 		t.Fatalf("SSE server without command was skipped: %v", names)
@@ -312,7 +322,7 @@ func TestUnapprovedRemoteMCPDoesNotConnect(t *testing.T) {
 func TestRemoteMCPToolRequiresPerCallHostNetwork(t *testing.T) {
 	client := NewClient("remote", ServerConfig{Transport: "sse", BaseURL: "https://example.test/sse", NetworkAuthorized: true})
 	tool := &mcpTool{client: client, def: ToolDef{Name: "read"}}
-	if _, err := tool.Run(&tools.Context{Context: context.Background(), Args: map[string]any{}}); err == nil || !strings.Contains(err.Error(), "per-call outbound network authorization") {
+	if _, err := executeToolText(tool, &tools.Context{Context: context.Background(), Args: map[string]any{}}); err == nil || !strings.Contains(err.Error(), "per-call outbound network authorization") {
 		t.Fatalf("remote MCP call without per-call authorization = %v", err)
 	}
 }

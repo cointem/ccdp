@@ -83,7 +83,7 @@ func BenchmarkOrdinaryStatePublication(b *testing.B) {
 			cfg := config.Default()
 			cfg.Workspace = b.TempDir()
 			cfg.NoSessionPersistence = true
-			cfg.EnableMemory = config.BoolPtr(false)
+			cfg.EnableProjectMemory = false
 			a, err := testNewWithOptions(b, &cfg, Options{EffectiveConfigFrozen: true})
 			if err != nil {
 				b.Fatal(err)

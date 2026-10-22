@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -79,6 +80,19 @@ type Store struct {
 
 // New uses memory when dir is empty. On-disk state is separate from the workspace.
 func New(dir string) *Store { return &Store{dir: dir, memory: make(map[string][]byte)} }
+
+// Clone opens an independent handle to the same contents. In-memory objects,
+// including mutable transaction records, are copied; disk handles retain their
+// backing directory.
+func (s *Store) Clone() *Store {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cloned := New(s.dir)
+	for key, data := range s.memory {
+		cloned.memory[key] = append([]byte(nil), data...)
+	}
+	return cloned
+}
 
 func digest(b []byte) string   { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func validID(id string) bool   { b, e := hex.DecodeString(id); return e == nil && len(b) == 32 }
@@ -302,11 +316,16 @@ func (s *Store) ReadFile(root, rel string, policy *sandbox.Sandbox) (File, error
 	}
 	defer handle.Close()
 	before, e := handle.Lstat(rel)
-	if os.IsNotExist(e) {
+	if os.IsNotExist(e) || errors.Is(e, syscall.ENOTDIR) {
 		return absent(), nil
 	}
 	if e != nil {
 		return File{}, e
+	}
+	// Snapshots contain file leaves. A directory at an old file path means
+	// that leaf is absent; its current children have their own entries.
+	if before.IsDir() {
+		return absent(), nil
 	}
 	var data []byte
 	kind := "regular"

@@ -120,6 +120,7 @@ type StreamChoice struct {
 type Delta struct {
 	Role             string     `json:"role"`
 	Content          *string    `json:"content"`
+	Refusal          *string    `json:"refusal"`
 	ReasoningContent *string    `json:"reasoning_content"` // OpenAI-style chain-of-thought deltas
 	ToolCalls        []ToolCall `json:"tool_calls"`
 }
@@ -188,10 +189,10 @@ type CompletionRequest struct {
 	Verbosity       string          `json:"verbosity,omitempty"`
 	Model           string          `json:"model"`
 	Messages        []ChatMessage   `json:"messages"`
-	// SystemBlocks is the structured system prompt. chat/responses render it as
-	// a single system message (joined); anthropic renders it as a system array
-	// with cache_control on cacheable sections. Empty means the system message
-	// in Messages is authoritative.
+	// SystemBlocks describes the leading system message in Messages.
+	// Anthropic replaces that message with these cache-aware blocks and keeps
+	// subsequent system messages as session context. Other wires use Messages.
+	// Empty means all system messages are rendered directly from Messages.
 	SystemBlocks []SystemBlock `json:"system_blocks,omitempty"`
 	Tools        []ToolDef     `json:"tools,omitempty"`
 	Temperature  *float64      `json:"temperature,omitempty"`

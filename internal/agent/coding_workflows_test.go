@@ -35,7 +35,7 @@ func codingFixture(t *testing.T) (*Agent, string) {
 	cfg.SessionDir = t.TempDir()
 	cfg.PermissionMode = "bypass"
 	cfg.EnableGuardian = config.BoolPtr(false)
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.MCPServers = nil
 	a, e := testNew(t, &cfg)
 	if e != nil {

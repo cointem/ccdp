@@ -21,7 +21,7 @@ func BenchmarkAcceptanceFsync(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		batch := Batch{TransactionID: fmt.Sprintf("memory-%d", i), Events: []Event{MemoryChanged{Revision: uint64(i + 1), Text: "benchmark durable state"}}}
+		batch := Batch{TransactionID: fmt.Sprintf("tasks-%d", i), Events: []Event{TasksChanged{Revision: uint64(i + 1), Tasks: []Task{{TaskID: "benchmark", Title: "benchmark durable state", Status: "pending"}}}}}
 		start := time.Now()
 		_, err = store.Commit(store.CurrentCursor(), batch)
 		samples[i] = time.Since(start).Nanoseconds()

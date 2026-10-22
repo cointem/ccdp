@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"ccdp/internal/protocol"
 )
@@ -98,14 +99,14 @@ func (a *Agent) gitWorktreePaths(ctx context.Context, cmd protocol.Command, root
 			continue
 		}
 		info, err := os.Lstat(filepath.Join(root, path))
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
 		if info.IsDir() {
-			return nil, errors.New("tracked file replaced by directory: " + path)
+			continue
 		}
 		paths = append(paths, path)
 	}

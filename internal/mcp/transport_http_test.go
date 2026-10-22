@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"ccdp/internal/tools"
+
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -299,12 +301,20 @@ func TestHTTPInteroperatesWithOfficialServer(t *testing.T) {
 		stream.ServeHTTP(w, r)
 	}))
 	defer srv.Close()
-	c := NewClient("official", ServerConfig{Transport: "sse", BaseURL: srv.URL, NetworkAuthorized: true})
-	defer c.Close()
+	m := NewManager()
+	defer m.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := c.Start(ctx); err != nil {
+	if err := m.StartChecked(ctx, map[string]ServerConfig{"official": {Transport: "sse", BaseURL: srv.URL, NetworkAuthorized: true}}); err != nil {
 		t.Fatal(err)
+	}
+	reg := tools.NewRegistry()
+	if err := m.RegisterTools(reg); err != nil {
+		t.Fatal(err)
+	}
+	c, ok := m.Server("official")
+	if !ok {
+		t.Fatal("official server was not published")
 	}
 	if out, err := c.Call(ctx, "echo", nil); err != nil || out != "official response" {
 		t.Fatalf("call=%q err=%v", out, err)
@@ -315,7 +325,7 @@ func TestHTTPInteroperatesWithOfficialServer(t *testing.T) {
 		t.Fatal("notification stream did not open")
 	}
 	changed := make(chan struct{}, 1)
-	c.SetChangeListener(func() {
+	reg.SetChangeListener(func() {
 		select {
 		case changed <- struct{}{}:
 		default:
@@ -329,6 +339,9 @@ func TestHTTPInteroperatesWithOfficialServer(t *testing.T) {
 	}
 	if len(c.Tools()) != 2 {
 		t.Fatalf("tools=%v", c.Tools())
+	}
+	if binding, ok := reg.Get("mcp__official__new_tool"); !ok || binding.(*mcpTool).client != c {
+		t.Fatal("tool change did not publish the new registry binding")
 	}
 	_ = c.Close()
 	if !terminated.Load() {

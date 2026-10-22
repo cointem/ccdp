@@ -52,7 +52,7 @@ func TestFrontendWorkspaceProjection(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace = t.TempDir()
 	cfg.SessionDir = filepath.Join(t.TempDir(), "sessions")
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.BaseURL = "http://127.0.0.1:1"
 	cfg.APIKey = "test"
 	a, err := agent.NewWithOptions(&cfg, agent.Options{EffectiveConfigFrozen: true})
@@ -118,7 +118,7 @@ func TestFrontendRejectedInputCanRetryAfterAttachmentAppears(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace = t.TempDir()
 	cfg.SessionDir = filepath.Join(t.TempDir(), "sessions")
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.BaseURL = "http://127.0.0.1:1"
 	cfg.APIKey = "test"
 	a, e := agent.NewWithOptions(&cfg, agent.Options{EffectiveConfigFrozen: true})

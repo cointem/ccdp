@@ -29,7 +29,18 @@ type toolAuthority struct {
 
 func (c *toolAuthority) Admit() (tooling.Admission, *tooling.Result) {
 	a, tc := c.agent, c.call
-	tool, out, allow, denied := a.hardAdmitTool(tc, c.journal, c.execution)
+	if c.journal.context != nil && c.journal.context.Err() != nil {
+		c.execution.setStatus("cancelled")
+		return tooling.Admission{}, &tooling.Result{Output: c.journal.context.Err().Error(), IsError: true, Status: "cancelled"}
+	}
+	args, err := c.journal.toolLease.PrepareArguments(tc.Name, tc.Arguments)
+	if err != nil {
+		c.execution.setStatus("error")
+		return tooling.Admission{}, &tooling.Result{Output: "invalid tool arguments/schema: " + err.Error(), IsError: true, Status: "error"}
+	}
+	tc.Arguments = args
+	c.call = tc
+	tool, out, allow, denied := a.hardAdmitTool(tc, c.journal)
 	fail := func(out string) (tooling.Admission, *tooling.Result) {
 		return tooling.Admission{}, &tooling.Result{Output: out, IsError: true}
 	}
@@ -42,7 +53,6 @@ func (c *toolAuthority) Admit() (tooling.Admission, *tooling.Result) {
 		a.emit(toolEvent(tc, "cancelled", "goal is stopped"))
 		return fail("goal is stopped; no new tool work was executed")
 	}
-	var err error
 	c.policy, c.capabilities, c.version, err = a.toolCapabilityPolicy(tc, tool)
 	if err != nil {
 		a.emit(toolEvent(tc, "denied", err.Error()))
@@ -54,7 +64,11 @@ func (c *toolAuthority) GoPreHook() (plugin.ToolDecision, string) {
 	return c.agent.services.gohooks.RunPreTool(c.call.Name, c.call.Arguments)
 }
 func (c *toolAuthority) ShellPreHook() hooks.Output {
-	return c.agent.runHookWithJournal(c.agent.turn.turnCtx, hooks.EventPreToolUse, func(ctx context.Context) hooks.Output {
+	ctx := c.journal.context
+	if ctx == nil {
+		ctx = c.agent.turn.turnCtx
+	}
+	return c.agent.runHookWithJournal(ctx, hooks.EventPreToolUse, func(ctx context.Context) hooks.Output {
 		return c.agent.services.hooks.PreToolUse(ctx, c.call.Name, c.call.Arguments)
 	})
 }
@@ -63,7 +77,7 @@ func (c *toolAuthority) CheckPermission() (permissions.Decision, string) {
 }
 func (c *toolAuthority) Approve(reason string) bool {
 	var approved, remember bool
-	c.policy, c.version, approved, remember = c.agent.approveToolWithCapabilities(c.call, reason, c.policy, c.version, c.capabilities)
+	c.policy, c.version, approved, remember = c.agent.approveToolWithCapabilities(c.call, reason, c.policy, c.version, c.capabilities, c.journal.context)
 	if remember {
 		key := permissions.SessionKey(c.call.Name, c.call.Arguments)
 		if approved {
@@ -75,6 +89,9 @@ func (c *toolAuthority) Approve(reason string) bool {
 	return approved
 }
 func (c *toolAuthority) CheckReady() error {
+	if c.journal.context != nil && c.journal.context.Err() != nil {
+		return c.journal.context.Err()
+	}
 	a := c.agent
 	if err := a.toolExecutionError(); err != nil {
 		return err
@@ -91,10 +108,10 @@ func (c *toolAuthority) CheckReady() error {
 	return errors.New("permission denied: sandbox policy changed; retry the tool under the current policy")
 }
 func (c *toolAuthority) Invoke() tooling.Result {
-	out, failed := c.agent.runToolWithJournalPolicy(c.call, c.tool, c.journal, c.execution, c.policy)
-	return tooling.Result{Output: out, IsError: failed}
+	return c.agent.runToolWithJournalPolicy(c.call, c.tool, c.journal, c.execution, c.policy)
 }
 func (c *toolAuthority) Rejected(status, reason string) {
+	c.execution.setStatus(status)
 	c.agent.emit(toolEvent(c.call, status, reason))
 }
 

@@ -13,6 +13,13 @@ import (
 
 func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text string, initial *SessionSnapshot) {
 	defer s.directory.WorkerDone()
+	slots := r.parent.childSlotsForRun(r.fact.Child.Purpose)
+	acquired := false
+	defer func() {
+		if acquired {
+			slots.release()
+		}
+	}()
 	defer func() {
 		close(r.done)
 		s.publishChildOutcome(r)
@@ -22,7 +29,9 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 	defer r.workspaceLease.Close()
 	defer r.cancel()
 	defer r.lease.Close()
-	if isTaskChild(r.fact.Child.Purpose) {
+	err := slots.acquire(ctx)
+	acquired = err == nil
+	if acquired && isTaskChild(r.fact.Child.Purpose) {
 		r.parent.runChildHook(ctx, true, text)
 		defer func() {
 			cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -30,14 +39,16 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 			r.parent.runChildHook(cleanup, false, r.fact.Child.Run.Output)
 		}()
 	}
-	err := r.parent.childSlotsForRun().acquire(ctx)
 	if err == nil {
-		defer r.parent.childSlotsForRun().release()
 		r.mu.Lock()
 		r.fact.Child.Run.Status = "starting"
 		r.fact.Child.Run.StartedAt = time.Now().UTC()
-		err = s.persist(r, "starting")
+		reply := enqueueRunRecordLocked(r, "starting")
 		r.mu.Unlock()
+		err = r.parent.waitChildRecord(reply)
+		if err == nil {
+			s.publishChildOutcome(r)
+		}
 	}
 	var child supervision.ChildRuntime
 	var output string
@@ -59,8 +70,12 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 			r.mu.Lock()
 			r.agent = child
 			r.fact.Child.Run.Status = "running"
-			err = s.persist(r, "running")
+			reply := enqueueRunRecordLocked(r, "running")
 			r.mu.Unlock()
+			err = r.parent.waitChildRecord(reply)
+			if err == nil {
+				s.publishChildOutcome(r)
+			}
 		}
 		if err == nil {
 			err = s.flushChildMessages(r, child)
@@ -112,11 +127,17 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 			r.fact.Child.Run.Status = "failed"
 		}
 	}
-	if persistErr := s.recordOutcome(r); persistErr != nil {
+	reply := enqueueRunOutcomeLocked(r)
+	r.mu.Unlock()
+	persistErr := r.parent.waitChildRecord(reply)
+	r.mu.Lock()
+	if persistErr != nil {
 		r.executionBoundaryErr = persistErr
 		r.err = errors.Join(r.err, persistErr)
 		r.fact.Child.Run.Status = "failed"
 		r.fact.Child.Run.Error = r.err.Error()
+	} else {
+		r.fact.UsageAccounted = true
 	}
 	r.mu.Unlock()
 	// Retain only immutable data after settlement. Cold continuation rebinds

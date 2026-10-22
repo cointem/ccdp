@@ -31,6 +31,9 @@ type Writer struct {
 	// Read views must never wait behind filesystem I/O while holding a runtime
 	// lock needed by cancellation or shutdown.
 	confirmedCursor atomic.Uint64
+	// openedAtCursor separates recovered facts from this writer's live work.
+	// It changes only when construction restores an in-memory log.
+	openedAtCursor session.Cursor
 
 	sessionID string
 	dir       string
@@ -233,14 +236,21 @@ func (p *Writer) putBlobLocked(ctx context.Context, data []byte, mediaType strin
 // readSnapshot captures records and the matching artifact capability under the
 // same lifetime boundary. Consumers cannot close or replace the owned store.
 func (p *Writer) ReadSnapshot() ([]session.Record, ArtifactAccess, error) {
+	records, blobs, _, err := p.ReadSnapshotWithRecovery()
+	return records, blobs, err
+}
+
+// ReadSnapshotWithRecovery freezes records and their recovery boundary under
+// the same writer lock. The boundary is internal metadata, not a durable fact.
+func (p *Writer) ReadSnapshotWithRecovery() ([]session.Record, ArtifactAccess, session.Cursor, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.store == nil {
-		return nil, nil, session.ErrClosed
+		return nil, nil, 0, session.ErrClosed
 	}
 	blobs := p.artifactAccess
 	records, err := p.store.Read(session.Beginning)
-	return records, blobs, err
+	return records, blobs, p.openedAtCursor, err
 }
 
 func (p *Writer) TranscriptView() *sessionview.Transcript { return p.transcript }

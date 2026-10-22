@@ -20,7 +20,7 @@ func runTool(t *testing.T, tool Tool, ctx *Context, args map[string]any) (string
 	t.Helper()
 	c := *ctx
 	c.Args = args
-	return tool.Run(&c)
+	return executeToolText(tool, &c)
 }
 
 func TestRecentReadsRecencyOrder(t *testing.T) {

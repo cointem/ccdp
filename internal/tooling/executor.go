@@ -3,7 +3,8 @@
 package tooling
 
 import (
-	"sync"
+	"ccdp/internal/protocol"
+	"encoding/json"
 )
 
 // Invocation owns one frozen call and its durable completion path. Execute
@@ -15,9 +16,15 @@ type Invocation interface {
 }
 
 type Result struct {
-	Output  string
-	IsError bool
-	Status  string
+	Output           string
+	Code             *protocol.CodeResult
+	IsError          bool
+	Status           string
+	Data             json.RawMessage
+	DataTruncated    bool
+	DisplayTruncated bool
+	DataError        string
+	OutputID         string
 }
 
 type Executor struct{ MaxParallel int }
@@ -26,40 +33,26 @@ type Executor struct{ MaxParallel int }
 // barrier: all previous reads finish before it starts, and subsequent reads
 // start only after it finishes. Output always follows the original call order.
 func (e Executor) Execute(calls []Invocation) []Result {
-	n := max(1, e.MaxParallel)
 	results := make([]Result, len(calls))
-	for start := 0; start < len(calls); {
-		if !calls[start].ReadOnly() {
-			results[start] = calls[start].Execute()
-			start++
-			continue
+	gate := Barrier{Limit: e.MaxParallel}
+	type completed struct {
+		index  int
+		read   bool
+		result Result
+	}
+	done := make(chan completed, max(1, e.MaxParallel))
+	next := 0
+	for next < len(calls) || gate.Active > 0 {
+		for next < len(calls) && gate.CanStart(calls[next].ReadOnly()) {
+			i := next
+			next++
+			read := calls[i].ReadOnly()
+			gate.Start(read)
+			go func() { done <- completed{i, read, calls[i].Execute()} }()
 		}
-		end := start + 1
-		for end < len(calls) && calls[end].ReadOnly() {
-			end++
-		}
-		workers := min(n, end-start)
-		if workers == 1 {
-			for i := start; i < end; i++ {
-				results[i] = calls[i].Execute()
-			}
-		} else {
-			jobs := make(chan int)
-			var wg sync.WaitGroup
-			for w := 0; w < workers; w++ {
-				wg.Go(func() {
-					for i := range jobs {
-						results[i] = calls[i].Execute()
-					}
-				})
-			}
-			for i := start; i < end; i++ {
-				jobs <- i
-			}
-			close(jobs)
-			wg.Wait()
-		}
-		start = end
+		c := <-done
+		gate.Finish(c.read)
+		results[c.index] = c.result
 	}
 	return results
 }

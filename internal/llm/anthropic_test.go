@@ -386,6 +386,62 @@ func TestAnthropicBodySystemFallback(t *testing.T) {
 	}
 }
 
+func TestAnthropicPreparedRequestPreservesHistoricalSystemContext(t *testing.T) {
+	c, err := NewClient(Config{BaseURL: "https://example.invalid/v1", Wire: "anthropic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := CompletionRequest{
+		Model: "test",
+		SystemBlocks: []SystemBlock{
+			{Text: "BASE_INSTRUCTIONS", Cacheable: true},
+			{Text: "DYNAMIC_ENVIRONMENT"},
+		},
+		Messages: []ChatMessage{
+			{Role: "system", Content: "BASE_INSTRUCTIONS\n\nDYNAMIC_ENVIRONMENT"},
+			{Role: "system", Content: "BRANCH_SUMMARY"},
+			{Role: "user", Content: "continue"},
+			{Role: "system", Content: "RESTORE_NOTICE"},
+			{Role: "system", Content: "HOOK_CONTEXT"},
+		},
+	}
+	call, err := NewPreparedCall(c, "test", "https://example.invalid/v1", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := PreparedRequest(call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := c.anthropicBody(frozen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		System   []map[string]any `json:"system"`
+		Messages []ChatMessage    `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.System) != 3 {
+		t.Fatalf("expected prompt blocks followed by session context: %s", body)
+	}
+	if doc.System[0]["text"] != "BASE_INSTRUCTIONS" || doc.System[0]["cache_control"] == nil ||
+		doc.System[1]["text"] != "DYNAMIC_ENVIRONMENT" || doc.System[1]["cache_control"] != nil ||
+		doc.System[2]["text"] != "BRANCH_SUMMARY\n\nRESTORE_NOTICE\n\nHOOK_CONTEXT" || doc.System[2]["cache_control"] != nil {
+		t.Fatalf("lost context, ordering, or stable cache boundary: %s", body)
+	}
+	for _, marker := range []string{"BASE_INSTRUCTIONS", "DYNAMIC_ENVIRONMENT", "BRANCH_SUMMARY", "RESTORE_NOTICE", "HOOK_CONTEXT"} {
+		if strings.Count(string(body), marker) != 1 {
+			t.Fatalf("system context %q must appear exactly once: %s", marker, body)
+		}
+	}
+	if len(doc.Messages) != 1 || doc.Messages[0].Role != "user" {
+		t.Fatalf("system context leaked into the messages array: %s", body)
+	}
+}
+
 // TestAnthropicBodyAdaptiveThinking covers the effort folding and the beta
 // headers: ccdp-only levels map into low|medium|high|max, "none" disables the
 // thinking block entirely, and thinking without effort stays adaptive-only.

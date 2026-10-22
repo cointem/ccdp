@@ -509,39 +509,20 @@ func TestApprovalTimeoutAndAllowCommitExactlyOneFact(t *testing.T) {
 	}
 }
 
-func TestMemoryIgnoresLegacyCache(t *testing.T) {
+func TestProjectMemoryIgnoresSessionCache(t *testing.T) {
 	a := newMemoryAgent(t)
 	defer a.Close()
-	if err := os.MkdirAll(filepath.Join(a.services.cfg.SessionDir, a.SessionID()+"-memory.md"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(a.services.cfg.SessionDir, a.SessionID()+"-memory.md"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	a.mu.Lock()
-	a.turnMemory.turnUserMsg = "cache failure request"
-	a.turnMemory.turnSummary = "typed memory remains authoritative"
-	a.mu.Unlock()
-	if err := a.recordMemory(); err != nil {
-		t.Fatalf("recordMemory returned cache failure: %v", err)
+	store, err := projectMemoryStore(a.configSnapshot(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := store.List(); err != nil || len(entries) != 0 {
+		t.Fatalf("%v %v", entries, err)
 	}
 	if err := a.persistenceFailure(); err != nil {
-		t.Fatalf("cache failure poisoned persistence: %v", err)
-	}
-	if got := a.MemoryText(); !strings.Contains(got, "cache failure request") {
-		t.Fatalf("typed memory was not retained after cache failure: %q", got)
-	}
-	if p := a.persistenceHandle(); p != nil {
-		records, err := p.Read(session.Beginning)
-		if err != nil {
-			t.Fatal(err)
-		}
-		found := false
-		for _, record := range records {
-			if record.Event.Type() == session.EventTypeMemoryChanged {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatal("typed MemoryChanged fact missing after cache failure")
-		}
+		t.Fatal(err)
 	}
 }

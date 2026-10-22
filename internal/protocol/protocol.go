@@ -109,7 +109,7 @@ const (
 	CommandSetWorkspace        CommandType = "set_workspace"
 	CommandReloadSettings      CommandType = "reload_settings"
 	CommandTrustProject        CommandType = "trust_project"
-	CommandClearMemory         CommandType = "clear_memory"
+	CommandProjectMemory       CommandType = "project_memory"
 	CommandGoal                CommandType = "goal"
 )
 
@@ -252,29 +252,29 @@ type Command struct {
 	ExpectedRevision uint64          `json:"expected_revision,omitempty"`
 	ExpectedRunID    RunID           `json:"expected_run_id,omitempty"`
 
-	Input              *SubmitInput         `json:"input,omitempty"`
-	Model              *SetModel            `json:"model,omitempty"`
-	ExecutionMode      *SetExecutionMode    `json:"execution_mode,omitempty"`
-	PermissionPolicy   *SetPermissionPolicy `json:"permission_policy,omitempty"`
-	SandboxPolicy      *SetSandboxPolicy    `json:"sandbox_policy,omitempty"`
-	RevokeCapabilities *RevokeCapabilities  `json:"revoke_capabilities,omitempty"`
-	Approval           *ApproveTool         `json:"approval,omitempty"`
-	Plan               *ApprovePlan         `json:"plan,omitempty"`
-	Remove             *RemoveMessages      `json:"remove,omitempty"`
-	Rewind             *RewindConversation  `json:"rewind,omitempty"`
-	Fork               *Fork                `json:"fork,omitempty"`
-	External           *ExternalCommand     `json:"external,omitempty"`
-	Apply              *ApplyCommand        `json:"apply,omitempty"`
-	Checkpoint         *CheckpointCommand   `json:"checkpoint,omitempty"`
-	Export             *ExportCommand       `json:"export,omitempty"`
-	Init               *InitCommand         `json:"init,omitempty"`
-	Workflow           *WorkflowCommand     `json:"workflow,omitempty"`
-	Query              *QueryCommand        `json:"query,omitempty"`
-	Workspace          *WorkspaceCommand    `json:"workspace,omitempty"`
-	Reload             *ReloadCommand       `json:"reload,omitempty"`
-	TrustProject       *TrustProjectCommand `json:"trust_project,omitempty"`
-	ClearMemory        *ClearMemoryCommand  `json:"clear_memory,omitempty"`
-	Goal               *GoalCommand         `json:"goal,omitempty"`
+	Input              *SubmitInput          `json:"input,omitempty"`
+	Model              *SetModel             `json:"model,omitempty"`
+	ExecutionMode      *SetExecutionMode     `json:"execution_mode,omitempty"`
+	PermissionPolicy   *SetPermissionPolicy  `json:"permission_policy,omitempty"`
+	SandboxPolicy      *SetSandboxPolicy     `json:"sandbox_policy,omitempty"`
+	RevokeCapabilities *RevokeCapabilities   `json:"revoke_capabilities,omitempty"`
+	Approval           *ApproveTool          `json:"approval,omitempty"`
+	Plan               *ApprovePlan          `json:"plan,omitempty"`
+	Remove             *RemoveMessages       `json:"remove,omitempty"`
+	Rewind             *RewindConversation   `json:"rewind,omitempty"`
+	Fork               *Fork                 `json:"fork,omitempty"`
+	External           *ExternalCommand      `json:"external,omitempty"`
+	Apply              *ApplyCommand         `json:"apply,omitempty"`
+	Checkpoint         *CheckpointCommand    `json:"checkpoint,omitempty"`
+	Export             *ExportCommand        `json:"export,omitempty"`
+	Init               *InitCommand          `json:"init,omitempty"`
+	Workflow           *WorkflowCommand      `json:"workflow,omitempty"`
+	Query              *QueryCommand         `json:"query,omitempty"`
+	Workspace          *WorkspaceCommand     `json:"workspace,omitempty"`
+	Reload             *ReloadCommand        `json:"reload,omitempty"`
+	TrustProject       *TrustProjectCommand  `json:"trust_project,omitempty"`
+	ProjectMemory      *ProjectMemoryCommand `json:"project_memory,omitempty"`
+	Goal               *GoalCommand          `json:"goal,omitempty"`
 }
 
 // Normalize validates the discriminant/payload relationship and returns a
@@ -360,7 +360,7 @@ func (c Command) Normalize() (Command, error) {
 	if c.TrustProject != nil {
 		payloads++
 	}
-	if c.ClearMemory != nil {
+	if c.ProjectMemory != nil {
 		payloads++
 	}
 	if c.Goal != nil {
@@ -596,10 +596,50 @@ func (c Command) Normalize() (Command, error) {
 		}
 		trust := *c.TrustProject
 		c.TrustProject = &trust
-	case CommandClearMemory:
-		if err := requirePayload(c.ClearMemory != nil); err != nil {
+	case CommandProjectMemory:
+		if err := requirePayload(c.ProjectMemory != nil); err != nil {
 			return Command{}, err
 		}
+		memory := *c.ProjectMemory
+		if memory.Scope != "" && memory.Scope != "project" && memory.Scope != "user" {
+			return Command{}, fmt.Errorf("protocol: invalid memory scope")
+		}
+		switch memory.Action {
+		case "enable", "disable", "readonly", "history-on", "history-off", "tidy":
+		case "extract", "extract-auto":
+			if err := validateCommandText("session id", memory.ID, 128, false); err != nil {
+				return Command{}, err
+			}
+		case "read", "delete", "edit":
+			if err := validateCommandText("memory id", memory.ID, 64, true); err != nil {
+				return Command{}, err
+			}
+			if memory.Action == "edit" {
+				if err := validateCommandText("old text", memory.OldText, 8192, true); err != nil {
+					return Command{}, err
+				}
+				if err := validateCommandText("new text", memory.NewText, 8192, false); err != nil {
+					return Command{}, err
+				}
+			}
+		case "save":
+			if err := validateCommandText("memory id", memory.ID, 64, false); err != nil {
+				return Command{}, err
+			}
+			if err := validateCommandText("memory title", memory.Title, 320, false); err != nil {
+				return Command{}, err
+			}
+			if err := validateCommandText("memory body", memory.Body, 8192, true); err != nil {
+				return Command{}, err
+			}
+		case "search":
+			if err := validateCommandText("memory query", memory.Query, 1024, true); err != nil {
+				return Command{}, err
+			}
+		default:
+			return Command{}, fmt.Errorf("protocol: unknown memory action %q", memory.Action)
+		}
+		c.ProjectMemory = &memory
 	case CommandGoal:
 		if err := requirePayload(c.Goal != nil); err != nil {
 			return Command{}, err
@@ -878,11 +918,13 @@ const (
 )
 
 type ToolView struct {
-	ID     CallID          `json:"id"`
-	Name   string          `json:"name"`
-	Status string          `json:"status"`
-	Args   json.RawMessage `json:"args,omitempty"`
-	Output string          `json:"output,omitempty"`
+	ParentCallID CallID          `json:"parent_call_id,omitempty"`
+	ChildIndex   int             `json:"child_index,omitempty"`
+	ID           CallID          `json:"id"`
+	Name         string          `json:"name"`
+	Status       string          `json:"status"`
+	Args         json.RawMessage `json:"args,omitempty"`
+	Output       string          `json:"output,omitempty"`
 }
 
 // EventView is the typed projection of a legacy agent event. It contains no

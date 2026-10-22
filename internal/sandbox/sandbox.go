@@ -664,8 +664,14 @@ func isMultiplyLinkedRegularFile(path string) bool {
 func (s *Sandbox) blockedByDisallowed(path string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if len(s.DisallowedDirs) == 0 {
+		return false
+	}
+	// Normalize directory aliases without following the leaf: a symlink
+	// inside a denied directory is still denied when its target is readable.
+	canonicalEntry := filepath.Join(canonicalRoot(filepath.Dir(path)), filepath.Base(path))
 	for _, root := range s.DisallowedDirs {
-		if pathWithin(root, path) {
+		if pathWithin(root, path) || pathWithin(root, canonicalEntry) {
 			return true
 		}
 	}

@@ -104,7 +104,7 @@ func (m *Matcher) AddGitignore(data []byte, baseDir string) {
 
 // loadFile parses one .gitignore file whose patterns apply under baseDir.
 func (m *Matcher) loadFile(path, baseDir string) error {
-	data, truncated, err := readBounded(path, 256<<10)
+	data, truncated, err := readBounded(path, 256<<10, filepath.Abs)
 	if truncated {
 		return nil
 	}

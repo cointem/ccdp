@@ -243,7 +243,17 @@ type TrustProjectCommand struct {
 }
 
 type ReloadCommand struct{}
-type ClearMemoryCommand struct{}
+type ProjectMemoryCommand struct {
+	Action  string `json:"action"`
+	Scope   string `json:"scope,omitempty"`
+	ID      string `json:"id,omitempty"`
+	Kind    string `json:"kind,omitempty"`
+	Title   string `json:"title,omitempty"`
+	Body    string `json:"body,omitempty"`
+	Query   string `json:"query,omitempty"`
+	OldText string `json:"old_text,omitempty"`
+	NewText string `json:"new_text,omitempty"`
+}
 
 const (
 	maxExternalArgs      = 64

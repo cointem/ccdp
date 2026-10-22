@@ -120,7 +120,7 @@ func TestClipboardInputDurableQueueReplayAndIdentity(t *testing.T) {
 	frozen := resumed.inbox.inputAttachments[pending.ID]
 	resumed.mu.Unlock()
 	msg := messages.Message{Role: messages.RoleUser, Content: pending.Text, ImagesFrozen: true, ImageAttachments: frozen.Attachments}
-	parts, _, hasImage, err := resumed.imageContentPartsForMessage(cfg.Workspace, msg, maxAttachmentBytes)
+	parts, _, hasImage, err := resumed.imageContentPartsForMessage(cfg.Workspace, msg, maxAttachmentBytes, resumed.currentSandbox().ResolveRead)
 	if err != nil || !hasImage {
 		t.Fatalf("replay: %v", err)
 	}

@@ -104,8 +104,6 @@ func decodeEvent(w wireEvent) (Event, error) {
 		event = &ConversationRewound{}
 	case EventTypeTasksChanged:
 		event = &TasksChanged{}
-	case EventTypeMemoryChanged:
-		event = &MemoryChanged{}
 	case EventTypeToolsDiscovered:
 		event = &ToolsDiscovered{}
 	case EventTypeUsageChanged:

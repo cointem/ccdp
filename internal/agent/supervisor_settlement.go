@@ -8,17 +8,10 @@ import (
 	"ccdp/internal/supervision"
 )
 
-func (s *SessionSupervisor) persist(r *managedRun, transition string) error {
-	reply := r.parent.enqueueChildRecord(supervision.RunRecord{TransactionID: "child-" + string(r.fact.Child.Run.ID) + "-" + transition, Fact: r.fact})
-	r.mu.Unlock()
-	err := r.parent.waitChildRecord(reply)
-	r.mu.Lock()
-	if err == nil && transition != "delivered" && transition != "queued" {
-		r.mu.Unlock()
-		s.publishChildOutcome(r)
-		r.mu.Lock()
-	}
-	return err
+// Caller holds r.mu so enqueue freezes the fact before another transition.
+// The caller must unlock before waiting for the owner's acknowledgement.
+func enqueueRunRecordLocked(r *managedRun, transition string) <-chan error {
+	return r.parent.enqueueChildRecord(supervision.RunRecord{TransactionID: "child-" + string(r.fact.Child.Run.ID) + "-" + transition, Fact: r.fact})
 }
 
 func setRunOutcome(r *managedRun, output string, err error, ctx context.Context) {
@@ -36,17 +29,11 @@ func setRunOutcome(r *managedRun, output string, err error, ctx context.Context)
 
 // Terminal catalog acknowledgement follows per-attempt accounting. Recovery
 // retries inspect its durable marker and never charge aggregate run usage again.
-func (s *SessionSupervisor) recordOutcome(r *managedRun) error {
+// Caller holds r.mu, unlocks before waiting, then sets UsageAccounted under
+// r.mu only after a successful acknowledgement.
+func enqueueRunOutcomeLocked(r *managedRun) <-chan error {
 	// Every descendant attempt was already charged by the root owner. The
 	// terminal catalog receipt must not write another absolute UsageChanged:
 	// doing so could replace newer parent usage with a captured older total.
-	reply := r.parent.enqueueChildRecord(supervision.RunRecord{TransactionID: "child-outcome-" + string(r.fact.Child.Run.ID), Fact: r.fact, Terminal: true})
-	r.mu.Unlock()
-	err := r.parent.waitChildRecord(reply)
-	r.mu.Lock()
-	if err != nil {
-		return err
-	}
-	r.fact.UsageAccounted = true
-	return nil
+	return r.parent.enqueueChildRecord(supervision.RunRecord{TransactionID: "child-outcome-" + string(r.fact.Child.Run.ID), Fact: r.fact, Terminal: true})
 }

@@ -104,11 +104,13 @@ func (j *deliveryJob) recoverCommit(ctx context.Context) (string, error) {
 	if _, e = j.exec(ctx, root, policy, []string{"git", "-c", "maintenance.auto=false", "fetch", "--no-tags", "--no-write-fetch-head", state.Candidate, commit}, nil, nil); e != nil {
 		return "", e
 	}
-	state.Commit = commit
-	state.Stage = "candidate_committed"
-	if e = j.record(*state); e != nil {
+	committed := *state
+	committed.Commit = commit
+	committed.Stage = "candidate_committed"
+	if e = j.record(committed); e != nil {
 		return "", e
 	}
+	*state = committed
 
 	return "", nil
 }

@@ -88,7 +88,6 @@ func (a *Agent) finalizeChildOutbox(cleanupErr error) error {
 		addFailure(err)
 		if err == nil {
 			fact.Child.ResultSnapshotID, fact.Child.MergeStatus = id, "pending_merge"
-			output += "\nIsolated changes retained in " + workspace + ". Prepare merge with /merge prepare " + string(fact.Child.SessionID)
 		}
 	}
 	supervision.SetOutcome(&fact, output, failure, request.SaveError, request.Outcome, request.Cancelled, time.Now().UTC())

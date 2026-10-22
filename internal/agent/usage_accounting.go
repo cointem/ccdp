@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 )
 
@@ -21,6 +22,10 @@ func (a *Agent) usageOwner() usageAccountTarget {
 // when opening the session. Unknown outcomes retain their entire
 // frozen reservation as estimated usage.
 func (a *Agent) reconcileDescendantUsage() error {
+	ctx := a.rootContext()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	p := a.persistenceHandle()
 	if p == nil {
 		return nil
@@ -44,6 +49,9 @@ func (a *Agent) reconcileDescendantUsage() error {
 	var visit func([]session.Record) error
 	visit = func(records []session.Record) error {
 		for _, record := range records {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			child, ok := record.Event.(*session.ChildRunRecorded)
 			if !ok {
 				continue
@@ -53,15 +61,10 @@ func (a *Agent) reconcileDescendantUsage() error {
 				continue
 			}
 			seen[id] = true
-			store, err := session.OpenJSONLReadOnly(a.services.cfg.SessionDir, id)
+			rows, _, err := a.services.supervisor.readRecordedSessionRecords(ctx, protocol.SessionID(id))
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			if err != nil {
-				return err
-			}
-			rows, err := store.Read(session.Beginning)
-			_ = store.Close()
 			if err != nil {
 				return err
 			}
@@ -70,6 +73,9 @@ func (a *Agent) reconcileDescendantUsage() error {
 				return err
 			}
 			for _, entry := range entries {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if err := a.accountSharedAttempt(entry.attempt); err != nil {
 					return err
 				}

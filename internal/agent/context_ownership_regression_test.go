@@ -28,10 +28,14 @@ type frozenSearchTool struct {
 	schema            map[string]any
 }
 
-func (t *frozenSearchTool) Name() string                       { return t.name }
-func (t *frozenSearchTool) Description() string                { return t.description }
-func (t *frozenSearchTool) Parameters() map[string]any         { return t.schema }
-func (t *frozenSearchTool) Run(*tools.Context) (string, error) { return "", nil }
+func (t *frozenSearchTool) Name() string               { return t.name }
+func (t *frozenSearchTool) Description() string        { return t.description }
+func (t *frozenSearchTool) Parameters() map[string]any { return t.schema }
+func (t *frozenSearchTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) { return "", nil }()
+	return tools.Result{Text: text}, err
+}
 
 func TestToolSearchDiscoveryUsesFrozenCatalogDefinition(t *testing.T) {
 	a, p, _ := newJournalAgent(t, true)
@@ -43,11 +47,11 @@ func TestToolSearchDiscoveryUsesFrozenCatalogDefinition(t *testing.T) {
 	// schema or description paired with the published implementation.
 	tool.description = "new"
 	tool.schema["const"] = "new"
-	text, err := (&toolSearchTool{ag: a}).Run(&tools.Context{Args: map[string]any{"query": "needle"}})
+	text, err := executeToolText((&toolSearchTool{ag: a}), &tools.Context{Args: map[string]any{"query": "needle"}})
 	if err != nil || !strings.Contains(text, "old needle") {
 		t.Fatalf("search=%q err=%v", text, err)
 	}
-	text, err = (&toolSearchTool{ag: a}).Run(&tools.Context{Args: map[string]any{"name": "candidate"}})
+	text, err = executeToolText((&toolSearchTool{ag: a}), &tools.Context{Args: map[string]any{"name": "candidate"}})
 	if err != nil || !strings.Contains(text, "old needle") {
 		t.Fatalf("discovery=%q err=%v", text, err)
 	}
@@ -121,7 +125,7 @@ func TestActiveFallbackControlsCompactionAndSummaryBudget(t *testing.T) {
 	if before == a.compactFailureKeyLocked() {
 		t.Fatal("failure state ignores active budget")
 	}
-	if err := a.compactContext(context.Background()); err != nil {
+	if _, err := a.summarize(context.Background(), a.History()); err != nil {
 		t.Fatal(err)
 	}
 	caps := llm.Capabilities{ContextWindow: 1024, SystemRole: true, Reasoning: true}
@@ -234,7 +238,7 @@ func TestReviewAndMemoryDoNotReadLegacyFiles(t *testing.T) {
 			if report, err := a.readReviews(&protocol.WorkflowCommand{Action: "report", ID: id}); err == nil {
 				t.Fatalf("read legacy report: %q", report)
 			}
-			if text := a.MemoryText(); text != "" {
+			if text := a.MemoryText(); strings.Contains(text, "old memory") {
 				t.Fatalf("read legacy memory: %q", text)
 			}
 		})

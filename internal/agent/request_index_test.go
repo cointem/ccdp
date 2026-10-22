@@ -20,7 +20,7 @@ func (s rejectRequestReadStore) Read(session.Cursor) ([]session.Record, error) {
 
 func TestRequestSettlementUsesCommittedIndexWithoutReadingHistoryOrBlob(t *testing.T) {
 	a, p, cfg := newJournalAgent(t, false)
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestRequestSettlementUsesCommittedIndexWithoutReadingHistoryOrBlob(t *testi
 
 func TestCommittedRequestIndexRebuiltOnReopen(t *testing.T) {
 	a, p, cfg := newJournalAgent(t, false)
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func BenchmarkRequestSettlement(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
-				attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+				attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -113,7 +113,7 @@ func BenchmarkRequestSettlement(b *testing.B) {
 
 func TestMemoryContinuationRebuildsRequestSettlementIndex(t *testing.T) {
 	a, p, _ := newJournalAgent(t, true)
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}

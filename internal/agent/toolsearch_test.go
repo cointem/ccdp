@@ -131,7 +131,7 @@ func TestToolSearchRun(t *testing.T) {
 
 	// Keyword search finds the custom tool by description.
 	ts := &toolSearchTool{ag: ag}
-	out, err := ts.Run(&tools.Context{
+	out, err := executeToolText(ts, &tools.Context{
 		WorkingDir: ag.services.cfg.Workspace,
 		Args:       map[string]any{"query": "format files"},
 	})
@@ -149,7 +149,7 @@ func TestToolSearchRun(t *testing.T) {
 	ag2 := newAgentWithCustomTool(t)
 	defer ag2.Close()
 	ts2 := &toolSearchTool{ag: ag2}
-	out2, err := ts2.Run(&tools.Context{
+	out2, err := executeToolText(ts2, &tools.Context{
 		WorkingDir: ag2.services.cfg.Workspace,
 		Args:       map[string]any{"name": "my-fmt"},
 	})
@@ -158,7 +158,7 @@ func TestToolSearchRun(t *testing.T) {
 	}
 
 	// Unknown name errors.
-	_, err = ts2.Run(&tools.Context{WorkingDir: ag2.services.cfg.Workspace, Args: map[string]any{"name": "nope"}})
+	_, err = executeToolText(ts2, &tools.Context{WorkingDir: ag2.services.cfg.Workspace, Args: map[string]any{"name": "nope"}})
 	if err == nil {
 		t.Error("expected error for unknown tool")
 	}

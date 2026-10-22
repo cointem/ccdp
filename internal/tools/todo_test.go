@@ -1,114 +1,75 @@
 package tools
 
 import (
-	"os"
-	"path/filepath"
+	"errors"
+	"reflect"
 	"strings"
 	"testing"
-
-	"ccdp/internal/sandbox"
 )
 
-func TestTodoPersistsAcrossStores(t *testing.T) {
-	dir := t.TempDir()
-	resources := NewResources("todo-test", dir)
-	t.Cleanup(func() { _ = resources.Close() })
-	ctx := resources.Context(nil, dir, sandbox.New(dir))
-	ctx.Args = map[string]any{
-		"todos": []any{
-			map[string]any{"content": "step one", "status": "in_progress", "priority": "high"},
-			map[string]any{"content": "step two"},
-		},
+func TestTodoWriteUsesSessionWriter(t *testing.T) {
+	ctx := freshCtx(t)
+	var committed []TodoState
+	ctx.ReplaceTodos = func(states []TodoState) error {
+		committed = append([]TodoState(nil), states...)
+		return nil
 	}
-
-	tool := NewTodoWriteTool()
-	if _, err := tool.Run(ctx); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-
-	// Persisted to disk.
-	data, err := os.ReadFile(filepath.Join(dir, "todos.json"))
-	if err != nil || !strings.Contains(string(data), "step one") {
-		t.Fatalf("todos not persisted: %v %s", err, data)
-	}
-
-	// A fresh store (simulating a restart) reads it back.
-	restarted := NewTodoStore("todo-restart", dir)
-	t.Cleanup(restarted.Close)
-	sec, err := restarted.Section()
+	out, err := runTool(t, NewTodoWriteTool(), ctx, map[string]any{"todos": []any{
+		map[string]any{"content": "step one", "status": "in_progress", "priority": "high"},
+		map[string]any{"content": "step two"},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(sec, "step one") || !strings.Contains(sec, "# Task list") {
-		t.Errorf("section missing todos: %q", sec)
+	want := []TodoState{{ID: "1", Content: "step one", Status: "in_progress", Priority: "high"}, {ID: "2", Content: "step two", Status: "pending", Priority: "medium"}}
+	if !reflect.DeepEqual(committed, want) {
+		t.Fatalf("committed=%+v", committed)
 	}
-
-	// Different session dirs are isolated.
-	other := NewTodoStore("todo-other", t.TempDir())
-	t.Cleanup(other.Close)
-	if section, err := other.Section(); err != nil || section != "" {
-		t.Errorf("unrelated session should have no todos, got %q", section)
+	if !strings.Contains(out, "(high) step one") || !strings.Contains(TodoSection(committed), "[~] (high) step one") {
+		t.Fatal(out, TodoSection(committed))
+	}
+	if _, err = runTool(t, NewTodoWriteTool(), ctx, map[string]any{"todos": []any{}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(committed) != 0 {
+		t.Fatalf("empty replacement kept tasks: %+v", committed)
 	}
 }
 
-func TestTodoFailedPublicationPreservesMemory(t *testing.T) {
-	root := t.TempDir()
-	store := NewTodoStore("test", root)
-	old := map[string]TodoState{"1": {ID: "1", Content: "original"}}
-	if err := store.Store(old); err != nil {
+func TestTodoWriteRequiresSuccessfulCommit(t *testing.T) {
+	ctx := freshCtx(t)
+	args := map[string]any{"todos": []any{map[string]any{"content": "new"}}}
+	if _, err := runTool(t, NewTodoWriteTool(), ctx, args); err == nil {
+		t.Fatal("missing session writer accepted")
+	}
+	failure := errors.New("commit failed")
+	calls := 0
+	ctx.ReplaceTodos = func([]TodoState) error { calls++; return failure }
+	if out, err := runTool(t, NewTodoWriteTool(), ctx, args); !errors.Is(err, failure) || out != "" {
+		t.Fatalf("failed commit reported success: %q %v", out, err)
+	}
+	if calls != 1 {
+		t.Fatal(calls)
+	}
+	if _, err := runTool(t, NewTodoWriteTool(), ctx, map[string]any{"todos": []any{map[string]any{"content": "new", "priority": "invalid"}}}); err == nil {
+		t.Fatal("invalid priority accepted")
+	}
+	if calls != 1 {
+		t.Fatal("invalid replacement reached owner")
+	}
+	if err := ctx.Resources.Close(); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(root, "todos.json")
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
+	if _, err := runTool(t, NewTodoWriteTool(), ctx, args); err == nil {
+		t.Fatal("closed session accepted tasks")
 	}
-	if err := os.Mkdir(path, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Store(map[string]TodoState{"1": {ID: "1", Content: "uncommitted"}}); err == nil {
-		t.Fatal("write unexpectedly succeeded")
-	}
-	got, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got["1"].Content != "original" {
-		t.Fatalf("unpublished state visible: %+v", got)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("temporary publication files leaked: %v", entries)
+	if calls != 1 {
+		t.Fatal("closed resource reached owner")
 	}
 }
 
-func TestTodoCorruptLoadNeverOverwritesRecord(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "todos.json")
-	bad := []byte(`{"1":`)
-	if err := os.WriteFile(path, bad, 0600); err != nil {
-		t.Fatal(err)
-	}
-	store := NewTodoStore("test", root)
-	if _, err := store.Load(); err == nil {
-		t.Fatal("corrupt state loaded")
-	}
-	if _, err := store.Section(); err == nil {
-		t.Fatal("corrupt state hidden in section")
-	}
-	if _, err := store.Snapshot(); err == nil {
-		t.Fatal("corrupt state hidden in snapshot")
-	}
-	if err := store.Store(map[string]TodoState{}); err == nil {
-		t.Fatal("corrupt state overwritten")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != string(bad) {
-		t.Fatalf("record changed: %q", data)
+func TestTodoSectionOldRecordPriority(t *testing.T) {
+	if got := TodoSection([]TodoState{{ID: "1", Content: "legacy", Status: "pending"}}); !strings.Contains(got, "(medium) legacy") {
+		t.Fatal(got)
 	}
 }

@@ -33,7 +33,7 @@ func journalGoal(t *testing.T, a *Agent) *protocol.Goal {
 func TestGoalRequestAccountingSharesAttemptTransaction(t *testing.T) {
 	a, p, _ := newJournalAgent(t, true)
 	goal := journalGoal(t, a)
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestGoalRequestAccountingSharesAttemptTransaction(t *testing.T) {
 func TestGoalRequestKeepsPreparedOwnerAfterGoalReplacement(t *testing.T) {
 	a, _, _ := newJournalAgent(t, true)
 	journalGoal(t, a)
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "https://example.test", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}

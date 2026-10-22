@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"ccdp/internal/protocol"
 	"os"
 	"os/exec"
 	"strings"
@@ -11,8 +12,10 @@ import (
 // editorFinishedMsg carries the temp file holding the edited draft back to the
 // Model once the external editor exits and the TUI resumes.
 type editorFinishedMsg struct {
-	path string
-	err  error
+	path       string
+	err        error
+	sessionID  string
+	generation uint64
 }
 
 // externalEditor resolves the user's preferred editor from $VISUAL/$EDITOR,
@@ -64,16 +67,26 @@ func (m *Model) openExternalEditor() tea.Cmd {
 		return nil
 	}
 	cmd := exec.Command(name, append(args, path)...)
+	sessionID, generation := m.sessionID, m.attachmentGeneration
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		return editorFinishedMsg{path: path, err: err}
+		return editorFinishedMsg{path: path, err: err, sessionID: sessionID, generation: generation}
 	})
 }
 
-// closeExternalEditor folds the edited draft back into the composer and removes
-// the staging file. A failed editor exit keeps the original draft so work is
-// never lost to a transient error.
+// closeExternalEditor returns the edit to the session that staged its draft.
+// A completed navigation can arrive before the editor's asynchronous callback.
 func (m *Model) closeExternalEditor(msg editorFinishedMsg) {
 	defer os.Remove(msg.path)
+	m.withSessionView(protocol.SessionID(msg.sessionID), func(view *Model) {
+		if msg.sessionID != "" && msg.generation != view.attachmentGeneration {
+			return
+		}
+		view.applyExternalEditor(msg)
+	})
+}
+
+// A failed editor exit keeps the original draft.
+func (m *Model) applyExternalEditor(msg editorFinishedMsg) {
 	if msg.err != nil {
 		m.pushStatus("external editor failed: " + msg.err.Error())
 		return

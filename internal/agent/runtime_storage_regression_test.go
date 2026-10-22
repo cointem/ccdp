@@ -276,7 +276,7 @@ func TestForkChildResourcesUsePublishedSession(t *testing.T) {
 	if child.services.baseCfg.SessionDir != cfg.SessionDir || child.services.resources.SessionDir() != target {
 		t.Fatalf("runtime retains staging paths: base=%s resources=%s", child.services.baseCfg.SessionDir, child.services.resources.SessionDir())
 	}
-	output, failed := child.executeTool(messages.ToolCall{ID: "write-published", Name: "Write", Arguments: map[string]any{"file_path": "published.txt", "content": "published state"}})
+	output, failed := executeTestTool(t, child, messages.ToolCall{ID: "write-published", Name: "Write", Arguments: map[string]any{"file_path": "published.txt", "content": "published state"}})
 	if failed {
 		t.Fatalf("write after publication: %s", output)
 	}

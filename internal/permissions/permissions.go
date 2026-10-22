@@ -83,11 +83,12 @@ const (
 	KindProcess
 	KindNetwork
 	KindDelegate
+	KindOrchestration
 )
 
 func (k ToolKind) PlanAllowed() bool {
 	switch k {
-	case KindRead, KindState, KindNetwork, KindDelegate:
+	case KindRead, KindState, KindNetwork, KindDelegate, KindOrchestration:
 		return true
 	default:
 		return false
@@ -302,7 +303,7 @@ func (m *Manager) Check(toolName string, args map[string]any, kind ToolKind) (De
 			return DecisionAllow, "edit accepted by acceptEdits mode"
 		}
 		return DecisionAsk, fmt.Sprintf("%s requires approval", toolName)
-	case KindRead, KindState, KindNetwork, KindDelegate:
+	case KindRead, KindState, KindNetwork, KindDelegate, KindOrchestration:
 		return DecisionAllow, "built-in capability"
 	default:
 		return DecisionAsk, fmt.Sprintf("tool %q requires approval", toolName)

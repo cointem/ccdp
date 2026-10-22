@@ -88,8 +88,7 @@ func (a *Agent) prepareSettingsCandidate(workspace string) (*settingsCandidate, 
 	if _, err := filepath.Abs(workspace); err != nil {
 		return nil, err
 	}
-	sb := buildSandbox(&effective, workspace)
-	sb.ShareExecutionGuard(oldSandbox)
+	sb := rebuildSandbox(&effective, workspace, oldSandbox)
 	customPerms := make(map[string]string)
 	for _, spec := range effective.Tools {
 		name := strings.TrimSpace(spec.Name)
@@ -291,6 +290,8 @@ func (a *Agent) settingsForCandidateLocked(candidate *settingsCandidate, permiss
 		return settings
 	}
 	settings.Workspace = candidate.cfg.Workspace
+	settings.ProjectMemoryEnabled = candidate.cfg.EnableProjectMemory
+	settings.MemoryReadOnly, settings.MemoryHistory = candidate.cfg.MemoryReadOnly, candidate.cfg.MemoryHistory
 	binding := candidate.binding
 	if binding.model == "" {
 		binding = a.modelsState.activeBinding
@@ -310,7 +311,7 @@ func (a *Agent) settingsForCandidateLocked(candidate *settingsCandidate, permiss
 	settings.ContextWindow = candidate.cfg.ContextWindow
 	settings.EffectiveContextWindow = candidate.cfg.ContextWindowFor(binding.model)
 	settings.CompactThreshold = candidate.cfg.CompactThreshold
-	settings.MaxResultSizeChars = candidate.cfg.MaxResultSizeChars
+	settings.MaxResultSizeBytes = candidate.cfg.MaxResultSizeBytes
 	settings.MaxTurns = candidate.cfg.MaxTurns
 
 	maxOutputTokens := candidate.cfg.MaxOutputTokensFor(binding.model)
@@ -318,7 +319,7 @@ func (a *Agent) settingsForCandidateLocked(candidate *settingsCandidate, permiss
 	settings.ReasoningEffort = candidate.cfg.ReasoningEffort
 	settings.Verbosity = candidate.cfg.Verbosity
 	settings.GenerationOptionsSet = true
-	settings.MaxToolOutputCharsPerTurn = candidate.cfg.MaxToolOutputCharsPerTurn
+	settings.MaxToolOutputBytesPerTurn = candidate.cfg.MaxToolOutputBytesPerTurn
 	settings.ExecutionMode = "execute"
 	if planMode {
 		settings.ExecutionMode = "plan"

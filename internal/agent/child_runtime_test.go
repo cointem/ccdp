@@ -47,7 +47,7 @@ func newChildRuntimeTestAgent(t *testing.T, p llm.Provider) (*Agent, config.Conf
 	cfg.BaseURL = "http://127.0.0.1:1/unreachable"
 	cfg.PermissionMode = string(permissions.ModeBypass)
 	cfg.EnableGuardian = config.BoolPtr(false)
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.MaxTurns = 4
 	registry := plugin.NewModelRegistry()
 	registry.Register(p)

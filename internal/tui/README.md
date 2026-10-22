@@ -10,8 +10,8 @@ Go/Bubble Tea; the Codex reference and attribution live in `third_party/codex`.
 
 | Component | Responsibility |
 | --- | --- |
-| `session_host.go` | The only frontend integration with concrete `agent.Agent`: creation, resume, retirement and CLI shutdown. |
-| `protocol.go` | Applies identified cumulative transcript events, authoritative snapshots and command receipts. Raw stream/tool deltas never create a second transcript. |
+| `session_host.go` | Application-wide owner for concrete `agent.Agent` creation, resume, retirement and CLI shutdown. Cached session views share the same host. |
+| `protocol_events.go` / `protocol_snapshot.go` / `protocol_commands.go` | Apply identified cumulative transcript events, authoritative snapshots and command receipts. Raw stream/tool deltas never create a second transcript. |
 | `CellStore` | Original text, typed tool metadata, stable identity, revisions, ordered reports and indexed replacement. The reader uses the same projection. |
 | `historyLedger` | Terminal-independent ordered batch planner. Mutable cells block later commits; explicit `PreviousID` transitions reconcile committed and pending prefixes. |
 | `historyDelivery` | Draft transaction, generation/epoch and batch identity. Publishes only a matching successful write acknowledgment. |
@@ -36,6 +36,12 @@ the working directory locally.
 awaiting delivery, so clients do not inspect concrete Agent methods to decide
 whether execution has finished.
 
+After reattaching Watch, `OperationReader` recovers missed command completions
+and each input's consuming turn from durable facts. Live events can settle an
+operation first; recovery never resubmits it. Reports and external-editor
+drafts return to their source session, including its cached view, and cannot
+overwrite a newer session handle.
+
 The root `Model` is the Bubble Tea reducer: it coordinates effects between these
 owners. Retaining reducer methods on `Model` does not introduce a second state
 owner. Runtime objects are not imported into rendering/input/protocol modules.
@@ -45,6 +51,14 @@ restores the draft for a new admission attempt with a new identity. A transport
 failure retains the original envelope for an explicit idempotent retry, including
 its input strategy, images and expected run. History arrows and reverse search
 recall text, attachments and attachment expiry through the same entry index.
+Receipts, submission errors and query reports settle their originating session
+view, including while that view is cached after navigation.
+
+Pending user inputs (including Tab follow-ups) stay in a bounded shelf above
+the composer while output scrolls. The shelf combines the runtime queue with
+unconsumed local submissions by input ID; notices cannot replace it. User
+transcript cells and pagination positions are created only when the input is
+consumed, so follow-ups appear after the preceding answer, in their own turn.
 
 Untrusted display metadata is sanitized after decoding structured data and
 before terminal styling. Original source remains available to readers and

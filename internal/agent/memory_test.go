@@ -1,137 +1,239 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 
 	"ccdp/internal/config"
+	"ccdp/internal/projectmemory"
+	"ccdp/internal/protocol"
+	"ccdp/internal/session"
+	"ccdp/internal/tools"
 )
 
-// newMemoryAgent builds an agent with AutoMem enabled and a per-test session
-// directory.
 func newMemoryAgent(t *testing.T) *Agent {
 	t.Helper()
-	dir := t.TempDir()
 	cfg := config.Default()
-	cfg.Workspace = dir
-	cfg.SessionDir = dir + "/sessions"
-	cfg.EnableMemory = config.BoolPtr(true)
-	ag, err := testNew(t, &cfg)
+	cfg.Workspace = t.TempDir()
+	cfg.SessionDir = t.TempDir()
+	cfg.ProjectMemoryDir = t.TempDir()
+	cfg.EnableProjectMemory = true
+	a, err := testNew(t, &cfg)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	return ag
+	return a
 }
 
-func TestMemoryDisabledRecordsNothing(t *testing.T) {
-	dir := t.TempDir()
-	cfg := config.Default()
-	cfg.Workspace = dir
-	cfg.SessionDir = dir + "/sessions"
-	cfg.EnableMemory = config.BoolPtr(false) // default: off
-	ag, err := testNew(t, &cfg)
+func TestProjectMemoryToolsStoreExplicitNotes(t *testing.T) {
+	a := newMemoryAgent(t)
+	defer a.Close()
+	ctx := &tools.Context{Context: context.Background()}
+	a.bindProjectMemoryInvocation(ctx, a.configSnapshot(), "turn-1")
+	tool := &updateProjectMemoryTool{}
+	args := map[string]any{"action": "save", "id": "tests", "title": "Tests", "summary": "Unit test command", "body": "go test ./internal/..."}
+	result, err := tool.Execute(ctx, args)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	defer ag.Close()
-
-	ag.mu.Lock()
-	ag.turnMemory.turnUserMsg = "please add a feature"
-	ag.turnMemory.turnTouched = []string{"a.go"}
-	ag.turnMemory.turnSummary = "done"
-	ag.mu.Unlock()
-	ag.recordMemory()
-
-	if text := ag.MemoryText(); text != "" {
-		t.Fatalf("disabled memory recorded %q", text)
+	var entry projectmemory.Entry
+	if err = json.Unmarshal(result.Data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.SourceSession != a.SessionID() {
+		t.Fatalf("%+v", entry)
+	}
+	args["body"] = "different content"
+	if _, err = tool.Execute(ctx, args); !errors.Is(err, projectmemory.ErrConflict) {
+		t.Fatalf("stale update: %v", err)
+	}
+	index, err := projectMemorySection(a.configSnapshot())
+	if err != nil || !strings.Contains(index, "tests") {
+		t.Fatalf("%q %v", index, err)
+	}
+	read, err := (&readProjectMemoryTool{}).Execute(ctx, map[string]any{"id": "tests"})
+	if err != nil || !strings.Contains(read.Text, "go test ./internal") {
+		t.Fatalf("%+v %v", read, err)
 	}
 }
 
-func TestRecordMemoryCommitsAndInjects(t *testing.T) {
-	ag := newMemoryAgent(t)
-	defer ag.Close()
-
-	ag.mu.Lock()
-	ag.turnMemory.turnUserMsg = "refactor the http handler"
-	ag.turnMemory.turnTouched = []string{"server.go", "client.go"}
-	ag.turnMemory.turnSummary = "Split the handler into two routes and updated the client."
-	ag.mu.Unlock()
-	ag.recordMemory()
-
-	text := ag.MemoryText()
-	if text == "" {
-		t.Fatal("memory log empty after recordMemory")
+func TestProjectMemoryDisabledDoesNotTouchDisk(t *testing.T) {
+	cfg := config.Default()
+	cfg.EnableProjectMemory = false
+	cfg.Workspace = t.TempDir()
+	cfg.ProjectMemoryDir = t.TempDir() + "/uncreated"
+	text, err := projectMemorySection(cfg)
+	if err != nil || text != "" {
+		t.Fatalf("%q %v", text, err)
 	}
-	for _, want := range []string{"refactor the http handler", "client.go, server.go", "Split the handler"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("memory log missing %q:\n%s", want, text)
+	if _, err = os.Stat(cfg.ProjectMemoryDir); !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestProjectMemoryNoPersistenceIsReadOnly(t *testing.T) {
+	a := newMemoryAgent(t)
+	defer a.Close()
+	a.mu.Lock()
+	a.services.cfg.NoSessionPersistence = true
+	a.mu.Unlock()
+	ctx := &tools.Context{Context: context.Background()}
+	a.bindProjectMemoryInvocation(ctx, a.configSnapshot(), "turn-1")
+	_, err := (&updateProjectMemoryTool{}).Execute(ctx, map[string]any{"action": "save", "id": "x", "title": "X", "body": "body"})
+	if !errors.Is(err, projectmemory.ErrReadOnly) {
+		t.Fatal(err)
+	}
+}
+
+func TestProjectMemoryFrozenWithStep(t *testing.T) {
+	a := newMemoryAgent(t)
+	defer a.Close()
+	store, err := projectMemoryStore(a.configSnapshot(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := store.Update(context.Background(), projectmemory.Entry{ID: "test", Title: "Old title", Summary: "Old summary", Body: "details"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := a.beginStepChecked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.releaseStepContext(step)
+	e.Title = "New title"
+	if _, err = store.Update(context.Background(), e, e.Body); err != nil {
+		t.Fatal(err)
+	}
+	text := joinSystemBlocks(step.systemBlocks)
+	if !strings.Contains(text, "Old title") || strings.Contains(text, "New title") {
+		t.Fatalf("step memory changed: %s", text)
+	}
+}
+
+func TestProjectMemoryToggleUsesDurableSettings(t *testing.T) {
+	a := newMemoryAgent(t)
+	defer a.Close()
+	receipt, err := a.Submit(context.Background(), protocol.Command{
+		Type:          protocol.CommandProjectMemory,
+		ProjectMemory: &protocol.ProjectMemoryCommand{Action: "disable"},
+	})
+	if err != nil || receipt.Status != protocol.ReceiptApplied {
+		t.Fatalf("%+v %v", receipt, err)
+	}
+	if a.configSnapshot().EnableProjectMemory {
+		t.Fatal("disable was not applied")
+	}
+	records, err := a.persistenceHandle().Read(session.Beginning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, record := range records {
+		if event, ok := record.Event.(*session.SettingsChanged); ok {
+			seen = true
+			if event.Settings.ProjectMemoryEnabled {
+				continue
+			}
+			return
 		}
 	}
+	t.Fatalf("disabled setting not saved (settings seen=%v)", seen)
+}
 
-	// Build through the same checked, frozen step boundary used by a real turn.
-	step, err := ag.beginStepChecked()
+func TestProjectMemorySettingSurvivesResumeAndReload(t *testing.T) {
+	a := newMemoryAgent(t)
+	cfg := a.configSnapshot()
+	id := a.SessionID()
+	a.Close()
+	snapshot, err := LoadSession(cfg.SessionDir, id)
 	if err != nil {
-		t.Fatalf("beginStepChecked: %v", err)
+		t.Fatal(err)
 	}
-	req, err := ag.buildRequestForStepChecked(step)
-	releaseStepLease(step)
+	cfg.EnableProjectMemory = false
+	resumed, err := Resume(&cfg, snapshot)
 	if err != nil {
-		t.Fatalf("buildRequestForStepChecked: %v", err)
+		t.Fatal(err)
 	}
-	// The direct test does not run the turn-finalizer that normally clears this
-	// borrow; release it explicitly so no frozen child view survives the test.
-	ag.mu.Lock()
-	ag.children.childStep = nil
-	ag.mu.Unlock()
-	// The memory section appears in the system prompt when enabled.
-	sys, _ := req.Messages[0].Content.(string)
-	if !strings.Contains(sys, "# Session memory") || !strings.Contains(sys, "refactor the http handler") {
-		t.Errorf("system prompt missing memory section:\n%s", sys)
+	defer resumed.Close()
+	if !resumed.configSnapshot().EnableProjectMemory {
+		t.Fatal("saved memory setting not restored")
 	}
-
-	// Clear empties the log.
-	if err := ag.ClearMemory(); err != nil {
-		t.Fatalf("ClearMemory: %v", err)
+	cmd := protocol.Command{ID: "reload-memory", Type: protocol.CommandReloadSettings,
+		Reload: &protocol.ReloadCommand{}}
+	receipt, err := resumed.Submit(context.Background(), cmd)
+	if err != nil || receipt.Status != protocol.ReceiptScheduled {
+		t.Fatalf("%+v %v", receipt, err)
 	}
-	if ag.MemoryText() != "" {
-		t.Error("memory text should be empty after clear")
+	if done := waitWorkflowCompleted(t, resumed, cmd.ID); done.Outcome != "success" {
+		t.Fatalf("%+v", done)
+	}
+	if !resumed.configSnapshot().EnableProjectMemory {
+		t.Fatal("reload discarded the restored session's memory setting")
 	}
 }
 
-func TestRecordMemoryBounded(t *testing.T) {
-	ag := newMemoryAgent(t)
-	defer ag.Close()
-
-	// Simulate more turns than the cap allows.
-	for i := 0; i < maxMemoryEntries+5; i++ {
-		ag.mu.Lock()
-		ag.turnMemory.turnUserMsg = "turn " + string(rune('A'+i%26)) + string(rune('0'+i%10))
-		ag.turnMemory.turnTouched = nil
-		ag.turnMemory.turnSummary = "summary"
-		ag.mu.Unlock()
-		ag.recordMemory()
+func TestProjectMemoryCommandsRecordSourceAndDelete(t *testing.T) {
+	a := newMemoryAgent(t)
+	defer a.Close()
+	save := protocol.Command{ID: "memory-save", Type: protocol.CommandProjectMemory,
+		ProjectMemory: &protocol.ProjectMemoryCommand{Action: "save", ID: "build", Title: "Build", Body: "go test ./..."}}
+	receipt, err := a.Submit(context.Background(), save)
+	if err != nil || receipt.Status != protocol.ReceiptScheduled {
+		t.Fatalf("%+v %v", receipt, err)
 	}
-
-	// The log must stay bounded; the oldest entries are dropped.
-	if got := strings.Count(ag.MemoryText(), "### "); got > maxMemoryEntries {
-		t.Errorf("memory log exceeded cap: %d entries", got)
+	if done := waitWorkflowCompleted(t, a, save.ID); done.Outcome != "success" {
+		t.Fatalf("%+v", done)
 	}
-	if strings.Contains(ag.MemoryText(), "turn A0") {
-		t.Error("oldest memory entry should have been dropped")
+	store, err := projectMemoryStore(a.configSnapshot(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := store.Read("build")
+	if err != nil || entry.SourceCommand != string(save.ID) || entry.SourceTurn != "" {
+		t.Fatalf("%+v %v", entry, err)
+	}
+	remove := protocol.Command{ID: "memory-delete", Type: protocol.CommandProjectMemory,
+		ProjectMemory: &protocol.ProjectMemoryCommand{Action: "delete", ID: "build"}}
+
+	receipt, err = a.Submit(context.Background(), remove)
+	if err != nil || receipt.Status != protocol.ReceiptScheduled {
+		t.Fatalf("%+v %v", receipt, err)
+	}
+	if done := waitWorkflowCompleted(t, a, remove.ID); done.Outcome != "success" {
+		t.Fatalf("%+v", done)
+	}
+	if _, err = store.Read("build"); !os.IsNotExist(err) {
+		t.Fatalf("note still exists: %v", err)
 	}
 }
 
-func TestRecordTouchedDeduplicates(t *testing.T) {
-	ag := newMemoryAgent(t)
-	defer ag.Close()
-
-	ag.recordTouched("a.go")
-	ag.recordTouched("b.go")
-	ag.recordTouched("a.go")
-	ag.mu.Lock()
-	n := len(ag.turnMemory.turnTouched)
-	ag.mu.Unlock()
-	if n != 2 {
-		t.Errorf("expected 2 unique touched files, got %d", n)
+func TestProjectMemoryToolUsesInvocationWorkspace(t *testing.T) {
+	a := newMemoryAgent(t)
+	defer a.Close()
+	cfg := a.configSnapshot()
+	ctx := &tools.Context{Context: context.Background()}
+	a.bindProjectMemoryInvocation(ctx, cfg, "turn-original")
+	a.mu.Lock()
+	a.services.cfg.Workspace = t.TempDir()
+	a.mu.Unlock()
+	_, err := (&updateProjectMemoryTool{}).Execute(ctx, map[string]any{
+		"action": "save", "id": "frozen", "title": "Frozen", "body": "original project",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, _ := projectMemoryStore(cfg, true)
+	entry, err := original.Read("frozen")
+	if err != nil || entry.SourceTurn != "turn-original" {
+		t.Fatalf("%+v %v", entry, err)
+	}
+	current, _ := projectMemoryStore(a.configSnapshot(), true)
+	if entries, err := current.List(); err != nil || len(entries) != 0 {
+		t.Fatalf("wrote to new workspace: %v %v", entries, err)
 	}
 }

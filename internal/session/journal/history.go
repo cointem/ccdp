@@ -1,9 +1,8 @@
 package journal
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -111,6 +110,28 @@ func (p *Writer) PersistHistoryMessages(history []messages.Message, turnID strin
 		History []messages.Message
 	}{Cursor: baseCursor, TurnID: turnID, History: history})
 	_, err = p.commitLocked(session.Batch{TransactionID: txID, Events: events})
+	return err
+}
+
+// PersistHistoryCommand commits a synchronous history edit and its command
+// identity together. A lost receipt can then be recovered without applying the
+// edit again. The admission and completion leave no pending operation.
+func (p *Writer) PersistHistoryCommand(history []messages.Message, admission session.CommandScheduled) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	replacement, err := p.historyReplacementLocked(history,
+		messages.StableID("command-history-reset", admission), admission.CommandID)
+	if err != nil {
+		return err
+	}
+	_, err = p.commitLocked(session.Batch{
+		TransactionID: messages.StableID("command-history", admission),
+		Events: []session.Event{
+			admission,
+			replacement,
+			session.CommandCompleted{CommandID: admission.CommandID, Outcome: "applied"},
+		},
+	})
 	return err
 }
 
@@ -227,7 +248,7 @@ func messagesEquivalent(left, right messages.Message) bool {
 		left.CreatedAt = time.Time{}
 		right.CreatedAt = time.Time{}
 	}
-	return messageFingerprint(left) == messageFingerprint(right)
+	return equalMessageJSON(left, right)
 }
 func messageIdentityEquivalent(left, right messages.Message) bool {
 	left.ID = ""
@@ -237,12 +258,15 @@ func messageIdentityEquivalent(left, right messages.Message) bool {
 		left.CreatedAt = time.Time{}
 		right.CreatedAt = time.Time{}
 	}
-	return messageFingerprint(left) == messageFingerprint(right)
+	return equalMessageJSON(left, right)
 }
-func messageFingerprint(message messages.Message) string {
-	data, _ := json.Marshal(message)
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+func equalMessageJSON(left, right messages.Message) bool {
+	leftJSON, err := json.Marshal(left)
+	if err != nil {
+		return false
+	}
+	rightJSON, err := json.Marshal(right)
+	return err == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
 // messageToSessionLocked materializes frozen image bytes into the scoped blob

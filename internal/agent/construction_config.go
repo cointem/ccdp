@@ -31,6 +31,15 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 	if settings.Workspace != "" {
 		cfg.Workspace = settings.Workspace
 	}
+	if !launchOverride("enable_project_memory") {
+		cfg.EnableProjectMemory = settings.ProjectMemoryEnabled
+	}
+	if !launchOverride("memory_read_only") {
+		cfg.MemoryReadOnly = settings.MemoryReadOnly
+	}
+	if !launchOverride("memory_history") {
+		cfg.MemoryHistory = settings.MemoryHistory
+	}
 	if settings.Model != "" && !launchOverride("model") {
 		cfg.Model = settings.Model
 	}
@@ -81,8 +90,8 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 	if settings.CompactThreshold > 0 && !launchOverride("compact_threshold") {
 		cfg.CompactThreshold = settings.CompactThreshold
 	}
-	if settings.MaxResultSizeChars > 0 && !launchOverride("max_result_size_chars") {
-		cfg.MaxResultSizeChars = settings.MaxResultSizeChars
+	if settings.MaxResultSizeBytes > 0 && !launchOverride("max_result_size_bytes") {
+		cfg.MaxResultSizeBytes = settings.MaxResultSizeBytes
 	}
 	if settings.MaxTurns > 0 && !launchOverride("max_turns") {
 		cfg.MaxTurns = settings.MaxTurns
@@ -95,8 +104,8 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 			cfg.Verbosity = settings.Verbosity
 		}
 	}
-	if settings.MaxToolOutputCharsPerTurn > 0 && !launchOverride("max_tool_output_chars_per_turn") {
-		cfg.MaxToolOutputCharsPerTurn = settings.MaxToolOutputCharsPerTurn
+	if settings.MaxToolOutputBytesPerTurn > 0 && !launchOverride("max_tool_output_bytes_per_turn") {
+		cfg.MaxToolOutputBytesPerTurn = settings.MaxToolOutputBytesPerTurn
 	}
 }
 
@@ -191,7 +200,7 @@ func buildEffectiveConfig(base config.Config, initial *SessionSnapshot, isolated
 		}
 		base.MCPServers = map[string]mcp.ServerConfig{}
 		base.EnableGuardian = config.BoolPtr(false)
-		base.EnableMemory = config.BoolPtr(false)
+		base.EnableProjectMemory = false
 		if opts.Purpose == childPurposeGuardian {
 			// Guardian's read-only gate is name based. Do not let a configured
 			// custom command replace a built-in name such as Read and turn that

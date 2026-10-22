@@ -19,28 +19,30 @@ func (t *definitionTool) Description() string {
 	return t.name
 }
 func (t *definitionTool) Parameters() map[string]any { return t.schema }
-func (*definitionTool) Run(*Context) (string, error) { return "", nil }
+func (*definitionTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) { return "", nil })
+}
 
 func TestRegistryDefinitionBelongsToImplementationGeneration(t *testing.T) {
 	r := NewRegistry()
 	calls := 0
-	old := &definitionTool{name: "test", schema: map[string]any{"properties": map[string]any{"value": "old"}}}
+	old := &definitionTool{name: "test", schema: map[string]any{"properties": map[string]any{"value": map[string]any{"const": "old"}}}}
 	old.metadata = func() { calls++; _ = r.Names() } // callback can read the registry
 	dispose := r.Register(old)
 	lease := r.Acquire()
-	old.schema["properties"].(map[string]any)["value"] = "mutated"
+	old.schema["properties"].(map[string]any)["value"] = map[string]any{"const": "mutated"}
 	r.ReplaceScope("global", []Tool{&definitionTool{name: "test", schema: map[string]any{"const": "new"}}})
 	dispose() // a retired disposer cannot remove the replacement
 	if got, _ := lease.Get("test"); got != old {
 		t.Fatal("lease changed implementation")
 	}
 	definition, _ := lease.Definition("test")
-	if definition.Parameters["properties"].(map[string]any)["value"] != "old" {
+	if definition.Parameters["properties"].(map[string]any)["value"].(map[string]any)["const"] != "old" {
 		t.Fatal("registration retained caller schema")
 	}
-	definition.Parameters["properties"].(map[string]any)["value"] = "caller"
+	definition.Parameters["properties"].(map[string]any)["value"] = map[string]any{"const": "caller"}
 	schemas := lease.SchemasFiltered(nil)
-	if schemas[0]["function"].(map[string]any)["parameters"].(map[string]any)["properties"].(map[string]any)["value"] != "old" {
+	if schemas[0]["function"].(map[string]any)["parameters"].(map[string]any)["properties"].(map[string]any)["value"].(map[string]any)["const"] != "old" {
 		t.Fatal("definition exposed lease storage")
 	}
 	if got, _ := r.Acquire().Definition("test"); got.Parameters["const"] != "new" {

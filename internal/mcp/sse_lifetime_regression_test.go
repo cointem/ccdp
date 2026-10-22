@@ -18,9 +18,10 @@ func TestReviewRefreshSSESurvivesOperationCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := candidate.clients[0].client
-	if err = candidate.Commit(); err != nil {
+	if err = candidate.Publish(); err != nil {
 		t.Fatal(err)
 	}
+	candidate.FinishRetirement()
 	finishOperation()
 	select {
 	case <-c.closed:

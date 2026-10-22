@@ -71,7 +71,7 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 			cfg := config.Default()
 			cfg.Workspace, cfg.SessionDir, cfg.BaseURL = root, t.TempDir(), server.URL
 			cfg.APIKey, cfg.Model, cfg.PermissionMode = "test", "fake", "bypass"
-			cfg.EnableGuardian, cfg.EnableMemory, cfg.AutomaticCheckpoints = config.BoolPtr(false), config.BoolPtr(false), config.BoolPtr(false)
+			cfg.EnableGuardian, cfg.AutomaticCheckpoints = config.BoolPtr(false), config.BoolPtr(false)
 			cfg.MCPServers = nil
 			a, err := testNew(t, &cfg)
 			if err != nil {

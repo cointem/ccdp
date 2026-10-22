@@ -131,6 +131,9 @@ func TestAgentLateFailedReceiptReturnsDraftToOriginalView(t *testing.T) {
 	if m.textarea.Value() != "must not disappear" || m.pendingSubmissionCount() != 0 {
 		t.Fatal("failed original intent lost")
 	}
+	if op, ok := m.operation("pending"); !ok || op.Active() || op.State != OperationFailed {
+		t.Fatal("late transport failure did not settle the original operation")
+	}
 }
 
 func TestAgentSubmissionPinsViewedRun(t *testing.T) {

@@ -59,6 +59,7 @@ func newJournalAgent(t testing.TB, memory bool) (*Agent, *sessionPersistence, *c
 	if err := p.BindState(&a.conversation.durable, &a.mu); err != nil {
 		t.Fatal(err)
 	}
+	a.services.supervisor = &SessionSupervisor{root: a, sessionDir: cfg.SessionDir, memory: memory}
 	registerJournalBackend(t, p, backend)
 	t.Cleanup(func() { _ = p.Close() })
 	return a, p, &cfg
@@ -83,11 +84,11 @@ func TestRequestJournalReconstructsExactWireMemoryAndDisk(t *testing.T) {
 		t.Run(map[bool]string{true: "memory", false: "disk"}[memory], func(t *testing.T) {
 			a, p, cfg := newJournalAgent(t, memory)
 			req := journalRequest()
-			ctx := withRequestJournalMetadata(context.Background(), requestJournalMetadata{
-				Config: cfgValue(*cfg), SettingsRevision: 31, ContextRevision: 41,
+			metadata := requestJournalMetadata{
+				Config: cfg.Clone(), SettingsRevision: 31, ContextRevision: 41,
 				Turn: 12, Step: 13, HistoryLen: 17,
-			})
-			attempt, err := a.recordPreparedRequest(ctx, "main", "provider-a", "https://user:pass@example.test/v1/chat?api_key=url-secret", req)
+			}
+			attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://user:pass@example.test/v1/chat?api_key=url-secret", req, metadata)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -153,13 +154,25 @@ func TestRequestJournalReconstructsExactWireMemoryAndDisk(t *testing.T) {
 	}
 }
 
-// cfgValue makes the intended metadata snapshot explicit at call sites while
-// keeping the helper independent of pointer ownership.
-func cfgValue(cfg config.Config) config.Config { return cfg }
+// Unit fixtures capture request metadata explicitly, like the provider paths
+// do before handing the prepared request to the journal.
+func testRequestMetadata(a *Agent) requestJournalMetadata {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return requestJournalMetadata{
+		Config:           a.services.cfg.Clone(),
+		SettingsRevision: a.sequences.settingsRev,
+		ContextRevision:  a.sequences.contextRev,
+		CatalogVersion:   a.sequences.catalogVersion,
+		Turn:             a.sequences.turnSeq,
+		Step:             a.sequences.stepSeq,
+		HistoryLen:       len(a.historyLocked()),
+	}
+}
 
 func TestRequestJournalBlobMissingAndTamperedAreExplicit(t *testing.T) {
 	a, p, cfg := newJournalAgent(t, false)
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +198,7 @@ func TestRequestJournalFailurePoisonsAdmissionButCancellationDoesNot(t *testing.
 	a, p, _ := newJournalAgent(t, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := a.recordPreparedRequest(ctx, "main", "provider-a", "https://example.test/v1", journalRequest()); !errors.Is(err, context.Canceled) {
+	if _, err := a.recordPreparedRequest(ctx, "main", "provider-a", "https://example.test/v1", journalRequest(), testRequestMetadata(a)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled prepare err=%v", err)
 	}
 	if got := a.persistenceFailure(); got != nil {
@@ -196,7 +209,7 @@ func TestRequestJournalFailurePoisonsAdmissionButCancellationDoesNot(t *testing.
 	underlying := backend.store
 	backend.store = failingCommitStore{Store: underlying}
 	backend.mu.Unlock()
-	if _, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest()); !errors.Is(err, session.ErrPersistenceFailed) {
+	if _, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest(), testRequestMetadata(a)); !errors.Is(err, session.ErrPersistenceFailed) {
 		t.Fatalf("failed RequestPrepared err=%v", err)
 	}
 	if err := a.persistenceFailure(); !errors.Is(err, session.ErrPersistenceFailed) {
@@ -210,8 +223,8 @@ func TestRequestJournalAttemptErrorRedactsURLAndConfiguredKey(t *testing.T) {
 	cfg.Providers = map[string]config.ProviderConfig{
 		"provider-a": {BaseURL: "https://example.test/v1", APIKey: "provider-secret", Models: []string{"journal-model"}},
 	}
-	ctx := withRequestJournalMetadata(context.Background(), requestJournalMetadata{Config: cfgValue(*cfg), SettingsRevision: 2, Turn: 1, Step: 1, HistoryLen: 3})
-	attempt, err := a.recordPreparedRequest(ctx, "main", "provider-a", "https://example.test/v1", journalRequest())
+	metadata := requestJournalMetadata{Config: cfg.Clone(), SettingsRevision: 2, Turn: 1, Step: 1, HistoryLen: 3}
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest(), metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,23 +260,39 @@ func TestRequestJournalAttemptErrorRedactsURLAndConfiguredKey(t *testing.T) {
 	t.Fatal("AttemptFinished was not recorded")
 }
 
-func TestRequestJournalCapturesStepMetadataBeforeFinish(t *testing.T) {
+func TestRequestJournalUsesFrozenMetadataThroughSettlement(t *testing.T) {
 	a, _, cfg := newJournalAgent(t, true)
 	cfg.Providers = map[string]config.ProviderConfig{
-		"provider-a": {BaseURL: "https://example.test/v1", APIKey: "frozen-key", Models: []string{"journal-model"}},
+		"provider-a": {
+			BaseURL: "https://example.test/v1", APIKey: "frozen-key",
+			Models:       []string{"journal-model"},
+			ModelConfigs: map[string]config.ModelConfig{"journal-model": {MaxOutputTokens: 1234}},
+		},
 	}
 
 	stepConfig := cloneConfig(cfg)
-	ctx := withRequestJournalMetadata(context.Background(), requestJournalMetadata{
+	metadata := requestJournalMetadata{
 		Config: stepConfig, SettingsRevision: 8, Turn: 4, Step: 5, HistoryLen: 19,
-	})
-	attempt, err := a.recordPreparedRequest(ctx, "main", "provider-a", "https://example.test/v1", journalRequest())
+	}
+	// A new setting and history may be published after preparation, before
+	// RequestPrepared is admitted. They do not belong to this request.
+	a.mu.Lock()
+	a.services.cfg.Providers["provider-a"] = config.ProviderConfig{APIKey: "live-key", Models: []string{"journal-model"}}
+	a.sequences.settingsRev, a.sequences.turnSeq, a.sequences.stepSeq = 20, 21, 22
+	a.conversation.durable.History = append(a.conversation.durable.History, messages.Message{Content: "future history"})
+	a.mu.Unlock()
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest(), metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if manifest := attempt.Manifest; manifest.SourceRevision != 8 || manifest.TurnID != "turn-4" || manifest.StepID != "step-5" || manifest.ReservedUsage.OutputTokens != 1234 {
+		t.Fatalf("request admission used live settings: %+v", manifest)
+	}
+	if attempt.apiKey != "frozen-key" || attempt.historyLen != 19 {
+		t.Fatalf("request admission lost frozen diagnostics or history: history=%d", attempt.historyLen)
+	}
 	a.mu.Lock()
-	a.services.cfg.Providers["provider-a"] = config.ProviderConfig{APIKey: "live-key", Models: []string{"journal-model"}}
-	a.conversation.durable.History = append(a.conversation.durable.History, messages.Message{Content: "future history"})
+	a.conversation.durable.History = append(a.conversation.durable.History, messages.Message{Content: "history during streaming"})
 	a.mu.Unlock()
 	if err := a.finishRequestAttempt(attempt, llm.StreamResult{PromptTokens: 2, CompletionTok: 4}, nil); err != nil {
 		t.Fatal(err)
@@ -288,7 +317,7 @@ func TestRequestJournalUsageSubscriberCanPersist(t *testing.T) {
 		called = true
 		saveErr = a.persistWorkflowFact(session.WorkflowState{})
 	})
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +487,7 @@ func TestSessionCacheWeightedPersistedAndExcludesChildUsage(t *testing.T) {
 		{PromptTokens: 100, CachedTokens: 0, CacheReported: true},
 		{PromptTokens: 900, CachedTokens: 900, CacheReported: true},
 	} {
-		attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest())
+		attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest(), testRequestMetadata(a))
 		if err != nil {
 			t.Fatal(i, err)
 		}
@@ -476,8 +505,9 @@ func TestSessionCacheWeightedPersistedAndExcludesChildUsage(t *testing.T) {
 		Run: protocol.RunView{ID: "cache-run", Status: "succeeded", WaitPolicy: "join", Usage: protocol.UsageSnapshot{InputTokens: 500, CachedTokens: 50, TurnCount: 1}},
 	}}}
 	run.mu.Lock()
-	defer run.mu.Unlock()
-	if err := a.services.supervisor.recordOutcome(run); err != nil {
+	reply := enqueueRunOutcomeLocked(run)
+	run.mu.Unlock()
+	if err := run.parent.waitChildRecord(reply); err != nil {
 		t.Fatal(err)
 	}
 	if a.Usage().Cache != want {
@@ -491,7 +521,7 @@ func TestSessionCacheWeightedPersistedAndExcludesChildUsage(t *testing.T) {
 	if err != nil || restored.Usage.Cache != want {
 		t.Fatalf("cache lost in replay: %+v %v", restored, err)
 	}
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}

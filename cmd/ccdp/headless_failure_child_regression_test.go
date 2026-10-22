@@ -42,7 +42,7 @@ func TestReviewHeadlessFailureWithChildReturnsFailure(t *testing.T) {
 	cfg.SessionDir = filepath.Join(cfg.Workspace, "sessions")
 	cfg.Model = "review-headless"
 	cfg.PermissionMode = "bypassPermissions"
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	p := &reviewFailWithChildProvider{}
 	r := plugin.NewModelRegistry()
 	r.Register(p)

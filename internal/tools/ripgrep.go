@@ -39,6 +39,7 @@ type rgEvent struct {
 		} `json:"stats"`
 		Submatches []struct {
 			Match rgText `json:"match"`
+			Start int    `json:"start"`
 		} `json:"submatches"`
 	} `json:"data"`
 }
@@ -104,7 +105,7 @@ func ripgrepSearch(ctx *Context, r *rgRequest) ([]rgLine, bool, error) {
 		}
 		searched = true
 		argv := append(append([]string(nil), args...), batch...)
-		parser := &rgOutput{request: r, limit: limit - len(out), maxRecord: 6*ctx.readLimit() + 64<<10}
+		parser := &rgOutput{request: r, limit: limit - rgSourceLineCount(out), maxRecord: 6*ctx.readLimit() + 64<<10}
 		res, err := execution.RunReadOnlySearch(call, argv, execution.Request{Dir: r.base, Sandbox: ctx.Sandbox, Timeout: timeout, OutputLimit: 4096}, parser, ctx.ReadRoot)
 		batch = nil
 		batchBytes = 0
@@ -126,7 +127,7 @@ func ripgrepSearch(ctx *Context, r *rgRequest) ([]rgLine, bool, error) {
 		out = append(out, parser.out...)
 		truncated = truncated || parser.incomplete || len(parser.pending) > 0
 
-		if len(out) > limit || truncated {
+		if rgSourceLineCount(out) > limit || truncated {
 			truncated = true
 			return fs.SkipAll
 		}
@@ -172,6 +173,7 @@ type rgOutput struct {
 	pending                                []byte
 	discarding, incomplete, fileIncomplete bool
 	fileLines, out                         []rgLine
+	fileLineCount, lineCount               int
 	err                                    error
 }
 
@@ -219,23 +221,31 @@ func (p *rgOutput) event(raw []byte) {
 	switch e.Type {
 	case "begin":
 		p.fileLines = nil
+		p.fileLineCount = 0
 		p.fileIncomplete = false
 	case "match", "context":
 		if p.request.outputMode == rgModeCount || p.request.outputMode == rgModeFiles {
 			return
 		}
-		if len(p.fileLines) > p.limit {
+		if p.fileLineCount > p.limit {
 			return
 		}
-		text := strings.TrimSuffix(d.Lines.value(), "\n")
-		if p.request.onlyMatch && e.Type == "match" && len(d.Submatches) > 0 {
-			text = d.Submatches[0].Match.value()
-		}
-		for i, line := range strings.Split(text, "\n") {
-			if len(p.fileLines) > p.limit {
-				break
+		source := d.Lines.value()
+		add := func(text string, line int) {
+			for i, part := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+				l := rgLine{file: file, line: line + i, text: clipLine(strings.TrimSuffix(part, "\r")), match: e.Type == "match"}
+				p.fileLines = appendRgSourceLine(p.fileLines, l, &p.fileLineCount, p.limit)
 			}
-			p.fileLines = append(p.fileLines, rgLine{file: file, line: d.Line + i, text: clipLine(strings.TrimSuffix(line, "\r")), match: e.Type == "match"})
+		}
+		if p.request.onlyMatch && e.Type == "match" && len(d.Submatches) > 0 {
+			offset, line := 0, d.Line
+			for _, submatch := range d.Submatches {
+				line += strings.Count(source[offset:submatch.Start], "\n")
+				offset = submatch.Start
+				add(submatch.Match.value(), line)
+			}
+		} else {
+			add(source, d.Line)
 		}
 
 	case "end":
@@ -245,17 +255,40 @@ func (p *rgOutput) event(raw []byte) {
 		if p.request.outputMode == rgModeCount || p.request.outputMode == rgModeFiles {
 			if d.Stats.MatchedLines > 0 {
 				if p.request.outputMode == rgModeFiles {
-					p.out = append(p.out, rgLine{file: file, match: true})
+					p.out = appendRgSourceLine(p.out, rgLine{file: file, match: true}, &p.lineCount, p.limit)
 				} else {
-					p.out = append(p.out, rgLine{file: file, line: d.Stats.MatchedLines, count: d.Stats.MatchedLines, match: true})
+					p.out = appendRgSourceLine(p.out, rgLine{file: file, line: d.Stats.MatchedLines, count: d.Stats.MatchedLines, match: true}, &p.lineCount, p.limit)
 				}
 			}
 		} else {
-			p.out = append(p.out, p.fileLines...)
+			for _, line := range p.fileLines {
+				p.out = appendRgSourceLine(p.out, line, &p.lineCount, p.limit)
+			}
 		}
-		if len(p.out) > p.limit {
+		if p.lineCount > p.limit {
 			p.incomplete = true
-			p.out = p.out[:p.limit+1]
 		}
 	}
+}
+
+// Keep one extra source line to detect truncation, including every submatch on
+// that line. Counting rendered fragments would split only_matching pages.
+func appendRgSourceLine(lines []rgLine, line rgLine, count *int, limit int) []rgLine {
+	if len(lines) == 0 || lines[len(lines)-1].file != line.file || lines[len(lines)-1].line != line.line {
+		if *count > limit {
+			return lines
+		}
+		(*count)++
+	}
+	return append(lines, line)
+}
+
+func rgSourceLineCount(lines []rgLine) int {
+	count := 0
+	for i, line := range lines {
+		if i == 0 || lines[i-1].file != line.file || lines[i-1].line != line.line {
+			count++
+		}
+	}
+	return count
 }

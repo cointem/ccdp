@@ -233,6 +233,7 @@ type responsesUsage struct {
 }
 
 type responsesEvent struct {
+	Code        string              `json:"code"`
 	Type        string              `json:"type"`
 	Message     string              `json:"message"`
 	Delta       string              `json:"delta"`
@@ -242,6 +243,7 @@ type responsesEvent struct {
 	Response    *responsesEventResp `json:"response"`
 	Error       *struct {
 		Message string `json:"message"`
+		Code    string `json:"code"`
 	} `json:"error"`
 }
 
@@ -250,6 +252,7 @@ type responsesEventResp struct {
 	Usage  *responsesUsage `json:"usage"`
 	Error  *struct {
 		Message string `json:"message"`
+		Code    string `json:"code"`
 	} `json:"error"`
 }
 
@@ -368,8 +371,8 @@ loop:
 		switch ev.Type {
 		case "error":
 			result.FinishReason = "error"
-			return result, false, emitted, 0, fmt.Errorf("llm: provider error: %s", ev.Message)
-		case "response.output_text.delta":
+			return result, false, emitted, 0, structuredProviderError(ev.Message, "", ev.Code)
+		case "response.output_text.delta", "response.refusal.delta":
 			emitDelta(ev.Delta)
 		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
 			emitReasoning(ev.Delta)
@@ -433,14 +436,16 @@ loop:
 			}
 			if ev.Type == "response.failed" || result.FinishReason == "error" || (ev.Response != nil && ev.Response.Error != nil) {
 				message := "response failed"
+				code := ""
 				if ev.Response != nil && ev.Response.Error != nil && ev.Response.Error.Message != "" {
 					message = ev.Response.Error.Message
+					code = ev.Response.Error.Code
 				}
 				result.FinishReason = "error"
-				return result, false, emitted, 0, fmt.Errorf("llm: provider error: %s", message)
+				return result, false, emitted, 0, structuredProviderError(message, "", code)
 			}
 			if ev.Error != nil && ev.Error.Message != "" {
-				return result, false, emitted, 0, fmt.Errorf("llm: provider error: %s", ev.Error.Message)
+				return result, false, emitted, 0, structuredProviderError(ev.Error.Message, "", ev.Error.Code)
 			}
 			break loop
 		}

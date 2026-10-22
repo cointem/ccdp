@@ -74,6 +74,7 @@ func (b ContentBlock) validate() error {
 }
 
 type Message struct {
+	SourceOutputs    []BlobRef                `json:"source_outputs,omitempty"`
 	ToolUpdate       *messages.ToolUpdate     `json:"tool_update,omitempty"`
 	ImagesFrozen     bool                     `json:"images_frozen,omitempty"`
 	ProviderOrigin   string                   `json:"provider_origin,omitempty"`
@@ -93,6 +94,11 @@ type Message struct {
 }
 
 func (m Message) validate() error {
+	for _, ref := range m.SourceOutputs {
+		if err := ref.validate(); err != nil {
+			return fmt.Errorf("message source output: %w", err)
+		}
+	}
 	if err := requireID("message_id", m.MessageID); err != nil {
 		return err
 	}
@@ -111,9 +117,10 @@ func (m Message) validate() error {
 }
 
 type Task struct {
-	TaskID string `json:"task_id"`
-	Title  string `json:"title"`
-	Status string `json:"status"`
+	TaskID   string `json:"task_id"`
+	Title    string `json:"title"`
+	Status   string `json:"status"`
+	Priority string `json:"priority,omitempty"`
 }
 
 func (t Task) validate() error {
@@ -122,6 +129,11 @@ func (t Task) validate() error {
 	}
 	if t.Title == "" || t.Status == "" {
 		return errors.New("task title and status are required")
+	}
+	switch t.Priority {
+	case "", "high", "medium", "low":
+	default:
+		return errors.New("task priority must be high, medium or low")
 	}
 	return nil
 }
@@ -159,13 +171,6 @@ type TasksChanged struct {
 	Tasks    []Task `json:"tasks"`
 }
 
-type MemoryChanged struct {
-	Revision uint64   `json:"revision"`
-	Text     string   `json:"text,omitempty"`
-	Blob     *BlobRef `json:"blob,omitempty"`
-	Cleared  bool     `json:"cleared,omitempty"`
-}
-
 func (e AssistantCommitted) Type() EventType { return EventTypeAssistantCommitted }
 
 func (e AssistantCommitted) seal() {}
@@ -185,10 +190,6 @@ func (e ConversationRewound) seal() {}
 func (e TasksChanged) Type() EventType { return EventTypeTasksChanged }
 
 func (e TasksChanged) seal() {}
-
-func (e MemoryChanged) Type() EventType { return EventTypeMemoryChanged }
-
-func (e MemoryChanged) seal() {}
 
 func (e AssistantCommitted) validate() error {
 	if err := requireID("turn_id", e.TurnID); err != nil {
@@ -241,16 +242,6 @@ func (e TasksChanged) validate() error {
 		if err := task.validate(); err != nil {
 			return fmt.Errorf("tasks[%d]: %w", i, err)
 		}
-	}
-	return nil
-}
-
-func (e MemoryChanged) validate() error {
-	if e.Text == "" && e.Blob == nil && !e.Cleared {
-		return errors.New("memory requires text or blob")
-	}
-	if e.Blob != nil {
-		return e.Blob.validate()
 	}
 	return nil
 }

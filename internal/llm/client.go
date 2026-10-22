@@ -57,9 +57,11 @@ type RetryableError struct {
 type HTTPRejection struct {
 	StatusCode int
 	Message    string
+	Cause      error
 }
 
 func (e *HTTPRejection) Error() string { return e.Message }
+func (e *HTTPRejection) Unwrap() error { return e.Cause }
 
 func RejectedBeforeExecution(err error) bool {
 	var response *HTTPRejection
@@ -341,7 +343,7 @@ func (c *Client) postStream(ctx context.Context, url string, body []byte) (resp 
 				}
 			}
 		}
-		var statusErr error = &HTTPRejection{StatusCode: resp.StatusCode, Message: msg}
+		var statusErr error = &HTTPRejection{StatusCode: resp.StatusCode, Message: msg, Cause: providerErrorCause(raw)}
 		if retryable {
 			statusErr = &RetryableError{Err: statusErr, RetryAfter: after}
 		}
@@ -487,7 +489,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		}
 		if chunk.Error != nil {
 			result.FinishReason = "error"
-			return result, false, emitted, 0, fmt.Errorf("llm: provider error: %s", chunk.Error.Message)
+			return result, false, emitted, 0, structuredProviderError(chunk.Error.Message, chunk.Error.Type, chunk.Error.Code)
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -501,6 +503,9 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onDelta func(strin
 		delta := choice.Delta
 		if delta.Content != nil && *delta.Content != "" {
 			emitDelta(*delta.Content)
+		}
+		if delta.Refusal != nil {
+			emitDelta(*delta.Refusal)
 		}
 		if delta.ReasoningContent != nil && *delta.ReasoningContent != "" {
 			emitReasoning(*delta.ReasoningContent)
@@ -598,6 +603,9 @@ func nonStreamError(resp *http.Response, contentType string) error {
 		msg := probe.Error.Message
 		if msg == "" {
 			msg = body
+		}
+		if cause := providerErrorCause(raw); cause != nil {
+			return fmt.Errorf("llm: provider error (%d): %s: %w", resp.StatusCode, msg, cause)
 		}
 		return fmt.Errorf("llm: provider error (%d): %s", resp.StatusCode, msg)
 	}

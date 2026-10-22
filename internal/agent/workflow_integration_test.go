@@ -46,7 +46,7 @@ func newWorkflowTestSetupAt(t *testing.T, workspace string, permission permissio
 	cfg.PermissionMode = string(permission)
 	cfg.AlwaysDeny = append([]string(nil), deny...)
 	cfg.EnableGuardian = config.BoolPtr(false)
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.MCPServers = nil
 
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))

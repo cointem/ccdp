@@ -17,8 +17,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"unicode/utf8"
+
+	"ccdp/internal/fsops"
 )
 
 // Skill files are extension-provided input, not trusted bounded metadata.
@@ -31,11 +32,12 @@ const (
 
 // Skill is one loaded skill.
 type Skill struct {
-	Name        string
-	Description string
-	Body        string
-	Path        string // directory containing SKILL.md
-	Source      string // "user" or "project"
+	Name          string
+	Description   string
+	Body          string
+	Path          string // directory containing SKILL.md
+	Source        string // "user" or "project"
+	CanonicalFile string // file actually opened when the cached content was read
 }
 
 // Store holds the merged set of user + project skills.
@@ -56,22 +58,14 @@ func NewStore() *Store {
 	return &Store{byName: map[string]Skill{}}
 }
 
-// Load scans userDir and each project dir for skills and populates the store.
-// Project skills override user skills; within projects, earlier dirs win.
-func (s *Store) Load(userDir string, projectDirs ...string) {
-	_ = s.load(userDir, false, projectDirs...)
-}
-
-// LoadChecked is the error-returning form of Load. Missing SKILL.md files are
-// optional during directory discovery and remain ignored; a present special
-// file, oversized body, or other read failure is returned so a caller that
-// selected or trusted that input can surface the problem instead of silently
-// dropping it. The store is swapped only after a complete successful scan.
-func (s *Store) LoadChecked(userDir string, projectDirs ...string) error {
-	return s.load(userDir, true, projectDirs...)
-}
-
-func (s *Store) load(userDir string, strict bool, projectDirs ...string) error {
+// LoadChecked authorizes and loads user and project skills. Project skills
+// override user skills; within projects, earlier dirs win. Missing SKILL.md
+// files are optional, while invalid, oversized or denied files return an error.
+// The store is swapped only after a complete successful scan.
+func (s *Store) LoadChecked(authorize func(string) (string, error), userDir string, projectDirs ...string) error {
+	if authorize == nil {
+		return fmt.Errorf("skills: read policy is required")
+	}
 	dirs := make([]string, 0, len(projectDirs)+1)
 	dirs = append(dirs, userDir)
 	dirs = append(dirs, projectDirs...)
@@ -96,23 +90,14 @@ func (s *Store) load(userDir string, strict bool, projectDirs ...string) error {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			if !strict {
-				continue
-			}
 			return fmt.Errorf("skills: stat directory %q: %w", dir, err)
 		}
 		if !dirInfo.IsDir() {
-			if !strict {
-				continue
-			}
 			return fmt.Errorf("skills: %q is not a directory", dir)
 		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			if !strict {
 				continue
 			}
 			return fmt.Errorf("skills: read directory %q: %w", dir, err)
@@ -123,24 +108,21 @@ func (s *Store) load(userDir string, strict bool, projectDirs ...string) error {
 			}
 			dirName := e.Name()
 			md := filepath.Join(dir, dirName, "SKILL.md")
-			data, truncated, err := readBounded(md, DefaultMaxSkillFileBytes)
+			if _, err := os.Lstat(md); errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			data, canonical, truncated, err := readBounded(md, DefaultMaxSkillFileBytes, authorize)
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) {
 					continue
 				}
-				if !strict {
-					continue
-				}
 				return fmt.Errorf("skills: read %q: %w", md, err)
 			}
-			if truncated && strict {
+			if truncated {
 				return fmt.Errorf("skills: %q exceeds %d bytes", md, DefaultMaxSkillFileBytes)
 			}
-			content := string(data)
-			if truncated {
-				content += fmt.Sprintf("\n\n…[skill truncated at %d bytes]", DefaultMaxSkillFileBytes)
-			}
-			sk := parse(content, dirName, filepath.Join(dir, dirName), dir == userDir)
+			sk := parse(string(data), dirName, filepath.Join(dir, dirName), dir == userDir)
+			sk.CanonicalFile = canonical
 			if sk.Name == "" || sk.Body == "" {
 				continue
 			}
@@ -229,40 +211,23 @@ func truncateUTF8(value string, maxBytes int) string {
 	return value
 }
 
-func readBounded(path string, maxBytes int) ([]byte, bool, error) {
+func readBounded(path string, maxBytes int, authorize func(string) (string, error)) ([]byte, string, bool, error) {
 	if maxBytes <= 0 {
-		return nil, false, fmt.Errorf("skills: invalid read limit")
+		return nil, "", false, fmt.Errorf("skills: invalid read limit")
 	}
-	// A skill is a file-backed input, not a stream.  Check before opening so a
-	// FIFO cannot block session construction, then check the opened descriptor
-	// as well in case the path was replaced between the checks.
-	info, err := os.Stat(path)
+	f, err := fsops.OpenAuthorizedRegular("", path, authorize)
 	if err != nil {
-		return nil, false, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, false, fmt.Errorf("skills: %s is not a regular file", path)
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	defer f.Close()
-	openedInfo, err := f.Stat()
-	if err != nil {
-		return nil, false, err
-	}
-	if !openedInfo.Mode().IsRegular() {
-		return nil, false, fmt.Errorf("skills: %s is not a regular file", path)
-	}
 	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	if len(data) > maxBytes {
-		return data[:maxBytes], true, nil
+		return data[:maxBytes], f.Name(), true, nil
 	}
-	return data, false, nil
+	return data, f.Name(), false, nil
 }
 
 // parse splits frontmatter and body from a SKILL.md file.

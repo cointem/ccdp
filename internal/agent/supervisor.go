@@ -20,12 +20,14 @@ import (
 // Each session owner writes its own log. Cross-owner waits release run and
 // directory locks; publicationMu only orders short admission/view transitions.
 type SessionSupervisor struct {
-	directory     supervision.Supervisor[*managedRun]
-	publicationMu sync.Mutex // orders admission and child view publication, never held over I/O
-	root          supervisorRoot
-	sessionDir    string
-	recoveryErr   error
-	recoverOnce   sync.Once
+	directory      supervision.Supervisor[*managedRun]
+	publicationMu  sync.Mutex // orders admission and child view publication, never held over I/O
+	root           supervisorRoot
+	sessionDir     string
+	memory         bool
+	memoryChildren map[protocol.RunID]memoryRunRecords
+	recoveryErr    error
+	recoverOnce    sync.Once
 }
 
 type managedRun struct {
@@ -57,13 +59,22 @@ type managedRun struct {
 	executionBoundaryErr error
 }
 
-func newSessionSupervisor(root *Agent) *SessionSupervisor {
-	s := &SessionSupervisor{root: root, sessionDir: root.services.cfg.SessionDir}
+func newSessionSupervisor(root *Agent, memoryChildren map[protocol.RunID]memoryRunRecords) *SessionSupervisor {
+	s := &SessionSupervisor{root: root, sessionDir: root.services.cfg.SessionDir, memory: root.services.cfg.NoSessionPersistence, memoryChildren: memoryChildren}
+	ctx := root.rootContext()
+	if err := ctx.Err(); err != nil {
+		s.recoveryErr = err
+		return s
+	}
 	firstSeen := make(map[protocol.RunID]session.Cursor)
 	currentRun := make(map[protocol.SessionID]session.Cursor)
 	if p := root.persistenceHandle(); p != nil {
 		if records, err := p.Read(session.Beginning); err == nil {
 			for _, record := range records {
+				if err := ctx.Err(); err != nil {
+					s.recoveryErr = err
+					return s
+				}
 				if fact, ok := record.Event.(*session.ChildRunRecorded); ok && fact.Child.ParentSessionID == protocol.SessionID(root.conversation.sessionID) {
 					copy := *fact
 					if copy.Child.Run.Active() {
@@ -73,6 +84,9 @@ func newSessionSupervisor(root *Agent) *SessionSupervisor {
 					done := make(chan struct{})
 					close(done)
 					r := &managedRun{fact: copy, parent: root, done: done}
+					if saved, ok := memoryChildren[copy.Child.Run.ID]; ok {
+						r.memory, r.memoryBlobs = saved.records, saved.blobs
+					}
 					if firstSeen[copy.Child.Run.ID] == 0 {
 						firstSeen[copy.Child.Run.ID] = record.Seq
 					}

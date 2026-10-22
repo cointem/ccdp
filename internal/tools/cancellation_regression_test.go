@@ -47,7 +47,7 @@ func TestFileSearchToolsHonorCancellation(t *testing.T) {
 				ctx := scopedTestContext(t, root)
 				ctx.Context = &cancelAfterChecks{Context: context.Background(), remaining: after}
 				ctx.Args = tc.args
-				if out, err := tc.tool.Run(ctx); !errors.Is(err, context.Canceled) {
+				if out, err := executeToolText(tc.tool, ctx); !errors.Is(err, context.Canceled) {
 					t.Fatalf("returned %q, %v", out, err)
 				}
 			})
@@ -78,7 +78,7 @@ func TestWriteAndEditCancelAfterBeforeWrite(t *testing.T) {
 				cancel()
 				return func() error { finished = true; return nil }, nil
 			}
-			if _, err := tool.Run(ctx); !errors.Is(err, context.Canceled) {
+			if _, err := executeToolText(tool, ctx); !errors.Is(err, context.Canceled) {
 				t.Fatalf("got %v", err)
 			}
 			data, err := os.ReadFile(path)

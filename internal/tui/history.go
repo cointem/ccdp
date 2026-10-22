@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 
+	"ccdp/internal/protocol"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -140,11 +142,7 @@ func inlineItemComplete(item historyCell, turnDone bool) bool {
 	case "tool":
 		// Spawn completion is the dispatch receipt. Live child progress belongs
 		// to the shelf and must not hold the parent's transcript in the frame.
-		switch strings.ToLower(strings.TrimSpace(item.status)) {
-		case "success", "done", "completed", "complete", "error", "failed", "failure", "denied", "rejected", "cancelled", "canceled", "stopped", "interrupted":
-			return true
-		}
-		return false
+		return protocol.ToolTerminal(item.status)
 	default:
 		return strings.TrimSpace(item.text) != ""
 	}
@@ -375,24 +373,6 @@ func appendInlineFlush(model tea.Model, cmd tea.Cmd) (tea.Model, tea.Cmd) {
 	default:
 		return model, cmd
 	}
-}
-
-func boundDisplayLines(text string, width, limit int) []string {
-	if limit <= 0 {
-		limit = 1
-	}
-	if text == "" {
-		return nil
-	}
-	wrapped := lipgloss.NewStyle().Width(max(1, width)).Render(text)
-	lines := strings.Split(strings.TrimRight(wrapped, "\n"), "\n")
-	if len(lines) > limit {
-		lines = lines[len(lines)-limit:]
-		if len(lines) > 0 {
-			lines[0] = "… " + strings.TrimLeft(lines[0], " ")
-		}
-	}
-	return lines
 }
 
 // reconcile carries acknowledged and pending prefixes across the runtime's

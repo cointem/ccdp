@@ -7,16 +7,24 @@ import (
 	"sync"
 
 	"ccdp/internal/config"
+	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 	"ccdp/internal/session/journal"
 )
 
-// Memory forks are immutable saved records, shared by handles opened from the
-// same session. Closing one Agent does not invalidate another handle's source.
-// There is no process-global registry or hidden disk persistence.
+// Memory sessions retain their own records and child runs, shared by handles
+// opened from the same catalog. Closing one Agent does not invalidate another
+// handle's source. There is no process-global registry or hidden disk persistence.
 type memorySessionCatalog struct {
 	mu       sync.Mutex
 	sessions map[string]*SessionSnapshot
+}
+
+type memoryRunRecords struct {
+	// Both records and blob contents are immutable. No closed child runtime
+	// is retained; continuation constructs a fresh owner from these facts.
+	records []session.Record
+	blobs   journal.ArtifactAccess
 }
 
 func (a *Agent) memorySessionCatalog() *memorySessionCatalog {
@@ -29,20 +37,50 @@ func (a *Agent) memorySessionCatalog() *memorySessionCatalog {
 }
 
 func (a *Agent) retainMemorySession(c *memorySessionCatalog) error {
-	return retainMemoryPersistence(c, a.persistenceHandle())
+	snapshot, err := readMemorySession(a.persistenceHandle())
+	if err != nil {
+		return err
+	}
+	// Coding facts refer to a separate store using plain hashes, not BlobRefs.
+	// Capture it after the log so every recorded reference has its object.
+	snapshot.resumeCoding = a.codingState().store.Clone()
+	snapshot.resumeChildren = make(map[protocol.RunID]memoryRunRecords)
+	for id, saved := range a.services.supervisor.memoryChildren {
+		snapshot.resumeChildren[id] = saved
+	}
+	for _, run := range a.services.supervisor.directory.Runs() {
+		run.mu.Lock()
+		if run.fact.Child.RootSessionID != protocol.SessionID(snapshot.ID) &&
+			run.fact.Child.ParentSessionID != protocol.SessionID(snapshot.ID) {
+			run.mu.Unlock()
+			continue
+		}
+		id, child := run.fact.Child.Run.ID, run.agent
+		saved := memoryRunRecords{records: append([]session.Record(nil), run.memory...), blobs: run.memoryBlobs}
+		run.mu.Unlock()
+		if saved.records == nil && child != nil {
+			records, artifacts, err := child.ReadRunRecords(context.Background())
+			if err != nil {
+				return err
+			}
+			saved.records = records
+			saved.blobs, err = copyMemoryArtifacts(records, artifacts)
+			if err != nil {
+				return err
+			}
+		}
+		if saved.records != nil {
+			snapshot.resumeChildren[id] = saved
+		}
+	}
+	c.mu.Lock()
+	c.sessions[snapshot.ID] = snapshot
+	c.mu.Unlock()
+	return nil
 }
 
 func retainMemoryPersistence(c *memorySessionCatalog, p *sessionPersistence) error {
-	records, err := p.Read(session.Beginning)
-	if err != nil {
-		return err
-	}
-	snapshot, err := snapshotFromRecords(records, p.Identity())
-	if err != nil {
-		return err
-	}
-	snapshot.resumeRecords = records
-	snapshot.resumeArtifacts, err = p.RequestArtifacts()
+	snapshot, err := readMemorySession(p)
 	if err != nil {
 		return err
 	}
@@ -52,12 +90,34 @@ func retainMemoryPersistence(c *memorySessionCatalog, p *sessionPersistence) err
 	return nil
 }
 
+func readMemorySession(p *sessionPersistence) (*SessionSnapshot, error) {
+	records, artifacts, err := p.ReadSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := snapshotFromRecords(records, p.Identity())
+	if err != nil {
+		return nil, err
+	}
+	snapshot.resumeRecords = records
+	snapshot.resumeArtifacts = artifacts
+	return snapshot, nil
+}
+
 // Import complete typed facts and their blobs. Rebuilding facts from a display
 // snapshot would lose input identities, frozen attachments and request usage.
 func memoryResumeOptions(cfg *config.Config, snapshot *SessionSnapshot) (Options, error) {
 	if !cfg.NoSessionPersistence || len(snapshot.resumeRecords) == 0 {
 		return Options{}, nil
 	}
+	blobs, err := copyMemoryArtifacts(snapshot.resumeRecords, snapshot.resumeArtifacts)
+	if err != nil {
+		return Options{}, fmt.Errorf("import session %s artifacts: %w", snapshot.ID, err)
+	}
+	return Options{memoryResume: snapshot.resumeRecords, memoryBlobs: blobs, memoryChildren: snapshot.resumeChildren}, nil
+}
+
+func copyMemoryArtifacts(records []session.Record, artifacts journal.ArtifactReader) (journal.ArtifactAccess, error) {
 	blobs := journal.NewMemoryArtifacts(session.DefaultMaxBlobBytes)
 	seen := make(map[string]bool)
 	refType := reflect.TypeOf(session.BlobRef{})
@@ -71,10 +131,10 @@ func memoryResumeOptions(cfg *config.Config, snapshot *SessionSnapshot) (Options
 			if ref.Hash == "" || seen[ref.Hash] {
 				return nil
 			}
-			if snapshot.resumeArtifacts == nil {
-				return fmt.Errorf("session %s has no artifact source", snapshot.ID)
+			if artifacts == nil {
+				return fmt.Errorf("session has no artifact source")
 			}
-			data, err := snapshot.resumeArtifacts.Read(ref, session.DefaultMaxBlobBytes)
+			data, err := artifacts.Read(ref, session.DefaultMaxBlobBytes)
 			if err != nil {
 				return err
 			}
@@ -116,10 +176,10 @@ func memoryResumeOptions(cfg *config.Config, snapshot *SessionSnapshot) (Options
 		}
 		return nil
 	}
-	for _, record := range snapshot.resumeRecords {
+	for _, record := range records {
 		if err := copyRefs(reflect.ValueOf(record.Event)); err != nil {
-			return Options{}, fmt.Errorf("import session artifacts: %w", err)
+			return nil, err
 		}
 	}
-	return Options{memoryResume: snapshot.resumeRecords, memoryBlobs: blobs}, nil
+	return blobs, nil
 }

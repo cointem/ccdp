@@ -24,9 +24,10 @@ func TestDeadCandidateNotPublished(t *testing.T) {
 	c.tools = []ToolDef{{Name: "echo"}}
 	candidate.clients = append(candidate.clients, refreshClient{name: "dead", client: c})
 	c.fireClosed() // remote stream closes between successful prepare and publication
-	if e = candidate.Commit(); e != nil {
+	if e = candidate.Publish(); e != nil {
 		t.Fatal(e)
 	}
+	candidate.FinishRetirement()
 	if _, ok := reg.Get("mcp__dead__echo"); ok {
 		t.Fatalf("dead server still published: manager names=%v", m.Names())
 	}
@@ -81,9 +82,10 @@ func TestSSEDisconnectBeforeCommitUnregisters(t *testing.T) {
 		candidate.Abort()
 		t.Fatal("did not observe disconnected SSE")
 	}
-	if e = candidate.Commit(); e != nil {
+	if e = candidate.Publish(); e != nil {
 		t.Fatal(e)
 	}
+	candidate.FinishRetirement()
 	if _, ok := reg.Get("mcp__remote__echo"); ok {
 		t.Fatalf("disconnected SSE client exposed to next model step: manager names=%v", m.Names())
 	}

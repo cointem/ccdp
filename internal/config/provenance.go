@@ -69,11 +69,11 @@ type provenanceState struct {
 var configFieldNames = []string{
 	"api_key", "base_url", "model", "workspace", "providers", "reasoning_effort", "verbosity",
 	"permission_mode", "always_allow", "always_deny", "system_prompt",
-	"context_window", "compact_threshold", "max_result_size_chars",
+	"context_window", "compact_threshold", "max_result_size_bytes",
 	"keep_after_compact", "bash_timeout_seconds", "max_turns",
 	"fallback_model",
-	"max_tool_output_chars_per_turn", "enable_guardian", "enable_memory",
-	"max_parallel_tools", "sandbox_limits", "network_access", "network_proxy",
+	"max_tool_output_bytes_per_turn", "enable_guardian", "enable_project_memory", "project_memory_dir", "memory_read_only", "memory_history",
+	"max_parallel_tools", "max_concurrent_agents", "code_mode_enabled", "sandbox_limits", "network_access", "network_proxy",
 	"additional_directories", "additional_read_only_directories", "disallowed_directories",
 	"hooks", "enable_web_tools", "tools", "mcp_servers", "session_dir",
 	"verbose", "debug", "session_id", "no_session_persistence", "review", "delivery", "automatic_checkpoints", "language_servers",
@@ -258,8 +258,8 @@ func (c *Config) ApplyCLIOverride(field string, value any) error {
 		err = setInt(&c.ContextWindow)
 	case "compact_threshold":
 		err = setFloat(&c.CompactThreshold)
-	case "max_result_size_chars":
-		err = setInt(&c.MaxResultSizeChars)
+	case "max_result_size_bytes":
+		err = setInt(&c.MaxResultSizeBytes)
 	case "keep_after_compact":
 		err = setInt(&c.KeepAfterCompact)
 	case "bash_timeout_seconds":
@@ -272,22 +272,28 @@ func (c *Config) ApplyCLIOverride(field string, value any) error {
 		err = setBool(&c.Debug)
 	case "fallback_model":
 		err = setString(&c.FallbackModel)
-	case "max_tool_output_chars_per_turn":
-		err = setInt(&c.MaxToolOutputCharsPerTurn)
+	case "max_tool_output_bytes_per_turn":
+		err = setInt(&c.MaxToolOutputBytesPerTurn)
 	case "enable_guardian":
 		var v bool
 		err = setBool(&v)
 		if err == nil {
 			c.EnableGuardian = cloneBool(&v)
 		}
-	case "enable_memory":
-		var v bool
-		err = setBool(&v)
-		if err == nil {
-			c.EnableMemory = cloneBool(&v)
-		}
+	case "enable_project_memory":
+		err = setBool(&c.EnableProjectMemory)
+	case "project_memory_dir":
+		err = setString(&c.ProjectMemoryDir)
+	case "memory_read_only":
+		err = setBool(&c.MemoryReadOnly)
+	case "memory_history":
+		err = setBool(&c.MemoryHistory)
+	case "max_concurrent_agents":
+		err = setInt(&c.MaxConcurrentAgents)
 	case "max_parallel_tools":
 		err = setInt(&c.MaxParallelTools)
+	case "code_mode_enabled":
+		err = setBool(&c.CodeModeEnabled)
 	case "network_proxy":
 		err = setString(&c.NetworkProxy)
 	case "network_access":
@@ -374,8 +380,8 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			dst.ContextWindow = src.ContextWindow
 		case "compact_threshold":
 			dst.CompactThreshold = src.CompactThreshold
-		case "max_result_size_chars":
-			dst.MaxResultSizeChars = src.MaxResultSizeChars
+		case "max_result_size_bytes":
+			dst.MaxResultSizeBytes = src.MaxResultSizeBytes
 		case "keep_after_compact":
 			dst.KeepAfterCompact = src.KeepAfterCompact
 		case "bash_timeout_seconds":
@@ -388,14 +394,24 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			dst.Debug = src.Debug
 		case "fallback_model":
 			dst.FallbackModel = src.FallbackModel
-		case "max_tool_output_chars_per_turn":
-			dst.MaxToolOutputCharsPerTurn = src.MaxToolOutputCharsPerTurn
+		case "max_tool_output_bytes_per_turn":
+			dst.MaxToolOutputBytesPerTurn = src.MaxToolOutputBytesPerTurn
 		case "enable_guardian":
 			dst.EnableGuardian = cloneBool(src.EnableGuardian)
-		case "enable_memory":
-			dst.EnableMemory = cloneBool(src.EnableMemory)
+		case "enable_project_memory":
+			dst.EnableProjectMemory = src.EnableProjectMemory
+		case "project_memory_dir":
+			dst.ProjectMemoryDir = src.ProjectMemoryDir
+		case "memory_read_only":
+			dst.MemoryReadOnly = src.MemoryReadOnly
+		case "memory_history":
+			dst.MemoryHistory = src.MemoryHistory
+		case "max_concurrent_agents":
+			dst.MaxConcurrentAgents = src.MaxConcurrentAgents
 		case "max_parallel_tools":
 			dst.MaxParallelTools = src.MaxParallelTools
+		case "code_mode_enabled":
+			dst.CodeModeEnabled = src.CodeModeEnabled
 		case "sandbox_limits":
 			dst.SandboxLimits = cloneLimits(src.SandboxLimits)
 		case "network_proxy":
@@ -462,7 +478,6 @@ func (c Config) Clone() Config {
 	c.AdditionalReadOnlyDirectories = append([]string(nil), c.AdditionalReadOnlyDirectories...)
 	c.provenance = c.provenance.clone()
 	c.EnableGuardian = cloneBool(c.EnableGuardian)
-	c.EnableMemory = cloneBool(c.EnableMemory)
 	c.EnableWebTools = cloneBool(c.EnableWebTools)
 	c.AlwaysAllow = append([]string(nil), c.AlwaysAllow...)
 	c.AlwaysDeny = append([]string(nil), c.AlwaysDeny...)
@@ -650,6 +665,7 @@ func ProjectExecutableFingerprint(root string, cfg Config) (string, error) {
 		MCPServers            map[string]mcp.ServerConfig         `json:"mcp_servers"`
 		AlwaysAllow           []string                            `json:"always_allow"`
 		EnableWebTools        *bool                               `json:"enable_web_tools"`
+		CodeModeEnabled       bool                                `json:"code_mode_enabled,omitempty"`
 		AdditionalDirectories []string                            `json:"additional_directories"`
 		NetworkAccess         bool                                `json:"network_access"`
 	}{
@@ -661,6 +677,7 @@ func ProjectExecutableFingerprint(root string, cfg Config) (string, error) {
 		MCPServers:            cloneMCPServers(cfg.MCPServers),
 		AlwaysAllow:           append([]string(nil), cfg.AlwaysAllow...),
 		EnableWebTools:        cloneBool(cfg.EnableWebTools),
+		CodeModeEnabled:       cfg.CodeModeEnabled,
 		AdditionalDirectories: append([]string(nil), cfg.AdditionalDirectories...),
 		NetworkAccess:         cfg.NetworkAccess,
 	}

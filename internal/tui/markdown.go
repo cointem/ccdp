@@ -56,13 +56,8 @@ const maxMarkdownLines = 8192
 // is available to the reader.
 const maxMarkdownPreviewLines = 256
 
-// parseMarkdownBlocks recognizes the block constructs we can lay out safely
+// parseMarkdownBlocksBounded recognizes the block constructs we can lay out safely
 // in a terminal.  Unknown syntax is retained as ordinary paragraph text.
-func parseMarkdownBlocks(source string) []markdownBlock {
-	blocks, _ := parseMarkdownBlocksBounded(source)
-	return blocks
-}
-
 func parseMarkdownBlocksBounded(source string) ([]markdownBlock, bool) {
 	truncated := false
 	if len(source) > maxMarkdownSourceBytes {

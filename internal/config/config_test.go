@@ -164,7 +164,7 @@ func TestTriStateBoolMerge(t *testing.T) {
 	content := `{
 		"enable_web_tools": false,
 		"enable_guardian": true,
-		"enable_memory": false
+		"enable_project_memory": false
 	}`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -179,18 +179,18 @@ func TestTriStateBoolMerge(t *testing.T) {
 	if !cfg.GuardianEnabled() {
 		t.Error("enable_guardian:true was ignored by the merge")
 	}
-	if cfg.MemoryEnabled() {
-		t.Error("enable_memory:false was ignored by the merge")
+	if cfg.EnableProjectMemory {
+		t.Error("enable_project_memory:false was ignored by the merge")
 	}
 
-	// Unset keys fall back to the defaults (web on, guardian/memory off).
+	// Unset keys fall back to the defaults (web/memory on, guardian off).
 	cfg2, err := LoadFrom(filepath.Join(t.TempDir(), "empty.json"))
 	if err != nil {
 		t.Fatalf("LoadFrom: %v", err)
 	}
-	if !cfg2.WebToolsEnabled() || cfg2.GuardianEnabled() || cfg2.MemoryEnabled() {
+	if !cfg2.WebToolsEnabled() || cfg2.GuardianEnabled() || !cfg2.EnableProjectMemory {
 		t.Errorf("defaults wrong: web=%v guardian=%v memory=%v",
-			cfg2.WebToolsEnabled(), cfg2.GuardianEnabled(), cfg2.MemoryEnabled())
+			cfg2.WebToolsEnabled(), cfg2.GuardianEnabled(), cfg2.EnableProjectMemory)
 	}
 }
 
@@ -349,18 +349,18 @@ func TestProjectTrustInvalidatesPrivilegeChanges(t *testing.T) {
 }
 
 func TestCloneDeepCopiesOptionalPointersAndNestedSchemas(t *testing.T) {
-	guardian, memory, web := true, false, true
+	guardian, web := true, true
 	cfg := Default()
-	cfg.EnableGuardian, cfg.EnableMemory, cfg.EnableWebTools = &guardian, &memory, &web
+	cfg.EnableGuardian, cfg.EnableWebTools = &guardian, &web
 	cfg.Tools = []ToolSpec{{InputSchema: map[string]any{
 		"properties": map[string]any{"items": []any{map[string]any{"type": "string"}}},
 	}}}
 	clone := cfg.Clone()
 	*clone.EnableGuardian = false
-	*clone.EnableMemory = true
+	clone.EnableProjectMemory = false
 	*clone.EnableWebTools = false
 	clone.Tools[0].InputSchema["properties"].(map[string]any)["items"].([]any)[0].(map[string]any)["type"] = "integer"
-	if !*cfg.EnableGuardian || *cfg.EnableMemory || !*cfg.EnableWebTools {
+	if !*cfg.EnableGuardian || !cfg.EnableProjectMemory || !*cfg.EnableWebTools {
 		t.Fatal("optional config pointers were aliased")
 	}
 	if got := cfg.Tools[0].InputSchema["properties"].(map[string]any)["items"].([]any)[0].(map[string]any)["type"]; got != "string" {

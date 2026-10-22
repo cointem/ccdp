@@ -7,6 +7,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"ccdp/internal/sandbox"
 )
 
 func writeSkill(t *testing.T, dir, name, fm, body string) string {
@@ -34,7 +36,9 @@ func TestLoadAndGet(t *testing.T) {
 		"# Go Build\nRun go build and go test.\n")
 
 	s := NewStore()
-	s.Load(user, proj)
+	if err := s.LoadChecked(sandbox.New(user).ResolveRead, user, proj); err != nil {
+		t.Fatal(err)
+	}
 
 	if got := len(s.All()); got != 2 {
 		t.Fatalf("expected 2 skills, got %d", got)
@@ -63,7 +67,9 @@ func TestProjectOverridesUser(t *testing.T) {
 	writeSkill(t, proj, "x", "name: dup\ndescription: project version\n", "project body")
 
 	s := NewStore()
-	s.Load(user, proj)
+	if err := s.LoadChecked(sandbox.New(user).ResolveRead, user, proj); err != nil {
+		t.Fatal(err)
+	}
 	sk, ok := s.Get("dup")
 	if !ok {
 		t.Fatal("missing dup")
@@ -82,7 +88,9 @@ func TestEarlierProjectDirWins(t *testing.T) {
 	writeSkill(t, projB, "x", "name: dup\ndescription: second project version\n", "second project body")
 
 	s := NewStore()
-	s.Load(user, projA, projB)
+	if err := s.LoadChecked(sandbox.New(user).ResolveRead, user, projA, projB); err != nil {
+		t.Fatal(err)
+	}
 	sk, ok := s.Get("dup")
 	if !ok {
 		t.Fatal("missing dup")
@@ -102,7 +110,9 @@ func TestFoldedDescription(t *testing.T) {
 		"body")
 
 	s := NewStore()
-	s.Load(user)
+	if err := s.LoadChecked(sandbox.New(user).ResolveRead, user); err != nil {
+		t.Fatal(err)
+	}
 	sk, _ := s.Get("multi")
 	if !strings.Contains(sk.Description, "line two") {
 		t.Errorf("folded description not parsed: %q", sk.Description)
@@ -116,7 +126,9 @@ func TestNoFrontmatterFallsBack(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# plain skill\nbody"), 0o644)
 
 	s := NewStore()
-	s.Load(user)
+	if err := s.LoadChecked(sandbox.New(user).ResolveRead, user); err != nil {
+		t.Fatal(err)
+	}
 	sk, ok := s.Get("plain")
 	if !ok {
 		t.Fatal("expected fallback name from directory")
@@ -135,7 +147,7 @@ func TestReadBoundedRejectsFIFOWithoutBlocking(t *testing.T) {
 	done := make(chan struct{})
 	var err error
 	go func() {
-		_, _, err = readBounded(path, 32)
+		_, _, _, err = readBounded(path, 32, sandbox.New(filepath.Dir(path)).ResolveRead)
 		close(done)
 	}()
 	select {
@@ -148,27 +160,11 @@ func TestReadBoundedRejectsFIFOWithoutBlocking(t *testing.T) {
 	}
 }
 
-func TestLoadMarksOversizedSkill(t *testing.T) {
-	user := t.TempDir()
-	body := strings.Repeat("x", DefaultMaxSkillFileBytes+32)
-	writeSkill(t, user, "large", "name: large\ndescription: bounded\n", body)
-
-	s := NewStore()
-	s.Load(user)
-	sk, ok := s.Get("large")
-	if !ok {
-		t.Fatal("oversized skill was not loaded")
-	}
-	if !strings.Contains(sk.Body, "skill truncated") {
-		t.Fatalf("oversized skill body lacks truncation marker")
-	}
-}
-
 func TestLoadCheckedRejectsOversizedSkill(t *testing.T) {
 	user := t.TempDir()
 	skillDir := writeSkill(t, user, "large", "name: large\ndescription: bounded\n", strings.Repeat("x", DefaultMaxSkillFileBytes+1))
 
-	err := NewStore().LoadChecked(user)
+	err := NewStore().LoadChecked(sandbox.New(user).ResolveRead, user)
 	if err == nil || !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), filepath.Join(skillDir, "SKILL.md")) {
 		t.Fatalf("oversized skill error = %v, want path and limit", err)
 	}
@@ -187,7 +183,7 @@ func TestLoadCheckedSurfacesPresentFIFO(t *testing.T) {
 	done := make(chan struct{})
 	var err error
 	go func() {
-		err = NewStore().LoadChecked(user)
+		err = NewStore().LoadChecked(sandbox.New(user).ResolveRead, user)
 		close(done)
 	}()
 	select {
@@ -209,7 +205,7 @@ func TestLoadCheckedSurfacesFIFOUserDirectory(t *testing.T) {
 	done := make(chan struct{})
 	var err error
 	go func() {
-		err = NewStore().LoadChecked(path)
+		err = NewStore().LoadChecked(sandbox.New(filepath.Dir(path)).ResolveRead, path)
 		close(done)
 	}()
 	select {

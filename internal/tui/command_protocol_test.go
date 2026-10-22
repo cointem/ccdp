@@ -91,9 +91,52 @@ func TestWorkspaceCommandsUseTypedRuntimePayloads(t *testing.T) {
 				t.Fatalf("memory command = %#v", command)
 			}
 		}},
-		{line: "/memory clear", check: func(t *testing.T, command protocol.Command) {
-			if command.Type != protocol.CommandClearMemory || command.ClearMemory == nil {
-				t.Fatalf("memory clear command = %#v", command)
+		{line: "/memory off", check: func(t *testing.T, command protocol.Command) {
+			if command.Type != protocol.CommandProjectMemory || command.ProjectMemory == nil || command.ProjectMemory.Action != "disable" {
+				t.Fatalf("memory disable command = %#v", command)
+			}
+		}},
+		{line: "/memory OFF", check: func(t *testing.T, command protocol.Command) {
+			if command.Type != protocol.CommandProjectMemory || command.ProjectMemory == nil || command.ProjectMemory.Action != "disable" {
+				t.Fatalf("memory disable command = %#v", command)
+			}
+		}},
+		{line: "/memory read build", check: func(t *testing.T, command protocol.Command) {
+			if command.Type != protocol.CommandProjectMemory || command.ProjectMemory == nil || command.ProjectMemory.Action != "read" || command.ProjectMemory.ID != "build" {
+				t.Fatalf("memory read command = %#v", command)
+			}
+		}},
+		{line: "/memory save go test ./...", check: func(t *testing.T, command protocol.Command) {
+			p := command.ProjectMemory
+			if command.Type != protocol.CommandProjectMemory || p == nil || p.Action != "save" || p.Body != "go test ./..." {
+				t.Fatalf("memory save command = %#v", command)
+			}
+		}},
+		{line: "/memory save --user 默认中文回答", check: func(t *testing.T, command protocol.Command) {
+			p := command.ProjectMemory
+			if p == nil || p.Action != "save" || p.Scope != "user" || p.Body != "默认中文回答" {
+				t.Fatalf("user memory: %#v", p)
+			}
+		}},
+		{line: "/memory edit user:language 中文 | 英文", check: func(t *testing.T, command protocol.Command) {
+			p := command.ProjectMemory
+			if p == nil || p.Action != "edit" || p.Scope != "user" || p.ID != "language" || p.OldText != "中文" || p.NewText != "英文" {
+				t.Fatalf("edit memory: %#v", p)
+			}
+		}},
+		{line: "/memory readonly", check: func(t *testing.T, command protocol.Command) {
+			if p := command.ProjectMemory; p == nil || p.Action != "readonly" {
+				t.Fatalf("readonly: %#v", p)
+			}
+		}},
+		{line: "/memory history on", check: func(t *testing.T, command protocol.Command) {
+			if p := command.ProjectMemory; p == nil || p.Action != "history-on" {
+				t.Fatalf("history: %#v", p)
+			}
+		}},
+		{line: "/memory extract source-session", check: func(t *testing.T, command protocol.Command) {
+			if p := command.ProjectMemory; p == nil || p.Action != "extract" || p.ID != "source-session" {
+				t.Fatalf("extract: %#v", p)
 			}
 		}},
 		{line: "/cd /tmp", check: func(t *testing.T, command protocol.Command) {

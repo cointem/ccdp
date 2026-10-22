@@ -65,55 +65,61 @@ func (*UpdateGoalTool) Parameters() map[string]any {
 	}
 }
 
-func (*CreateGoalTool) Run(ctx *Context) (string, error) {
-	controller, err := goalController(ctx, "objective", "token_budget")
-	if err != nil {
-		return "", err
-	}
-	objective := strings.TrimSpace(StringArg(ctx.Args, "objective", ""))
-	if objective == "" {
-		return "", fmt.Errorf("CreateGoal: objective must be a non-empty string")
-	}
-	var budget *int64
-	if raw, supplied := ctx.Args["token_budget"]; supplied {
-		if raw == nil {
-			return "", fmt.Errorf("CreateGoal: token_budget must be a positive integer")
+func (*CreateGoalTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
+		controller, err := goalController(ctx, "objective", "token_budget")
+		if err != nil {
+			return "", err
 		}
-		n, err := IntArgChecked(ctx.Args, "token_budget", 0)
-		if err != nil || n <= 0 {
-			return "", fmt.Errorf("CreateGoal: token_budget must be a positive integer")
+		objective := strings.TrimSpace(StringArg(ctx.Args, "objective", ""))
+		if objective == "" {
+			return "", fmt.Errorf("CreateGoal: objective must be a non-empty string")
 		}
-		value := int64(n)
-		budget = &value
-	}
-	goal, err := controller.CreateGoal(objective, budget)
-	return goalResult(goal, err)
+		var budget *int64
+		if raw, supplied := ctx.Args["token_budget"]; supplied {
+			if raw == nil {
+				return "", fmt.Errorf("CreateGoal: token_budget must be a positive integer")
+			}
+			n, err := IntArgChecked(ctx.Args, "token_budget", 0)
+			if err != nil || n <= 0 {
+				return "", fmt.Errorf("CreateGoal: token_budget must be a positive integer")
+			}
+			value := int64(n)
+			budget = &value
+		}
+		goal, err := controller.CreateGoal(objective, budget)
+		return goalResult(goal, err)
+	})
 }
 
-func (*GetGoalTool) Run(ctx *Context) (string, error) {
-	controller, err := goalController(ctx)
-	if err != nil {
-		return "", err
-	}
-	goal, err := controller.GetGoal()
-	return goalResult(goal, err)
+func (*GetGoalTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
+		controller, err := goalController(ctx)
+		if err != nil {
+			return "", err
+		}
+		goal, err := controller.GetGoal()
+		return goalResult(goal, err)
+	})
 }
 
-func (*UpdateGoalTool) Run(ctx *Context) (string, error) {
-	controller, err := goalController(ctx, "status", "reason")
-	if err != nil {
-		return "", err
-	}
-	status := StringArg(ctx.Args, "status", "")
-	if status != "complete" && status != "blocked" && status != "paused" {
-		return "", fmt.Errorf("UpdateGoal: status must be complete, blocked or paused")
-	}
-	reason := strings.TrimSpace(StringArg(ctx.Args, "reason", ""))
-	if reason == "" {
-		return "", fmt.Errorf("UpdateGoal: reason must describe completion evidence, the blocker or the pause request")
-	}
-	goal, err := controller.UpdateGoal(status, reason)
-	return goalResult(goal, err)
+func (*UpdateGoalTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
+		controller, err := goalController(ctx, "status", "reason")
+		if err != nil {
+			return "", err
+		}
+		status := StringArg(ctx.Args, "status", "")
+		if status != "complete" && status != "blocked" && status != "paused" {
+			return "", fmt.Errorf("UpdateGoal: status must be complete, blocked or paused")
+		}
+		reason := strings.TrimSpace(StringArg(ctx.Args, "reason", ""))
+		if reason == "" {
+			return "", fmt.Errorf("UpdateGoal: reason must describe completion evidence, the blocker or the pause request")
+		}
+		goal, err := controller.UpdateGoal(status, reason)
+		return goalResult(goal, err)
+	})
 }
 
 func goalController(ctx *Context, allowedArgs ...string) (GoalControl, error) {

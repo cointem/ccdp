@@ -302,10 +302,9 @@ func (m *Model) openTranscriptReader() tea.Cmd {
 	m.reader = &readerState{workspace: m.workspace, kind: readerTranscript, title: "Transcript details", sessionID: protocol.SessionID(m.sessionID), entries: entries, index: len(entries) - 1, request: m.readerRequest, returnOffset: m.viewport.YOffset, returnFollow: m.followOutput, historyMore: m.snapshot.TranscriptMore}
 	return m.enterReaderScreen()
 }
-func (m *Model) openOutputReader(msg agentOutputMsg) tea.Cmd {
-	if msg.sessionID != m.sessionID || msg.request != 0 && msg.request != m.readerRequest {
-		return nil
-	}
+
+// setOutputReader updates the source view without operating the active terminal.
+func (m *Model) setOutputReader(msg agentOutputMsg) {
 	previous := m.reader
 	r := &readerState{workspace: m.workspace, kind: readerOutput, title: "Saved output", sessionID: protocol.SessionID(msg.sessionID), itemID: msg.itemID, text: msg.page.Text, rawText: msg.page.Text, pageOffset: msg.offset, next: msg.page.Next, total: msg.page.Total, more: msg.page.More, request: msg.request, returnOffset: m.viewport.YOffset, returnFollow: m.followOutput}
 	if previous != nil {
@@ -315,7 +314,6 @@ func (m *Model) openOutputReader(msg agentOutputMsg) tea.Cmd {
 		r.returnFollow = previous.returnFollow
 	}
 	m.reader = r
-	return m.enterReaderScreen()
 }
 func (m *Model) closeReader() tea.Cmd {
 	if m.reader == nil {

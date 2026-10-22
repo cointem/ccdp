@@ -110,6 +110,16 @@ func GitControlEntryPaths(workspace string) []string {
 	return []string{marker}
 }
 
+// GitCommonDirectory identifies the local repository shared by its worktrees.
+// It reads Git metadata without running Git or evaluating repository config.
+func GitCommonDirectory(workspace string) string {
+	_, _, common, _, _, ok := findGitMetadata(workspace)
+	if !ok {
+		return ""
+	}
+	return common
+}
+
 func findGitMetadata(workspace string) (root, gitDir, commonDir, marker string, linked, ok bool) {
 	for current := workspace; ; current = filepath.Dir(current) {
 		candidate := filepath.Join(current, ".git")

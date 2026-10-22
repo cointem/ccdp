@@ -81,10 +81,12 @@ func TestParseDuckDuckGo(t *testing.T) {
 
 type registryTestTool struct{ name string }
 
-func (t *registryTestTool) Name() string                 { return t.name }
-func (t *registryTestTool) Description() string          { return "test" }
-func (t *registryTestTool) Parameters() map[string]any   { return map[string]any{"type": "object"} }
-func (t *registryTestTool) Run(*Context) (string, error) { return "", nil }
+func (t *registryTestTool) Name() string               { return t.name }
+func (t *registryTestTool) Description() string        { return "test" }
+func (t *registryTestTool) Parameters() map[string]any { return map[string]any{"type": "object"} }
+func (t *registryTestTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) { return "", nil })
+}
 
 func TestRegistryDisposerDoesNotRemoveReplacement(t *testing.T) {
 	r := NewRegistry()

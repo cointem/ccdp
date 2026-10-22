@@ -9,7 +9,6 @@ type goalTransition uint8
 
 const (
 	goalApplyPending goalTransition = iota
-	goalFinishTurn
 	goalRecordResponse
 	goalAdmitAttempt
 	goalCreate
@@ -56,8 +55,6 @@ func (a *Agent) applyGoalTransition(request goalTransitionRequested) (result goa
 	switch request.transition {
 	case goalApplyPending:
 		result.err = a.applyPendingGoalEditOwned()
-	case goalFinishTurn:
-		a.finishGoalTurnOwned()
 	case goalRecordResponse:
 		a.recordGoalResponseOwned(request.text, request.toolCalls)
 	case goalAdmitAttempt:
@@ -75,9 +72,6 @@ func (a *Agent) applyGoalTransition(request goalTransitionRequested) (result goa
 }
 func (a *Agent) applyPendingGoalEdit() error {
 	return a.requestGoalTransition(goalTransitionRequested{transition: goalApplyPending}).err
-}
-func (a *Agent) finishGoalTurn() {
-	a.requestGoalTransition(goalTransitionRequested{transition: goalFinishTurn})
 }
 func (a *Agent) recordGoalResponse(text string, toolCalls int) {
 	a.requestGoalTransition(goalTransitionRequested{transition: goalRecordResponse, text: text, toolCalls: toolCalls})

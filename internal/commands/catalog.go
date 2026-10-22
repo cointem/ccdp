@@ -253,7 +253,7 @@ func Default() Catalog {
 		{Name: "config", Help: "show runtime configuration or set a session setting", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, TransientSubcommands: []string{"set"}},
 		{Name: "doctor", Help: "run environment diagnostics", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "permissions", Help: "show or manage permission rules", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, TransientSubcommands: []string{"allow", "deny", "remove"}, Mutation: true},
-		{Name: "memory", Help: "show or clear session memory", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, TransientSubcommands: []string{"clear"}, Mutation: true},
+		{Name: "memory", Help: "automatic memory: on, readonly, off, read, search, save, edit, delete, tidy, history, extract", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true, TransientSubcommands: []string{"on", "readonly", "off", "save", "edit", "delete", "tidy", "history", "extract"}, Mutation: true},
 		{Name: "github", Help: "show GitHub integration status", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "pr-comments", Help: "fetch review comments on the current PR", Feedback: FeedbackReport, Busy: BusyAllow, Transcript: true},
 		{Name: "commit-push-pr", Aliases: []string{"deliver"}, Help: "prepare selected changes, then apply/resume delivery", Feedback: FeedbackOperation, Busy: BusyReject, Mutation: true},

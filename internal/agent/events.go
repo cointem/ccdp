@@ -50,11 +50,13 @@ type Usage struct {
 
 // ToolEvent describes one tool invocation for the UI.
 type ToolEvent struct {
-	ID     string         `json:"id"`
-	Name   string         `json:"name"`
-	Args   map[string]any `json:"args"`
-	Status string         `json:"status"` // running | success | error | denied
-	Output string         `json:"output"` // truncated result preview
+	ParentCallID string         `json:"parent_call_id,omitempty"`
+	ChildIndex   int            `json:"child_index,omitempty"`
+	ID           string         `json:"id"`
+	Name         string         `json:"name"`
+	Args         map[string]any `json:"args"`
+	Status       string         `json:"status"` // running | success | error | denied
+	Output       string         `json:"output"` // truncated result preview
 }
 
 // ApprovalRequest is issued when a tool needs the user to decide.

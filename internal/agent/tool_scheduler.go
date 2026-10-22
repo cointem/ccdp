@@ -2,17 +2,13 @@ package agent
 
 import (
 	"ccdp/internal/messages"
+	"ccdp/internal/protocol"
 	"ccdp/internal/tooling"
 )
 
-// dispatchTools executes a batch of tool calls. With maxParallelTools > 1 the
-// calls run concurrently (bounded worker pool); approvals stay serialized so
-// the user only ever sees one modal. Results come back in call order.
-func (a *Agent) dispatchTools(calls []messages.ToolCall) []toolRunResult {
-	return a.dispatchToolsForContext(calls, toolJournalContext{})
-}
-
-func (a *Agent) dispatchToolsForContext(calls []messages.ToolCall, jc toolJournalContext) []toolRunResult {
+// dispatchToolsForContext settles a batch and projects its model output in
+// call order, independently of the order in which concurrent reads finish.
+func (a *Agent) dispatchToolsForContext(calls []messages.ToolCall, jc toolJournalContext) ([]toolRunResult, error) {
 	n := jc.maxParallel
 	if n == 0 {
 		a.mu.Lock()
@@ -30,13 +26,11 @@ func (a *Agent) dispatchToolsForContext(calls []messages.ToolCall, jc toolJourna
 	executed := (tooling.Executor{MaxParallel: n}).Execute(invocations)
 	results := make([]toolRunResult, len(executed))
 	for i, result := range executed {
-		results[i] = toolRunResult{output: result.Output, isErr: result.IsError, status: result.Status}
+		results[i] = toolRunResult{output: result.Output, code: result.Code, isErr: result.IsError, status: result.Status, displayTruncated: result.DisplayTruncated, dataError: result.DataError, outputID: result.OutputID}
 	}
 
-	if jc.enabled {
-		_, _ = a.projectToolResults(jc, calls, results)
-	}
-	return results
+	_, err := a.projectToolResults(jc, calls, results)
+	return results, err
 }
 
 func withToolCallIndex(jc toolJournalContext, index int) toolJournalContext {
@@ -44,15 +38,14 @@ func withToolCallIndex(jc toolJournalContext, index int) toolJournalContext {
 	return jc
 }
 
-func withToolCallStatus(jc toolJournalContext, sink *string) toolJournalContext {
-	jc.statusSink = sink
-	return jc
-}
-
 type toolRunResult struct {
-	output string
-	isErr  bool
-	status string // explicit success/error/denied/cancelled outcome
+	output           string
+	code             *protocol.CodeResult
+	isErr            bool
+	status           string // explicit success/error/denied/cancelled outcome
+	displayTruncated bool
+	dataError        string
+	outputID         string
 }
 
 // toolInvocation bridges runtime admission and journal settlement into the
@@ -74,14 +67,5 @@ func (c toolInvocation) Execute() tooling.Result {
 		}
 		return tooling.Result{Output: output, IsError: true, Status: "cancelled"}
 	}
-	var status string
-	out, failed := a.executeToolWithJournal(c.call, withToolCallStatus(c.journal, &status))
-	if status == "" {
-		if failed {
-			status = "error"
-		} else {
-			status = "success"
-		}
-	}
-	return tooling.Result{Output: out, IsError: failed, Status: status}
+	return a.executeToolResultWithJournal(c.call, c.journal)
 }

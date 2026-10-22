@@ -289,6 +289,11 @@ func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
 		}
 		switch m.Role {
 		case "system":
+			// Structured blocks replace only the leading prompt. Later
+			// system messages carry session context and must still be sent.
+			if i == 0 && len(req.SystemBlocks) > 0 {
+				continue
+			}
 			if system.Len() > 0 {
 				system.WriteString("\n\n")
 			}
@@ -353,6 +358,9 @@ func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
 		for _, b := range req.SystemBlocks {
 			block := map[string]any{"type": "text", "text": b.Text}
 			sys = append(sys, block)
+		}
+		if system.Len() > 0 {
+			sys = append(sys, map[string]any{"type": "text", "text": system.String()})
 		}
 		systemBlocks = sys
 		systemValue = sys
@@ -616,11 +624,13 @@ loop:
 		switch ev.Type {
 		case "error":
 			message := "anthropic error"
+			kind := ""
 			if ev.Error != nil && ev.Error.Message != "" {
 				message = ev.Error.Message
+				kind = ev.Error.Type
 			}
 			result.FinishReason = "error"
-			return result, false, emitted, 0, fmt.Errorf("llm: provider error: %s", message)
+			return result, false, emitted, 0, structuredProviderError(message, kind, "")
 		case "message_start":
 			if ev.Message != nil {
 				applyUsage(ev.Message.Usage)

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"ccdp/internal/messages"
+	"ccdp/internal/session"
 )
 
 // Markdown renders a replayed snapshot without constructing an
@@ -41,6 +42,26 @@ func Markdown(snapshot *Snapshot) string {
 			fmt.Fprintf(&sb, "### Tool result\n\n```text\n%s\n```\n\n", message.Content)
 		case messages.RoleSystem:
 			fmt.Fprintf(&sb, "## System\n\n%s\n\n", message.Content)
+		}
+	}
+	wroteChildren := false
+	for _, record := range snapshot.Records {
+		if e, ok := record.Event.(*session.ToolFinished); ok && e.ResultTarget == "program" {
+			if !wroteChildren {
+				sb.WriteString("\n## Code Mode execution log\n\n")
+				wroteChildren = true
+			}
+			name := "Tool"
+			if e.Call != nil {
+				name = e.Call.ToolID
+			}
+			fmt.Fprintf(&sb, "### %s · child %d · %s\n\nParent: `%s` · Call: `%s`\n\n", name, e.ChildIndex, e.Status, e.ParentCallID, e.CallID)
+			// Indentation preserves arbitrary tool output without allowing an
+			// embedded fence to terminate the enclosing export block.
+			for _, line := range strings.Split(e.Result.Text, "\n") {
+				fmt.Fprintf(&sb, "    %s\n", line)
+			}
+			sb.WriteString("\n")
 		}
 	}
 	return strings.TrimRight(sb.String(), "\n") + "\n"

@@ -106,20 +106,19 @@ func (p *State) Apply(event session.Event) error {
 			key := p.resolveToolFactKey(e.TurnID, e.StepID, result.CallID)
 			p.projected[key] = true
 			content := result.Text
-			if result.Status != "success" && result.Status != "ok" && !strings.HasPrefix(content, "Error: ") {
+			// An explicitly empty, truncated projection has exhausted its
+			// byte budget. Keep status metadata without inventing more text.
+			if !(content == "" && result.DisplayTruncated) && result.Status != "success" && result.Status != "ok" && !strings.HasPrefix(content, "Error: ") {
 				content = "Error: " + content
 			}
-			toolMessage := messages.Message{Role: messages.RoleTool, ToolCallID: result.CallID, Content: content}
+			toolMessage := messages.Message{Role: messages.RoleTool, ToolCallID: result.CallID, ToolStatus: result.Status, Content: content}
+			toolMessage.DisplayTruncated, toolMessage.DataError = result.DisplayTruncated, result.DataError
+			if finished, ok := p.finishedTools[key]; ok {
+				toolMessage.OutputRef = outputReference(finished)
+			}
 			toolMessage.ID = toolResultMessageID(key, result.Text, result.Status)
 			p.History = append(p.History, toolMessage)
 			p.historyStep = append(p.historyStep, e.StepID)
-		}
-	case *session.MemoryChanged:
-		p.MemorySeen = true
-		if e.Cleared {
-			p.MemoryText = ""
-		} else if e.Text != "" {
-			p.MemoryText = e.Text
 		}
 	case *session.TasksChanged:
 		p.Tasks = append([]session.Task(nil), e.Tasks...)

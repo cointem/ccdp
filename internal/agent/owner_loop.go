@@ -104,8 +104,6 @@ func (a *Agent) handleOwnerControl(message ownerControl, preparing bool) {
 		close(message.done)
 	case auxiliaryFactPrepared:
 		replyOwned(a, message.result, a.commitAuxiliaryOwned(message))
-	case memoryClearRequested:
-		replyOwned(a, message.result, a.clearMemoryOwned())
 	case directoryAccessRequested:
 		a.setDirectoryAccessOwned(message)
 		close(message.done)
@@ -130,8 +128,6 @@ func (a *Agent) handleOwnerControl(message ownerControl, preparing bool) {
 		replyOwned(a, message.result, sessionCapabilitiesResult{policy: policy, version: version, err: err})
 	case guardianSlotRequested:
 		replyOwned(a, message.result, a.takeGuardianSlotOwned())
-	case toolOutputRequested:
-		replyOwned(a, message.result, a.clipAggregateOwned(message.text))
 	case toolsDiscoveredPrepared:
 		replyOwned(a, message.result, a.installDiscoveredTools(message))
 	case tasksPrepared:

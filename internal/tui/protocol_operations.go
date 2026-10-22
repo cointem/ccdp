@@ -93,50 +93,54 @@ func (m *Model) finishInputOperations(turnID protocol.TurnID, outcome protocol.T
 		if turnID == "" && op.TurnID != "" {
 			continue
 		}
-		state, phase := OperationApplied, ActivityCompleted
-		switch outcome {
-		case protocol.TurnFailed:
-			state, phase = OperationFailed, ActivityFailed
-		case protocol.TurnCancelled:
-			state, phase = OperationCancelled, ActivityCancelled
+		m.finishInputOperation(op, outcome, detail)
+	}
+}
+
+func (m *Model) finishInputOperation(op Operation, outcome protocol.TurnOutcomeStatus, detail string) {
+	state, phase := OperationApplied, ActivityCompleted
+	switch outcome {
+	case protocol.TurnFailed:
+		state, phase = OperationFailed, ActivityFailed
+	case protocol.TurnCancelled:
+		state, phase = OperationCancelled, ActivityCancelled
+	}
+	var receipt protocol.Receipt
+	receipt.CommandID, receipt.SessionID = op.CommandID, op.SessionID
+	receipt.Status = protocol.ReceiptApplied
+	if state == OperationFailed || state == OperationCancelled {
+		receipt.Status = protocol.ReceiptRejected
+		code := protocol.ErrorInternal
+		if state == OperationCancelled {
+			code = protocol.ErrorClosed
 		}
-		var receipt protocol.Receipt
-		receipt.CommandID, receipt.SessionID = op.CommandID, op.SessionID
-		receipt.Status = protocol.ReceiptApplied
-		if state == OperationFailed || state == OperationCancelled {
-			receipt.Status = protocol.ReceiptRejected
-			code := protocol.ErrorInternal
+		receipt.Error = &protocol.CommandError{Code: code, Message: detail}
+	}
+	m.updateOperation(op.CommandID, state, receipt)
+	// A turn outcome proves the runtime already consumed this input.
+	// Provider failure or cancellation must not put a sent message back in
+	// the composer (or reuse its command ID as an unaccepted retry). Only
+	// submission rejection/transport failure restores an unsent draft.
+	m.consumeSubmission(op.CommandID)
+	if m.inputRetry != nil && op.CommandID == m.inputRetry.command.ID {
+		m.inputRetry = nil
+	}
+	if m.operationOwnsPresentation(op.CommandID) {
+		if state == OperationApplied {
+			m.finishActivity(op.CommandID, phase, "")
+			m.clearNotice(op.CommandID)
+		} else {
+			message := "message turn failed"
 			if state == OperationCancelled {
-				code = protocol.ErrorClosed
+				message = "message turn cancelled"
 			}
-			receipt.Error = &protocol.CommandError{Code: code, Message: detail}
-		}
-		m.updateOperation(op.CommandID, state, receipt)
-		// A turn outcome proves the runtime already consumed this input.
-		// Provider failure or cancellation must not put a sent message back in
-		// the composer (or reuse its command ID as an unaccepted retry). Only
-		// submission rejection/transport failure restores an unsent draft.
-		m.consumeSubmission(op.CommandID)
-		if m.inputRetry != nil && op.CommandID == m.inputRetry.command.ID {
-			m.inputRetry = nil
-		}
-		if m.operationOwnsPresentation(op.CommandID) {
-			if state == OperationApplied {
-				m.finishActivity(op.CommandID, phase, "")
-				m.clearNotice(op.CommandID)
-			} else {
-				message := "message turn failed"
-				if state == OperationCancelled {
-					message = "message turn cancelled"
-				}
-				if detail != "" {
-					message += ": " + detail
-				}
-				m.finishActivity(op.CommandID, phase, detail)
-				m.clearNotice(op.CommandID)
-				if state == OperationCancelled || !m.hasTurnError(turnID, detail) {
-					m.addNotice(Notice{CommandID: op.CommandID, Severity: NoticeError, Text: message, Sticky: true})
-				}
+			if detail != "" {
+				message += ": " + detail
+			}
+			m.finishActivity(op.CommandID, phase, detail)
+			m.clearNotice(op.CommandID)
+			if state == OperationCancelled || !m.hasTurnError(op.TurnID, detail) {
+				m.addNotice(Notice{CommandID: op.CommandID, Severity: NoticeError, Text: message, Sticky: true})
 			}
 		}
 	}

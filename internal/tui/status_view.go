@@ -167,7 +167,7 @@ func (m *Model) turnStalled() bool {
 		return false
 	}
 	for _, item := range m.items {
-		if item.kind == "tool" && !toolStatusComplete(item.status) && !toolStatusIsFailure(item.status) {
+		if item.kind == "tool" && !protocol.ToolTerminal(item.status) {
 			return false
 		}
 	}

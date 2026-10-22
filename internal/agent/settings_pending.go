@@ -75,7 +75,7 @@ func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutato
 		nextConfig.AdditionalDirectories = cloneStringSlice(target.AdditionalDirectories)
 		nextConfig.AdditionalReadOnlyDirectories = cloneStringSlice(target.AdditionalReadOnlyDirectories)
 		nextConfig.DisallowedDirectories = cloneStringSlice(target.DisallowedDirectories)
-		nextSandbox := buildSandbox(&nextConfig, nextConfig.Workspace)
+		nextSandbox := rebuildSandbox(&nextConfig, nextConfig.Workspace, oldSandbox)
 		sandboxTightened = sandbox.PolicyTightened(oldSandbox, nextSandbox)
 	}
 	var scope *sandboxQuiescence
@@ -243,6 +243,10 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 	}
 
 	// generation
+	a.services.cfg.EnableProjectMemory, a.services.baseCfg.EnableProjectMemory = target.ProjectMemoryEnabled, target.ProjectMemoryEnabled
+	a.services.cfg.MemoryReadOnly, a.services.baseCfg.MemoryReadOnly = target.MemoryReadOnly, target.MemoryReadOnly
+	a.services.cfg.MemoryHistory, a.services.baseCfg.MemoryHistory = target.MemoryHistory, target.MemoryHistory
+	a.cancelDisabledMemoryHistoryLocked()
 	a.services.cfg.ReasoningEffort, a.services.baseCfg.ReasoningEffort = target.ReasoningEffort, target.ReasoningEffort
 	a.services.cfg.Verbosity, a.services.baseCfg.Verbosity = target.Verbosity, target.Verbosity
 
@@ -276,8 +280,7 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 	a.services.baseCfg.DisallowedDirectories = cloneStringSlice(target.DisallowedDirectories)
 	if sandboxChanged {
 		cfgCopy := cloneConfig(a.services.cfg)
-		newSandbox := buildSandbox(&cfgCopy, a.services.cfg.Workspace)
-		newSandbox.ShareExecutionGuard(a.services.sandbox)
+		newSandbox := rebuildSandbox(&cfgCopy, a.services.cfg.Workspace, a.services.sandbox)
 		a.services.sandbox = newSandbox
 		a.services.sandbox.Revision = revision
 		// This is the monotonic sandbox-approval epoch. Do not rely only on the
@@ -298,17 +301,15 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 	if binding != nil {
 		a.registerBindingRoutes(*binding, routeCfg)
 	}
-	if permChanged || planChanged {
-		a.services.perms.SetMode(mode)
-	}
+	var policy *permissions.Policy
 	if permChanged {
-		a.services.perms.SetPolicy(permissions.Policy{
+		policy = &permissions.Policy{
 			AlwaysAllow: cloneStringSlice(target.AlwaysAllow),
 			AlwaysDeny:  cloneStringSlice(target.AlwaysDeny),
-		})
+		}
 	}
 	if permChanged || sandboxChanged || planChanged {
-		a.syncHookContext()
+		a.syncSettingsPolicy(mode, policy)
 	}
 	if modelChanged {
 		a.emit(Event{Type: EventModeChanged, Text: "model:" + binding.model})
@@ -327,6 +328,17 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 			target.NetworkAccess, len(target.AdditionalDirectories), len(target.AdditionalReadOnlyDirectories))
 	}
 	a.publishState()
+}
+
+// syncSettingsPolicy publishes authorization state after the settings mutation.
+// Callers hold settingsCommitMu, but not a.mu. A nil policy preserves rules
+// when only the execution mode or sandbox changed.
+func (a *Agent) syncSettingsPolicy(mode permissions.Mode, policy *permissions.Policy) {
+	a.services.perms.SetMode(mode)
+	if policy != nil {
+		a.services.perms.SetPolicy(*policy)
+	}
+	a.syncHookContext()
 }
 
 func cloneStringSlice(src []string) []string {

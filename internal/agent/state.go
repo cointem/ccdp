@@ -67,7 +67,7 @@ type budgetState struct {
 	outputBudget int
 }
 
-// turnMemoryState groups AutoMem / guardian / interrupt bookkeeping (guarded
+// turnMemoryState groups context usage / guardian / interrupt bookkeeping (guarded
 // by mu).
 type turnMemoryState struct {
 	tokenBaseline struct {
@@ -75,9 +75,6 @@ type turnMemoryState struct {
 		historyLen   int
 	}
 	guardianUses  int
-	turnUserMsg   string
-	turnTouched   []string
-	turnSummary   string
 	interruptNote bool
 }
 
@@ -143,9 +140,10 @@ type sessionServices struct {
 
 // childRuntimeBindings holds the child-runtime hard-policy boundary.
 type childRuntimeBindings struct {
-	childState *childRuntimeState
-	childSlots *childSlots
-	childStep  *childStepSnapshot
+	childState    *childRuntimeState
+	childSlots    *childSlots
+	guardianSlots *childSlots
+	childStep     *childStepSnapshot
 }
 
 // conversationState groups identity and history (guarded by mu where documented).

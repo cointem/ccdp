@@ -25,7 +25,7 @@ type childParent interface {
 	childPolicy() *sandbox.Sandbox
 	childResultCapture() supervision.ResultCapture
 	childResultBudget() int
-	childSlotsForRun() *childSlots
+	childSlotsForRun(purpose string) *childSlots
 	prepareChild(string, string) (config.Config, Options, *mcp.StepLease, *tools.Lease, []plugin.PreToolHook, error)
 	runChildHook(context.Context, bool, string)
 	runReviewWith(context.Context, protocol.Command, reviewExecutor) (string, protocol.ExecutionOutcome, error)
@@ -52,9 +52,14 @@ type supervisorRoot interface {
 	emitStatus(string, ...any)
 }
 
-func (a *Agent) childResultBudget() int { return a.configSnapshot().MaxResultSizeChars }
+func (a *Agent) childResultBudget() int { return a.configSnapshot().MaxResultSizeBytes }
 
-func (a *Agent) rootContext() context.Context { return a.lifecycle.rootCtx }
+func (a *Agent) rootContext() context.Context {
+	if a.lifecycle.rootCtx != nil {
+		return a.lifecycle.rootCtx
+	}
+	return context.Background()
+}
 func (a *Agent) childParentClosed() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -68,8 +73,8 @@ func (a *Agent) childPolicy() *sandbox.Sandbox {
 func (a *Agent) childResultCapture() supervision.ResultCapture {
 	return workspaceResultCapture{store: a.codingState().store}
 }
-func (a *Agent) childSlotsForRun() *childSlots { return slotsForParent(a) }
-func (a *Agent) signalChildActivity()          { a.mu.Lock(); a.signalAgentActivityLocked(); a.mu.Unlock() }
+func (a *Agent) childSlotsForRun(purpose string) *childSlots { return slotsForParent(a, purpose) }
+func (a *Agent) signalChildActivity()                        { a.mu.Lock(); a.signalAgentActivityLocked(); a.mu.Unlock() }
 func (a *Agent) publishChildUpdate(update protocol.Update) {
 	a.mu.Lock()
 	a.enqueueViewsLocked(update)

@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"ccdp/internal/config"
 	"ccdp/internal/mcp"
 	"ccdp/internal/protocol"
 )
@@ -47,7 +46,7 @@ func TestExtraReviewMCPReloadAfterSandboxReset(t *testing.T) {
 	defer srv.Close()
 	cfg := testPersistenceConfig(t)
 	cfg.NetworkAccess = true
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.MCPServers = map[string]mcp.ServerConfig{"remote": {Transport: "sse", BaseURL: srv.URL, NetworkAuthorized: true}}
 	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, ProviderRegistry: frozenProviderRegistry(cfg.Model)})
 	if err != nil {

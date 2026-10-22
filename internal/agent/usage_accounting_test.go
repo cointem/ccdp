@@ -14,7 +14,7 @@ import (
 
 func TestSharedAttemptImmediateIdempotentAndRecovered(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.EnableGuardian = config.BoolPtr(false)
 	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true})
 	if err != nil {
@@ -158,7 +158,7 @@ func TestSharedTokenUsageTwoChildrenAndRootFinalAndResume(t *testing.T) {
 
 func TestResumeReconcilesUncopiedDescendantAttempt(t *testing.T) {
 	cfg := testPersistenceConfig(t)
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	cfg.EnableGuardian = config.BoolPtr(false)
 	root, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true})
 	if err != nil {
@@ -173,7 +173,7 @@ func TestResumeReconcilesUncopiedDescendantAttempt(t *testing.T) {
 	}
 	req := journalRequest()
 	req.Model = cfg.Model
-	attempt, err := child.recordPreparedRequest(context.Background(), "task", "provider", "", req)
+	attempt, err := child.recordPreparedRequest(context.Background(), "task", "provider", "", req, testRequestMetadata(child))
 	if err != nil {
 		t.Fatal(err)
 	}

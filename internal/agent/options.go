@@ -35,4 +35,5 @@ type Options struct {
 	ExecutionGuard        *sandbox.ExecutionGuard
 	memoryResume          []session.Record
 	memoryBlobs           journal.ArtifactAccess
+	memoryChildren        map[protocol.RunID]memoryRunRecords
 }

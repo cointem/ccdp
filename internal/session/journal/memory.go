@@ -77,6 +77,7 @@ func (p *Writer) RestoreMemoryRun(records []session.Record, blobs ArtifactAccess
 	p.projection = nil
 	p.projectionCursor = 0
 	p.transcript = sessionview.FromRecords(records)
+	p.openedAtCursor = store.CurrentCursor()
 	p.requests = RequestIndex{}
 	for _, record := range records {
 		p.requests.Apply(record.Event, false)

@@ -39,13 +39,13 @@ approval in default permission mode.`
 
 func (t *WebFetchTool) Parameters() map[string]any {
 	return WithCapabilityRequest(map[string]any{
-		"type": "object",
+		"type": "object", "additionalProperties": false,
 		"properties": map[string]any{
 			"url": map[string]any{
 				"type":        "string",
 				"description": "The http(s) URL to fetch.",
 			},
-			"max_chars": map[string]any{
+			"max_chars": map[string]any{"default": 8000,
 				"type":        "integer",
 				"description": "Optional character cap for the returned text (default 8000).",
 			},
@@ -54,64 +54,66 @@ func (t *WebFetchTool) Parameters() map[string]any {
 	})
 }
 
-func (t *WebFetchTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
-	}
-	if !ctx.HostNetworkAllowed {
-		return "", errors.New("WebFetch: outbound network access is not authorized for this call")
-	}
-	raw := StringArg(ctx.Args, "url", "")
-	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return "", fmt.Errorf("WebFetch: invalid URL %q (only http/https)", raw)
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("WebFetch: URL %q has no host", raw)
-	}
-
-	maxChars, err := IntArgChecked(ctx.Args, "max_chars", 8000)
-	if err != nil {
-		return "", fmt.Errorf("WebFetch: %w", err)
-	}
-	if maxChars < 256 || maxChars > 40000 {
-		return "", fmt.Errorf("WebFetch: max_chars must be 256..40000")
-	}
-
-	body, finalURL, contentType, status, err := httpGetDetails(ctx.Context, u.String(), webProxy(ctx))
-	if err != nil {
-		return "", fmt.Errorf("WebFetch: %w", err)
-	}
-	text := string(body)
-	media, _, _ := mime.ParseMediaType(contentType)
-	switch media {
-	case "text/html", "application/xhtml+xml":
-		text = htmlToText(text)
-	case "", "text/plain", "text/markdown", "application/json", "application/xml", "text/xml":
-	default:
-		if !strings.HasPrefix(media, "text/") {
-			return "", fmt.Errorf("WebFetch: unsupported content type %s", media)
+func (t *WebFetchTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
+		if err := ctx.checkResources(); err != nil {
+			return "", err
 		}
-	}
-	if strings.TrimSpace(text) == "" {
-		return fmt.Sprintf("URL: %s\nHTTP %d: no readable text", finalURL, status), nil
-	}
-	header := fmt.Sprintf("URL: %s\nHTTP %d; content-type: %s\n\n", finalURL, status, contentType)
-	runes := []rune(text)
-	budget := min(50<<10, ctx.outputLimit()) - len(header) - 300
-	if budget < 0 {
-		return "", fmt.Errorf("WebFetch: output budget too small")
-	}
-	if len(runes) > maxChars || len(text) > budget {
-		path, e := saveToolText(ctx, "web-", text)
-		if e != nil {
-			return "", e
+		if !ctx.HostNetworkAllowed {
+			return "", errors.New("WebFetch: outbound network access is not authorized for this call")
 		}
-		text = string(runes[:min(len(runes), maxChars)])
-		text = truncateUTF8(text, budget)
-		text += fmt.Sprintf("\n[incomplete; use Read on %q to continue]", path)
-	}
-	return header + text, nil
+		raw := StringArg(ctx.Args, "url", "")
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			return "", fmt.Errorf("WebFetch: invalid URL %q (only http/https)", raw)
+		}
+		if u.Host == "" {
+			return "", fmt.Errorf("WebFetch: URL %q has no host", raw)
+		}
+
+		maxChars, err := IntArgChecked(ctx.Args, "max_chars", 8000)
+		if err != nil {
+			return "", fmt.Errorf("WebFetch: %w", err)
+		}
+		if maxChars < 256 || maxChars > 40000 {
+			return "", fmt.Errorf("WebFetch: max_chars must be 256..40000")
+		}
+
+		body, finalURL, contentType, status, err := httpGetDetails(ctx.Context, u.String(), webProxy(ctx))
+		if err != nil {
+			return "", fmt.Errorf("WebFetch: %w", err)
+		}
+		text := string(body)
+		media, _, _ := mime.ParseMediaType(contentType)
+		switch media {
+		case "text/html", "application/xhtml+xml":
+			text = htmlToText(text)
+		case "", "text/plain", "text/markdown", "application/json", "application/xml", "text/xml":
+		default:
+			if !strings.HasPrefix(media, "text/") {
+				return "", fmt.Errorf("WebFetch: unsupported content type %s", media)
+			}
+		}
+		if strings.TrimSpace(text) == "" {
+			return fmt.Sprintf("URL: %s\nHTTP %d: no readable text", finalURL, status), nil
+		}
+		header := fmt.Sprintf("URL: %s\nHTTP %d; content-type: %s\n\n", finalURL, status, contentType)
+		runes := []rune(text)
+		budget := min(50<<10, ctx.outputLimit()) - len(header) - 300
+		if budget < 0 {
+			return "", fmt.Errorf("WebFetch: output budget too small")
+		}
+		if len(runes) > maxChars || len(text) > budget {
+			path, e := saveToolText(ctx, "web-", text)
+			if e != nil {
+				return "", e
+			}
+			text = string(runes[:min(len(runes), maxChars)])
+			text = truncateUTF8(text, budget)
+			text += fmt.Sprintf("\n[incomplete; use Read on %q to continue]", path)
+		}
+		return header + text, nil
+	})
 }
 
 // ---------- WebSearch ----------
@@ -134,13 +136,13 @@ endpoint; results may be limited. Network access requires approval.`
 
 func (t *WebSearchTool) Parameters() map[string]any {
 	return WithCapabilityRequest(map[string]any{
-		"type": "object",
+		"type": "object", "additionalProperties": false,
 		"properties": map[string]any{
 			"query": map[string]any{
 				"type":        "string",
 				"description": "The search query.",
 			},
-			"max_results": map[string]any{
+			"max_results": map[string]any{"default": 5,
 				"type":        "integer",
 				"description": "Optional maximum number of results (default 5, max 10).",
 			},
@@ -149,47 +151,49 @@ func (t *WebSearchTool) Parameters() map[string]any {
 	})
 }
 
-func (t *WebSearchTool) Run(ctx *Context) (string, error) {
-	if err := ctx.checkResources(); err != nil {
-		return "", err
-	}
-	if !ctx.HostNetworkAllowed {
-		return "", errors.New("WebSearch: outbound network access is not authorized for this call")
-	}
-	q := StringArg(ctx.Args, "query", "")
-	if strings.TrimSpace(q) == "" {
-		return "", fmt.Errorf("WebSearch: empty query")
-	}
-	max, err := IntArgChecked(ctx.Args, "max_results", 5)
-	if err != nil {
-		return "", fmt.Errorf("WebSearch: %w", err)
-	}
-	if max < 1 {
-		max = 1
-	}
-	if max > 10 {
-		max = 10
-	}
-
-	endpoint := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(q)
-	body, _, _, _, err := httpGetDetails(ctx.Context, endpoint, webProxy(ctx))
-	if err != nil {
-		return "", fmt.Errorf("WebSearch: %w", err)
-	}
-	results := parseDuckDuckGo(string(body), max)
-	if len(results) == 0 {
-		if strings.Contains(strings.ToLower(string(body)), "no results") {
-			return fmt.Sprintf("WebSearch: no results for %q", q), nil
+func (t *WebSearchTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeText(ctx, args, func(ctx *Context) (string, error) {
+		if err := ctx.checkResources(); err != nil {
+			return "", err
 		}
-		return "", fmt.Errorf("WebSearch: response contained no recognized results (blocked or changed page format)")
-	}
+		if !ctx.HostNetworkAllowed {
+			return "", errors.New("WebSearch: outbound network access is not authorized for this call")
+		}
+		q := StringArg(ctx.Args, "query", "")
+		if strings.TrimSpace(q) == "" {
+			return "", fmt.Errorf("WebSearch: empty query")
+		}
+		max, err := IntArgChecked(ctx.Args, "max_results", 5)
+		if err != nil {
+			return "", fmt.Errorf("WebSearch: %w", err)
+		}
+		if max < 1 {
+			max = 1
+		}
+		if max > 10 {
+			max = 10
+		}
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "%d result(s) for %q:\n", len(results), q)
-	for i, r := range results {
-		fmt.Fprintf(&sb, "\n%d. %s\n   %s\n   %s\n", i+1, r.Title, r.URL, r.Snippet)
-	}
-	return boundedToolString(ctx, sb.String()), nil
+		endpoint := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(q)
+		body, _, _, _, err := httpGetDetails(ctx.Context, endpoint, webProxy(ctx))
+		if err != nil {
+			return "", fmt.Errorf("WebSearch: %w", err)
+		}
+		results := parseDuckDuckGo(string(body), max)
+		if len(results) == 0 {
+			if strings.Contains(strings.ToLower(string(body)), "no results") {
+				return fmt.Sprintf("WebSearch: no results for %q", q), nil
+			}
+			return "", fmt.Errorf("WebSearch: response contained no recognized results (blocked or changed page format)")
+		}
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "%d result(s) for %q:\n", len(results), q)
+		for i, r := range results {
+			fmt.Fprintf(&sb, "\n%d. %s\n   %s\n   %s\n", i+1, r.Title, r.URL, r.Snippet)
+		}
+		return boundedToolString(ctx, sb.String()), nil
+	})
 }
 
 // searchResult is one parsed search hit.

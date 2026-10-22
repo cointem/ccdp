@@ -625,11 +625,19 @@ func TestM1SubmitStoreFailureDoesNotStartProvider(t *testing.T) {
 func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	sessionID := protocol.SessionID(ag.SessionID())
+	submit := func(cmd protocol.Command) protocol.Receipt {
+		t.Helper()
+		receipt, err := ag.Submit(context.Background(), cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return receipt
+	}
 
 	// An empty clear is a valid candidate projection and must not panic or
 	// fabricate a history entry.
 	clearEmpty := protocol.Command{ID: "clear-empty", SessionID: sessionID, Type: protocol.CommandClearConversation}
-	if receipt := ag.applyCommand(clearEmpty); receipt.Rejected() {
+	if receipt := submit(clearEmpty); receipt.Rejected() {
 		t.Fatalf("empty clear rejected: %+v", receipt)
 	}
 	view, err := ag.Snapshot(context.Background())
@@ -646,7 +654,7 @@ func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 	)
 
 	clearA := protocol.Command{ID: "clear-a", SessionID: sessionID, Type: protocol.CommandClearConversation}
-	if receipt := ag.applyCommand(clearA); receipt.Rejected() {
+	if receipt := submit(clearA); receipt.Rejected() {
 		t.Fatalf("clear A rejected: %+v", receipt)
 	}
 	if snapshot, err := LoadSession(ag.SessionDir(), ag.SessionID()); err != nil {
@@ -668,7 +676,7 @@ func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 	// only then replace the in-memory history.
 	removeB := protocol.Command{ID: "remove-b", SessionID: sessionID, Type: protocol.CommandRemoveMessages,
 		Remove: &protocol.RemoveMessages{Count: 2}}
-	if receipt := ag.applyCommand(removeB); receipt.Rejected() {
+	if receipt := submit(removeB); receipt.Rejected() {
 		t.Fatalf("remove B rejected: %+v", receipt)
 	}
 	view, err = ag.Snapshot(context.Background())
@@ -695,7 +703,7 @@ func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 	ag.closePersistence()
 	rewind := protocol.Command{ID: "rewind-failed", SessionID: sessionID, Type: protocol.CommandRewindConversation,
 		Rewind: &protocol.RewindConversation{Count: 1}}
-	receipt := ag.applyCommand(rewind)
+	receipt := submit(rewind)
 	if !receipt.Rejected() || receipt.Error == nil || receipt.Error.Code != protocol.ErrorInternal {
 		t.Fatalf("failed durable rewind receipt = %+v", receipt)
 	}

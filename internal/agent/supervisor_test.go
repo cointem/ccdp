@@ -79,8 +79,9 @@ func TestSupervisorObservationDoesNotOwnExecution(t *testing.T) {
 		t.Fatalf("usage not accounted: %+v", a.Usage())
 	}
 	r.mu.Lock()
-	err = a.services.supervisor.recordOutcome(r)
+	reply := enqueueRunOutcomeLocked(r)
 	r.mu.Unlock()
+	err = r.parent.waitChildRecord(reply)
 	if err != nil {
 		t.Fatal(err)
 	}

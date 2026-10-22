@@ -78,11 +78,11 @@ func TestRegressionNoopWriteDoesNotBlockRewind(t *testing.T) {
 	toolCtx := a.services.resources.Context(ctx, root, a.services.sandbox)
 	toolCtx.BeforeWrite = a.beforeCodingWrite
 	toolCtx.Args = map[string]any{"file_path": "chosen.txt"}
-	if _, err = tools.NewReadTool().Run(toolCtx); err != nil {
+	if _, err = executeToolText(tools.NewReadTool(), toolCtx); err != nil {
 		t.Fatal(err)
 	}
 	toolCtx.Args = map[string]any{"file_path": "chosen.txt", "content": "base\n", "mode": "replace"}
-	if _, err = tools.NewWriteTool().Run(toolCtx); err != nil {
+	if _, err = executeToolText(tools.NewWriteTool(), toolCtx); err != nil {
 		t.Fatal(err)
 	}
 	if err = a.sealRecoveryPoint(context.Background(), point); err != nil {

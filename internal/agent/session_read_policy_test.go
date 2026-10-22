@@ -43,17 +43,17 @@ func TestSessionDataReadableButProtectedFromWrites(t *testing.T) {
 				defer r.Close()
 				ctx := r.Context(nil, workspace, sb)
 				ctx.Args = map[string]any{"file_path": path}
-				if out, err := tools.NewReadTool().Run(ctx); err != nil || !strings.Contains(out, "saved output") {
+				if out, err := executeToolText(tools.NewReadTool(), ctx); err != nil || !strings.Contains(out, "saved output") {
 					t.Fatalf("session read: %q, %v", out, err)
 				}
 				ctx.Args = map[string]any{"file_path": path, "mode": "replace", "content": "changed"}
-				if _, err := tools.NewWriteTool().Run(ctx); err == nil {
+				if _, err := executeToolText(tools.NewWriteTool(), ctx); err == nil {
 					t.Fatal("session state became writable")
 				}
 				cfg.DisallowedDirectories = []string{sessions}
 				ctx.Sandbox = makePolicy()
 				ctx.Args = map[string]any{"file_path": path}
-				if _, err := tools.NewReadTool().Run(ctx); err == nil {
+				if _, err := executeToolText(tools.NewReadTool(), ctx); err == nil {
 					t.Fatal("explicit user denial was ignored")
 				}
 			})
@@ -76,7 +76,7 @@ func TestWebFetchContinuationReadableAfterSessionResume(t *testing.T) {
 	ctx.Sandbox.NetworkProxy = proxy.URL
 	ctx.HostNetworkAllowed = true
 	ctx.Args = map[string]any{"url": "http://public.invalid/article", "max_chars": 256}
-	out, err := tools.NewWebFetchTool().Run(ctx)
+	out, err := executeToolText(tools.NewWebFetchTool(), ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestWebFetchContinuationReadableAfterSessionResume(t *testing.T) {
 			ctx = r.Context(nil, workspace, buildSandbox(cfg, workspace))
 		}
 		ctx.Args = map[string]any{"file_path": path, "offset": 2, "limit": 1}
-		got, err := tools.NewReadTool().Run(ctx)
+		got, err := executeToolText(tools.NewReadTool(), ctx)
 		if err != nil || !strings.Contains(got, "2\ttruncated正文") || !strings.Contains(got, "next_offset=3") {
 			t.Fatalf("resume=%v: %q, %v", resume, got, err)
 		}

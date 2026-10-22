@@ -23,8 +23,6 @@ type requestJournalMetadata struct {
 	HistoryLen       int
 }
 
-type requestJournalMetadataKey struct{}
-
 const (
 	// Runtime retries are deliberately owned by this journal boundary. The
 	// HTTP adapter is configured OneAttempt, so every retry below receives its
@@ -33,21 +31,6 @@ const (
 	runtimeProviderMaxRetries = 3
 	runtimeProviderRetryDelay = 500 * time.Millisecond
 )
-
-func withRequestJournalMetadata(ctx context.Context, metadata requestJournalMetadata) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, requestJournalMetadataKey{}, metadata)
-}
-
-func requestJournalMetadataFrom(ctx context.Context) (requestJournalMetadata, bool) {
-	if ctx == nil {
-		return requestJournalMetadata{}, false
-	}
-	metadata, ok := ctx.Value(requestJournalMetadataKey{}).(requestJournalMetadata)
-	return metadata, ok
-}
 
 // httpProviderFor creates the built-in OpenAI-compatible adapter for exactly
 // one model from the caller's already-resolved binding. The endpoint, key and
@@ -273,7 +256,9 @@ func (a *Agent) streamPrepared(ctx context.Context, purpose string, call llm.Pre
 		return llm.StreamResult{}, &requestJournalFailure{err: errors.New("prepared call is nil")}
 	}
 	defer call.Close()
-	ctx = withRequestJournalMetadata(ctx, metadata)
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	goalOwner, goalID := a.goalAccount()
 
 	for retry := 0; ; retry++ {
@@ -293,7 +278,7 @@ func (a *Agent) streamPrepared(ctx context.Context, purpose string, call llm.Pre
 		if err != nil {
 			return llm.StreamResult{}, &requestJournalFailure{err: err}
 		}
-		attempt, err := a.recordPreparedRequest(ctx, purpose, manifest.Provider, manifest.Endpoint, req)
+		attempt, err := a.recordPreparedRequest(ctx, purpose, manifest.Provider, manifest.Endpoint, req, metadata)
 		if err != nil {
 			return llm.StreamResult{}, &requestJournalFailure{err: err}
 		}

@@ -2,7 +2,9 @@ package tools
 
 import (
 	"ccdp/internal/jsonvalue"
+	"ccdp/internal/toolschema"
 	"encoding/json"
+	"fmt"
 
 	"sort"
 
@@ -29,7 +31,26 @@ type Registry struct {
 type Definition struct {
 	Name, Description string
 	Parameters        map[string]any
+	OutputSchema      map[string]any
+	ProgramCallable   bool
 	schemaJSON        []byte
+	input             *toolschema.Schema
+	output            *toolschema.Schema
+	inputError        error
+	outputError       error
+	externalInput     bool
+}
+
+// ValidationError explains why one registered tool is unavailable. Broken external
+// schemas never enter a provider request alongside otherwise valid tools.
+func (d Definition) ValidationError() error {
+	if d.inputError != nil {
+		return fmt.Errorf("%s input schema: %w", d.Name, d.inputError)
+	}
+	if d.outputError != nil {
+		return fmt.Errorf("%s output schema: %w", d.Name, d.outputError)
+	}
+	return nil
 }
 
 type registryEntry struct {
@@ -40,8 +61,81 @@ type registryEntry struct {
 
 func prepareRegistryEntry(tool Tool) registryEntry {
 	definition := Definition{Name: tool.Name(), Description: tool.Description(), Parameters: jsonvalue.Clone(tool.Parameters())}
-	definition.schemaJSON, _ = json.Marshal(definition.Parameters)
+	if t, ok := tool.(ProgramTool); ok {
+		definition.ProgramCallable = t.ProgramCallable()
+	}
+	inputSchema := definition.Parameters
+	if t, ok := tool.(InputDefiner); ok {
+		inputSchema = t.InputSchema()
+		definition.externalInput = true
+	}
+	if t, ok := tool.(OutputDefiner); ok {
+		definition.OutputSchema = jsonvalue.Clone(t.OutputSchema())
+	}
+	definition.input, definition.inputError = toolschema.Compile(inputSchema)
+	if definition.OutputSchema != nil {
+		definition.output, definition.outputError = toolschema.CompileValidation(definition.OutputSchema)
+	}
+	var err error
+	definition.schemaJSON, err = json.Marshal(definition.Parameters)
+	if err != nil {
+		definition.inputError = fmt.Errorf("encode input schema: %w", err)
+	}
 	return registryEntry{tool: tool, definition: definition}
+}
+
+// PrepareArguments uses the exact registration frozen in this lease.
+func (l *Lease) PrepareArguments(name string, args map[string]any) (map[string]any, error) {
+	definition, ok := l.definitions[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown tool %q", name)
+	}
+	if err := definition.ValidationError(); err != nil {
+		return nil, err
+	}
+	if !definition.externalInput {
+		return definition.input.Prepare(args)
+	}
+	// MCP/custom schemas remain rooted exactly as supplied. Host metadata is
+	// validated separately and never sent to the external implementation.
+	business := jsonvalue.Clone(args)
+	capabilities, hasCapabilities := business["requested_capabilities"]
+	delete(business, "requested_capabilities")
+	if hasCapabilities {
+		if err := capabilityArguments.Validate(map[string]any{"requested_capabilities": capabilities}); err != nil {
+			return nil, fmt.Errorf("requested_capabilities: %w", err)
+		}
+	}
+	prepared, err := definition.input.Prepare(business)
+	if err != nil {
+		return nil, err
+	}
+	if hasCapabilities {
+		prepared["requested_capabilities"] = capabilities
+	}
+	return prepared, nil
+}
+
+// ValidateOutput never executes the tool and never rewrites its output.
+func (l *Lease) ValidateOutput(name string, data json.RawMessage) error {
+	definition, ok := l.definitions[name]
+	if !ok {
+		return fmt.Errorf("unknown tool %q", name)
+	}
+	if definition.outputError != nil {
+		return fmt.Errorf("%s output schema: %w", name, definition.outputError)
+	}
+	if definition.output == nil {
+		if len(data) == 0 {
+			return nil
+		}
+		_, err := toolschema.Decode(data)
+		return err
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("tool declared an output schema but returned no structured data")
+	}
+	return definition.output.ValidateJSON(data)
 }
 
 // NewRegistry builds an empty registry.
@@ -269,9 +363,6 @@ func (r *Registry) Acquire() *Lease {
 	return &Lease{version: version, tools: view, definitions: definitions}
 }
 
-// Snapshot is a descriptive alias for Acquire used by step/runtime code.
-func (r *Registry) Snapshot() *Lease { return r.Acquire() }
-
 func (l *Lease) Version() uint64 {
 	if l == nil {
 		return 0
@@ -305,6 +396,7 @@ func (l *Lease) Definition(name string) (Definition, bool) {
 	}
 	definition, ok := l.definitions[name]
 	definition.Parameters = jsonvalue.Clone(definition.Parameters)
+	definition.OutputSchema = jsonvalue.Clone(definition.OutputSchema)
 	return definition, ok
 }
 
@@ -319,7 +411,7 @@ func (l *Lease) SchemasFiltered(keep func(name string) bool) []map[string]any {
 			continue
 		}
 		definition, ok := l.Definition(name)
-		if !ok {
+		if !ok || definition.ValidationError() != nil {
 			continue
 		}
 		out = append(out, map[string]any{"type": "function", "function": map[string]any{

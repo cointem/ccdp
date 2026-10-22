@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"ccdp/internal/config"
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
@@ -29,20 +30,23 @@ const (
 	toolJournalMaxText   = 64 << 10
 )
 
-// toolJournalContext is frozen at the model-step boundary. A zero context is
-// the legacy/direct-call compatibility path and deliberately does not write
-// typed tool facts.
+// toolJournalContext is frozen at the model-step boundary. Every dispatched
+// call records its execution facts, including calls inside Code Mode.
 type toolJournalContext struct {
-	enabled        bool
 	turnID         string
 	stepID         string
 	callIndex      int
 	policyRevision uint64
 	workspace      string
 	maxParallel    int
-	maxOutputChars int
+	maxOutputBytes int
 	toolLease      *tools.Lease
-	statusSink     *string // per-call outcome written by the execution adapter
+	context        context.Context
+	config         *config.Config
+	allowedTools   []string
+	parentCallID   string
+	childIndex     int
+	program        bool
 }
 
 // releaseStepLease closes the MCP generation reference (and its frozen tool
@@ -60,39 +64,41 @@ func releaseStepLease(step stepRuntime) {
 }
 
 func toolJournalContextForStep(step stepRuntime) toolJournalContext {
+	names := make([]string, 0, len(step.tools))
+	for _, t := range step.tools {
+		names = append(names, t.Function.Name)
+	}
+	cfg := cloneConfig(&step.cfg)
 	return toolJournalContext{
-		enabled:        true,
+		config: &cfg, allowedTools: names,
 		turnID:         fmt.Sprintf("turn-%d", step.turn),
 		stepID:         fmt.Sprintf("step-%d", step.step),
 		policyRevision: step.settingsRev,
 		workspace:      step.cfg.Workspace,
 		maxParallel:    step.cfg.MaxParallelTools,
-		maxOutputChars: step.cfg.MaxToolOutputCharsPerTurn,
+		maxOutputBytes: step.cfg.MaxToolOutputBytesPerTurn,
 		toolLease:      step.toolLease,
 	}
 }
 
 type toolJournalExecution struct {
-	ctx      toolJournalContext
-	started  bool
-	finished bool
-	status   string
+	ctx              toolJournalContext
+	started          bool
+	finished         bool
+	status           string
+	result           tools.Result
+	displayTruncated bool
+	outputID         string
 }
 
 func (j *toolJournalExecution) setStatus(status string) {
-	if j == nil || status == "" {
+	if status == "" {
 		return
 	}
 	j.status = status
-	if j.ctx.statusSink != nil {
-		*j.ctx.statusSink = status
-	}
 }
 
 func (j *toolJournalExecution) start(a *Agent, tc messages.ToolCall) error {
-	if j == nil || !j.ctx.enabled {
-		return nil
-	}
 	if j.started {
 		return nil
 	}
@@ -127,6 +133,7 @@ func (j *toolJournalExecution) start(a *Agent, tc messages.ToolCall) error {
 		}{j.ctx.turnID, j.ctx.stepID, tc.ID}),
 		Events: []session.Event{session.ToolStarted{
 			TurnID: j.ctx.turnID, StepID: j.ctx.stepID, CallIndex: j.ctx.callIndex,
+			ParentCallID: j.ctx.parentCallID, ChildIndex: j.ctx.childIndex, ResultTarget: j.ctx.resultTarget(),
 			Call:        session.ToolCall{CallID: tc.ID, ToolID: tc.Name, Arguments: append([]byte(nil), args...)},
 			Fingerprint: fingerprint, PolicyRevision: j.ctx.policyRevision,
 		}},
@@ -138,7 +145,7 @@ func (j *toolJournalExecution) start(a *Agent, tc messages.ToolCall) error {
 }
 
 func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output string, isErr bool) error {
-	if j == nil || !j.ctx.enabled || j.finished {
+	if j.finished {
 		return nil
 	}
 	fail := func(err error) error {
@@ -165,6 +172,7 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 		return fail(fmt.Errorf("agent: persist raw tool output: %w", err))
 	}
 	ref.MediaType = "text/plain; charset=utf-8"
+	j.outputID = ref.Hash
 	status := j.status
 	if status == "" {
 		if isErr {
@@ -193,9 +201,27 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 	}{j.ctx.turnID, j.ctx.stepID, tc.ID})
 	event := session.ToolFinished{
 		TurnID: j.ctx.turnID, StepID: j.ctx.stepID, CallID: tc.ID,
+		ParentCallID: j.ctx.parentCallID, ChildIndex: j.ctx.childIndex, ResultTarget: j.ctx.resultTarget(),
 		EffectID: effectID, Status: status, SideEffect: sideEffect,
 		RawOutput: &ref,
 		Result:    session.ToolResult{CallID: tc.ID, Status: status, Text: resultText},
+	}
+	event.DataError = j.result.DataError
+	event.DisplayTruncated = j.displayTruncated || resultText != output
+	event.DataTruncated = j.result.DataTruncated
+	event.Result.DataError = j.result.DataError
+	event.Result.DisplayTruncated = event.DisplayTruncated
+	if len(j.result.Data) > 0 {
+		dataRef, e := artifacts.PutContext(context.Background(), j.result.Data)
+		if e != nil {
+			return fail(fmt.Errorf("persist tool data: %w", e))
+		}
+		dataRef.MediaType = "application/json"
+		event.Data = &dataRef
+	}
+	if j.ctx.program {
+		args, _ := json.Marshal(tc.Arguments)
+		event.Call = &session.ToolCall{CallID: tc.ID, ToolID: tc.Name, Arguments: args}
 	}
 	if isErr {
 		event.Error = resultText
@@ -207,6 +233,13 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 	return nil
 }
 
+func (j toolJournalContext) resultTarget() string {
+	if j.program {
+		return "program"
+	}
+	return ""
+}
+
 func (a *Agent) toolJournalFailure(err error) error {
 	if err == nil {
 		return nil
@@ -215,10 +248,10 @@ func (a *Agent) toolJournalFailure(err error) error {
 	return err
 }
 
-func (a *Agent) toolOutputPreview(value string, maxBytes int) string {
+func (a *Agent) toolOutputPreview(value string, maxBytes int, outputID ...string) string {
 	if maxBytes <= 0 {
 		a.mu.Lock()
-		maxBytes = a.services.cfg.MaxResultSizeChars
+		maxBytes = a.services.cfg.MaxResultSizeBytes
 		a.mu.Unlock()
 	}
 	if maxBytes <= 0 {
@@ -227,31 +260,20 @@ func (a *Agent) toolOutputPreview(value string, maxBytes int) string {
 	if len(value) <= maxBytes {
 		return value
 	}
-	marker := "[tool result exceeds output limit; request a smaller result]"
-	if json.Valid([]byte(value)) {
-		if len(marker) > maxBytes {
-			return ""
-		}
-		return marker
+	marker := "\n[incomplete: tool output limit; use ReadOutput for the saved output]"
+	if len(outputID) > 0 && outputID[0] != "" {
+		marker = "\n[incomplete: use ReadOutput with output_id=" + outputID[0] + "]"
 	}
-	marker = "\n[incomplete: tool output limit]"
 	if maxBytes < len(marker) {
-		return ""
+		return messages.TruncateUTF8(value, maxBytes)
 	}
 	return messages.TruncateUTF8(value, maxBytes-len(marker)) + marker
 }
 
-// finishUnexecutedTool records a rejected/cancelled call that never crossed
+// finishUnexecutedToolWithStatus records a rejected/cancelled call that never crossed
 // the ToolStarted side-effect boundary. It is still a durable result for the
 // assistant tool call and is never eligible for automatic rerun.
-func (a *Agent) finishUnexecutedTool(jc toolJournalContext, tc messages.ToolCall, output string, isErr bool) error {
-	return a.finishUnexecutedToolWithStatus(jc, tc, output, isErr, "denied")
-}
-
 func (a *Agent) finishUnexecutedToolWithStatus(jc toolJournalContext, tc messages.ToolCall, output string, isErr bool, status string) error {
-	if !jc.enabled {
-		return nil
-	}
 	j := &toolJournalExecution{ctx: jc, status: status}
 	return j.finish(a, tc, output, isErr)
 }
@@ -259,9 +281,6 @@ func (a *Agent) finishUnexecutedToolWithStatus(jc toolJournalContext, tc message
 // persistToolResultsProjected commits the deterministic, model-visible
 // projection after every raw completion in this step has been admitted.
 func (a *Agent) persistToolResultsProjected(jc toolJournalContext, calls []messages.ToolCall, results []toolRunResult, budget session.Budget) error {
-	if !jc.enabled {
-		return nil
-	}
 	if len(calls) == 0 || len(calls) != len(results) {
 		return a.toolJournalFailure(errors.New("agent: tool projection call/result count mismatch"))
 	}
@@ -275,7 +294,7 @@ func (a *Agent) persistToolResultsProjected(jc toolJournalContext, calls []messa
 				status = "success"
 			}
 		}
-		projected = append(projected, session.ProjectedToolResult{CallID: calls[i].ID, Status: status, Text: result.output})
+		projected = append(projected, session.ProjectedToolResult{CallID: calls[i].ID, Status: status, Text: result.output, DisplayTruncated: result.displayTruncated, DataError: result.dataError})
 	}
 	p := a.persistenceHandle()
 	if p == nil {
@@ -293,21 +312,10 @@ func (a *Agent) persistToolResultsProjected(jc toolJournalContext, calls []messa
 	return nil
 }
 
-func (a *Agent) persistTasksSnapshot() error {
-	a.mu.Lock()
-	p := a.services.persistence
-	resources := a.services.resources
-	a.mu.Unlock()
-	if p == nil || resources == nil || resources.Todos == nil {
-		return errors.New("agent: task persistence resources are unavailable")
-	}
-	states, err := resources.Todos.Snapshot()
-	if err != nil {
-		return err
-	}
+func (a *Agent) replaceTodos(states []tools.TodoState) error {
 	tasks := make([]session.Task, 0, len(states))
 	for _, state := range states {
-		tasks = append(tasks, session.Task{TaskID: state.ID, Title: state.Content, Status: state.Status})
+		tasks = append(tasks, session.Task{TaskID: state.ID, Title: state.Content, Status: state.Status, Priority: state.Priority})
 	}
 	if err := a.saveTasksFromWorker(tasks); err != nil {
 		return a.toolJournalFailure(fmt.Errorf("agent: persist task state: %w", err))
@@ -340,18 +348,7 @@ func (a *Agent) persistToolDiscovery(version uint64, name, description string, p
 // that from a name it has not explicitly classified.  A barrier also gives
 // workspace/resource-owning tools an ordered happens-before edge.
 func (a *Agent) toolCallIsReadOnly(jc toolJournalContext, call messages.ToolCall) bool {
-	var tool tools.Tool
-	if jc.toolLease != nil {
-		tool, _ = jc.toolLease.Get(call.Name)
-	} else if a != nil && a.services.registry != nil {
-		// The zero-context compatibility path may be used by package tests and
-		// old embedders. Resolve the implementation before classifying it so a
-		// custom tool that merely steals a built-in name cannot be treated as
-		// read-only.
-		tool, _ = a.services.registry.Get(call.Name)
-	} else {
-		return false
-	}
+	tool, _ := jc.toolLease.Get(call.Name)
 	return toolKind(tool).Concurrent()
 }
 

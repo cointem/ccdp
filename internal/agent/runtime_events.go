@@ -11,7 +11,7 @@ import (
 func (a *Agent) emit(ev Event) {
 	if ev.Type == EventToolResult {
 		a.mu.Lock()
-		if a.publications.deferToolEvents {
+		if a.publications.deferToolEvents && (ev.Tool == nil || ev.Tool.ParentCallID == "") {
 			a.publications.deferredToolEvents = append(a.publications.deferredToolEvents, ev)
 			a.mu.Unlock()
 			return
@@ -50,6 +50,7 @@ func toolEvent(tc messages.ToolCall, status, output string) Event {
 	return Event{
 		Type: EventToolResult,
 		Tool: &ToolEvent{
+			ParentCallID: tc.ParentCallID, ChildIndex: tc.ChildIndex,
 			ID:     tc.ID,
 			Name:   tc.Name,
 			Args:   tc.Arguments,

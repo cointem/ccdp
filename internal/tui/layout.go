@@ -132,6 +132,9 @@ func (m *Model) composeChrome() frameChrome {
 			row += strings.Repeat(" ", max(0, pad)) + toast
 		}
 		c.input = "\n" + row + "\n" + c.input
+		if pending := m.renderPendingInputs(); pending != "" {
+			c.input = pending + "\n" + c.input
+		}
 	}
 	if !m.hasSnapshot {
 		if state := base.renderPersistentStatus(); state != "" {

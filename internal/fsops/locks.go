@@ -2,10 +2,10 @@
 package fsops
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"ccdp/internal/atomicfile"
 )
@@ -25,6 +25,9 @@ func LeaseWorkspace(root string) (*atomicfile.Lock, error) { return lock(root, "
 func LockDelivery(root, plan string) (*atomicfile.Lock, error) { return lock(root, "delivery-"+plan) }
 
 func lock(root, purpose string) (*atomicfile.Lock, error) {
+	if purpose == "" || purpose == "." || purpose == ".." || strings.ContainsAny(purpose, "/\\\x00") {
+		return nil, fmt.Errorf("invalid lock purpose: %q", purpose)
+	}
 	canonical, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
@@ -46,11 +49,19 @@ func lock(root, purpose string) (*atomicfile.Lock, error) {
 	for i := len(tail) - 1; i >= 0; i-- {
 		canonical = filepath.Join(canonical, tail[i])
 	}
-	dir := filepath.Join(os.TempDir(), "ccdp-workspace-locks")
+	projectPath, err := filepath.Rel(string(filepath.Separator), canonical)
+	if err != nil || !filepath.IsLocal(projectPath) {
+		return nil, fmt.Errorf("invalid lock path: %s", canonical)
+	}
+	dir := filepath.Join(os.TempDir(), "ccdp-workspace-locks", purpose, projectPath)
 	if err = os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	// Hash only the path to obtain a bounded filename, never file contents.
-	key := sha256.Sum256([]byte(canonical))
-	return atomicfile.AcquireLock(filepath.Join(dir, hex.EncodeToString(key[:])+"-"+purpose+".lock"))
+	// Lock the mirrored directory itself. No reserved filename can collide
+	// with a child path, and replacing the target does not replace this inode.
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	return atomicfile.AcquireOpenedLock(f)
 }

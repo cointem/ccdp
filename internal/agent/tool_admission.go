@@ -14,13 +14,8 @@ import (
 // config-level custom-tool permissions. These must run before any hook,
 // permission override, or Tool.Run; a name a custom/plugin scope can shadow is
 // never used to classify capability. configuredAllow reports the custom "allow" setting; it does not bypass hooks.
-func (a *Agent) hardAdmitTool(tc messages.ToolCall, journal toolJournalContext, execution *toolJournalExecution) (tool tools.Tool, output string, configuredAllow, denied bool) {
-	var ok bool
-	if journal.enabled && journal.toolLease != nil {
-		tool, ok = journal.toolLease.Get(tc.Name)
-	} else {
-		tool, ok = a.services.registry.Get(tc.Name)
-	}
+func (a *Agent) hardAdmitTool(tc messages.ToolCall, journal toolJournalContext) (tool tools.Tool, output string, configuredAllow, denied bool) {
+	tool, ok := journal.toolLease.Get(tc.Name)
 	if denied, reason := ChildToolGate(a, tc, tool); denied {
 		a.emit(toolEvent(tc, "denied", reason))
 		return nil, fmt.Sprintf("permission denied: %s", reason), false, true

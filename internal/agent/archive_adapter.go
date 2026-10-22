@@ -27,7 +27,6 @@ func snapshotFromArchive(s *archive.Snapshot) (*SessionSnapshot, error) {
 		Settings:           s.Settings,
 		PendingCommands:    s.PendingCommands,
 		Workflow:           s.Workflow,
-		Memory:             s.Memory,
 		Tasks:              s.Tasks,
 		PendingInputs:      s.PendingInputs,
 		PendingAttachments: s.PendingAttachments,
@@ -79,13 +78,10 @@ func ExportSessionMarkdown(s *SessionSnapshot) string {
 	if s == nil {
 		return ""
 	}
-	return archive.Markdown(&archive.Snapshot{ID: s.ID, Model: s.Model, Workspace: s.Workspace, History: s.History})
+	return archive.Markdown(&archive.Snapshot{
+		ID: s.ID, Model: s.Model, Workspace: s.Workspace, History: s.History,
+		Records: s.resumeRecords, Artifacts: s.resumeArtifacts,
+	})
 }
 
 func sessionTitle(history []messages.Message) string { return archive.Title(history) }
-
-func snapshotSettings(s session.Settings) *session.Settings { return archive.SnapshotSettings(s) }
-
-func snapshotWorkflow(s session.WorkflowState) *session.WorkflowState {
-	return archive.SnapshotWorkflow(s)
-}

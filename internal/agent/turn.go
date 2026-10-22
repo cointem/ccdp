@@ -37,6 +37,4 @@ func (a *Agent) beginTurnLocked(label, text string) {
 		primary.version = a.modelsState.activeBinding.version + 1
 		a.modelsState.activeBinding = primary
 	}
-	a.turnMemory.turnUserMsg, a.turnMemory.turnSummary = text, ""
-	a.turnMemory.turnTouched = nil
 }

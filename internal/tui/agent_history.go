@@ -10,10 +10,11 @@ import (
 )
 
 type agentHistoryMsg struct {
-	sessionID string
-	page      protocol.TranscriptPage
-	err       error
-	request   uint64
+	sessionID  string
+	page       protocol.TranscriptPage
+	err        error
+	request    uint64
+	generation uint64
 }
 type agentOutputMsg struct {
 	sessionID, itemID string
@@ -21,13 +22,14 @@ type agentOutputMsg struct {
 	page              protocol.OutputPage
 	err               error
 	request           uint64
+	generation        uint64
 }
 
 func (m *Model) loadAgentHistory(before uint64) tea.Cmd {
 	if m.routing == nil {
 		return nil
 	}
-	id, directory := m.sessionID, m.routing.directory
+	id, directory, generation := m.sessionID, m.routing.directory, m.attachmentGeneration
 	m.readerSeq++
 	request := m.readerSeq
 	m.readerRequest = request
@@ -39,7 +41,7 @@ func (m *Model) loadAgentHistory(before uint64) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		page, err := directory.ReadTranscript(ctx, protocol.SessionID(id), before, 64)
-		return agentHistoryMsg{sessionID: id, page: page, err: err, request: request}
+		return agentHistoryMsg{sessionID: id, page: page, err: err, request: request, generation: generation}
 	}
 }
 func (m *Model) loadAgentOutput(id string, offset int64) tea.Cmd {
@@ -51,17 +53,17 @@ func (m *Model) loadAgentOutputWithRequest(id string, offset int64, request uint
 	if m.routing == nil {
 		return nil
 	}
-	sid, directory := m.sessionID, m.routing.directory
+	sid, directory, generation := m.sessionID, m.routing.directory, m.attachmentGeneration
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		page, err := directory.ReadOutput(ctx, protocol.SessionID(sid), id, offset, readerPageSize)
-		return agentOutputMsg{sessionID: sid, itemID: id, offset: offset, page: page, err: err, request: request}
+		return agentOutputMsg{sessionID: sid, itemID: id, offset: offset, page: page, err: err, request: request, generation: generation}
 	}
 }
-func (m *Model) showAgentHistory(msg agentHistoryMsg) tea.Cmd {
-	if msg.sessionID != m.sessionID || msg.request != 0 && msg.request != m.readerRequest {
-		return nil
+func (m *Model) applyAgentHistory(msg agentHistoryMsg) bool {
+	if msg.generation != m.attachmentGeneration || msg.sessionID != m.sessionID || msg.request != 0 && msg.request != m.readerRequest {
+		return false
 	}
 	if msg.err != nil {
 		m.pushStatus("history: " + msg.err.Error())
@@ -69,7 +71,7 @@ func (m *Model) showAgentHistory(msg agentHistoryMsg) tea.Cmd {
 			m.reader.loading = false
 			m.reader.errText = "history: " + msg.err.Error()
 		}
-		return nil
+		return false
 	}
 	entries := readerEntriesFromTranscript(msg.page.Items)
 	if len(entries) == 0 {
@@ -78,7 +80,7 @@ func (m *Model) showAgentHistory(msg agentHistoryMsg) tea.Cmd {
 			m.reader.loading = false
 			m.reader.historyMore = false
 		}
-		return nil
+		return false
 	}
 	previous := m.reader
 	r := &readerState{workspace: m.workspace, kind: readerTranscript, title: "Saved history", sessionID: protocol.SessionID(msg.sessionID), entries: entries, index: len(entries) - 1, request: msg.request, returnOffset: m.viewport.YOffset, returnFollow: m.followOutput, historyBefore: msg.page.Before, historyMore: msg.page.More}
@@ -91,7 +93,7 @@ func (m *Model) showAgentHistory(msg agentHistoryMsg) tea.Cmd {
 		r.returnReader = previous
 	}
 	m.reader = r
-	return m.enterReaderScreen()
+	return true
 }
 func (m *Model) agentOutputSelection(id string) tea.Cmd {
 	if strings.HasPrefix(id, "history-before:") {
@@ -100,9 +102,9 @@ func (m *Model) agentOutputSelection(id string) tea.Cmd {
 	}
 	return m.loadAgentOutput(id, 0)
 }
-func (m *Model) showAgentOutput(msg agentOutputMsg) tea.Cmd {
-	if msg.sessionID != m.sessionID || msg.request != 0 && msg.request != m.readerRequest {
-		return nil
+func (m *Model) applyAgentOutput(msg agentOutputMsg) bool {
+	if msg.generation != m.attachmentGeneration || msg.sessionID != m.sessionID || msg.request != 0 && msg.request != m.readerRequest {
+		return false
 	}
 	if msg.err != nil {
 		m.pushStatus("output: " + msg.err.Error())
@@ -110,7 +112,7 @@ func (m *Model) showAgentOutput(msg agentOutputMsg) tea.Cmd {
 			m.reader.loading = false
 			m.reader.errText = "output: " + msg.err.Error()
 		}
-		return nil
+		return false
 	}
 	r := m.reader
 	if r != nil && r.kind == readerOutput && r.itemID == msg.itemID && r.request == msg.request {
@@ -135,7 +137,8 @@ func (m *Model) showAgentOutput(msg agentOutputMsg) tea.Cmd {
 			r.matches = r.findMatches()
 			r.selectMatch(0)
 		}
-		return nil
+		return false
 	}
-	return m.openOutputReader(msg)
+	m.setOutputReader(msg)
+	return true
 }

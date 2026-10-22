@@ -77,6 +77,16 @@ func (m *Model) detailContent(item *historyCell) string {
 		}
 		p.Expanded = true
 		text = renderToolPresentation(p, m.width)
+		if item.toolName == "RunCode" {
+			for i := range m.items {
+				child := &m.items[i]
+				if child.parentCallID == item.toolID && child.turnID == item.turnID {
+					cp := toolPresentationFromItem(child)
+					cp.Expanded = true
+					text += "\n\n" + renderToolPresentation(cp, m.width)
+				}
+			}
+		}
 	}
 
 	return text

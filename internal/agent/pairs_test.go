@@ -38,7 +38,7 @@ func TestSanitizeToolPairsDropsOrphanResults(t *testing.T) {
 	// drop the tool result:
 	hist = append(hist[:2], hist[3])
 	// The assistant keeps its call record and gets a synthetic error result
-	// (mirrors dispatchTools' interrupt semantics), rather than silently
+	// (mirrors the scheduler's interrupt semantics), rather than silently
 	// losing the fact that a call was attempted.
 	got := sanitizeToolPairs(hist)
 	if len(got) != 4 {

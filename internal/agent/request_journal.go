@@ -85,8 +85,9 @@ func newRequestJournalID(prefix string) string {
 
 // recordPreparedRequest durably records the exact request body before the
 // provider call begins. req is already frozen by the provider adapter and
-// must carry Stream=true; this method never re-encodes or edits its prompt.
-func (a *Agent) recordPreparedRequest(ctx context.Context, purpose, providerName, endpoint string, req llm.CompletionRequest) (requestAttempt, error) {
+// must carry Stream=true; metadata belongs to the same frozen request.
+// This method never edits the prompt or reads live request settings.
+func (a *Agent) recordPreparedRequest(ctx context.Context, purpose, providerName, endpoint string, req llm.CompletionRequest, metadata requestJournalMetadata) (requestAttempt, error) {
 	var zero requestAttempt
 	if a == nil {
 		return zero, errors.New("agent: nil agent")
@@ -111,9 +112,6 @@ func (a *Agent) recordPreparedRequest(ctx context.Context, purpose, providerName
 	}
 	if p == nil {
 		return fail(errors.New("agent: session persistence is unavailable"))
-	}
-	if a.services.cfg == nil {
-		return fail(errors.New("agent: config is unavailable"))
 	}
 	if err := a.persistenceFailure(); err != nil {
 		return zero, err
@@ -149,44 +147,23 @@ func (a *Agent) recordPreparedRequest(ctx context.Context, purpose, providerName
 	sum := sha256.Sum256(wire)
 	digest := hex.EncodeToString(sum[:])
 
-	// Freeze source metadata before artifact I/O. The owner will admit this
-	// exact manifest; a later settings change cannot rewrite the wire identity.
-	a.mu.Lock()
-	sessionID := a.conversation.sessionID
-	turnSeq := a.sequences.turnSeq
-	stepSeq := a.sequences.stepSeq
-	sourceRevision := a.sequences.settingsRev
-	reservedOutput := a.services.cfg.MaxOutputTokensFor(req.Model)
-	_, apiKey := a.services.cfg.EndpointFor(req.Model)
-	historyLen := len(a.historyLocked())
-	a.mu.Unlock()
-	if metadata, ok := requestJournalMetadataFrom(ctx); ok {
-		// Provider callers pass the immutable step snapshot through context.
-		// Prefer it over Agent state so a concurrent /config or model switch
-		// cannot rewrite the request's source revision or redaction
-		// key after the adapter froze the body.
-		if metadata.SettingsRevision != 0 {
-			sourceRevision = metadata.SettingsRevision
-		} else if metadata.ContextRevision != 0 {
-			sourceRevision = metadata.ContextRevision
-		}
-		turnSeq = metadata.Turn
-		stepSeq = metadata.Step
-		historyLen = metadata.HistoryLen
-		if historyLen < 0 {
-			return fail(errors.New("agent: request history length must not be negative"))
-		}
-		reservedOutput = metadata.Config.MaxOutputTokensFor(req.Model)
-		_, apiKey = metadata.Config.EndpointFor(req.Model)
+	// The owner admits the frozen source metadata, even when a settings
+	// change or history append completes before artifact I/O begins.
+	sessionID := p.Identity()
+	sourceRevision := metadata.SettingsRevision
+	if sourceRevision == 0 {
+		sourceRevision = metadata.ContextRevision
 	}
-	if sessionID == "" {
-		sessionID = p.Identity()
+	if metadata.HistoryLen < 0 {
+		return fail(errors.New("agent: request history length must not be negative"))
 	}
 	if sourceRevision == 0 {
 		sourceRevision = 1
 	}
-	turnID := fmt.Sprintf("turn-%d", turnSeq)
-	stepID := fmt.Sprintf("step-%d", stepSeq)
+	reservedOutput := metadata.Config.MaxOutputTokensFor(req.Model)
+	_, apiKey := metadata.Config.EndpointFor(req.Model)
+	turnID := fmt.Sprintf("turn-%d", metadata.Turn)
+	stepID := fmt.Sprintf("step-%d", metadata.Step)
 	requestID := newRequestJournalID("request")
 	if req.MaxTokens != nil && *req.MaxTokens > 0 {
 		reservedOutput = *req.MaxTokens
@@ -231,7 +208,7 @@ func (a *Agent) recordPreparedRequest(ctx context.Context, purpose, providerName
 	return requestAttempt{
 		goalOwner: goalOwner, goalID: goalID, estimatedInput: llm.EstimateTokens(string(wire)),
 		AttemptID: newRequestJournalID("attempt"), RequestID: requestID, Manifest: manifest,
-		apiKey: apiKey, historyLen: historyLen,
+		apiKey: apiKey, historyLen: metadata.HistoryLen,
 	}, nil
 }
 

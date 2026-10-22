@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"ccdp/internal/codemode"
 	"ccdp/internal/config"
 	"ccdp/internal/events"
 	"ccdp/internal/hooks"
@@ -109,6 +110,9 @@ func buildExtensionHost(cfg *config.Config, opts Options, rootCancel context.Can
 // has completed its handshake, so a failed candidate never produces a visible
 // hook side effect.
 func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated bool, inheritedCapabilities []protocol.CapabilityRequest, inheritedExecutionGuard *sandbox.ExecutionGuard) error {
+	if a.services.cfg.CodeModeEnabled && codemode.Available {
+		a.services.registry.RegisterIn("code", &tools.RunCodeTool{})
+	}
 	a.services.sandbox = a.services.cfg.Sandbox()
 	a.services.sandbox.SetExecutionGuard(inheritedExecutionGuard)
 	if a.services.resources != nil {
@@ -132,7 +136,10 @@ func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated boo
 			a.abortConstruction(rootCancel, true)
 			return err
 		}
-		a.services.mcp.RegisterTools(a.services.registry)
+		if err := a.services.mcp.RegisterTools(a.services.registry); err != nil {
+			a.abortConstruction(rootCancel, true)
+			return err
+		}
 		if hookOut := a.runHookWithJournal(a.lifecycle.rootCtx, hooks.EventSessionStart, func(hctx context.Context) hooks.Output {
 			return a.services.hooks.SessionStart(hctx)
 		}); hookOut.Decision == hooks.DecisionDeny || hookOut.Decision == hooks.DecisionBlock {
@@ -149,6 +156,9 @@ func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated boo
 // deferred (MCP + config custom) tools for on-demand discovery, and loads user
 // and project skills.
 func (a *Agent) finalizeToolsAndSkills(isolated bool) {
+	a.services.registry.RegisterIn("builtin", tools.NewReadOutputTool())
+	a.services.registry.RegisterIn("builtin", &readProjectMemoryTool{})
+	a.services.registry.RegisterIn("builtin", &updateProjectMemoryTool{})
 	a.services.registry.RegisterIn("builtin", &toolSearchTool{ag: a})
 	a.services.registry.RegisterIn("builtin", &askUserQuestionTool{ag: a})
 	a.services.registry.RegisterIn("builtin", &enterPlanModeTool{ag: a})
@@ -166,27 +176,37 @@ func (a *Agent) finalizeToolsAndSkills(isolated bool) {
 	a.services.skills = skills.NewStore()
 	if !isolated {
 		home, _ := os.UserHomeDir()
-		a.services.skills.Load(filepath.Join(home, ".ccdp", "skills"),
+		// Step input loading reports any error before a provider request. Do
+		// the initial scan with the same policy, leaving the store empty on
+		// failure rather than caching unauthorized descriptions or bodies.
+		_ = a.services.skills.LoadChecked(a.services.sandbox.ResolveRead, filepath.Join(home, ".ccdp", "skills"),
 			filepath.Join(a.services.cfg.Workspace, ".ccdp", "skills"))
 	}
 }
 
 // openTraceAndSupervisor opens the JSONL trace and attaches the session
 // supervisor, then publishes the session-created lifecycle event.
-func (a *Agent) openTraceAndSupervisor(opts Options) {
+func (a *Agent) openTraceAndSupervisor(opts Options) error {
 	a.openTrace()
 	a.services.hooks.SetTranscript(a.TracePath())
 	a.streamEpoch = nextRuntimeID("stream")
 	if opts.Supervisor != nil {
 		a.services.supervisor = opts.Supervisor
 	} else {
-		a.services.supervisor = newSessionSupervisor(a)
+		a.services.supervisor = newSessionSupervisor(a, opts.memoryChildren)
 		a.services.supervisorOwner = true
+		if err := a.rootContext().Err(); err != nil {
+			return err
+		}
 		if err := a.reconcileDescendantUsage(); err != nil {
+			if a.rootContext().Err() != nil {
+				return a.rootContext().Err()
+			}
 			a.emitStatus("token usage recovery incomplete: %v", err)
 		}
 	}
 	a.emitSessionLifecycle(false)
+	return a.rootContext().Err()
 }
 
 // emitSessionLifecycle publishes session events to the bus and plugins.

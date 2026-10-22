@@ -26,7 +26,7 @@ func sugModel() *Model {
 			ContextWindow: 100000},
 		Catalog: protocol.CatalogSnapshot{Providers: []protocol.ProviderSnapshot{{ID: "test", Models: []string{"test-model", "test-model-2"}}}}}
 	client := &recordingClient{snapshot: snapshot}
-	return &Model{composerState: composerState{textarea: ta}, client: client, snapshot: snapshot, hasSnapshot: true,
+	return &Model{sessionHost: &sessionHost{}, composerState: composerState{textarea: ta}, client: client, snapshot: snapshot, hasSnapshot: true,
 		sessionID: "test-session", modelName: "test-model", mode: permissions.ModeDefault,
 		workspace: "", followOutput: true}
 }
@@ -446,7 +446,7 @@ func TestSlashCommandOutputLifetime(t *testing.T) {
 		{"/permissions", true},
 		{"/permissions allow Bash:git status", false},
 		{"/memory", true},
-		{"/memory clear", false},
+		{"/memory off", false},
 		{"/skills", true},
 		{"/unknown", true},
 	}

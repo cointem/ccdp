@@ -145,7 +145,7 @@ func TestSupervisorRecoversDurableOutboxWithoutExecution(t *testing.T) {
 	}
 	req := journalRequest()
 	req.Model = cfg.Model
-	attempt, err := child.recordPreparedRequest(context.Background(), "task", p.Name(), "", req)
+	attempt, err := child.recordPreparedRequest(context.Background(), "task", p.Name(), "", req, testRequestMetadata(child))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,14 +189,16 @@ func TestSupervisorRecoversDurableOutboxWithoutExecution(t *testing.T) {
 		if r.fact.Child.Run.Status != "succeeded" || r.fact.Child.Run.Output != "saved answer" {
 			t.Fatalf("outbox not recovered: %+v", r.fact)
 		}
-		r.mu.Lock()
-		err = s.recordOutcome(r)
-		if err == nil {
-			err = s.recordOutcome(r)
-		}
-		r.mu.Unlock()
-		if err != nil {
-			t.Fatal(err)
+		for retry := 0; retry < 2; retry++ {
+			r.mu.Lock()
+			reply := enqueueRunOutcomeLocked(r)
+			r.mu.Unlock()
+			if err := r.parent.waitChildRecord(reply); err != nil {
+				t.Fatal(err)
+			}
+			r.mu.Lock()
+			r.fact.UsageAccounted = true
+			r.mu.Unlock()
 		}
 		if got := resumed.Usage(); got.InputTokens != 7 || got.OutputTokens != 3 {
 			t.Fatalf("resume %d usage not idempotent: %+v", i, got)
@@ -249,9 +251,13 @@ func TestSupervisorOutputPagesReadFullScopedArtifact(t *testing.T) {
 
 func TestSupervisorTranscriptPaginationIsStableAndBounded(t *testing.T) {
 	a, _ := newChildRuntimeTestAgent(t, &childRuntimeTestProvider{name: "pages"})
-	events := make([]session.Event, 600)
-	for i := range events {
-		events[i] = session.InputQueued{InputID: fmt.Sprintf("input-%d", i), Text: fmt.Sprintf("item %d", i), Strategy: "followup"}
+	events := make([]session.Event, 0, 1200)
+	for i := range 600 {
+		id := fmt.Sprintf("input-%d", i)
+		events = append(events,
+			session.InputQueued{InputID: id, Text: fmt.Sprintf("item %d", i), Strategy: "followup"},
+			session.InputDelivered{InputID: id, TurnID: "turn-1"},
+		)
 	}
 	for start := 0; start < len(events); start += 200 {
 		if _, err := a.persistenceHandle().CommitEvents(fmt.Sprintf("many-inputs-%d", start), events[start:min(start+200, len(events))]...); err != nil {
@@ -358,7 +364,7 @@ func TestSupervisorLateOldDeliveryCannotReplaceCurrentRunOnRecovery(t *testing.T
 	if _, err := p.CommitEvents("late-delivered", old); err != nil {
 		t.Fatal(err)
 	}
-	s := newSessionSupervisor(a)
+	s := newSessionSupervisor(a, nil)
 	r, err := s.lookup(id)
 	if err != nil {
 		t.Fatal(err)

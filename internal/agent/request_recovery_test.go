@@ -37,6 +37,7 @@ func reopenAccountingAgent(t *testing.T, old *Agent) *Agent {
 	if err := p.BindState(&a.conversation.durable, &a.mu); err != nil {
 		t.Fatal(err)
 	}
+	a.services.supervisor = &SessionSupervisor{root: a, sessionDir: old.services.cfg.SessionDir, memory: old.services.cfg.NoSessionPersistence}
 	return a
 }
 
@@ -45,7 +46,7 @@ func TestPreparedRequestRecoveryKeepsReservationAndGoalChargeOnce(t *testing.T) 
 	journalGoal(t, a)
 
 	req := journalRequest()
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "", req)
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "", req, testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +137,7 @@ func TestPreparedNestedChildRecoveryTransfersTokensAndGoalOnce(t *testing.T) {
 					t.Fatal(err)
 				}
 				child := &Agent{services: sessionServices{cfg: cfg, persistence: p}, conversation: conversationState{sessionID: id, goalOwner: root, goalOwnerID: goal.ID}}
-				request, err := child.recordPreparedRequest(context.Background(), "task", "provider", "", journalRequest())
+				request, err := child.recordPreparedRequest(context.Background(), "task", "provider", "", journalRequest(), testRequestMetadata(child))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -179,7 +180,7 @@ func TestPreparedNestedChildRecoveryTransfersTokensAndGoalOnce(t *testing.T) {
 func TestAccountingRecoverySkipsCurrentRootAndChildRequests(t *testing.T) {
 	root, _, cfg := newJournalAgent(t, false)
 	goal := journalGoal(t, root)
-	if _, err := root.recordPreparedRequest(context.Background(), "main", "provider", "", journalRequest()); err != nil {
+	if _, err := root.recordPreparedRequest(context.Background(), "main", "provider", "", journalRequest(), testRequestMetadata(root)); err != nil {
 		t.Fatal(err)
 	}
 	childID := "live-child"
@@ -192,7 +193,7 @@ func TestAccountingRecoverySkipsCurrentRootAndChildRequests(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Close() })
 	child := &Agent{services: sessionServices{cfg: cfg, persistence: p}, conversation: conversationState{sessionID: childID, goalOwner: root, goalOwnerID: goal.ID}}
-	if _, err := child.recordPreparedRequest(context.Background(), "task", "provider", "", journalRequest()); err != nil {
+	if _, err := child.recordPreparedRequest(context.Background(), "task", "provider", "", journalRequest(), testRequestMetadata(child)); err != nil {
 		t.Fatal(err)
 	}
 	root.services.supervisor = testSupervisor(root, &managedRun{agent: child, fact: session.ChildRunRecorded{Child: protocol.ChildSession{SessionID: protocol.SessionID(childID)}}})
@@ -251,7 +252,7 @@ func TestChildUsageBeforeFirstOwnRequestDoesNotInventUnknownCacheHistory(t *test
 	if err := a.accountSharedAttempt(session.Attempt{AttemptID: "child", SessionID: "child", Usage: session.Usage{InputTokens: 100, OutputTokens: 20, TotalTokens: 120, TurnCount: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "", journalRequest())
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "", journalRequest(), testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +292,7 @@ func TestTokenAccountingRespectsExplicitZeroUsage(t *testing.T) {
 	a, p, _ := newJournalAgent(t, true)
 
 	req := journalRequest()
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "", req)
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "", req, testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +319,7 @@ func TestProviderRejectionConsumesNoGoalTokens(t *testing.T) {
 	journalGoal(t, a)
 
 	req := journalRequest()
-	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "", req)
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "", req, testRequestMetadata(a))
 	if err != nil {
 		t.Fatal(err)
 	}

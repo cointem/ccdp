@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -18,7 +19,7 @@ func (s *SessionSupervisor) ReadTranscript(ctx context.Context, id protocol.Sess
 	if limit <= 0 || limit > sessionview.Window {
 		limit = sessionview.Window
 	}
-	records, _, err := s.readSessionRecords(ctx, id)
+	records, _, recoveredThrough, err := s.readSessionRecordsWithRecovery(ctx, id)
 	if err != nil {
 		return protocol.TranscriptPage{}, err
 	}
@@ -26,11 +27,8 @@ func (s *SessionSupervisor) ReadTranscript(ctx context.Context, id protocol.Sess
 	// The compact identity index preserves stable pagination when later facts
 	// complete tools that started before this page.
 	t := sessionview.NewTranscript(before, limit)
-	for _, record := range records {
-		if err := ctx.Err(); err != nil {
-			return protocol.TranscriptPage{}, err
-		}
-		t.Facts([]session.Event{record.Event})
+	if err := t.ReplayRecords(ctx, records, recoveredThrough); err != nil {
+		return protocol.TranscriptPage{}, err
 	}
 	items, _ := t.Snapshot()
 	var cursor uint64
@@ -45,46 +43,112 @@ type outputReader interface {
 }
 
 func (s *SessionSupervisor) readSessionRecords(ctx context.Context, id protocol.SessionID) ([]session.Record, outputReader, error) {
+	records, blobs, _, err := s.readSessionRecordsWithRecovery(ctx, id)
+	return records, blobs, err
+}
+
+func (s *SessionSupervisor) readSessionRecordsWithRecovery(ctx context.Context, id protocol.SessionID) ([]session.Record, outputReader, session.Cursor, error) {
+	if id != protocol.SessionID(s.root.SessionID()) {
+		r, err := s.lookup(id)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		r.mu.Lock()
+		id = r.fact.Child.SessionID
+		r.mu.Unlock()
+	}
+	return s.readRecordedSessionRecordsWithRecovery(ctx, id)
+}
+
+// readRecordedSessionRecords also serves accounting traversal of descendant
+// IDs found in the journal, including older nested children outside the live
+// directory. Public child readers validate directory membership above.
+func (s *SessionSupervisor) readRecordedSessionRecords(ctx context.Context, id protocol.SessionID) ([]session.Record, outputReader, error) {
+	records, blobs, _, err := s.readRecordedSessionRecordsWithRecovery(ctx, id)
+	return records, blobs, err
+}
+
+func (s *SessionSupervisor) readRecordedSessionRecordsWithRecovery(ctx context.Context, id protocol.SessionID) ([]session.Record, outputReader, session.Cursor, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	var reader interface {
 		ReadRunRecords(context.Context) ([]session.Record, journal.ArtifactReader, error)
 	}
 	if id == protocol.SessionID(s.root.SessionID()) {
 		reader = s.root
-	} else {
-		r, err := s.lookup(id)
-		if err != nil {
-			return nil, nil, err
-		}
+	} else if r := s.directory.Current(id); r != nil {
 		r.mu.Lock()
-		id = r.fact.Child.SessionID
-		if r.agent != nil {
-			reader = r.agent
-		}
-		if reader == nil && r.memory != nil {
-			records, blobs := append([]session.Record(nil), r.memory...), r.memoryBlobs
-			r.mu.Unlock()
-			return records, blobs, nil
-		}
+		reader = r.agent
 		r.mu.Unlock()
 	}
 	if reader != nil {
 		// Keep the writer/reader handle alive for this read. Closing the owner
 		// may detach it, but cannot invalidate the copied immutable records.
-		records, blobs, err := reader.ReadRunRecords(ctx)
-		if !errors.Is(err, session.ErrClosed) {
-			return records, blobs, err
+		if live, ok := reader.(interface {
+			ReadRunRecordsWithRecovery(context.Context) ([]session.Record, journal.ArtifactReader, session.Cursor, error)
+		}); ok {
+			records, blobs, recoveredThrough, err := live.ReadRunRecordsWithRecovery(ctx)
+			if !errors.Is(err, session.ErrClosed) {
+				return records, blobs, recoveredThrough, err
+			}
+		} else {
+			// Alternate live runtime adapters have no recovered prefix unless
+			// they explicitly expose a recovery boundary.
+			records, blobs, err := reader.ReadRunRecords(ctx)
+			if !errors.Is(err, session.ErrClosed) {
+				return records, blobs, 0, err
+			}
 		}
+	}
+	// Continuations keep complete prefixes of the same session log. A newly
+	// queued run may have no runtime yet, so select the newest retained prefix,
+	// rather than concatenating overlapping histories or choosing an old run.
+	var saved []session.Record
+	var artifacts outputReader
+	// Nested archived children need not be executable directory entries, but
+	// their journals still belong to accounting traversal after a memory reopen.
+	for _, child := range s.memoryChildren {
+		if len(child.records) == 0 {
+			continue
+		}
+		created, ok := child.records[0].Event.(*session.SessionCreated)
+		if ok && created.SessionID == string(id) &&
+			(len(saved) == 0 || child.records[len(child.records)-1].Seq > saved[len(saved)-1].Seq) {
+			saved, artifacts = child.records, child.blobs
+		}
+	}
+	for _, r := range s.directory.Runs() {
+		r.mu.Lock()
+		if r.fact.Child.SessionID == id && len(r.memory) > 0 &&
+			(len(saved) == 0 || r.memory[len(r.memory)-1].Seq > saved[len(saved)-1].Seq) {
+			saved, artifacts = r.memory, r.memoryBlobs
+		}
+		r.mu.Unlock()
+	}
+	if saved != nil {
+		return append([]session.Record(nil), saved...), artifacts, saved[len(saved)-1].Seq, nil
+	}
+	if s.memory {
+		return nil, nil, 0, os.ErrNotExist // a queued child may not have opened a writer
 	}
 	store, err := session.OpenJSONLReadOnly(s.sessionDir, string(id))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer store.Close()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, 0, err
+	}
 	records, err := store.Read(session.Beginning)
-	return records, session.OpenArtifactStoreReadOnly(filepath.Join(s.sessionDir, string(id))), err
+	if ctx.Err() != nil {
+		return nil, nil, 0, ctx.Err()
+	}
+	var recoveredThrough session.Cursor
+	if len(records) > 0 {
+		recoveredThrough = records[len(records)-1].Seq
+	}
+	return records, session.OpenArtifactStoreReadOnly(filepath.Join(s.sessionDir, string(id))), recoveredThrough, err
 }
 
 func (s *SessionSupervisor) ReadOutput(ctx context.Context, id protocol.SessionID, itemID string, offset int64, limit int) (protocol.OutputPage, error) {

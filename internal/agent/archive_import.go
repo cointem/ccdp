@@ -81,9 +81,6 @@ func appendResumeStateFacts(events []session.Event, snapshot SessionSnapshot) []
 	if snapshot.Workflow != nil {
 		events = append(events, session.WorkflowChanged{Workflow: *snapshot.Workflow})
 	}
-	if snapshot.Memory != "" {
-		events = append(events, session.MemoryChanged{Revision: 1, Text: snapshot.Memory})
-	}
 	if len(snapshot.Tasks) > 0 {
 		events = append(events, session.TasksChanged{Revision: 1, Tasks: append([]session.Task(nil), snapshot.Tasks...)})
 	}

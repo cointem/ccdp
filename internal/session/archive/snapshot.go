@@ -36,7 +36,6 @@ type Snapshot struct {
 	// completion yet. Resume exposes them as unknown; it never re-runs them.
 	PendingCommands []session.CommandScheduled `json:"pending_commands,omitempty"`
 	Workflow        *session.WorkflowState     `json:"workflow,omitempty"`
-	Memory          string                     `json:"memory,omitempty"`
 	Tasks           []session.Task             `json:"tasks,omitempty"`
 	// PendingInputs is the durable typed inbox.
 	PendingInputs []protocol.InputView `json:"pending_inputs,omitempty"`
@@ -68,7 +67,9 @@ func FromRecords(records []session.Record, id string) (*Snapshot, error) {
 	if id != "" && projection.ID != id {
 		return nil, fmt.Errorf("agent: replayed session id %q does not match requested id %q", projection.ID, id)
 	}
-	return fromProjection(projection, id), nil
+	snapshot := fromProjection(projection, id)
+	snapshot.Records = records
+	return snapshot, nil
 }
 
 func fromProjection(projection *replay.State, id string) *Snapshot {
@@ -89,9 +90,9 @@ func fromProjection(projection *replay.State, id string) *Snapshot {
 		Settings: SnapshotSettings(projection.Settings), Workflow: SnapshotWorkflow(projection.Workflow),
 		Goal:              protocol.CloneGoal(projection.Goal),
 		GoalAccountingIDs: maps.Clone(projection.GoalAccountingIDs),
-		Memory:            projection.MemoryText, Tasks: append([]session.Task(nil), projection.Tasks...),
-		PendingCommands: projection.PendingCommands(),
-		ParentID:        projection.ParentID, BranchPoint: projection.BranchPoint, BranchSummary: projection.BranchSummary,
+		Tasks:             append([]session.Task(nil), projection.Tasks...),
+		PendingCommands:   projection.PendingCommands(),
+		ParentID:          projection.ParentID, BranchPoint: projection.BranchPoint, BranchSummary: projection.BranchSummary,
 		TurnSeq: projection.TurnSeq, StepSeq: projection.StepSeq,
 	}
 }

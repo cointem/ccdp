@@ -119,14 +119,16 @@ func (a *Agent) recoverGoalAccounting() error {
 // The ready result distinguishes unreadable child accounting from a failure
 // of the parent journal. Construction tolerates the former; resume cannot.
 func (a *Agent) recoverGoalAccountingState() (ready bool, err error) {
+	ctx := a.rootContext()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	a.mu.Lock()
 	goalID := ""
 	if a.conversation.durable.Goal != nil {
 		goalID = a.conversation.durable.Goal.ID
 	}
 	rootID := a.conversation.sessionID
-	dir := a.services.cfg.SessionDir
-	memory := a.services.cfg.NoSessionPersistence
 	a.mu.Unlock()
 	if goalID == "" {
 		return true, nil
@@ -148,6 +150,9 @@ func (a *Agent) recoverGoalAccountingState() (ready bool, err error) {
 		visited[id] = true
 		childIDs := make(map[string]bool)
 		for _, record := range records {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			switch fact := record.Event.(type) {
 			case *session.ChildRunRecorded:
 				if string(fact.Child.ParentSessionID) == id && fact.Child.SessionID != "" && fact.GoalSessionID == rootID && fact.GoalID == goalID {
@@ -162,6 +167,9 @@ func (a *Agent) recoverGoalAccountingState() (ready bool, err error) {
 			return err
 		}
 		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if entry.recovered && id == rootID {
 				if err := a.accountRecoveredOwnAttempt(entry); err != nil {
 					return err
@@ -176,23 +184,15 @@ func (a *Agent) recoverGoalAccountingState() (ready bool, err error) {
 				return err
 			}
 		}
-		if memory {
-			return nil
-		}
 		for childID := range childIDs {
 			if visited[childID] {
 				continue
 			}
-			store, err := session.OpenJSONLReadOnly(dir, childID)
+			childRecords, _, err := a.services.supervisor.readRecordedSessionRecords(ctx, protocol.SessionID(childID))
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
 			if err != nil {
-				return fmt.Errorf("goal recovery child %s: %w", childID, err)
-			}
-			childRecords, readErr := store.Read(session.Beginning)
-			closeErr := store.Close()
-			if err := errors.Join(readErr, closeErr); err != nil {
 				return fmt.Errorf("goal recovery child %s: %w", childID, err)
 			}
 			if err := visit(childID, childRecords); err != nil {
@@ -204,6 +204,9 @@ func (a *Agent) recoverGoalAccountingState() (ready bool, err error) {
 	err = visit(rootID, records)
 	if err == nil {
 		return true, nil
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
 	}
 	if a.persistenceFailure() != nil {
 		return false, err

@@ -12,6 +12,7 @@ import (
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
 	"ccdp/internal/sandbox"
+	"ccdp/internal/tools"
 	"ccdp/internal/workspace"
 )
 
@@ -84,11 +85,6 @@ func (a *Agent) buildSystemBlocks(cfg config.Config, sessionStartAt time.Time, s
 	if plan {
 		add(false, "\n\n"+PlanModeInstructions)
 	}
-	if cfg.MemoryEnabled() {
-		if sec := a.MemorySection(); sec != "" {
-			add(false, sec)
-		}
-	}
 	if sec := a.todoSection(); sec != "" {
 		add(false, "\n\n"+sec)
 	}
@@ -109,18 +105,13 @@ func joinSystemBlocks(blocks []llm.SystemBlock) string {
 }
 
 func (a *Agent) todoSection() string {
-	text, _ := a.todoSectionChecked()
-	return text
-}
-
-func (a *Agent) todoSectionChecked() (string, error) {
 	a.mu.Lock()
-	resources := a.services.resources
-	a.mu.Unlock()
-	if resources == nil || resources.Todos == nil {
-		return "", nil
+	defer a.mu.Unlock()
+	states := make([]tools.TodoState, 0, len(a.conversation.durable.Tasks))
+	for _, task := range a.conversation.durable.Tasks {
+		states = append(states, tools.TodoState{ID: task.TaskID, Content: task.Title, Status: task.Status, Priority: task.Priority})
 	}
-	return resources.Todos.Section()
+	return tools.TodoSection(states)
 }
 
 // shellName returns the user's shell for the environment section.

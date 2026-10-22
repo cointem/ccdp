@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"ccdp/internal/config"
 	"ccdp/internal/hooks"
@@ -35,8 +36,8 @@ func isTaskChild(purpose string) bool {
 }
 
 // guardianReadOnlyTools is an execution allowlist, not merely prompt text.
-// The provider's executeTool path must invoke ChildToolGate before registry
-// lookup, hooks, permission checks, or Tool.Run.
+// The tool admission path invokes ChildToolGate before hooks, permission
+// checks, or Tool.Run.
 var guardianReadOnlyTools = map[string]bool{
 	"Read":         true,
 	"Glob":         true,
@@ -104,63 +105,97 @@ type childStepSnapshot struct {
 	revision uint64
 }
 
-// childSlots is stored on the parent Agent and shared by all delegation calls in
-// that parent turn/session. A bounded semaphore prevents concurrent delegation calls
-// from multiplying unbounded child goroutines.
+// childSlots keeps a stable identity across settings reloads. Shrinking does
+// not interrupt running children; queued work waits for active to fall below max.
 type childSlots struct {
-	sem chan struct{}
-	max int
+	mu      sync.Mutex
+	max     int
+	active  int
+	changed chan struct{}
 }
 
 func newChildSlots(max int) *childSlots {
-	if max <= 0 {
-		max = defaultChildWorkers
+	if max < 1 || max > 16 {
+		panic("child concurrency limit must be between 1 and 16")
 	}
-	if max > 16 {
-		max = 16
-	}
-	return &childSlots{sem: make(chan struct{}, max), max: max}
+	return &childSlots{max: max, changed: make(chan struct{})}
 }
 
-func slotsForParent(a *Agent) *childSlots {
+func slotsForParent(a *Agent, purpose string) *childSlots {
 	if a == nil {
 		return newChildSlots(1)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if purpose == childPurposeGuardian {
+		if a.children.guardianSlots == nil {
+			a.children.guardianSlots = newChildSlots(1)
+		}
+		return a.children.guardianSlots
+	}
 	if a.children.childSlots == nil {
 		limit := defaultChildWorkers
-		if a.services.cfg != nil && a.services.cfg.MaxParallelTools > 0 {
-			limit = a.services.cfg.MaxParallelTools
+		if a.services.cfg != nil {
+			limit = a.services.cfg.MaxConcurrentAgents
 		}
 		a.children.childSlots = newChildSlots(limit)
 	}
 	return a.children.childSlots
 }
 
+func (s *childSlots) setLimit(max int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if max == s.max {
+		return
+	}
+	s.max = max
+	close(s.changed)
+	s.changed = make(chan struct{})
+}
+
 func (s *childSlots) acquire(ctx context.Context) error {
-	if s == nil || s.sem == nil {
+	if s == nil {
 		return errors.New("child slots are unavailable")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	select {
-	case s.sem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if s.active < s.max {
+			s.active++
+			s.mu.Unlock()
+			return nil
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
 func (s *childSlots) release() {
-	if s == nil || s.sem == nil {
+	if s == nil {
 		return
 	}
-	select {
-	case <-s.sem:
-	default:
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active == 0 {
+		return
 	}
+	s.active--
+	close(s.changed)
+	s.changed = make(chan struct{})
 }
 
 func cloneChildAllowed(src map[string]bool) map[string]bool {
@@ -219,32 +254,46 @@ func pinChildProvider(source *plugin.ModelRegistry, cfg config.Config, binding m
 	return pinned.Freeze()
 }
 
-// ChildToolGate is the non-overridable child admission check. Provider glue
-// should call it before normal Agent.executeTool admission. For non-child
-// Agents it returns an allow/no-op result. Approval requests in a
-// non-interactive child are denials, never implicit approvals.
-func ChildToolGate(a *Agent, tc messages.ToolCall, tool tools.Tool) (bool, string) {
+// childToolEligibility checks the frozen child role and tool allowlist without
+// evaluating arguments. Catalog construction uses this static boundary; actual
+// invocations must still pass ChildToolGate with their complete arguments.
+func childToolEligibility(a *Agent, name string, tool tools.Tool) (bool, string) {
 	if a == nil || a.children.childState == nil {
 		return false, ""
 	}
 	s := a.children.childState
-	if (s.purpose == childPurposeGuardian || s.readOnlyWorkspace) && !childReadOnlyTools(s.purpose)[tc.Name] {
-		return true, fmt.Sprintf("guardian hard deny: tool %q is outside the read-only allowlist", tc.Name)
+	if (s.purpose == childPurposeGuardian || s.readOnlyWorkspace) && !childReadOnlyTools(s.purpose)[name] {
+		return true, fmt.Sprintf("guardian hard deny: tool %q is outside the read-only allowlist", name)
 	}
-	if s.allowed != nil && !s.allowed[tc.Name] {
-		return true, fmt.Sprintf("child hard deny: tool %q is outside the frozen allowlist", tc.Name)
+	if s.allowed != nil && !s.allowed[name] {
+		return true, fmt.Sprintf("child hard deny: tool %q is outside the frozen allowlist", name)
 	}
 	// Delegation is deliberately one level only. This remains a hard
 	// gate even when a caller passed a nil allowlist.
-	if isTaskChild(s.purpose) && childControlTool(tc.Name) {
+	if isTaskChild(s.purpose) && childControlTool(name) {
 		return true, "child hard deny: nested task is not available"
 	}
 	if s.purpose == childPurposeGuardian {
 		kind := toolKind(tool)
 		if kind != permissions.KindRead {
-			return true, fmt.Sprintf("guardian hard deny: tool %q is not read-only", tc.Name)
+			return true, fmt.Sprintf("guardian hard deny: tool %q is not read-only", name)
 		}
 	}
+	return false, ""
+}
+
+// ChildToolGate is the non-overridable child admission check. Provider glue
+// should call it before normal tool permission admission. For non-child
+// Agents it returns an allow/no-op result. Approval requests in a
+// non-interactive child are denials, never implicit approvals.
+func ChildToolGate(a *Agent, tc messages.ToolCall, tool tools.Tool) (bool, string) {
+	if denied, reason := childToolEligibility(a, tc.Name, tool); denied {
+		return true, reason
+	}
+	if a == nil || a.children.childState == nil {
+		return false, ""
+	}
+	s := a.children.childState
 	if s.nonInteractive && s.perms != nil {
 		decision, reason := s.perms.Check(tc.Name, tc.Arguments, toolKind(tool))
 		if decision == permissions.DecisionAsk {
@@ -281,41 +330,6 @@ func parentTurnContext(a *Agent) context.Context {
 		return context.Background()
 	}
 	return ctx
-}
-
-// childToolLeaseFromParent returns the immutable tool view captured for the
-// currently executing parent step.  A child may borrow MCP/plugin tools from
-// this view, but it cannot retain the parent registry or manager: the parent
-// step owns the lease and releases it after all tool calls (including the
-// synchronous child join) have completed.
-func childToolLeaseFromParent(a *Agent) *tools.Lease {
-	if a == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if !a.turn.busy || a.children.childStep == nil || a.children.childStep.turn != a.sequences.turnSeq {
-		return nil
-	}
-	return a.children.childStep.toolLease
-}
-
-// childPreHooksFromParent snapshots only trusted in-process pre-tool
-// decisions. A child receives its own GoHooks registry populated from this
-// slice; no mutable parent registry or post/lifecycle observer is retained.
-func childPreHooksFromParent(a *Agent) []plugin.PreToolHook {
-	if a == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.turn.busy && a.children.childStep != nil && a.children.childStep.turn == a.sequences.turnSeq {
-		return append([]plugin.PreToolHook(nil), a.children.childStep.preHooks...)
-	}
-	if a.services.gohooks == nil {
-		return nil
-	}
-	return a.services.gohooks.SnapshotPreTool()
 }
 
 // inheritBorrowedPreHooks installs a frozen copy of parent pre-tool decisions
@@ -410,11 +424,11 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 	cfg.SessionID = ""
 	cfg.EnableGuardian = config.BoolPtr(false)
 	// The constructor filters cfg.Hooks to decision hooks. It must not replay
-	// project lifecycle commands, start MCP servers, or write AutoMem state as
+	// project lifecycle commands, start MCP servers, or write project memory state as
 	// a startup side effect. Parent SubagentStart/Stop callbacks remain around
 	// delegation itself; they are not duplicated inside the child.
 	cfg.MCPServers = nil
-	cfg.EnableMemory = config.BoolPtr(false)
+	cfg.EnableProjectMemory = false
 	return cfg, Options{
 		RootContext:           parentCtx,
 		EffectiveConfigFrozen: true,

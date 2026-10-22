@@ -227,7 +227,7 @@ type Config struct {
 	// Context management
 	ContextWindow      int     `json:"context_window"`        // estimated model context window in tokens
 	CompactThreshold   float64 `json:"compact_threshold"`     // 0..1 of context window triggering auto-compact
-	MaxResultSizeChars int     `json:"max_result_size_chars"` // tool results are truncated beyond this
+	MaxResultSizeBytes int     `json:"max_result_size_bytes"` // tool-result byte limit
 	KeepAfterCompact   int     `json:"keep_after_compact"`    // most recent messages always kept intact
 
 	BashTimeoutSeconds int `json:"bash_timeout_seconds"`
@@ -251,22 +251,25 @@ type Config struct {
 	// --fallback-model).
 	FallbackModel string `json:"fallback_model"`
 
-	// MaxToolOutputCharsPerTurn caps the combined tool-result characters
+	// MaxToolOutputBytesPerTurn caps the combined tool-result bytes
 	// delivered to the model in one turn (Claude's 200k aggregate limit).
-	MaxToolOutputCharsPerTurn int `json:"max_tool_output_chars_per_turn"`
+	MaxToolOutputBytesPerTurn int `json:"max_tool_output_bytes_per_turn"`
 
 	// EnableGuardian runs a review sub-agent before high-risk tool calls
 	// (Codex's guardian). Costs extra model calls; off by default. A nil
 	// pointer means "not set" (defaults to false; see GuardianEnabled).
 	EnableGuardian *bool `json:"enable_guardian"`
 
-	// EnableMemory keeps a lightweight session memory log that is injected
-	// into later system prompts (Claude's AutoMem, simplified). A nil pointer
-	// means "not set" (defaults to false; see MemoryEnabled).
-	EnableMemory *bool `json:"enable_memory"`
+	// EnableProjectMemory enables automatic durable notes (on by default).
+	EnableProjectMemory bool   `json:"enable_project_memory"`
+	ProjectMemoryDir    string `json:"project_memory_dir"`
+	MemoryReadOnly      bool   `json:"memory_read_only"`
+	MemoryHistory       bool   `json:"memory_history"`
 
 	// Sandbox & execution policy
-	MaxParallelTools int `json:"max_parallel_tools"` // tools executed concurrently per turn (0 = sequential)
+	MaxParallelTools    int  `json:"max_parallel_tools"`    // concurrent tools; 1–16
+	MaxConcurrentAgents int  `json:"max_concurrent_agents"` // task/review children; 1–16
+	CodeModeEnabled     bool `json:"code_mode_enabled"`     // isolated JavaScript tool orchestration; enabled unless explicitly false
 
 	// SandboxLimits apply per-process resource bounds (ulimit).
 	SandboxLimits *sandbox.Limits `json:"sandbox_limits"`
@@ -475,25 +478,29 @@ type ToolSpec struct {
 func defaultConfig() Config {
 	home, _ := os.UserHomeDir()
 	return Config{
-		BaseURL:            "https://api.openai.com/v1",
-		Model:              "gpt-5.4-mini",
-		Workspace:          ".",
-		PermissionMode:     string(permissions.ModeAcceptEdits),
-		SystemPrompt:       DefaultSystemPrompt,
-		ContextWindow:      200000,
-		CompactThreshold:   0.85,
-		MaxResultSizeChars: 32000,
-		KeepAfterCompact:   8,
-		BashTimeoutSeconds: 120,
-		MaxParallelTools:   4,
-		Hooks:              hooks.Config{},
-		EnableWebTools:     BoolPtr(true),
-		NetworkAccess:      true,
-		MCPServers:         map[string]mcp.ServerConfig{},
-		Providers:          map[string]ProviderConfig{},
-		SessionDir:         filepath.Join(home, ".ccdp", "sessions"),
-		sourcePath:         filepath.Join(home, ".ccdp", "config.json"),
-		provenance:         newProvenance(),
+		BaseURL:             "https://api.openai.com/v1",
+		Model:               "gpt-5.4-mini",
+		Workspace:           ".",
+		PermissionMode:      string(permissions.ModeAcceptEdits),
+		SystemPrompt:        DefaultSystemPrompt,
+		ContextWindow:       200000,
+		CompactThreshold:    0.85,
+		MaxResultSizeBytes:  32000,
+		KeepAfterCompact:    8,
+		BashTimeoutSeconds:  120,
+		MaxParallelTools:    4,
+		MaxConcurrentAgents: 4,
+		ProjectMemoryDir:    filepath.Join(home, ".ccdp", "projects"),
+		EnableProjectMemory: true,
+		CodeModeEnabled:     true,
+		Hooks:               hooks.Config{},
+		EnableWebTools:      BoolPtr(true),
+		NetworkAccess:       true,
+		MCPServers:          map[string]mcp.ServerConfig{},
+		Providers:           map[string]ProviderConfig{},
+		SessionDir:          filepath.Join(home, ".ccdp", "sessions"),
+		sourcePath:          filepath.Join(home, ".ccdp", "config.json"),
+		provenance:          newProvenance(),
 	}
 }
 
@@ -567,13 +574,14 @@ func applyEnvChecked(cfg *Config) error {
 		}
 		return err
 	})
-	apply("CCDP_ENABLE_MEMORY", func(v string) error {
-		b, err := parseEnvBool("CCDP_ENABLE_MEMORY", v)
+	apply("CCDP_ENABLE_PROJECT_MEMORY", func(v string) error {
+		b, err := parseEnvBool("CCDP_ENABLE_PROJECT_MEMORY", v)
 		if err == nil {
-			cfg.EnableMemory = BoolPtr(b)
+			cfg.EnableProjectMemory = b
 		}
 		return err
 	})
+	apply("CCDP_PROJECT_MEMORY_DIR", func(v string) error { cfg.ProjectMemoryDir = v; return nil })
 	return errors.Join(errs...)
 }
 
@@ -723,11 +731,14 @@ func (c *Config) Validate() error {
 	if c.CompactThreshold <= 0 || c.CompactThreshold >= 1 {
 		return fmt.Errorf("config: compact_threshold must be between 0 and 1, got %v", c.CompactThreshold)
 	}
-	if c.MaxResultSizeChars < 1024 {
-		return fmt.Errorf("config: max_result_size_chars must be at least 1024")
+	if c.MaxResultSizeBytes < 1024 {
+		return fmt.Errorf("config: max_result_size_bytes must be at least 1024")
 	}
-	if c.MaxParallelTools < 0 || c.MaxParallelTools > 16 {
-		return fmt.Errorf("config: max_parallel_tools must be between 0 and 16, got %d", c.MaxParallelTools)
+	if c.MaxParallelTools < 1 || c.MaxParallelTools > 16 {
+		return fmt.Errorf("config: max_parallel_tools must be between 1 and 16, got %d", c.MaxParallelTools)
+	}
+	if c.MaxConcurrentAgents < 1 || c.MaxConcurrentAgents > 16 {
+		return fmt.Errorf("config: max_concurrent_agents must be between 1 and 16, got %d", c.MaxConcurrentAgents)
 	}
 	if c.Hooks == nil {
 		c.Hooks = hooks.Config{}
@@ -855,8 +866,13 @@ func (c *Config) Sandbox() *sandbox.Sandbox {
 	if c.SessionDir != "" {
 		s.AddProtectedDir(c.SessionDir)
 	}
+	// Project notes are edited only through the dedicated memory operation.
+	if c.ProjectMemoryDir != "" {
+		s.AddProtectedDir(c.ProjectMemoryDir)
+	}
 	// Configuration, project instructions, and trust metadata are application
 	// control state and never ordinary model-writable files.
+	s.AddProtectedDir(c.ProjectPermissionsDir())
 	s.AddProtectedDir(ProjectSettingsDir(c.Workspace))
 	if source := c.SourcePath(); source != "" {
 		s.AddProtectedDir(source)
@@ -903,6 +919,9 @@ func loadProjectSettings(ws string, store *TrustStore) (Config, error) {
 	proj.Hooks = hooks.Config{}
 	proj.MCPServers = map[string]mcp.ServerConfig{}
 	proj.EnableWebTools = nil
+	// Omitted project settings inherit the effective user config and must not
+	// add a capability grant to the project's executable fingerprint.
+	proj.CodeModeEnabled = false
 	for _, name := range []string{"settings.json", "settings.local.json"} {
 		p := filepath.Join(ProjectSettingsDir(ws), name)
 		data, err := os.ReadFile(p)
@@ -976,6 +995,24 @@ func applyProjectSettings(dst, src *Config) {
 		dst.ensureProvenance()
 		dst.provenance.setProject(srcReport.ProjectRoot, true, srcReport.ProjectFingerprint)
 	}
+	// Untrusted projects may reduce resource budgets, but cannot increase them.
+	for _, field := range []string{"max_parallel_tools", "max_concurrent_agents"} {
+		if !src.IsExplicit(field) || !projectOverrideAllowed(dst, field) {
+			continue
+		}
+		if field == "max_parallel_tools" {
+			if !srcReport.ProjectTrusted && src.MaxParallelTools > dst.MaxParallelTools {
+				continue
+			}
+			dst.MaxParallelTools = src.MaxParallelTools
+		} else {
+			if !srcReport.ProjectTrusted && src.MaxConcurrentAgents > dst.MaxConcurrentAgents {
+				continue
+			}
+			dst.MaxConcurrentAgents = src.MaxConcurrentAgents
+		}
+		dst.markSource(field, src.SourceOf(field), srcReport.Fields[field].Path, srcReport.ProjectTrusted)
+	}
 	// Denials are cumulative across trust boundaries. The project cannot use an
 	// empty list to revoke a user denial.
 	if src.IsExplicit("always_deny") {
@@ -993,6 +1030,10 @@ func applyProjectSettings(dst, src *Config) {
 			dst.EnableWebTools = BoolPtr(*src.EnableWebTools)
 			dst.markSource("enable_web_tools", src.SourceOf("enable_web_tools"), srcReport.Fields["enable_web_tools"].Path, srcReport.ProjectTrusted)
 		}
+	}
+	if src.IsExplicit("code_mode_enabled") && projectOverrideAllowed(dst, "code_mode_enabled") && (!src.CodeModeEnabled || srcReport.ProjectTrusted) {
+		dst.CodeModeEnabled = src.CodeModeEnabled
+		dst.markSource("code_mode_enabled", src.SourceOf("code_mode_enabled"), srcReport.Fields["code_mode_enabled"].Path, srcReport.ProjectTrusted)
 	}
 	// Project settings may tighten the network boundary but cannot enable
 	// network access. This keeps /reload and workspace selection capable of
@@ -1109,7 +1150,3 @@ func (c *Config) WebToolsEnabled() bool { return c.EnableWebTools == nil || *c.E
 // GuardianEnabled reports whether the guardian review sub-agent runs before
 // high-risk tool calls. Unset (nil) defaults to false.
 func (c *Config) GuardianEnabled() bool { return c.EnableGuardian != nil && *c.EnableGuardian }
-
-// MemoryEnabled reports whether the session memory log is active. Unset (nil)
-// defaults to false.
-func (c *Config) MemoryEnabled() bool { return c.EnableMemory != nil && *c.EnableMemory }

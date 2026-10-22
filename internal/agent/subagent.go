@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -61,11 +62,15 @@ func (a *Agent) spawnAgent(request tools.SpawnAgentRequest, callID string) (prot
 }
 
 // Guardian is an internal synchronous inspection, driven by the same supervisor.
-func (a *Agent) runGuardianChild(description string) (string, error) {
+func (a *Agent) runGuardianChild(description string, contexts ...context.Context) (string, error) {
 	if a.children.childState != nil {
 		return "", errors.New("nested guardian is not available")
 	}
-	r, err := a.services.supervisor.launch(a, parentTurnContext(a), childTask{Description: description, SystemPrompt: GuardianSystem}, childPurposeGuardian, "")
+	ctx := parentTurnContext(a)
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
+	}
+	r, err := a.services.supervisor.launch(a, ctx, childTask{Description: description, SystemPrompt: GuardianSystem}, childPurposeGuardian, "")
 	if err != nil {
 		return "", err
 	}

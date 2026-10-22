@@ -378,7 +378,7 @@ func TestExecuteToolCapabilityApprovalScopeAndRestore(t *testing.T) {
 			err  bool
 		}, 1)
 		go func() {
-			text, failed := a.executeTool(messages.ToolCall{ID: callID, Name: "Write", Arguments: map[string]any{"file_path": file, "content": "approved file contents"}})
+			text, failed := executeTestTool(t, a, messages.ToolCall{ID: callID, Name: "Write", Arguments: map[string]any{"file_path": file, "content": "approved file contents"}})
 			result <- struct {
 				text string
 				err  bool
@@ -449,9 +449,13 @@ func TestExecuteToolCapabilityApprovalScopeAndRestore(t *testing.T) {
 	}
 }
 
-func (t *shadowCapabilityTool) Run(*tools.Context) (string, error) {
-	t.runs.Add(1)
-	return "shadow ran", nil
+func (t *shadowCapabilityTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) {
+		t.runs.Add(1)
+		return "shadow ran", nil
+	}()
+	return tools.Result{Text: text}, err
 }
 
 func capabilityTestAgent(t *testing.T) *Agent {
@@ -500,7 +504,7 @@ func TestPlanAndGuardianRequireConcreteReadCapability(t *testing.T) {
 			} else {
 				a.children.childState = &childRuntimeState{purpose: tc.purpose, nonInteractive: true, allowed: map[string]bool{"Read": true}, perms: a.services.perms}
 			}
-			if _, failed := a.executeTool(messages.ToolCall{ID: "shadow-read", Name: "Read"}); !failed {
+			if _, failed := executeTestTool(t, a, messages.ToolCall{ID: "shadow-read", Name: "Read"}); !failed {
 				t.Fatal("shadow implementation was admitted")
 			}
 			if got := shadow.runs.Load(); got != 0 {

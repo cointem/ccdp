@@ -3,6 +3,7 @@ package tools
 import (
 	"ccdp/internal/workspace"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -183,7 +184,7 @@ func TestRgToolRun(t *testing.T) {
 		t.Helper()
 		ctx := rgCtx(dir)
 		ctx.Args = args
-		out, err := tool.Run(ctx)
+		out, err := executeToolText(tool, ctx)
 		if err != nil {
 			t.Fatalf("Rg.Run(%v): %v", args, err)
 		}
@@ -211,10 +212,10 @@ func TestRgToolRun(t *testing.T) {
 		t.Errorf("expected a group separator between non-contiguous context blocks:\n%s", out)
 	}
 
-	if _, err := tool.Run(&Context{Context: context.Background(), WorkingDir: dir, Sandbox: sandbox.New(dir), Args: map[string]any{"pattern": "needle", "mode": "bogus"}}); err == nil {
+	if _, err := executeToolText(tool, &Context{Context: context.Background(), WorkingDir: dir, Sandbox: sandbox.New(dir), Args: map[string]any{"pattern": "needle", "mode": "bogus"}}); err == nil {
 		t.Error("expected an error for an unknown output_mode")
 	}
-	if _, err := tool.Run(&Context{Context: context.Background(), WorkingDir: dir, Sandbox: sandbox.New(dir), Args: map[string]any{"pattern": "(["}}); err == nil {
+	if _, err := executeToolText(tool, &Context{Context: context.Background(), WorkingDir: dir, Sandbox: sandbox.New(dir), Args: map[string]any{"pattern": "(["}}); err == nil {
 		t.Error("expected an error for a malformed regex")
 	}
 }
@@ -261,6 +262,15 @@ func TestTranslateFileGlob(t *testing.T) {
 		{"src/*.go", "src/main.go", true},
 		{"src/*.go", "other/main.go", false},
 		{"**/*.ts", "a/b/c.ts", true},
+		{"**/*.go", "main.go", true},
+		{"src/**/main.go", "src/main.go", true},
+		{"src/**/main.go", "src/a/b/main.go", true},
+		{"src/**/main.go", "other/main.go", false},
+		{"**/**/main.go", "main.go", true},
+		{"src/*.go", "src/nested/main.go", false},
+		{"**/*.{go,ts}", "main.go", true},
+		{"**/*.{go,ts}", "src/main.ts", true},
+		{"**/*.{go,ts}", "main.md", false},
 		{"*.{go,ts}", "a.ts", true},
 		{"*.{go,ts}", "a.md", false},
 		{"test_?.go", "test_a.go", true},
@@ -275,6 +285,41 @@ func TestTranslateFileGlob(t *testing.T) {
 		got := re.MatchString(tc.path) || re.MatchString(name)
 		if got != tc.want {
 			t.Errorf("glob %q vs %q = %v, want %v", tc.glob, tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestRgRecursiveGlobIncludesRootFiles(t *testing.T) {
+	root := t.TempDir()
+	for _, path := range []string{"main.go", "src/main.go", "src/deep/main.go", "other.txt"} {
+		reviewRgWrite(t, root, path, "needle\n")
+	}
+	for _, mode := range []string{rgModeContent, rgModeFiles, rgModeCount} {
+		for _, glob := range []string{"**/*.go", "!**/*.go"} {
+			t.Run(mode+"/"+glob, func(t *testing.T) {
+				ctx := rgCtx(root)
+				ctx.Args = map[string]any{"pattern": "needle", "glob": glob, "mode": mode}
+				out, err := executeToolResult(NewRgTool(), ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var page struct {
+					Entries []struct{ Path string }
+				}
+				if err := json.Unmarshal(out.Data, &page); err != nil {
+					t.Fatal(err)
+				}
+				found := map[string]bool{}
+				for _, entry := range page.Entries {
+					found[entry.Path] = true
+				}
+				for _, path := range []string{"main.go", "src/main.go", "src/deep/main.go", "other.txt"} {
+					want := strings.HasSuffix(path, ".go") != strings.HasPrefix(glob, "!")
+					if found[path] != want {
+						t.Errorf("path %s present=%v, want %v: %s", path, found[path], want, out.Text)
+					}
+				}
+			})
 		}
 	}
 }
@@ -340,7 +385,7 @@ func TestRgStreamsLargeTextAndFollowsExplicitAlias(t *testing.T) {
 	ctx := rgCtx(root)
 	ctx.ReadRoot = root
 	ctx.Args = map[string]any{"pattern": "needle", "path": "alias.txt", "mode": "count"}
-	output, err := NewRgTool().Run(ctx)
+	output, err := executeToolText(NewRgTool(), ctx)
 	if err != nil || !strings.Contains(output, "alias.txt:1\n") || strings.Contains(output, "incomplete") {
 		t.Fatalf("large alias search: %q %v", output, err)
 	}
@@ -354,7 +399,7 @@ func TestRgUnicodeRegexAndIncompleteMultiline(t *testing.T) {
 	ctx := rgCtx(root)
 	for pattern, want := range map[string]bool{`\w+`: true, `\p{L}+`: true} {
 		ctx.Args = map[string]any{"pattern": pattern}
-		output, err := NewRgTool().Run(ctx)
+		output, err := executeToolText(NewRgTool(), ctx)
 		if err != nil || strings.Contains(output, "中文") != want {
 			t.Fatalf("%s: %q %v", pattern, output, err)
 		}
@@ -363,8 +408,13 @@ func TestRgUnicodeRegexAndIncompleteMultiline(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx.Args = map[string]any{"pattern": "absent", "multiline": true}
-	output, err := NewRgTool().Run(ctx)
+	output, err := executeToolText(NewRgTool(), ctx)
 	if err != nil || !strings.Contains(output, "search incomplete") {
 		t.Fatalf("bounded multiline result: %q %v", output, err)
 	}
+}
+
+// Test convenience for exercising the production page formatter.
+func formatRgResult(lines []rgLine, r *rgRequest, truncated bool) string {
+	return formatRgPage(newRgPage(lines, r, truncated), r)
 }

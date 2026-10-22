@@ -80,6 +80,21 @@ type sessionDraft struct {
 	paste         *pasteFoldState
 }
 
+// withSessionView settles asynchronous results in the view that submitted
+// them, even when navigation has moved that view into the cache.
+func (m *Model) withSessionView(id protocol.SessionID, apply func(*Model)) {
+	if id == "" || id.String() == m.sessionID {
+		apply(m)
+		return
+	}
+	if m.routing != nil {
+		if saved, ok := m.routing.views[id.String()]; ok {
+			apply(&saved)
+			m.routing.views[id.String()] = saved
+		}
+	}
+}
+
 func (m *Model) installSessionRouting(directory protocol.SessionDirectory) {
 	if directory == nil {
 		return
@@ -326,6 +341,7 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	opened := *r.pending
 	r.pending = nil
 	fromChild := m.sessionID != r.rootID
+	fromAlternate := fromChild || m.reader != nil && m.reader.screenEntered
 	targetID := string(opened.snapshot.SessionID)
 	m.releaseAgentShelf(m.sessionID)
 	m.retainAgentShelf(targetID)
@@ -362,7 +378,7 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	for len(r.views) > 8 && len(r.order) > 0 {
 		old := r.order[0]
 		r.order = r.order[1:]
-		if old != r.rootID && old != m.sessionID && r.views[old].pendingSubmissionCount() == 0 && r.views[old].pasteRequest == "" {
+		if old != r.rootID && old != m.sessionID && len(r.views[old].activeOperations()) == 0 && r.views[old].pendingSubmissionCount() == 0 && r.views[old].pasteRequest == "" {
 			view := r.views[old]
 			r.drafts[old] = sessionDraft{text: view.textarea.Value(), retry: view.inputRetry, images: cloneInputImages(view.inputImages), missingImages: view.missingHistoryImages, follow: view.followOutput, offset: view.viewport.YOffset, paste: clonePasteFold(view.pasteFold)}
 			delete(r.views, old)
@@ -370,7 +386,7 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	}
 	host := m.terminal
 	width, height := m.width, m.height
-	ag := m.ag
+	sessionHost := m.sessionHost
 	generation := m.watchGeneration + 1
 	_, cached := r.views[string(opened.snapshot.SessionID)]
 	if previous, ok := r.views[string(opened.snapshot.SessionID)]; ok {
@@ -380,7 +396,7 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 		fresh.routing = r
 		*m = fresh
 	}
-	m.ag = ag
+	m.sessionHost = sessionHost
 	m.terminal = host
 	m.delivery.pending = nil
 	m.routing = r
@@ -423,12 +439,17 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 		m.inline.showBaseline = false
 	}
 	m.layout()
+	toAlternate := toChild || m.reader != nil
+	if m.reader != nil {
+		m.reader.screenEntered = !toChild
+		m.reader.enterPending = false
+	}
 	g := r.generation
 	ack := func() tea.Msg { return agentViewResetMsg{generation: g} }
 	switch {
-	case !fromChild && toChild:
+	case !fromAlternate && toAlternate:
 		return tea.Sequence(tea.EnterAltScreen, tea.ClearScreen, ack)
-	case fromChild && !toChild:
+	case fromAlternate && !toAlternate:
 		return tea.Sequence(tea.ExitAltScreen, ack)
 	default:
 		return tea.Sequence(tea.ClearScreen, ack)
@@ -624,6 +645,7 @@ func projectTranscriptCell(item protocol.TranscriptItem) historyCell {
 	}
 	return historyCell{kind: item.Kind, text: text, textOffset: int(item.TextOffset), messageID: item.ID, turnID: item.TurnID,
 		toolID: string(item.CallID), status: item.Status, toolName: item.Tool, toolArgs: args,
+		parentCallID: string(item.ParentCallID), childIndex: item.ChildIndex,
 		toolArgsRaw: string(item.Args), toolTruncated: item.Truncated}
 }
 

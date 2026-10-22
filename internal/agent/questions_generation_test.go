@@ -133,7 +133,7 @@ func TestQuestionPlanCapabilityAndCancellation(t *testing.T) {
 	_ = json.Unmarshal(raw, &args)
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
-	go func() { _, err := tool.Run(&tools.Context{Context: ctx, Args: args}); result <- err }()
+	go func() { _, err := executeToolText(tool, &tools.Context{Context: ctx, Args: args}); result <- err }()
 	deadline := time.After(time.Second)
 	for {
 		snapshot, _ := ag.Snapshot(context.Background())
@@ -178,7 +178,7 @@ func TestGenerationSettingsPersistResetAndFreeze(t *testing.T) {
 		t.Fatal("settings not published")
 	}
 	frozen := cloneConfig(ag.services.cfg)
-	req := ag.buildRequestFromConfig(frozen, "openai-test", "test", nil, false, nil)
+	req := ag.buildRequestFromConfig(frozen, ag.currentSandbox().Snapshot(), "openai-test", "test", nil, false, nil)
 	if req.ReasoningEffort != "max" || req.Verbosity != "low" {
 		t.Fatal("request lost settings")
 	}
@@ -197,7 +197,7 @@ func TestGenerationSettingsPersistResetAndFreeze(t *testing.T) {
 	if req.ReasoningEffort != "max" {
 		t.Fatal("prepared request mutated")
 	}
-	req = ag.buildRequestFromConfig(restored, "openai-test", "test", nil, false, nil)
+	req = ag.buildRequestFromConfig(restored, ag.currentSandbox().Snapshot(), "openai-test", "test", nil, false, nil)
 	body, _ := json.Marshal(req)
 	if req.ReasoningEffort != config.DefaultReasoningEffort {
 		t.Fatalf("reset effort = %q, want built-in default %q", req.ReasoningEffort, config.DefaultReasoningEffort)
@@ -206,7 +206,7 @@ func TestGenerationSettingsPersistResetAndFreeze(t *testing.T) {
 		t.Fatalf("verbosity must stay omitted when unset: %s", body)
 	}
 	restored.ReasoningEffort = "none"
-	req = ag.buildRequestFromConfig(restored, "deepseek-test", "test", []messages.Message{{Role: messages.RoleAssistant, Content: "ok", ReasoningContent: "reason"}}, false, nil)
+	req = ag.buildRequestFromConfig(restored, ag.currentSandbox().Snapshot(), "deepseek-test", "test", []messages.Message{{Role: messages.RoleAssistant, Content: "ok", ReasoningContent: "reason"}}, false, nil)
 	if req.Thinking == nil || req.Thinking.Type != "disabled" || req.ReasoningEffort != "" {
 		t.Fatal("DeepSeek none must disable thinking")
 	}

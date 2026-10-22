@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"ccdp/internal/codemode"
 	"ccdp/internal/jsonvalue"
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
+	"context"
 )
 
 // requestApproval blocks until the user answers the approval request. It is
@@ -20,12 +22,17 @@ func (a *Agent) requestApproval(tc messages.ToolCall, reason string) (bool, bool
 	return answer.approve, answer.remember
 }
 
-func (a *Agent) requestApprovalDetailed(tc messages.ToolCall, reason string, capabilities []protocol.CapabilityRequest) approvalAnswer {
+func (a *Agent) requestApprovalDetailed(tc messages.ToolCall, reason string, capabilities []protocol.CapabilityRequest, contexts ...context.Context) approvalAnswer {
 	if a.children.childState != nil && a.children.childState.nonInteractive {
 		return approvalAnswer{}
 	}
 	tc.Arguments = jsonvalue.Clone(tc.Arguments)
-	return a.awaitDecision(&decisionRequest{kind: decisionTool, ctx: a.decisionContext(), call: tc, reason: reason, capabilities: append([]protocol.CapabilityRequest(nil), capabilities...)}).approval
+	ctx := a.decisionContext()
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
+	}
+	defer codemode.Pause(ctx)()
+	return a.awaitDecision(&decisionRequest{kind: decisionTool, ctx: ctx, call: tc, reason: reason, capabilities: append([]protocol.CapabilityRequest(nil), capabilities...)}).approval
 }
 
 // inPlanMode reports whether plan mode is active (guarded).

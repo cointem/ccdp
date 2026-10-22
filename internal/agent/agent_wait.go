@@ -45,15 +45,17 @@ func (a *Agent) waitAgentEvent(ctx context.Context) (string, error) {
 			a.inbox.agentActivity = make(chan struct{})
 		}
 		changed := a.inbox.agentActivity
+		userHeadSeen := false
 		for _, input := range a.conversation.durable.PendingInputViews() {
 			if input.Strategy == protocol.InputMessage {
 				a.mu.Unlock()
 				return "collaboration", nil
 			}
-			if input.Strategy == protocol.InputSteer {
+			if !userHeadSeen && input.Strategy == protocol.InputSteer {
 				a.mu.Unlock()
 				return "user_input", nil
 			}
+			userHeadSeen = true
 		}
 		a.mu.Unlock()
 		if err := a.persistenceFailure(); err != nil {

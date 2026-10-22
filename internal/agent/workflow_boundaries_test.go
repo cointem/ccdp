@@ -98,7 +98,7 @@ func TestRegressionCodeRestoreRetryPreservesNewConversation(t *testing.T) {
 	id := deliveryID(t, out)
 	tc := a.services.resources.Context(ctx, root, a.services.sandbox)
 	tc.Args = map[string]any{"command": "sleep 30", "yield_ms": 0}
-	raw, err := tools.NewBashTool().Run(tc)
+	raw, err := executeToolText(tools.NewBashTool(), tc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestRegressionCodeRestoreRetryPreservesNewConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 	tc.Args = map[string]any{"action": "stop", "id": proc.ID}
-	if _, err = tools.NewProcessTool().Run(tc); err != nil {
+	if _, err = executeToolText(tools.NewProcessTool(), tc); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = runCoding(t, a, protocol.WorkflowCommand{Kind: protocol.WorkflowRestore, Action: "apply", ID: id}); err != nil {

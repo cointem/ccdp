@@ -74,10 +74,13 @@ func (a *Agent) saveReview(id string) error {
 					r.fact.Child.Run.Error = "审查失败；报告已保存，详见正文。"
 				}
 				r.err = nil
-				if err := a.services.supervisor.persist(r, "report-saved"); err != nil {
-					r.mu.Unlock()
+				reply := enqueueRunRecordLocked(r, "report-saved")
+				r.mu.Unlock()
+				if err := r.parent.waitChildRecord(reply); err != nil {
 					return err
 				}
+				a.services.supervisor.publishChildOutcome(r)
+				continue
 			}
 			r.mu.Unlock()
 		}

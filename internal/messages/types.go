@@ -21,9 +21,11 @@ const (
 
 // ToolCall is a request emitted by the model to invoke a tool.
 type ToolCall struct {
-	ID        string         `json:"id"`
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments"`
+	ParentCallID string         `json:"parent_call_id,omitempty"`
+	ChildIndex   int            `json:"child_index,omitempty"`
+	ID           string         `json:"id"`
+	Name         string         `json:"name"`
+	Arguments    map[string]any `json:"arguments"`
 }
 
 // ImageAttachment is an immutable snapshot of a local image referenced by a
@@ -46,8 +48,21 @@ type StreamSegment struct {
 	Bytes int    `json:"bytes"`
 }
 
+// OutputReference identifies immutable tool output in this session's artifacts.
+// It is not a filesystem path and is never sufficient to read another session.
+type OutputReference struct {
+	Hash      string `json:"hash"`
+	Size      int64  `json:"size"`
+	MediaType string `json:"media_type,omitempty"`
+}
+
 // Message is a single entry in the conversation history.
 type Message struct {
+	ToolStatus       string            `json:"tool_status,omitempty"`
+	OutputRef        *OutputReference  `json:"output_ref,omitempty"`
+	SourceOutputs    []OutputReference `json:"source_outputs,omitempty"`
+	DisplayTruncated bool              `json:"display_truncated,omitempty"`
+	DataError        string            `json:"data_error,omitempty"`
 	ToolUpdate       *ToolUpdate       `json:"tool_update,omitempty"`
 	ProviderOrigin   string            `json:"provider_origin,omitempty"`
 	ProviderWire     string            `json:"provider_wire,omitempty"`
@@ -76,13 +91,16 @@ type Message struct {
 
 // NewToolResult builds a tool result message from a tool call and its output.
 func NewToolResult(call ToolCall, content string, isErr bool) Message {
+	status := "success"
 	if isErr {
+		status = "error"
 		content = "Error: " + content
 	}
 	return Message{
 		Role:       RoleTool,
 		ToolCallID: call.ID,
 		Content:    content,
+		ToolStatus: status,
 		CreatedAt:  time.Now(),
 	}
 }

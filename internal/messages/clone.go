@@ -14,6 +14,11 @@ func Clone(src []Message) []Message {
 	dst := make([]Message, len(src))
 	for i, m := range src {
 		dst[i] = m
+		if m.OutputRef != nil {
+			ref := *m.OutputRef
+			dst[i].OutputRef = &ref
+		}
+		dst[i].SourceOutputs = append([]OutputReference(nil), m.SourceOutputs...)
 		dst[i].ToolUpdate = CloneToolUpdate(m.ToolUpdate)
 		dst[i].ProviderContent = CloneProviderBlocks(m.ProviderContent)
 		dst[i].StreamSegments = append([]StreamSegment(nil), m.StreamSegments...)

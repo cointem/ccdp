@@ -36,12 +36,18 @@ func TestOutputReaderReplacesPagesAndCanReturn(t *testing.T) {
 	defer m.Close()
 	m.readerSeq, m.readerRequest = 1, 1
 	first := strings.Repeat("a", readerPageSize)
-	m.showAgentOutput(agentOutputMsg{sessionID: m.sessionID, itemID: "tool", request: 1, page: protocol.OutputPage{Text: first, Next: readerPageSize, Total: 3 * readerPageSize, More: true}})
+	{
+		next, _ := m.Update(agentOutputMsg{sessionID: m.sessionID, itemID: "tool", request: 1, page: protocol.OutputPage{Text: first, Next: readerPageSize, Total: 3 * readerPageSize, More: true}})
+		m = modelValue(t, next)
+	}
 	if cmd := m.loadNextReaderPage(); cmd == nil {
 		t.Fatal("next page unavailable")
 	}
 	request := m.readerRequest
-	m.showAgentOutput(agentOutputMsg{sessionID: m.sessionID, itemID: "tool", request: request, offset: readerPageSize, page: protocol.OutputPage{Text: "SECOND", Next: 2 * readerPageSize, Total: 3 * readerPageSize, More: true}})
+	{
+		next, _ := m.Update(agentOutputMsg{sessionID: m.sessionID, itemID: "tool", request: request, offset: readerPageSize, page: protocol.OutputPage{Text: "SECOND", Next: 2 * readerPageSize, Total: 3 * readerPageSize, More: true}})
+		m = modelValue(t, next)
+	}
 	if m.reader.sourceText() != "SECOND" {
 		t.Fatal("reader accumulated previous pages instead of replacing its bounded page")
 	}
@@ -49,12 +55,18 @@ func TestOutputReaderReplacesPagesAndCanReturn(t *testing.T) {
 		t.Fatal("previous page unavailable")
 	}
 	request = m.readerRequest
-	m.showAgentOutput(agentOutputMsg{sessionID: m.sessionID, itemID: "tool", request: request, offset: 0, page: protocol.OutputPage{Text: first, Next: readerPageSize, Total: 3 * readerPageSize, More: true}})
+	{
+		next, _ := m.Update(agentOutputMsg{sessionID: m.sessionID, itemID: "tool", request: request, offset: 0, page: protocol.OutputPage{Text: first, Next: readerPageSize, Total: 3 * readerPageSize, More: true}})
+		m = modelValue(t, next)
+	}
 	if m.reader.sourceText() != first || len(m.reader.previousOffsets) != 0 {
 		t.Fatal("previous page did not restore its source and cursor")
 	}
 	m.closeReader()
-	m.showAgentOutput(agentOutputMsg{sessionID: m.sessionID, itemID: "tool", request: request, page: protocol.OutputPage{Text: "LATE"}})
+	{
+		next, _ := m.Update(agentOutputMsg{sessionID: m.sessionID, itemID: "tool", request: request, page: protocol.OutputPage{Text: "LATE"}})
+		m = modelValue(t, next)
+	}
 	if m.reader != nil {
 		t.Fatal("late output reopened dismissed reader")
 	}

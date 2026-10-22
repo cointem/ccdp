@@ -69,6 +69,7 @@ func (m *Model) handleWatchClosed(msg watchClosedMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleWatchUpdate(msg watchUpdateMsg) (tea.Model, tea.Cmd) {
+	var recovery tea.Cmd
 	if msg.generation != m.watchGeneration || msg.sessionID.String() != m.sessionID {
 		return m, nil
 	}
@@ -104,6 +105,7 @@ func (m *Model) handleWatchUpdate(msg watchUpdateMsg) (tea.Model, tea.Cmd) {
 		m.watchDisconnected = false
 		m.watchRetry = 0
 		m.applySnapshot(*u.Snapshot)
+		recovery = m.recoverOperationsCmd()
 	}
 	if u.Receipt != nil && u.Type == protocol.UpdateReceipt {
 		m.applyReceipt(*u.Receipt, "")
@@ -114,7 +116,7 @@ func (m *Model) handleWatchUpdate(msg watchUpdateMsg) (tea.Model, tea.Cmd) {
 	resetNativeHistory := m.nativeHistoryResetPending
 	m.nativeHistoryResetPending = false
 	m.renderVisibleTranscript()
-	cmds := []tea.Cmd{readWatchCmd(msg.sub, msg.sessionID, msg.generation), m.flushInline()}
+	cmds := []tea.Cmd{readWatchCmd(msg.sub, msg.sessionID, msg.generation), m.flushInline(), recovery}
 	if resetNativeHistory {
 		// The erase sequence is written before the renderer repaints, so the
 		// discarded conversation cannot reappear in a later frame.

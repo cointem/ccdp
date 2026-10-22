@@ -13,10 +13,6 @@ func openSessionPersistence(cfg *config.Config, sessionID string, createdAt time
 	return openSessionPersistenceMode(cfg, sessionID, createdAt, "agent", false)
 }
 
-func openSessionPersistenceSource(cfg *config.Config, sessionID string, createdAt time.Time, source string) (*sessionPersistence, error) {
-	return openSessionPersistenceMode(cfg, sessionID, createdAt, source, false)
-}
-
 func openSessionPersistenceMode(cfg *config.Config, sessionID string, createdAt time.Time, source string, rejectExisting bool) (*sessionPersistence, error) {
 	return openSessionPersistenceModeWithParent(cfg, sessionID, createdAt, source, rejectExisting, "")
 }
@@ -25,7 +21,7 @@ func openSessionPersistenceModeWithParent(cfg *config.Config, sessionID string, 
 	if cfg == nil {
 		return nil, errors.New("agent: nil config")
 	}
-	opts := journal.OpenOptions{SessionID: sessionID, SessionDir: cfg.SessionDir, CreatedAt: createdAt, Source: source, ParentID: parentID, Workspace: cfg.Workspace, Model: cfg.Model, NoSessionPersistence: cfg.NoSessionPersistence, RejectExisting: rejectExisting}
+	opts := journal.OpenOptions{SessionID: sessionID, SessionDir: cfg.SessionDir, CreatedAt: createdAt, Source: source, ParentID: parentID, Workspace: cfg.Workspace, Model: cfg.Model, NoSessionPersistence: cfg.NoSessionPersistence, RejectExisting: rejectExisting, ProjectMemoryEnabled: cfg.EnableProjectMemory, MemoryReadOnly: cfg.MemoryReadOnly, MemoryHistory: cfg.MemoryHistory}
 	if len(backend) > 0 {
 		opts.Backend = backend[0]
 	}

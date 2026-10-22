@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"ccdp/internal/config"
-	"ccdp/internal/fsops"
 	"ccdp/internal/hooks"
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
@@ -122,7 +121,11 @@ func TestDispatchToolsInterruptedFillsEveryResult(t *testing.T) {
 	ag.turn.interruptFlag = true
 	ag.mu.Unlock()
 
-	results := ag.dispatchTools(calls)
+	step := testToolStep(t, ag)
+	results, err := ag.dispatchToolsForContext(calls, toolJournalContextForStep(step))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(results) != len(calls) {
 		t.Fatalf("expected %d results, got %d", len(calls), len(results))
 	}
@@ -449,52 +452,6 @@ func TestForkBranchesSession(t *testing.T) {
 	}
 	if len(after.History) != oldCount {
 		t.Fatalf("source session mutated by fork: %d → %d", oldCount, len(after.History))
-	}
-}
-
-// TestPostCompactFileAttachments pins the post-compaction file restore: files
-// read earlier are re-attached to the summary, files still referenced by the
-// kept tail are skipped, and missing files are dropped.
-func TestPostCompactFileAttachments(t *testing.T) {
-	ag := newRuntimeAgent(t)
-	dir := t.TempDir()
-	old := strings.Repeat("old file content\n", 10)
-	fresh := "fresh file content"
-	if err := os.WriteFile(dir+"/old.go", []byte(old), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dir+"/fresh.go", []byte(fresh), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{dir + "/old.go", dir + "/fresh.go"} {
-		v, err := fsops.Observe(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ag.services.resources.Files.MarkVersion(path, v)
-	}
-
-	// fresh.go is still referenced by the kept tail → skipped; old.go attached.
-	tail := []messages.Message{{
-		Role: messages.RoleAssistant,
-		ToolCalls: []messages.ToolCall{{
-			ID: "c1", Name: "Read", Arguments: map[string]any{"file_path": dir + "/fresh.go"},
-		}},
-	}}
-	out := ag.postCompactFileAttachments(tail)
-	if !strings.Contains(out, "old file content") {
-		t.Fatalf("old.go content missing from attachments:\n%s", out)
-	}
-	if strings.Contains(out, "fresh file content") {
-		t.Fatal("kept-tail file should not be re-attached")
-	}
-
-	// A file that disappeared is dropped silently.
-	if err := os.Remove(dir + "/old.go"); err != nil {
-		t.Fatal(err)
-	}
-	if out := ag.postCompactFileAttachments(nil); strings.Contains(out, "old file content") {
-		t.Fatal("deleted file should not be attached")
 	}
 }
 

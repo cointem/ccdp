@@ -170,7 +170,7 @@ func (a *Agent) settingsPreparationPending() bool {
 }
 func settingsMutationCommand(kind protocol.CommandType) bool {
 	switch kind {
-	case protocol.CommandSetModel, protocol.CommandSetGeneration, protocol.CommandSetExecutionMode, protocol.CommandSetPermissionPolicy, protocol.CommandSetSandboxPolicy, protocol.CommandRevokeCapabilities, protocol.CommandReloadSettings, protocol.CommandSetWorkspace, protocol.CommandTrustProject:
+	case protocol.CommandSetModel, protocol.CommandSetGeneration, protocol.CommandSetExecutionMode, protocol.CommandSetPermissionPolicy, protocol.CommandSetSandboxPolicy, protocol.CommandRevokeCapabilities, protocol.CommandReloadSettings, protocol.CommandSetWorkspace, protocol.CommandTrustProject, protocol.CommandProjectMemory:
 		return true
 	default:
 		return false

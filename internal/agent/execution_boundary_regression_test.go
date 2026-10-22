@@ -45,7 +45,9 @@ func TestReviewExplorerAdmitsItsAllowedWebTool(t *testing.T) {
 	}
 	t.Cleanup(a.Close)
 	tc := messages.ToolCall{ID: "web", Name: "WebFetch", Arguments: map[string]any{"url": "https://example.com"}}
-	_, reason, _, denied := a.hardAdmitTool(tc, toolJournalContext{}, nil)
+	lease := a.services.registry.Acquire()
+	defer lease.Close()
+	_, reason, _, denied := a.hardAdmitTool(tc, toolJournalContext{toolLease: lease})
 	if denied {
 		t.Fatalf("explorer WebFetch blocked despite explicit allowed set: %s", reason)
 	}
@@ -77,7 +79,7 @@ func TestReviewCancellationDuringGuardianHasNoWrite(t *testing.T) {
 	a.mu.Unlock()
 	p.cancel = a.interrupt
 	path := filepath.Join(cfg.Workspace, "after-cancel.txt")
-	out, failed := a.executeTool(messages.ToolCall{ID: "write", Name: "Write", Arguments: map[string]any{"file_path": path, "content": "after cancellation"}})
+	out, failed := executeTestTool(t, a, messages.ToolCall{ID: "write", Name: "Write", Arguments: map[string]any{"file_path": path, "content": "after cancellation"}})
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("guardian cancellation still wrote file: failed=%v output=%s stat=%v", failed, out, err)
 	}

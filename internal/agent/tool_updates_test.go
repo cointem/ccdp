@@ -18,7 +18,11 @@ func (t *catalogRuntimeTool) Description() string { return t.description }
 func (t *catalogRuntimeTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{}}
 }
-func (t *catalogRuntimeTool) Run(*tools.Context) (string, error) { return t.description, nil }
+func (t *catalogRuntimeTool) Execute(ctx *tools.Context, args map[string]any) (tools.Result, error) {
+	ctx = ctx.WithArgs(args)
+	text, err := func() (string, error) { return t.description, nil }()
+	return tools.Result{Text: text}, err
+}
 
 func TestStepToolUpdatesPersistAndFreeze(t *testing.T) {
 	a := newRuntimeAgent(t)

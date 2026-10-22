@@ -58,21 +58,6 @@ func (a *Agent) commitAuxiliary(transactionID string, fact session.Event) (sessi
 	}
 }
 
-type memoryClearRequested struct{ result chan error }
-
-func (memoryClearRequested) ownerControlMessage() {}
-func (a *Agent) clearMemoryOwned() error {
-	p := a.persistenceHandle()
-	if p == nil {
-		return session.ErrClosed
-	}
-	if err := p.PersistMemory("", true); err != nil {
-		a.markPersistenceFailure(err)
-		return err
-	}
-	return nil
-}
-
 type directoryAccessRequested struct {
 	dir    string
 	denied bool
@@ -90,6 +75,9 @@ func (a *Agent) setDirectoryAccessOwned(r directoryAccessRequested) {
 		}
 	}
 	a.mu.Unlock()
+	if a.services.hooks != nil {
+		a.syncHookContext()
+	}
 	if r.denied {
 		a.emitStatus("disallowed directory: %s", r.dir)
 	} else {

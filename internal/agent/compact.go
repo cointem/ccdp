@@ -83,86 +83,143 @@ func (a *Agent) compactFailureKeyLocked() string {
 }
 
 func (a *Agent) compactContextMode(ctx context.Context, manual bool) error {
+	step, req, err := a.snapshotContextRequest()
+	if err != nil {
+		return err
+	}
+	// Attachments can be the reason for compaction. Validate the retained
+	// candidate before commit; the oversized source cannot pass that guard.
+	_, err = a.reduceContext(ctx, manual, &req, false, step)
+	return err
+}
+
+// reduceContext prepares a replacement off to the side and commits once.
+// Neither a failed summary nor a stale source can discard the current history.
+func (a *Agent) reduceContext(ctx context.Context, manual bool, req *llm.CompletionRequest, force bool, frozen ...stepRuntime) (changed bool, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	a.mu.Lock()
 	key := a.compactFailureKeyLocked()
 	paused := !manual && a.lifecycle.compactFailure != nil && a.lifecycle.compactFailure.key == key
+	history := messages.Clone(a.historyLocked())
+	source := historySource(history)
+	keep := max(4, a.services.cfg.KeepAfterCompact)
+	window, provider := a.contextWindowLocked(), a.modelsState.activeBinding.client
+	budget := window / 3
+	outputCap := 0
+	step := stepRuntime{cfg: cloneConfig(a.services.cfg), binding: a.modelsState.activeBinding, history: history,
+		policy: a.services.sandbox.Snapshot()}
+	if len(frozen) > 0 {
+		step = frozen[0]
+		window, provider = contextWindowForStep(step), step.binding.client
+		budget = window / 3
+		keep = max(4, step.cfg.KeepAfterCompact)
+	}
 	a.mu.Unlock()
-	if paused {
-		return nil
+	if len(frozen) > 0 && historySource(step.history) != source {
+		return false, fmt.Errorf("conversation changed before context preparation")
+	}
+	if paused && !force {
+		return false, nil
+	}
+	defer func() {
+		if err != nil {
+			if !manual && ctx.Err() == nil {
+				a.rememberCompactFailure(key, err)
+			}
+			a.emitStatus("compaction kept existing history: %v", err)
+		}
+	}()
+	if req != nil {
+		requestBudget := frozenRequestBudget(provider, *req, window)
+		fixed := requestBudget.SystemTokens + requestBudget.SchemaTokens + requestBudget.ReservedOutputTokens
+		if window > 0 && fixed >= window {
+			return false, &llm.AdmissionError{Cause: llm.ErrContextWindowExceeded, Budget: requestBudget, Limit: window,
+				Detail: "system instructions, tool schemas and reserved output fill the context window; shortening history cannot make this request fit"}
+		}
+		// Leave room for the same instructions, schemas and generation limit
+		// when choosing both the recent tail and the summary's output cap.
+		available := max(1, window-fixed)
+		outputCap = min(4096, max(1, available/2))
+		budget = min(budget, max(1, available-outputCap-256))
 	}
 	if ho := a.runHookWithJournal(ctx, hooks.EventPreCompact, func(hctx context.Context) hooks.Output {
 		return a.services.hooks.PreCompact(hctx)
 	}); ho.Decision == hooks.DecisionBlock || ho.Decision == hooks.DecisionDeny || ho.Continue != nil && !*ho.Continue {
-		return fmt.Errorf("compaction blocked by hook: %s", ho.Reason)
+		return false, fmt.Errorf("compaction blocked by hook: %s", ho.Reason)
 	}
-	head, span, tail, lastTs, keep, ok, source := a.compactSpans()
-	if !ok {
-		return nil
+	candidate, pruned := a.pruneToolOutputs(ctx, history, keep)
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
-	summary, err := a.summarize(ctx, span)
-	if err == nil {
-		err = a.commitCompaction(ctx, head, summary, tail, lastTs, keep, source)
-	}
-	if err != nil {
-		if !manual && ctx.Err() == nil {
-			a.rememberCompactFailure(key, err)
+	// Cleaning is sufficient when the complete frozen request now fits its
+	// target. Manual /compact still asks for a summary of earlier work.
+	check := func(history []messages.Message) error {
+		if req == nil {
+			return nil
 		}
-		a.emitStatus("compaction kept existing history: %v", err)
+		return a.checkContextCandidate(history, *req, step, window)
 	}
-	return err
+	if !manual && req != nil && pruned && a.cleanedRequestFits(*req, history, candidate, force, step) {
+		if err := check(candidate); err != nil {
+			return false, err
+		}
+		if err := a.replaceHistoryFromWorker(historyReplacementPrepared{ctx: ctx, history: candidate, source: source, compact: true}); err != nil {
+			return false, err
+		}
+		a.emit(Event{Type: EventCompacted})
+		a.emitStatus("older tool outputs shortened; original output remains available with ReadOutput")
+		a.runHookWithJournal(ctx, hooks.EventPostCompact, func(hctx context.Context) hooks.Output { return a.services.hooks.PostCompact(hctx) })
+		return true, nil
+	}
+	head, span, tail, lastTs, ok := compactHistorySpans(candidate, keep, budget)
+	if !ok {
+		return false, nil
+	}
+	summary, err := a.summarizeWithLimit(ctx, span, outputCap)
+	if err == nil {
+		err = a.commitCompactionWithOutputs(ctx, head, summary, tail, lastTs, keep, source, collectOutputReferences(span), check)
+	}
+	return err == nil, err
 }
 
-// compactSpans snapshots the history spans needed by a compaction under one
-// lock: the leading system facts (head), the region to summarize
-// (toSummarize), and complete recent tool groups kept verbatim (keptTail). ok is
-// false when the history is already small enough that no compaction is needed.
-func (a *Agent) compactSpans() (head, toSummarize, keptTail []messages.Message, lastTs time.Time, keep int, ok bool, source string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	source = historySource(a.historyLocked())
-	keep = a.services.cfg.KeepAfterCompact
-	if keep < 4 {
-		keep = 4
+func compactHistorySpans(history []messages.Message, keep, budget int) (head, toSummarize, keptTail []messages.Message, lastTs time.Time, ok bool) {
+	if len(history) <= 1+keep && estimateHistoryTokens(history) <= budget && historyAttachmentBytes(history) <= maxAttachmentBytes {
+		return nil, nil, nil, time.Time{}, false
 	}
-	budget := a.contextWindowLocked() / 3
-	if len(a.historyLocked()) <= 1+keep && estimateHistoryTokens(a.historyLocked()) <= budget && historyAttachmentBytes(a.historyLocked()) <= maxAttachmentBytes {
-		return nil, nil, nil, time.Time{}, keep, false, source
-	}
-	cut := compactCut(a.historyLocked(), keep, budget)
+	cut := compactCut(history, keep, budget)
 	// The request has a separate raw-attachment budget. Move complete older
 	// groups into the summary even when their text fits in the context window.
-	if historyAttachmentBytes(a.historyLocked()[cut:]) > maxAttachmentBytes {
-		cut = compactAttachmentCut(a.historyLocked(), cut, maxAttachmentBytes)
+	if historyAttachmentBytes(history[cut:]) > maxAttachmentBytes {
+		cut = compactAttachmentCut(history, cut, maxAttachmentBytes)
 	}
 	if cut <= 0 {
-		return nil, nil, nil, time.Time{}, keep, false, source
+		return nil, nil, nil, time.Time{}, false
 	}
 	// History does not contain the wire system prompt. Preserve only any
 	// explicit leading system facts; pinning history[0] would permanently keep
 	// the first user message and make compaction ineffective for short sessions.
 	headLen := 0
-	for headLen < cut && a.historyLocked()[headLen].Role == messages.RoleSystem {
+	for headLen < cut && history[headLen].Role == messages.RoleSystem {
 		headLen++
 	}
-	head = messages.Clone(a.historyLocked()[:headLen])
-	toSummarize = messages.Clone(a.historyLocked()[headLen:cut])
-	keptTail = messages.Clone(a.historyLocked()[cut:])
+	head = messages.Clone(history[:headLen])
+	toSummarize = messages.Clone(history[headLen:cut])
+	keptTail = messages.Clone(history[cut:])
 	// Preserve the latest real user input verbatim even if a long current turn
 	// moved its completed tool groups into the summary.
-	for i := len(a.historyLocked()) - 1; i >= headLen; i-- {
-		if a.historyLocked()[i].Role != messages.RoleUser || strings.HasPrefix(a.historyLocked()[i].Content, summaryPrefix) {
+	for i := len(history) - 1; i >= headLen; i-- {
+		if history[i].Role != messages.RoleUser || strings.HasPrefix(history[i].Content, summaryPrefix) {
 			continue
 		}
 		if i < cut {
-			keptTail = append(messages.Clone(a.historyLocked()[i:i+1]), keptTail...)
+			keptTail = append(messages.Clone(history[i:i+1]), keptTail...)
 		}
 		break
 	}
-	lastTs = a.historyLocked()[cut-1].CreatedAt
-	return head, toSummarize, keptTail, lastTs, keep, true, source
+	lastTs = history[cut-1].CreatedAt
+	return head, toSummarize, keptTail, lastTs, len(toSummarize) > 0
 }
 
 // commitCompaction rebuilds history as the leading facts plus a summary user
@@ -170,6 +227,10 @@ func (a *Agent) compactSpans() (head, toSummarize, keptTail []messages.Message, 
 // overwrite it), resets the token baseline, and publishes the compacted events
 // and post-compact hook.
 func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, summary string, keptTail []messages.Message, lastTs time.Time, keep int, source string) error {
+	return a.commitCompactionWithOutputs(hctx, head, summary, keptTail, lastTs, keep, source, nil, nil)
+}
+
+func (a *Agent) commitCompactionWithOutputs(hctx context.Context, head []messages.Message, summary string, keptTail []messages.Message, lastTs time.Time, keep int, source string, outputs []messages.OutputReference, check func([]messages.Message) error) error {
 	a.mu.Lock()
 	originalTokens := estimateHistoryTokens(a.historyLocked())
 	originalAttachments := historyAttachmentBytes(a.historyLocked())
@@ -178,14 +239,6 @@ func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, 
 	// restore: discovered tools, active todos, recently touched files).
 	if restore := a.restoreContextSnippet(keptTail); restore != "" {
 		summary += "\n\n" + restore
-	}
-	// Re-attach the content of recently read files (Claude Code's
-	// post-compaction file attachments) so the model keeps its working set
-	// without having to re-Read everything.
-	if att := a.postCompactFileAttachments(keptTail); att != "" {
-		if estimateHistoryTokens(head)+estimateHistoryTokens(keptTail)+llm.EstimateTokens(summary+att) < originalTokens {
-			summary += "\n\n" + att
-		}
 	}
 
 	// Commit the replacement under the lock. The summary is injected as a user
@@ -196,9 +249,9 @@ func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, 
 	newHistory = append(newHistory, head...)
 	newHistory = append(newHistory, messages.Message{
 		Role: messages.RoleUser,
-		Content: summaryPrefix + "\n<ccdp-context-summary>\nThis is a structured summary of the earlier conversation; treat it as accurate context.\n\n" +
+		Content: summaryPrefix + "\n<ccdp-context-summary>\nThis is a summary of earlier conversation. Verify uncertain details against original outputs when necessary.\n\n" +
 			summary + "\n</ccdp-context-summary>" + a.traceEscapeHatch(),
-		CreatedAt: lastTs,
+		CreatedAt: lastTs, SourceOutputs: outputs,
 	})
 	newHistory = append(newHistory, keptTail...)
 	if err := hctx.Err(); err != nil {
@@ -206,6 +259,11 @@ func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, 
 	}
 	if estimateHistoryTokens(newHistory) >= originalTokens && historyAttachmentBytes(newHistory) >= originalAttachments {
 		return fmt.Errorf("compaction did not reduce context; existing history kept")
+	}
+	if check != nil {
+		if err := check(newHistory); err != nil {
+			return err
+		}
 	}
 	// A compaction summary is confirmed by the store before it becomes visible
 	// in memory or through the event stream. This also serializes the rewrite
