@@ -5,6 +5,7 @@ import (
 
 	"ccdp/internal/jsonvalue"
 	"ccdp/internal/messages"
+	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 	"ccdp/internal/tooling"
 	"ccdp/internal/tools"
@@ -26,21 +27,19 @@ func (a *Agent) admitToolStart(tc messages.ToolCall, tool tools.Tool, execution 
 	tc.Arguments = jsonvalue.Clone(tc.Arguments)
 	request := toolStartRequested{call: tc, tool: tool, journal: execution.ctx, started: execution.started, result: make(chan error, 1)}
 	var err error
-	if a.owner == nil {
-		err = a.acceptToolStart(request)
-	} else {
-		a.ensureRun()
-		select {
-		case a.owner.control <- request:
-		case <-a.owner.done:
-			return session.ErrClosed
-		}
-		select {
-		case err = <-request.result:
-		case <-a.owner.done:
-			return session.ErrClosed
-		}
+
+	a.ensureRun()
+	select {
+	case a.owner.control <- request:
+	case <-a.owner.done:
+		return session.ErrClosed
 	}
+	select {
+	case err = <-request.result:
+	case <-a.owner.done:
+		return session.ErrClosed
+	}
+
 	if err == nil {
 		execution.started = true
 	}
@@ -67,9 +66,7 @@ func (toolCompleted) ownerControlMessage() {}
 
 func (a *Agent) settleToolResult(fact session.ToolFinished) error {
 	request := toolCompleted{fact: fact, result: make(chan error, 1)}
-	if a.owner == nil {
-		return a.commitToolResult(request)
-	}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- request:
@@ -105,14 +102,14 @@ func (a *Agent) commitToolResult(request toolCompleted) error {
 type toolProjectionRequested struct {
 	journal toolJournalContext
 	calls   []messages.ToolCall
-	results []toolRunResult
+	results []tooling.Result
 	result  chan toolProjectionResult
 }
 
 func (toolProjectionRequested) ownerControlMessage() {}
 
 type toolProjectionResult struct {
-	results []toolRunResult
+	results []tooling.Result
 	budget  session.Budget
 	err     error
 }
@@ -125,11 +122,58 @@ func (a *Agent) projectToolsOwned(request toolProjectionRequested) toolProjectio
 	if request.journal.config != nil {
 		perResultLimit = request.journal.config.MaxResultSizeBytes
 	}
-	raw := make([]tooling.Result, len(request.results))
-	for i, r := range request.results {
-		raw[i] = tooling.Result{Output: r.output, Code: r.code, IsError: r.isErr, Status: r.status, DisplayTruncated: r.displayTruncated, DataError: r.dataError, OutputID: r.outputID}
+	raw := request.results
+	a.mu.Lock()
+	claimed := map[string]bool{}
+	cancelled := a.turn.interruptFlag || a.turn.turnCtx != nil && a.turn.turnCtx.Err() != nil || request.journal.context != nil && request.journal.context.Err() != nil
+	for i := range raw {
+		r := &raw[i]
+		if r.Process != nil {
+			if p, ok := a.conversation.durable.Processes[r.Process.ID]; ok && p.State.Released {
+				r.Process = protocol.CloneProcessOutput(r.Process)
+				r.Process.Log = ""
+				if !r.Process.Terminal() {
+					ref := p.State.ProcessOutput.Reference()
+					r.Process = &ref
+				}
+			}
+		}
+		if r.Process != nil && len(r.CompletionIDs) > 0 {
+			if p, ok := a.conversation.durable.Processes[r.Process.ID]; ok && (p.Projected || claimed[r.Process.ID] || cancelled) {
+				ref := r.Process.Reference()
+				r.Process = &ref
+				r.CompletionIDs = nil
+			}
+		}
+		if r.Process != nil && len(r.CompletionIDs) > 0 {
+			claimed[r.Process.ID] = true
+		}
+		if r.Code != nil {
+			code := *r.Code
+			code.Completed = append([]protocol.ProcessOutput(nil), code.Completed...)
+			r.Code = &code
+			kept := make([]string, 0, len(code.Processes))
+			for _, id := range code.Processes {
+				if p, ok := a.conversation.durable.Processes[id]; !ok || !p.State.Released {
+					kept = append(kept, id)
+				}
+			}
+			r.Code.Processes = kept
+			for i := range r.Code.Completed {
+				id := r.Code.Completed[i].ID
+				if p, ok := a.conversation.durable.Processes[id]; ok && p.State.Released {
+					r.Code.Completed[i].Log = ""
+				}
+				claimed[id] = true
+			}
+			if cancelled {
+				r.Code.Outputs = nil
+				r.CompletionIDs = nil
+			}
+		}
 	}
-	projected, budget, err := tooling.ApplyOutputBudget(request.calls, raw, perResultLimit, int64(request.journal.maxOutputBytes), int64(used))
+	a.mu.Unlock()
+	results, budget, err := tooling.ApplyOutputBudget(request.calls, raw, perResultLimit, int64(request.journal.maxOutputBytes), int64(used))
 	if err != nil {
 		// The turn stops before another model request. Reuse the recovery
 		// view for completed, unprojected calls so the next explicit input
@@ -141,10 +185,6 @@ func (a *Agent) projectToolsOwned(request toolProjectionRequested) toolProjectio
 		a.mu.Unlock()
 		return toolProjectionResult{err: err}
 	}
-	results := make([]toolRunResult, len(projected))
-	for i, result := range projected {
-		results[i] = toolRunResult{output: result.Output, code: result.Code, isErr: result.IsError, status: result.Status, displayTruncated: result.DisplayTruncated, dataError: result.DataError, outputID: result.OutputID}
-	}
 	if err := a.persistToolResultsProjected(request.journal, request.calls, results, budget); err != nil {
 		return toolProjectionResult{results: results, budget: budget, err: err}
 	}
@@ -154,12 +194,10 @@ func (a *Agent) projectToolsOwned(request toolProjectionRequested) toolProjectio
 	return toolProjectionResult{results: results, budget: budget}
 }
 
-func (a *Agent) projectToolsFromWorker(journal toolJournalContext, calls []messages.ToolCall, results []toolRunResult) toolProjectionResult {
+func (a *Agent) projectToolsFromWorker(journal toolJournalContext, calls []messages.ToolCall, results []tooling.Result) toolProjectionResult {
 	frozenCalls := messages.Clone([]messages.Message{{ToolCalls: calls}})[0].ToolCalls
-	request := toolProjectionRequested{journal: journal, calls: frozenCalls, results: append([]toolRunResult(nil), results...), result: make(chan toolProjectionResult, 1)}
-	if a.owner == nil {
-		return a.projectToolsOwned(request)
-	}
+	request := toolProjectionRequested{journal: journal, calls: frozenCalls, results: append([]tooling.Result(nil), results...), result: make(chan toolProjectionResult, 1)}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- request:

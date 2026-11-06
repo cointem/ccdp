@@ -156,6 +156,7 @@ func (a ApprovalResolution) validate() error {
 }
 
 type ToolStarted struct {
+	ProcessID    string `json:"process_id,omitempty"`
 	ParentCallID string `json:"parent_call_id,omitempty"`
 	ChildIndex   int    `json:"child_index,omitempty"`
 	ResultTarget string `json:"result_target,omitempty"`
@@ -170,23 +171,27 @@ type ToolStarted struct {
 }
 
 type ToolFinished struct {
-	DisplayTruncated bool       `json:"display_truncated,omitempty"`
-	DataError        string     `json:"data_error,omitempty"`
-	Call             *ToolCall  `json:"call,omitempty"`
-	ParentCallID     string     `json:"parent_call_id,omitempty"`
-	ChildIndex       int        `json:"child_index,omitempty"`
-	ResultTarget     string     `json:"result_target,omitempty"`
-	Data             *BlobRef   `json:"data,omitempty"`
-	DataTruncated    bool       `json:"data_truncated,omitempty"`
-	TurnID           string     `json:"turn_id"`
-	StepID           string     `json:"step_id,omitempty"`
-	CallID           string     `json:"call_id"`
-	EffectID         string     `json:"effect_id,omitempty"`
-	Status           string     `json:"status"`
-	Error            string     `json:"error,omitempty"`
-	SideEffect       string     `json:"side_effect,omitempty"`
-	RawOutput        *BlobRef   `json:"raw_output,omitempty"`
-	Result           ToolResult `json:"result"`
+	Image            *BlobRef                `json:"image,omitempty"`
+	Process          *protocol.ProcessOutput `json:"process,omitempty"`
+	CompletionIDs    []string                `json:"completion_ids,omitempty"`
+	Failure          *protocol.ToolFailure   `json:"failure,omitempty"`
+	DisplayTruncated bool                    `json:"display_truncated,omitempty"`
+	DataError        string                  `json:"data_error,omitempty"`
+	Call             *ToolCall               `json:"call,omitempty"`
+	ParentCallID     string                  `json:"parent_call_id,omitempty"`
+	ChildIndex       int                     `json:"child_index,omitempty"`
+	ResultTarget     string                  `json:"result_target,omitempty"`
+	Data             *BlobRef                `json:"data,omitempty"`
+	DataTruncated    bool                    `json:"data_truncated,omitempty"`
+	TurnID           string                  `json:"turn_id"`
+	StepID           string                  `json:"step_id,omitempty"`
+	CallID           string                  `json:"call_id"`
+	EffectID         string                  `json:"effect_id,omitempty"`
+	Status           string                  `json:"status"`
+	Error            string                  `json:"error,omitempty"`
+	SideEffect       string                  `json:"side_effect,omitempty"`
+	RawOutput        *BlobRef                `json:"raw_output,omitempty"`
+	Result           ToolResult              `json:"result"`
 }
 
 type ToolResultsProjected struct {
@@ -273,6 +278,14 @@ func (e ToolStarted) validate() error {
 }
 
 func (e ToolFinished) validate() error {
+	if e.Image != nil {
+		if err := e.Image.validate(); err != nil {
+			return err
+		}
+		if e.Image.MediaType != "image/jpeg" && e.Image.MediaType != "image/png" {
+			return errors.New("tool image must be JPEG or PNG")
+		}
+	}
 	if e.Call != nil {
 		if err := e.Call.validate(); err != nil {
 			return err

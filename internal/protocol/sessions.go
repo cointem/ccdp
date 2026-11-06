@@ -40,7 +40,6 @@ type ChildSession struct {
 	Capabilities     AgentCapabilities `json:"capabilities"`
 	Approval         *ApprovalView     `json:"approval,omitempty"`
 	Question         *QuestionRequest  `json:"question,omitempty"`
-	Plan             *PlanView         `json:"plan,omitempty"`
 	DeliveryPending  bool              `json:"delivery_pending,omitempty"`
 }
 
@@ -59,7 +58,7 @@ type RunView struct {
 
 func (r RunView) Active() bool {
 	switch r.Status {
-	case "queued", "starting", "running", "waiting_approval", "waiting_question", "waiting_plan", "stopping", "settling":
+	case "queued", "starting", "running", "waiting_approval", "waiting_question", "stopping", "settling":
 		return true
 	}
 	return false
@@ -67,6 +66,7 @@ func (r RunView) Active() bool {
 
 // Item identity is session-local and stable across deltas and final commit.
 type TranscriptItem struct {
+	Process      *ProcessState   `json:"process,omitempty"`
 	ParentCallID CallID          `json:"parent_call_id,omitempty"`
 	ChildIndex   int             `json:"child_index,omitempty"`
 	ID           string          `json:"id"`

@@ -26,9 +26,6 @@ func messageView(m messages.Message) protocol.MessageView {
 }
 
 func (a *Agent) refreshSnapshotLocked() {
-	if a.owner == nil {
-		return
-	}
 	cache := &a.snapshotProjection
 	var first *messages.Message
 	if len(a.historyLocked()) > 0 {

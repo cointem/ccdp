@@ -81,6 +81,7 @@ type Message struct {
 	ProviderWire     string                   `json:"provider_wire,omitempty"`
 	ProviderContent  []json.RawMessage        `json:"provider_content,omitempty"`
 	InternalSource   string                   `json:"internal_source,omitempty"`
+	ContextKey       string                   `json:"context_key,omitempty"`
 	StreamSegments   []messages.StreamSegment `json:"stream_segments,omitempty"`
 	ReasoningContent string                   `json:"reasoning_content,omitempty"`
 	MessageID        string                   `json:"message_id"`

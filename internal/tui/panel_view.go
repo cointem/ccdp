@@ -118,10 +118,6 @@ func (m *Model) pickerOptionCurrent(index int) bool {
 		}
 	case selectorAgent:
 		current = m.sessionID
-	case selectorPlan:
-		if m.planMode {
-			current = option.ID
-		}
 	}
 	return current != "" && option.ID == current
 }
@@ -164,10 +160,8 @@ func (m *Model) renderApprovalInline() string {
 	if maxOffset > 0 {
 		rows = append(rows, styleHints.Render(fmt.Sprintf("PgUp/PgDn · %d–%d/%d", offset+1, end, len(details))))
 	}
-	if tool == "Plan" {
-		rows = append(rows, renderApprovalChoices([]string{"Approve plan", "Decline plan"}, m.selectedApprovalChoice())...)
-	} else if len(m.approval.Capabilities) > 0 {
-		rows = append(rows, renderApprovalChoices([]string{"Allow this call", "Allow for session", "Deny"}, m.selectedApprovalChoice())...)
+	if len(m.approval.Capabilities) > 0 {
+		rows = append(rows, renderApprovalChoices([]string{"Allow this call", "Allow for session + tasks", "Deny"}, m.selectedApprovalChoice())...)
 	} else {
 		rows = append(rows, renderApprovalChoices([]string{"Allow once", "Always allow", "Deny"}, m.selectedApprovalChoice())...)
 	}
@@ -324,7 +318,7 @@ func (m *Model) approvalVisibleRows() int {
 	// state first. Remaining rows belong to the actual command, not a hidden
 	// composer. Leave two transcript rows when there is room.
 	reserved := presentationHeight(m.headerPresentation(), m.width) +
-		presentationHeight(m.renderPersistentStatus(), width) + approvalChoiceCount(m.approval) +
+		presentationHeight(m.renderPersistentStatus(), width) + approvalChoiceCount +
 		presentationHeight("↑↓ choose · enter confirm · esc later", width) + 2
 	if m.approvalPending {
 		reserved++

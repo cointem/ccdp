@@ -192,7 +192,7 @@ func protocolSnapshot(session string, history ...protocol.MessageView) protocol.
 		Revision:  protocol.Revision{LogSeq: uint64(len(history))},
 		Settings: protocol.SettingsSnapshot{
 			Model:      protocol.ModelBinding{Model: "test-model"},
-			Permission: protocol.PermissionPolicy{Mode: "default"},
+			Permission: protocol.PermissionPolicy{Mode: "manual"},
 			Sandbox:    protocol.SandboxPolicy{},
 		},
 		History:    history,

@@ -21,32 +21,24 @@ import (
 	"ccdp/internal/tools"
 )
 
-// These named state values make ownership explicit at call sites. Session
-// transitions run in sessionOwner; construction owns unpublished initialization.
-// Agent.mu guards read views and bounded producer inboxes during publication.
-// The state values do not introduce their own mutexes or background workers.
-//
-// planState groups plan-mode bookkeeping (Claude Code's /plan). Guarded by mu.
-type planState struct {
-	planMode     bool
-	pendingPlan  *PlanRequest
-	planResp     chan bool
-	planBaseMode permissions.Mode
-}
-
 // approvalState groups per-turn approval bookkeeping. Guarded by mu.
 type approvalState struct {
-	approvalCache map[string]bool
+	denialTurn        uint64
+	denialKey         string
+	denialRounds      int
+	approvalCache     map[string]bool
+	resourceDecisions map[string]approvalAnswer
 	// Pending approval (guarded by mu).
 	pendingQuestion   *protocol.QuestionRequest
 	questionResp      chan protocol.AnswerQuestion
-	pendingApproval   *ApprovalRequest
+	pendingApproval   *protocol.ApprovalView
+	approvalJournalID string // occurrence-scoped durable identity
 	approvalResp      chan approvalAnswer
 	approvalResolving bool
 }
 
 // modelState groups the primary + fallback model binding bookkeeping. Guarded
-// by mu (see currentProvider / activeModelSnapshot).
+// by mu and frozen together at each step boundary.
 type modelState struct {
 	// primaryBinding and fallbackBinding each hold a complete provider identity
 	// — client, endpoint, wire format and the config provider record that
@@ -103,7 +95,7 @@ type dedupState struct {
 // watchState holds stream coalescing state. Guarded by mu; only the owner consumes publications.
 type watchState struct {
 	deferToolEvents       bool
-	deferredToolEvents    []Event
+	deferredToolEvents    []protocol.EventView
 	statePending          bool
 	pendingViews          []protocol.Update
 	streamTimerGeneration uint64
@@ -124,11 +116,9 @@ type sessionServices struct {
 	perms           *permissions.Manager
 	hooks           *hooks.Manager
 	sandbox         *sandbox.Sandbox
-	host            *plugin.Host
 	evbus           *events.Bus
 	models          *plugin.ModelRegistry
 	gohooks         *plugin.GoHooks
-	sessionReg      *plugin.SessionRegistry
 	mcp             *mcp.Manager
 	skills          *skills.Store
 	coding          *codingState
@@ -218,7 +208,7 @@ type sessionLifecycle struct {
 	closed   bool
 	settling bool // terminal event published before a queued turn starts
 	phase    protocol.RuntimePhase
-	workflow protocol.WorkflowState
+
 	lastTurn *protocol.TurnOutcome
 }
 
@@ -227,6 +217,8 @@ type capabilityState struct {
 	// so prior approval events cannot restore a capability.
 	capabilityGrants   map[string]protocol.CapabilityRequest
 	capabilityRevision uint64
+	// Unlike grant additions, revocations invalidate pending resource decisions.
+	revocationRevision uint64
 	capabilityRevoking bool
 	settingsPreparing  bool
 }

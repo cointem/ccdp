@@ -1,15 +1,24 @@
 package agent
 
 import (
-	"ccdp/internal/messages"
-	"ccdp/internal/tooling"
 	"fmt"
+
+	"ccdp/internal/messages"
+	"ccdp/internal/protocol"
+	"ccdp/internal/tooling"
 )
 
 // executeToolResultWithJournal runs one call through admission, hooks and
 // execution, recording its outcome before returning the structured result.
 func (a *Agent) executeToolResultWithJournal(tc messages.ToolCall, journal toolJournalContext) (result tooling.Result) {
+	a.emitToolPhase(tc, protocol.ExecutionQueued)
 	execution := &toolJournalExecution{ctx: journal}
+	defer func() {
+		result.Failure = execution.failure
+		ev := toolEvent(tc, result.Status, "")
+		ev.Kind, ev.Tool.Phase, ev.Tool.Failure = protocol.EventToolPhase, protocol.ExecutionCompleted, execution.failure
+		a.emit(ev)
+	}()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			result = tooling.Result{Output: fmt.Sprintf("tool execution panicked; outcome unknown: %v", recovered), IsError: true}

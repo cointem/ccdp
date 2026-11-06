@@ -79,7 +79,7 @@ func isolatedTestConfig(t *testing.T, model string) config.Config {
 	cfg.SessionDir = filepath.Join(dir, "sessions")
 	cfg.Model = model
 	cfg.BaseURL = "http://127.0.0.1:1/unreachable"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	cfg.NoSessionPersistence = true
 	cfg.EnableGuardian = config.BoolPtr(false)
 	cfg.EnableProjectMemory = false
@@ -226,7 +226,7 @@ func TestGuardianOptionsDisableLifecycleSideEffects(t *testing.T) {
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("guardian SessionStart hook ran: %v", err)
 	}
-	if got := a.MCPServers(); len(got) != 0 {
+	if got := a.services.mcp.Names(); len(got) != 0 {
 		t.Fatalf("guardian unexpectedly started MCP servers: %v", got)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func TestToolOutputBudgetPreservesSessionArtifacts(t *testing.T) {
@@ -20,6 +21,7 @@ func TestToolOutputBudgetPreservesSessionArtifacts(t *testing.T) {
 		t.Run(map[bool]string{false: "disk", true: "memory"}[memory], func(t *testing.T) {
 			cfg := isolatedTestConfig(t, "output-budget-model")
 			cfg.NoSessionPersistence = memory
+			cfg.AlwaysAllow = []string{"OutputFixture"}
 			cfg.MaxResultSizeBytes = 1024
 			cfg.MaxToolOutputBytesPerTurn = 1500
 			var requests atomic.Int32
@@ -109,7 +111,7 @@ func TestToolOutputBudgetPreservesSessionArtifacts(t *testing.T) {
 }
 
 func TestLoadSessionRejectsTraversalID(t *testing.T) {
-	if _, err := LoadSession(t.TempDir(), "../outside"); err == nil {
+	if _, err := archive.Load(t.TempDir(), "../outside"); err == nil {
 		t.Fatal("expected traversal session id to be rejected")
 	}
 }

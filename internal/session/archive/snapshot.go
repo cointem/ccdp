@@ -35,7 +35,6 @@ type Snapshot struct {
 	// PendingCommands records admitted asynchronous operations with no durable
 	// completion yet. Resume exposes them as unknown; it never re-runs them.
 	PendingCommands []session.CommandScheduled `json:"pending_commands,omitempty"`
-	Workflow        *session.WorkflowState     `json:"workflow,omitempty"`
 	Tasks           []session.Task             `json:"tasks,omitempty"`
 	// PendingInputs is the durable typed inbox.
 	PendingInputs []protocol.InputView `json:"pending_inputs,omitempty"`
@@ -87,7 +86,7 @@ func fromProjection(projection *replay.State, id string) *Snapshot {
 		ID: projection.ID, CreatedAt: projection.CreatedAt, UpdatedAt: projection.UpdatedAt,
 		Workspace: projection.Workspace, Model: projection.Model, Title: title,
 		History: messages.Clone(projection.History), Usage: projection.Usage, PendingInputs: projection.PendingInputViews(), PendingAttachments: projection.PendingAttachments(),
-		Settings: SnapshotSettings(projection.Settings), Workflow: SnapshotWorkflow(projection.Workflow),
+		Settings:          SnapshotSettings(projection.Settings),
 		Goal:              protocol.CloneGoal(projection.Goal),
 		GoalAccountingIDs: maps.Clone(projection.GoalAccountingIDs),
 		Tasks:             append([]session.Task(nil), projection.Tasks...),
@@ -102,13 +101,5 @@ func SnapshotSettings(settings session.Settings) *session.Settings {
 		return nil
 	}
 	copy := settings.Clone()
-	return &copy
-}
-
-func SnapshotWorkflow(workflow session.WorkflowState) *session.WorkflowState {
-	if workflow == (session.WorkflowState{}) {
-		return nil
-	}
-	copy := workflow
 	return &copy
 }

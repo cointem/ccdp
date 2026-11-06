@@ -8,6 +8,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"ccdp/internal/sandbox"
 )
 
 // Process owns group signalling and reaping. Keep the leader unreaped until
@@ -15,24 +17,26 @@ import (
 // Callers configure streams before Start. Start owns the sole reaper; Wait
 // observes the same completion as Stop and may be called more than once.
 type Process struct {
-	cmd         *exec.Cmd
-	mu          sync.Mutex
-	inputMu     sync.Mutex
-	input       io.WriteCloser
-	stdinRead   *os.File
-	terminal    *os.File
-	slave       *os.File
-	output      io.Writer
-	stdoutRead  *os.File
-	stdoutWrite *os.File
-	done        chan struct{}
-	started     bool
-	err         error
-	reason      string
-	timeout     time.Duration
-	reaping     bool
-	cleanup     func()
-	cleanupOnce sync.Once
+	cmd             *exec.Cmd
+	executionPolicy *sandbox.Sandbox
+	remote          *remoteProcess
+	mu              sync.Mutex
+	inputMu         sync.Mutex
+	input           io.WriteCloser
+	stdinRead       *os.File
+	terminal        *os.File
+	slave           *os.File
+	output          io.Writer
+	stdoutRead      *os.File
+	stdoutWrite     *os.File
+	done            chan struct{}
+	started         bool
+	err             error
+	reason          string
+	timeout         time.Duration
+	reaping         bool
+	cleanup         func()
+	cleanupOnce     sync.Once
 }
 
 func newProcess(cmd *exec.Cmd) *Process {
@@ -72,6 +76,11 @@ func (p *Process) StdoutPipe() (io.ReadCloser, error) {
 }
 
 func (p *Process) SetTerminal(output io.Writer) error {
+	if p.remote != nil {
+		p.remote.tty = true
+		p.cmd.Stdout, p.cmd.Stderr = output, output
+		return nil
+	}
 	m, s, err := openProcessPTY()
 	if err != nil {
 		return err
@@ -86,6 +95,9 @@ func (p *Process) Done() <-chan struct{}      { return p.done }
 func (p *Process) Reason() string             { p.mu.Lock(); defer p.mu.Unlock(); return p.reason }
 
 func (p *Process) WriteInput(data []byte) error {
+	if p.remote != nil {
+		return p.remote.write(data)
+	}
 	p.inputMu.Lock()
 	defer p.inputMu.Unlock()
 	if p.input == nil {
@@ -100,6 +112,9 @@ func (p *Process) WriteInput(data []byte) error {
 }
 
 func (p *Process) CloseInput() error {
+	if p.remote != nil {
+		return p.remote.closeInput()
+	}
 	p.inputMu.Lock()
 	defer p.inputMu.Unlock()
 	if p.input == nil {
@@ -115,6 +130,9 @@ func (p *Process) CloseInput() error {
 }
 
 func (p *Process) Start() error {
+	if p.remote != nil {
+		return p.remote.start()
+	}
 	p.mu.Lock()
 	if p.started {
 		p.mu.Unlock()
@@ -139,6 +157,9 @@ func (p *Process) Start() error {
 		return err
 	}
 	p.started = true
+	if p.executionPolicy != nil {
+		p.executionPolicy.MarkExternalExecution()
+	}
 	p.mu.Unlock()
 	var drained chan struct{}
 	if p.terminal != nil {
@@ -205,6 +226,9 @@ func (p *Process) Wait() error {
 
 // Stop reports reclamation errors, not the expected signal exit status.
 func (p *Process) Stop(reason string) error {
+	if p.remote != nil {
+		return p.remote.stop(reason)
+	}
 	_ = p.signal(syscall.SIGINT, reason)
 	select {
 	case <-p.done:

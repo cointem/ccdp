@@ -41,6 +41,7 @@ type Info struct {
 	TotalSize int64   // total bytes of visible files
 	Ignored   int     // files skipped via .gitignore / rules
 	Files     []Entry // visible files, sorted by relative path
+	Truncated bool    // inventory reached its bound
 }
 
 // Entry is one visible file in the workspace.
@@ -116,12 +117,20 @@ func ScanContext(ctx context.Context, root string, maxFiles int) (*Info, error) 
 	if err != nil {
 		return nil, err
 	}
+	// Load only ancestors and visited directories. A preliminary recursive
+	// gitignore scan would defeat maxFiles and descend into dependency trees.
 	if isRepo {
-		if err := ignore.LoadGitignoresContext(ctx, gitRoot); err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
+		var ancestors []string
+		for dir := abs; dir != gitRoot; {
+			dir = filepath.Dir(dir)
+			ancestors = append(ancestors, dir)
+		}
+		for i := len(ancestors) - 1; i >= 0; i-- {
+			base, _ := filepath.Rel(gitRoot, ancestors[i])
+			if base == "." {
+				base = ""
 			}
-			ignore = NewMatcherSafe()
+			_ = ignore.loadFile(filepath.Join(ancestors[i], ".gitignore"), base)
 		}
 	}
 
@@ -142,6 +151,13 @@ func ScanContext(ctx context.Context, root string, maxFiles int) (*Info, error) 
 			return nil
 		}
 		if path == abs {
+			if isRepo {
+				base, _ := filepath.Rel(gitRoot, path)
+				if base == "." {
+					base = ""
+				}
+				_ = ignore.loadFile(filepath.Join(path, ".gitignore"), base)
+			}
 			return nil
 		}
 		rel, rerr := filepath.Rel(abs, path)
@@ -180,7 +196,11 @@ func ScanContext(ctx context.Context, root string, maxFiles int) (*Info, error) 
 		}
 
 		if len(info.Files) >= maxFiles {
+			info.Truncated = true
 			return filepath.SkipAll
+		}
+		if isRepo && d.IsDir() {
+			_ = ignore.loadFile(filepath.Join(path, ".gitignore"), filepath.ToSlash(ignoreRel))
 		}
 
 		info.FileCount++
@@ -347,12 +367,12 @@ func CachedScan(root string, force bool) (*Info, error) {
 	if !force {
 		if v, ok := cache.Load(abs); ok {
 			entry := v.(cachedInfo)
-			if time.Since(entry.at) < 2*time.Second {
+			if time.Since(entry.at) < 30*time.Second {
 				return entry.info, nil
 			}
 		}
 	}
-	info, err := Scan(abs, int(^uint(0)>>1))
+	info, err := Scan(abs, 20000)
 	if err != nil {
 		return nil, err
 	}
@@ -493,21 +513,4 @@ func readBounded(path string, maxBytes int, authorize func(string) (string, erro
 		return data[:maxBytes], true, nil
 	}
 	return data, false, nil
-}
-
-// InitInstructionsFile writes the AGENTS.md template into the workspace root
-// and returns its path. It refuses to overwrite an existing non-empty file.
-func InitInstructionsFile(root string) (string, error) {
-	abs, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	path := filepath.Join(abs, InstructionFile)
-	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) > 0 {
-		return path, fmt.Errorf("%s already exists", path)
-	}
-	if err := os.WriteFile(path, []byte(InstructionTemplate), 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
 }

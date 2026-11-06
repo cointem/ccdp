@@ -18,25 +18,20 @@ import (
 	"ccdp/internal/tools"
 )
 
-// extensionHost aggregates the domain registries, plugin host, and the
+// extensionRegistries aggregates the domain registries and the
 // primary/fallback provider bindings produced before the Agent literal exists.
-type extensionHost struct {
+type extensionRegistries struct {
 	bus      *events.Bus
 	registry *tools.Registry
 	models   *plugin.ModelRegistry
-	ectx     *plugin.Context
-	host     *plugin.Host
 	// primaryBinding is always resolved; fallbackBinding is the zero binding when
 	// no fallback model is configured or when it could not be resolved.
 	primaryBinding  modelBinding
 	fallbackBinding modelBinding
 }
 
-// buildExtensionHost wires the domain bus, tool registry, model registry and
-// plugin host, and resolves the primary and fallback provider bindings. It
-// takes the cancellation func of the yet-to-exist root context so a rejected
-// construction can roll back without leaving a live root or plugin.
-func buildExtensionHost(cfg *config.Config, opts Options, rootCancel context.CancelFunc) (*extensionHost, error) {
+// buildExtensionRegistries registers built-ins and resolves provider bindings.
+func buildExtensionRegistries(cfg *config.Config, opts Options, rootCancel context.CancelFunc) (*extensionRegistries, error) {
 	bus := events.NewBus()
 	registry := tools.NewRegistry()
 	models := plugin.NewModelRegistry()
@@ -49,41 +44,17 @@ func buildExtensionHost(cfg *config.Config, opts Options, rootCancel context.Can
 		return nil, resolveErr
 	}
 	client := primaryBinding.client
-	ectx := &plugin.Context{
-		Events:  bus,
-		Tools:   registry,
-		Models:  models,
-		Hooks:   plugin.NewGoHooks(),
-		Session: plugin.NewSessionRegistry(),
-	}
-	host := plugin.NewHost(ectx)
-	// New performs a few fallible extension steps before the Agent exists. Keep
-	// one rollback path for those steps so a rejected construction never leaves
-	// the root context or an already-loaded plugin alive.
-	rollback := func() {
-		rootCancel()
-		_ = host.Close()
-	}
 	registry.SetChangeListener(func() {
 		bus.Emit(events.TopicToolChange, events.ToolEvent{ToolName: ""})
 	})
-	if err := host.Load(plugin.NewToolsPlugin(cfg.WebToolsEnabled())); err != nil {
-		rollback()
-		return nil, err
-	}
+	tools.RegisterBuiltins(registry, cfg.WebToolsEnabled())
 	if len(cfg.LanguageServers) == 0 {
 		registry.Unregister("builtin", "CodeNavigate")
 	}
-	// A supplied registry may already contain an explicit fake/plugin route.
-	// Loading the default HTTP plugin in that case would overwrite a route for
-	// the same model, so only install the built-in plugin when this model was
-	// resolved by the HTTP adapter.
-	if _, suppliedRoute := opts.ProviderRegistry.ResolveRoute(cfg.Model); opts.ProviderRegistry == nil || !suppliedRoute {
-		httpFingerprint := primaryBinding.httpBinding(cfg.ResolveProvider(cfg.Model).APIKey)
-		if err := host.Load(plugin.NewHTTPProviderPlugin(client, cfg.Model, httpFingerprint)); err != nil {
-			rollback()
-			return nil, err
-		}
+	// Preserve explicit routes supplied by the parent or caller.
+	if _, suppliedRoute := opts.ProviderRegistry.ResolveRoute(cfg.Model); !suppliedRoute {
+		models.Register(client)
+		models.RouteDefault(cfg.Model, client.Name(), primaryBinding.httpBinding(cfg.ResolveProvider(cfg.Model).APIKey))
 	}
 
 	// Fallback model (Claude's --fallback-model): built lazily, used only if
@@ -94,12 +65,10 @@ func buildExtensionHost(cfg *config.Config, opts Options, rootCancel context.Can
 		// construction, matching the primary provider remaining usable.
 		fallbackBinding, _ = providerBinding(*cfg, models, cfg.FallbackModel, 1)
 	}
-	return &extensionHost{
+	return &extensionRegistries{
 		bus:             bus,
 		registry:        registry,
 		models:          models,
-		ectx:            ectx,
-		host:            host,
 		primaryBinding:  primaryBinding,
 		fallbackBinding: fallbackBinding,
 	}, nil
@@ -113,16 +82,18 @@ func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated boo
 	if a.services.cfg.CodeModeEnabled && codemode.Available {
 		a.services.registry.RegisterIn("code", &tools.RunCodeTool{})
 	}
+	a.services.cfg.ExecutorID = a.services.resources.ExecutorID()
+	a.services.baseCfg.ExecutorID = a.services.cfg.ExecutorID
 	a.services.sandbox = a.services.cfg.Sandbox()
 	a.services.sandbox.SetExecutionGuard(inheritedExecutionGuard)
 	if a.services.resources != nil {
-		// Execution caches and temporary files live for this session only. The
-		// directory is created by the harness and removed when Resources.Close
-		// shuts down the session; subprocess invocations never receive host /tmp.
-		if scratch := a.services.resources.ScratchDir(); scratch != "" {
-			a.services.sandbox.AddScratchDir(scratch)
+		if err := a.services.resources.CheckOpen(); err != nil {
+			a.abortConstruction(rootCancel, true)
+			return err
 		}
+		a.services.resources.BindSandbox(a.services.sandbox)
 	}
+
 	for _, capability := range inheritedCapabilities {
 		if err := applyCapability(a.services.sandbox, capability); err != nil {
 			return fmt.Errorf("inherit parent sandbox capability: %w", err)
@@ -131,7 +102,11 @@ func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated boo
 	a.services.hooks = hooks.NewManager(a.services.cfg.Hooks, hooks.Options{SessionID: a.conversation.sessionID, Workspace: a.services.cfg.Workspace, Mode: a.services.cfg.PermissionMode, Sandbox: a.services.sandbox, FailClosed: true})
 	a.services.mcp.SetSandbox(a.services.sandbox)
 	a.services.hooks.SetTranscript(a.services.cfg.SessionDir)
-	if !isolated {
+	if err := a.services.sandbox.CheckExecution(); err != nil {
+		a.capabilities.capabilityRevoking = true
+		a.emitStatus("%v", err)
+	}
+	if !isolated && !a.capabilities.capabilityRevoking {
 		if err := a.services.mcp.StartChecked(a.lifecycle.rootCtx, a.services.cfg.MCPServers); err != nil {
 			a.abortConstruction(rootCancel, true)
 			return err
@@ -156,13 +131,14 @@ func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated boo
 // deferred (MCP + config custom) tools for on-demand discovery, and loads user
 // and project skills.
 func (a *Agent) finalizeToolsAndSkills(isolated bool) {
+	if a.services.cfg.ComputerUseEnabled && a.children.childState == nil {
+		a.services.registry.RegisterIn("builtin", &tools.ComputerTool{})
+	}
 	a.services.registry.RegisterIn("builtin", tools.NewReadOutputTool())
 	a.services.registry.RegisterIn("builtin", &readProjectMemoryTool{})
 	a.services.registry.RegisterIn("builtin", &updateProjectMemoryTool{})
 	a.services.registry.RegisterIn("builtin", &toolSearchTool{ag: a})
 	a.services.registry.RegisterIn("builtin", &askUserQuestionTool{ag: a})
-	a.services.registry.RegisterIn("builtin", &enterPlanModeTool{ag: a})
-	a.services.registry.RegisterIn("builtin", &exitPlanModeTool{ag: a})
 	for _, spec := range a.services.cfg.Tools {
 		if name := strings.TrimSpace(spec.Name); name != "" {
 			a.discovery.deferTools[name] = true
@@ -209,13 +185,11 @@ func (a *Agent) openTraceAndSupervisor(opts Options) error {
 	return a.rootContext().Err()
 }
 
-// emitSessionLifecycle publishes session events to the bus and plugins.
+// emitSessionLifecycle publishes session events to observers.
 func (a *Agent) emitSessionLifecycle(resumed bool) {
 	if resumed {
-		a.services.sessionReg.RunResume(a.conversation.sessionID)
 		a.services.evbus.Emit(events.TopicSessionResumed, events.SessionEvent{ID: a.conversation.sessionID})
 		return
 	}
-	a.services.sessionReg.RunCreate(a.conversation.sessionID, a.services.cfg.Workspace)
 	a.services.evbus.Emit(events.TopicSessionCreated, events.SessionEvent{ID: a.conversation.sessionID, Workspace: a.services.cfg.Workspace})
 }

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"ccdp/internal/messages"
+	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 )
 
@@ -21,11 +22,11 @@ func (a *Agent) historyLocked() []messages.Message {
 	return a.conversation.durable.History
 }
 
-func sessionUsage(u Usage) session.Usage {
+func sessionUsage(u protocol.UsageSnapshot) session.Usage {
 	return session.Usage{InputTokens: int64(u.InputTokens), OutputTokens: int64(u.OutputTokens), CachedTokens: int64(u.CachedTokens), TurnCount: int64(u.TurnCount), TotalTokens: int64(u.InputTokens) + int64(u.OutputTokens), Cache: u.Cache}
 }
 
-func (a *Agent) runtimeUsageLocked() Usage {
+func (a *Agent) runtimeUsageLocked() protocol.UsageSnapshot {
 	u, err := usageFromSession(a.conversation.durable.Usage)
 	if err != nil {
 		panic(err)

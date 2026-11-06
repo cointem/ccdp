@@ -7,6 +7,7 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/messages"
 	"ccdp/internal/plugin"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/supervision"
 	"ccdp/internal/tools"
 )
@@ -17,7 +18,7 @@ import (
 type childFactory struct {
 	config        config.Config
 	options       Options
-	initial       *SessionSnapshot
+	initial       *archive.Snapshot
 	history       []messages.Message
 	historySource historyArtifactSource
 	tools         *tools.Lease

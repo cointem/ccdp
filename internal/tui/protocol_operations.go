@@ -16,17 +16,7 @@ func (m *Model) associateInputOperationFromEvent(ev protocol.EventView) {
 		if candidate.TurnID != "" {
 			continue
 		}
-		matches := candidate.InputText == ev.Text
-		if candidate.InputID != "" && ev.MessageID != "" {
-			matches = protocol.InputMessageID(candidate.InputID) == ev.MessageID
-		}
-		// Older events without message identity use the legacy text fallback.
-		// Identity-bearing events must never match another input by text,
-		// including image-only submissions whose text is expanded at runtime.
-		if !matches && candidate.InputText == "" && ev.MessageID == "" {
-			matches = true
-		}
-		if !matches {
+		if candidate.InputID == "" || protocol.InputMessageID(candidate.InputID) != ev.MessageID {
 			continue
 		}
 		candidate.TurnID = ev.TurnID
@@ -49,11 +39,7 @@ func (m *Model) associateInputOperationsFromSnapshot(snapshot protocol.SessionVi
 			continue
 		}
 		for _, candidate := range m.activeInputOperations() {
-			matches := candidate.InputText == item.Text
-			if candidate.InputID != "" && item.ID != "" {
-				matches = protocol.InputMessageID(candidate.InputID) == item.ID
-			}
-			if candidate.TurnID != "" || !matches {
+			if candidate.TurnID != "" || candidate.InputID == "" || protocol.InputMessageID(candidate.InputID) != item.ID {
 				continue
 			}
 			candidate.TurnID = item.TurnID
@@ -100,7 +86,7 @@ func (m *Model) finishInputOperations(turnID protocol.TurnID, outcome protocol.T
 func (m *Model) finishInputOperation(op Operation, outcome protocol.TurnOutcomeStatus, detail string) {
 	state, phase := OperationApplied, ActivityCompleted
 	switch outcome {
-	case protocol.TurnFailed:
+	case protocol.TurnFailed, protocol.TurnLimited, protocol.TurnBlocked:
 		state, phase = OperationFailed, ActivityFailed
 	case protocol.TurnCancelled:
 		state, phase = OperationCancelled, ActivityCancelled

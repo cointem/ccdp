@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 )
 
@@ -48,6 +49,7 @@ func (a *Agent) sessionSettingsLocked() session.Settings {
 	settings.AlwaysAllow = append([]string(nil), a.services.cfg.AlwaysAllow...)
 	settings.AlwaysDeny = append([]string(nil), a.services.cfg.AlwaysDeny...)
 	settings.NetworkAccess = a.services.cfg.NetworkAccess
+	settings.LocalDevelopmentNetwork = a.services.cfg.LocalDevelopmentNetwork
 	settings.AdditionalDirectories = append([]string(nil), a.services.cfg.AdditionalDirectories...)
 	settings.AdditionalReadOnlyDirectories = append([]string(nil), a.services.cfg.AdditionalReadOnlyDirectories...)
 	settings.DisallowedDirectories = append([]string(nil), a.services.cfg.DisallowedDirectories...)
@@ -63,38 +65,7 @@ func (a *Agent) sessionSettingsLocked() session.Settings {
 	settings.Verbosity = a.services.cfg.Verbosity
 	settings.GenerationOptionsSet = true
 	settings.MaxToolOutputBytesPerTurn = a.services.cfg.MaxToolOutputBytesPerTurn
-	if a.plan.planMode {
-		settings.ExecutionMode = "plan"
-	} else {
-		settings.ExecutionMode = "execute"
-	}
 	return settings
-}
-
-// persistSettingsWorkflowFact commits settings and its workflow companion as
-// one typed transaction. Callers use it before publishing/mutating either
-// projection, so an injected store failure cannot expose a half-applied
-// command.
-func (a *Agent) persistSettingsWorkflowFact(settings session.Settings, revision uint64, workflow *session.WorkflowState) error {
-	p := a.persistenceHandle()
-	if p == nil {
-		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
-	}
-	if err := p.PersistSettingsWorkflow(settings, revision, workflow); err != nil {
-		return a.toolJournalFailure(err)
-	}
-	return nil
-}
-
-func (a *Agent) persistWorkflowFact(workflow session.WorkflowState) error {
-	p := a.persistenceHandle()
-	if p == nil {
-		return a.toolJournalFailure(errors.New("agent: session persistence is unavailable"))
-	}
-	if err := p.PersistWorkflow(workflow); err != nil {
-		return a.toolJournalFailure(fmt.Errorf("agent: persist workflow: %w", err))
-	}
-	return nil
 }
 
 func (a *Agent) persistCommandCompletedFact(event session.CommandCompleted) error {
@@ -108,6 +79,6 @@ func (a *Agent) persistCommandCompletedFact(event session.CommandCompleted) erro
 	return nil
 }
 
-func (p *sessionPersistence) persistUsage(u Usage) error {
+func (p *sessionPersistence) persistUsage(u protocol.UsageSnapshot) error {
 	return p.Writer.PersistUsage(session.Usage{InputTokens: int64(u.InputTokens), OutputTokens: int64(u.OutputTokens), CachedTokens: int64(u.CachedTokens), TurnCount: int64(u.TurnCount), TotalTokens: int64(u.InputTokens) + int64(u.OutputTokens), Cache: u.Cache})
 }

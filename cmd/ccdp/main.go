@@ -19,8 +19,10 @@ import (
 
 	"ccdp/internal/agent"
 	"ccdp/internal/codemode"
+	"ccdp/internal/computer"
 	"ccdp/internal/config"
 	"ccdp/internal/permissions"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/tui"
 )
 
@@ -46,7 +48,8 @@ func main() {
 		resumeFlag     = flag.String("r", "", "resume session by id")
 		continueFlag   = flag.Bool("c", false, "open the session picker on start (continue a session)")
 		replayFlag     = flag.String("replay", "", "print a saved session as a markdown replay and exit")
-		modeFlag       = flag.String("mode", "", "permission mode: manual|edits|bypass (default: edits)")
+		modeFlag       = flag.String("mode", "", "permission mode: auto|manual (default: auto)")
+		computerFlag   = flag.Bool("computer-use", false, "enable macOS desktop screenshots and input for this launch (requires OS permissions)")
 		listSessions   = flag.Bool("l", false, "list saved sessions and exit")
 		showVersion    = flag.Bool("version", false, "print version and exit")
 		noWarnMissing  = flag.Bool("y", false, "do not prompt on missing config")
@@ -144,6 +147,7 @@ Flags:
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+	cfg.ComputerUseEnabled = *computerFlag
 
 	// Resolve workspace.
 	workspaceInput := cfg.Workspace
@@ -174,7 +178,7 @@ Flags:
 	}
 
 	if *listSessions {
-		sessions, issues, err := agent.ListSessions(cfg.SessionDir)
+		sessions, issues, err := archive.List(cfg.SessionDir)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
@@ -193,15 +197,22 @@ Flags:
 	}
 
 	if *replayFlag != "" {
-		snap, err := agent.LoadSession(cfg.SessionDir, *replayFlag)
+		snap, err := archive.Load(cfg.SessionDir, *replayFlag)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error: cannot load session:", err)
 			os.Exit(1)
 		}
 		// Replay is strictly read-only: project the JSONL session and
 		// render it without constructing an Agent, MCP host, or writer lock.
-		fmt.Println(agent.ExportSessionMarkdown(snap))
+		fmt.Println(archive.Markdown(snap))
 		return
+	}
+
+	if cfg.ComputerUseEnabled {
+		if err := computer.RequestAccess(context.Background()); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	}
 
 	if cfg.ResolveProvider(cfg.Model).APIKey == "" && !*noWarnMissing {
@@ -209,10 +220,20 @@ Flags:
 	}
 
 	var ag *agent.Agent
+	stdinInfo, _ := os.Stdin.Stat()
+	interactive := stdinInfo != nil && stdinInfo.Mode()&os.ModeCharDevice != 0 && *promptFlag == "" && *inputFormat != "stream-json" && goalCommand == nil
 	if *resumeFlag != "" {
-		snap, err := agent.LoadSession(cfg.SessionDir, *resumeFlag)
+		snap, err := archive.Load(cfg.SessionDir, *resumeFlag)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: cannot resume session %q: %v\n", *resumeFlag, err)
+			os.Exit(1)
+		}
+		cfg, err = agent.ResolveResumeConfig(&cfg, snap)
+		if err == nil {
+			err = prepareDevelopmentEnvironment(&cfg, os.Stdin, os.Stderr, interactive)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
 		ag, err = agent.Resume(&cfg, snap)
@@ -222,6 +243,10 @@ Flags:
 		}
 		fmt.Fprintf(os.Stderr, "resumed session %s\n", *resumeFlag)
 	} else {
+		if err := prepareDevelopmentEnvironment(&cfg, os.Stdin, os.Stderr, interactive); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 		ag, err = agent.New(&cfg)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)

@@ -97,7 +97,7 @@ func (a *Agent) handleOwnerControl(message ownerControl, preparing bool) {
 		a.drainRejectedCommands()
 		a.dispatchOwned(message.request)
 	case quiescenceRequested:
-		scope, err := a.beginSandboxQuiescence(message.ctx, message.closeMCP)
+		scope, err := a.beginSandboxQuiescence(message.ctx, message.closeMCP, message.allowPending)
 		replyOwned(a, message.result, quiescenceResult{scope, err})
 	case quiescenceAborted:
 		a.abortQuiescenceOwned(message.revision)
@@ -169,6 +169,10 @@ func (a *Agent) handleOwnerControl(message ownerControl, preparing bool) {
 		close(message.done)
 	case toolStartRequested:
 		replyOwned(a, message.result, a.acceptToolStart(message))
+	case processFactRequested:
+		replyOwned(a, message.result, a.commitProcessFact(message))
+	case processProjectionRequested:
+		replyOwned(a, message.result, a.projectPendingProcessesOwned())
 	case toolCompleted:
 		replyOwned(a, message.result, a.commitToolResult(message))
 	case toolProjectionRequested:
@@ -217,8 +221,6 @@ func (a *Agent) handleOwnerControl(message ownerControl, preparing bool) {
 		a.releaseSettingsMutationOwned()
 		a.refreshSnapshotOwned()
 		close(message.done)
-	case executionModeRequested:
-		replyOwned(a, message.result, a.installExecutionMode(message.on))
 	case settingsCandidateInstall:
 		replyOwned(a, message.result, a.installSettingsCandidate(message))
 	case sessionClosingPrepared:

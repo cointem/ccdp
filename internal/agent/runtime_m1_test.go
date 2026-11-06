@@ -14,6 +14,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session/archive"
 )
 
 func TestM1StepFreezesModelClientAndConfigAcrossStream(t *testing.T) {
@@ -74,7 +75,7 @@ func TestM1StepFreezesModelClientAndConfigAcrossStream(t *testing.T) {
 	cfg.BaseURL = firstServer.URL
 	cfg.APIKey = "key-a"
 	cfg.Model = "model-a"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	cfg.MaxTurns = 3
 	cfg.Providers = map[string]config.ProviderConfig{
 		"provider-a": {BaseURL: firstServer.URL, APIKey: "key-a", Models: []string{"model-a"}},
@@ -196,12 +197,11 @@ func TestM1CapturedStepRemainsFrozenAfterBindingSwitch(t *testing.T) {
 	}
 }
 
-func TestM1SnapshotProjectsContextUsageAndStablePlanVersion(t *testing.T) {
+func TestM1SnapshotProjectsContextUsage(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	ag.mu.Lock()
 	ag.services.cfg.ContextWindow = 8192
 	ag.conversation.durable.History = []messages.Message{{Role: messages.RoleUser, Content: strings.Repeat("context", 32)}}
-	ag.plan.pendingPlan = &PlanRequest{ID: "plan-stable", Plan: "keep this plan"}
 	ag.sequences.settingsRev = 7
 	ag.refreshSnapshotLocked()
 	ag.mu.Unlock()
@@ -216,23 +216,6 @@ func TestM1SnapshotProjectsContextUsageAndStablePlanVersion(t *testing.T) {
 	if view.Settings.ContextWindow != 8192 {
 		t.Fatalf("context window = %d, want 8192", view.Settings.ContextWindow)
 	}
-	if view.Plan == nil || view.Plan.Version != planViewVersion {
-		t.Fatalf("plan snapshot = %+v, want stable version %d", view.Plan, planViewVersion)
-	}
-
-	// Settings revisions may advance while a plan is pending; the plan token is
-	// tied to its immutable ID, not reused as a settings revision.
-	ag.mu.Lock()
-	ag.sequences.settingsRev = 99
-	ag.refreshSnapshotLocked()
-	ag.mu.Unlock()
-	view, err = ag.Snapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if view.Plan == nil || view.Plan.Version != planViewVersion {
-		t.Fatalf("plan version changed with settings: %+v", view.Plan)
-	}
 }
 
 func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
@@ -241,7 +224,7 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 	cfg.Workspace = dir
 	cfg.SessionDir = dir + "/sessions"
 	cfg.BaseURL = "http://127.0.0.1:1"
-	cfg.PermissionMode = string(permissions.ModeDefault)
+	cfg.PermissionMode = string(permissions.ModeManual)
 	cfg.AlwaysAllow = []string{"Read:*"}
 	cfg.AlwaysDeny = []string{"Bash:rm *"}
 	cfg.NetworkAccess = true
@@ -254,7 +237,7 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 	defer ag.Close()
 
 	modeCmd := protocol.Command{ID: "mode-only-legacy", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandSetPermissionPolicy,
-		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeAcceptEdits)}}}
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeManual)}}}
 	if receipt := ag.applyCommand(modeCmd); receipt.Rejected() {
 		t.Fatalf("mode-only command rejected: %+v", receipt)
 	}
@@ -280,7 +263,7 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 	// Canonical mode-only policy commands use nil rule slices and must retain
 	// the existing rule set as well.
 	canonical := protocol.Command{ID: "mode-only", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandSetPermissionPolicy,
-		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)}}}
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeManual)}}}
 	if receipt := ag.applyCommand(canonical); receipt.Rejected() {
 		t.Fatalf("canonical mode-only command rejected: %+v", receipt)
 	}
@@ -305,7 +288,7 @@ func TestPermissionAndSandboxPolicyCommandsPreserveOtherSettings(t *testing.T) {
 }
 
 // TestM1SafetyChangesApplyImmediatelyWhileBusy covers the discrete-decision lane:
-// execution (plan) mode, permission policy and sandbox policy land on live state
+// permission policy and sandbox policy land on live state
 // at once even while a turn runs, because each provider request froze its own
 // config and each gate reads the mode atomically. Nothing is staged.
 func TestM1SafetyChangesApplyImmediatelyWhileBusy(t *testing.T) {
@@ -315,8 +298,7 @@ func TestM1SafetyChangesApplyImmediatelyWhileBusy(t *testing.T) {
 	ag.mu.Unlock()
 	session := protocol.SessionID(ag.SessionID())
 	commands := []protocol.Command{
-		{ID: "busy-execution", SessionID: session, Type: protocol.CommandSetExecutionMode, ExecutionMode: &protocol.SetExecutionMode{Mode: protocol.ExecutionModePlan}},
-		{ID: "busy-permission", SessionID: session, Type: protocol.CommandSetPermissionPolicy, PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeBypass)}}},
+		{ID: "busy-permission", SessionID: session, Type: protocol.CommandSetPermissionPolicy, PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeAuto)}}},
 		{ID: "busy-sandbox", SessionID: session, Type: protocol.CommandSetSandboxPolicy, SandboxPolicy: &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{NetworkAccess: true}}},
 	}
 	for _, command := range commands {
@@ -328,56 +310,11 @@ func TestM1SafetyChangesApplyImmediatelyWhileBusy(t *testing.T) {
 	// The discrete lane mutates live state immediately.
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	if !ag.plan.planMode {
-		t.Fatal("plan mode did not apply immediately")
-	}
-	if ag.services.cfg.PermissionMode != string(permissions.ModeBypass) {
+	if ag.services.cfg.PermissionMode != string(permissions.ModeAuto) {
 		t.Fatalf("permission mode did not apply immediately: %s", ag.services.cfg.PermissionMode)
 	}
 	if !ag.services.cfg.NetworkAccess {
 		t.Fatal("network capability did not apply immediately")
-	}
-}
-
-func TestM1PlanApprovalRestoresPermissionAndRejectStaysDrafting(t *testing.T) {
-	ag := newRuntimeAgent(t)
-	modeCommand := protocol.Command{ID: "plan-mode-permission", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandSetPermissionPolicy,
-		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeAcceptEdits)}}}
-	if receipt := ag.applyCommand(modeCommand); receipt.Rejected() {
-		t.Fatalf("permission mode command rejected: %+v", receipt)
-	}
-	if got := ag.PermissionMode(); got != permissions.ModeAcceptEdits {
-		t.Fatalf("permission mode did not apply: %s", got)
-	}
-
-	ag.setExecutionMode(true)
-	ag.mu.Lock()
-	ag.plan.pendingPlan = &PlanRequest{ID: "plan-approve", Plan: "do it"}
-	ag.plan.planResp = make(chan bool, 1)
-	ag.mu.Unlock()
-	approve := protocol.Command{ID: "approve", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandApprovePlan,
-		Plan: &protocol.ApprovePlan{PlanID: "plan-approve", Approve: true}}
-	if receipt := ag.applyCommand(approve); receipt.Rejected() {
-		t.Fatalf("plan approval rejected: %+v", receipt)
-	}
-	if ag.PlanMode() || ag.PermissionMode() != permissions.ModeAcceptEdits {
-		t.Fatalf("approval did not restore permission state: plan=%v mode=%s", ag.PlanMode(), ag.PermissionMode())
-	}
-
-	ag.setExecutionMode(true)
-	ag.mu.Lock()
-	ag.plan.pendingPlan = &PlanRequest{ID: "plan-reject", Plan: "revise"}
-	ag.plan.planResp = make(chan bool, 1)
-	ag.mu.Unlock()
-	reject := protocol.Command{ID: "reject", SessionID: protocol.SessionID(ag.SessionID()), Type: protocol.CommandApprovePlan,
-		Plan: &protocol.ApprovePlan{PlanID: "plan-reject", Approve: false}}
-	if receipt := ag.applyCommand(reject); receipt.Rejected() {
-		t.Fatalf("plan rejection rejected: %+v", receipt)
-	}
-	ag.mu.Lock()
-	defer ag.mu.Unlock()
-	if !ag.plan.planMode || ag.lifecycle.workflow != protocol.WorkflowDrafting || ag.services.perms.CurrentMode() != permissions.ModeAcceptEdits {
-		t.Fatalf("rejection changed execution/permission state: plan=%v workflow=%s mode=%s", ag.plan.planMode, ag.lifecycle.workflow, ag.services.perms.CurrentMode())
 	}
 }
 
@@ -400,7 +337,7 @@ func TestM1CompactInterruptDoesNotDrainQueuedInput(t *testing.T) {
 	cfg.SessionDir = dir + "/sessions"
 	cfg.BaseURL = server.URL
 	cfg.APIKey = "test"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	cfg.KeepAfterCompact = 4
 	ag, err := testNew(t, &cfg)
 	if err != nil {
@@ -453,7 +390,7 @@ func TestM1SubmitPersistsInputBeforeQueueAdmission(t *testing.T) {
 	if receipt.Rejected() {
 		t.Fatalf("durable submit rejected: %+v", receipt)
 	}
-	snapshot, err := LoadSession(ag.SessionDir(), ag.SessionID())
+	snapshot, err := archive.Load(ag.SessionDir(), ag.SessionID())
 	if err != nil {
 		t.Fatalf("load durable queue: %v", err)
 	}
@@ -490,7 +427,7 @@ func TestM1DurableInputResumeDoesNotReexecuteDeliveredID(t *testing.T) {
 	cfg.SessionDir = dir + "/sessions"
 	cfg.BaseURL = server.URL
 	cfg.APIKey = "resume-key"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	first, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -540,7 +477,7 @@ func TestM1DurableInputResumeDoesNotReexecuteDeliveredID(t *testing.T) {
 	}
 
 	first.Close()
-	snap, err := LoadSession(cfg.SessionDir, string(sessionID))
+	snap, err := archive.Load(cfg.SessionDir, string(sessionID))
 	if err != nil {
 		t.Fatalf("load after close: %v", err)
 	}
@@ -583,7 +520,7 @@ func TestM1SubmitStoreFailureDoesNotStartProvider(t *testing.T) {
 	cfg.SessionDir = dir + "/sessions"
 	cfg.BaseURL = server.URL
 	cfg.APIKey = "failure-key"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -657,7 +594,7 @@ func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 	if receipt := submit(clearA); receipt.Rejected() {
 		t.Fatalf("clear A rejected: %+v", receipt)
 	}
-	if snapshot, err := LoadSession(ag.SessionDir(), ag.SessionID()); err != nil {
+	if snapshot, err := archive.Load(ag.SessionDir(), ag.SessionID()); err != nil {
 		t.Fatalf("load after clear A: %v", err)
 	} else if len(snapshot.History) != 0 {
 		t.Fatalf("durable clear history = %+v", snapshot.History)
@@ -686,7 +623,7 @@ func TestM1HistoryCommandsCommitBeforeSwap(t *testing.T) {
 	if len(view.History) != 2 || view.History[0].Content != "A" || view.History[1].Content != "answer A" {
 		t.Fatalf("final A history = %+v", view.History)
 	}
-	snapshot, err := LoadSession(ag.SessionDir(), ag.SessionID())
+	snapshot, err := archive.Load(ag.SessionDir(), ag.SessionID())
 	if err != nil {
 		t.Fatalf("load final A: %v", err)
 	}

@@ -2,7 +2,7 @@
 //
 //   - Codex's structured per-tool permission gates with decision trees
 //     (safe allowlist, dangerous denylist, everything else asks).
-//   - Claude Code's permission modes (default / acceptEdits / bypassPermissions)
+//   - Explicit operation modes (auto / manual)
 //     and always-allow / always-deny rule files.
 //
 // The Manager is session-scoped: transient "always allow this" decisions from
@@ -18,47 +18,24 @@ import (
 	"sync"
 )
 
-// Mode mirrors Claude Code's permission modes (including plan).
+// Mode selects the operation approval policy.
 type Mode string
 
 const (
-	ModeDefault     Mode = "default"
-	ModeAcceptEdits Mode = "acceptEdits"
-	ModePlan        Mode = "plan"
-	ModeBypass      Mode = "bypassPermissions"
+	ModeAuto   Mode = "auto"
+	ModeManual Mode = "manual"
 )
 
 // ValidModes lists selectable modes.
-var ValidModes = []Mode{ModeDefault, ModeAcceptEdits, ModePlan, ModeBypass}
+var ValidModes = []Mode{ModeAuto, ModeManual}
 
-// ParseMode converts a string to a Mode.
+// ParseMode accepts the canonical mode names used by config, journal and UI.
 func ParseMode(s string) (Mode, error) {
-	switch s {
-	case "manual":
-		return ModeDefault, nil
-	case "edits":
-		return ModeAcceptEdits, nil
-	case "bypass":
-		return ModeBypass, nil
-	}
 	switch Mode(s) {
-	case ModeDefault, ModeAcceptEdits, ModePlan, ModeBypass:
+	case ModeAuto, ModeManual:
 		return Mode(s), nil
 	}
-	return "", fmt.Errorf("unknown permission mode %q (want manual|edits|bypass|plan)", s)
-}
-
-// Label returns the public name while persisted legacy values remain compatible.
-func (m Mode) Label() string {
-	switch m {
-	case ModeDefault:
-		return "manual"
-	case ModeAcceptEdits:
-		return "edits"
-	case ModeBypass:
-		return "bypass"
-	}
-	return string(m)
+	return "", fmt.Errorf("unknown permission mode %q (want auto|manual)", s)
 }
 
 // Decision is the outcome of a permission check.
@@ -84,21 +61,15 @@ const (
 	KindNetwork
 	KindDelegate
 	KindOrchestration
+	KindProcessRead
+	KindProcessStop
+	KindComputer
 )
 
-func (k ToolKind) PlanAllowed() bool {
-	switch k {
-	case KindRead, KindState, KindNetwork, KindDelegate, KindOrchestration:
-		return true
-	default:
-		return false
-	}
-}
-
-func (k ToolKind) Concurrent() bool { return k == KindRead }
+func (k ToolKind) Concurrent() bool { return k == KindRead || k == KindProcessRead }
 
 func (k ToolKind) NeedsReview() bool {
-	return k == KindUnknown || k == KindWrite || k == KindShell || k == KindProcess || k == KindNetwork
+	return k == KindUnknown || k == KindWrite || k == KindShell || k == KindProcess || k == KindNetwork || k == KindComputer
 }
 
 // Policy is the persistent, config-file-supplied rule set.
@@ -114,7 +85,6 @@ type Manager struct {
 	mu       sync.RWMutex
 	Mode     Mode
 	Policy   Policy
-	AllowAll bool            // bypass mode
 	allowMap map[string]bool // session "always allow" rememberances
 	denyMap  map[string]bool // session "never allow" rememberances
 }
@@ -126,7 +96,6 @@ type Manager struct {
 type Snapshot struct {
 	Mode     Mode
 	Policy   Policy
-	AllowAll bool
 	AllowMap map[string]bool
 	DenyMap  map[string]bool
 }
@@ -154,7 +123,6 @@ func (m *Manager) Snapshot() Snapshot {
 	s := Snapshot{
 		Mode:     m.Mode,
 		Policy:   Policy{AlwaysAllow: append([]string(nil), m.Policy.AlwaysAllow...), AlwaysDeny: append([]string(nil), m.Policy.AlwaysDeny...)},
-		AllowAll: m.AllowAll,
 		AllowMap: make(map[string]bool, len(m.allowMap)),
 		DenyMap:  make(map[string]bool, len(m.denyMap)),
 	}
@@ -172,7 +140,6 @@ func (m *Manager) Snapshot() Snapshot {
 // without affecting the source session.
 func NewManagerFromSnapshot(s Snapshot) *Manager {
 	m := NewManager(s.Mode, s.Policy)
-	m.AllowAll = s.AllowAll
 	for k, v := range s.AllowMap {
 		m.allowMap[k] = v
 	}
@@ -202,17 +169,6 @@ func (m *Manager) SetPolicy(p Policy) {
 		AlwaysAllow: append([]string(nil), p.AlwaysAllow...),
 		AlwaysDeny:  append([]string(nil), p.AlwaysDeny...),
 	}
-	m.mu.Unlock()
-}
-
-// SetAllowAll updates bypass mode under the manager lock. Bypass skips normal
-// approval prompts but never bypasses HardDeny or plan capability limits.
-func (m *Manager) SetAllowAll(allow bool) {
-	if m == nil {
-		return
-	}
-	m.mu.Lock()
-	m.AllowAll = allow
 	m.mu.Unlock()
 }
 
@@ -257,7 +213,7 @@ func (m *Manager) Check(toolName string, args map[string]any, kind ToolKind) (De
 		return DecisionDeny, reason
 	}
 	m.mu.RLock()
-	mode, allowAll := m.Mode, m.AllowAll
+	mode := m.Mode
 	policy := m.Policy
 	_, allowedSession := m.allowMap[SessionKey(toolName, args)]
 	m.mu.RUnlock()
@@ -265,13 +221,10 @@ func (m *Manager) Check(toolName string, args map[string]any, kind ToolKind) (De
 	// Rules are matched against the canonical invocation descriptor
 	// ("Bash:<cmd>", "Write:<path>"), not the session-rememberance key form.
 	invocation := describeInvocation(toolName, args)
-	if mode == ModePlan && !kind.PlanAllowed() {
-		return DecisionAsk, fmt.Sprintf("%s requires execute capability", toolName)
-	}
 	// Bash needs a command-aware gate: a whole-string glob rule can otherwise
 	// approve a chained command (`git status && <anything>`) whose tail the user
 	// never sanctioned. Handle Bash with the segment-aware path and return here;
-	// every non-Bash tool falls through to the generic rule/session/bypass chain.
+	// every non-Bash tool falls through to the generic rule/session chain.
 	if kind == KindShell {
 		command := StringArg(args, "command", "")
 		if commandAllowedByRules(command, policy.AlwaysAllow) {
@@ -279,9 +232,6 @@ func (m *Manager) Check(toolName string, args map[string]any, kind ToolKind) (De
 		}
 		if allowedSession {
 			return DecisionAllow, "allowed by session rule"
-		}
-		if allowAll || mode == ModeBypass {
-			return DecisionAllow, "bypass mode"
 		}
 		return m.checkBash(mode, command)
 	}
@@ -293,24 +243,30 @@ func (m *Manager) Check(toolName string, args map[string]any, kind ToolKind) (De
 	if allowedSession {
 		return DecisionAllow, "allowed by session rule"
 	}
-	if allowAll || mode == ModeBypass {
-		return DecisionAllow, "bypass mode"
-	}
-
 	switch kind {
 	case KindWrite:
-		if mode == ModeAcceptEdits {
-			return DecisionAllow, "edit accepted by acceptEdits mode"
+		if mode == ModeAuto {
+			return DecisionAllow, fmt.Sprintf("edit accepted by %s mode", mode)
 		}
 		return DecisionAsk, fmt.Sprintf("%s requires approval", toolName)
-	case KindRead, KindState, KindNetwork, KindDelegate, KindOrchestration:
+	case KindRead, KindState, KindNetwork, KindDelegate, KindOrchestration, KindProcessRead, KindProcessStop:
 		return DecisionAllow, "built-in capability"
+	case KindComputer:
+		if mode == ModeAuto {
+			return DecisionAllow, "desktop enabled for this session"
+		}
+		return DecisionAsk, "desktop access requires approval"
+	case KindProcess:
+		if mode == ModeAuto {
+			return DecisionAllow, "owned process input in automatic mode"
+		}
+		return DecisionAsk, "process input requires approval"
 	default:
 		return DecisionAsk, fmt.Sprintf("tool %q requires approval", toolName)
 	}
 }
 
-// HardDeny reports a denial that no ordinary allow, bypass mode or approval
+// HardDeny reports a denial that no ordinary allow or approval
 // hook may override. It is intentionally narrow so runtime can run it as the
 // first admission check for custom tools and hooks.
 func (m *Manager) HardDeny(toolName string, args map[string]any) (bool, string) {
@@ -395,8 +351,8 @@ func (m *Manager) checkBash(mode Mode, command string) (Decision, string) {
 		return DecisionDeny, "empty command"
 	}
 
-	if mode == ModeBypass {
-		return DecisionAllow, "bypass mode"
+	if mode == ModeAuto {
+		return DecisionAllow, "command admitted within the execution environment"
 	}
 
 	// Split into sequential command segments and require *every* one to be

@@ -39,11 +39,11 @@ func TestLoadFromEnvironmentOverridesFile(t *testing.T) {
 	t.Setenv("CCDP_API_KEY", "env-key")
 	t.Setenv("CCDP_BASE_URL", "https://env.example/v1")
 	t.Setenv("CCDP_MODEL", "env-model")
-	t.Setenv("CCDP_PERMISSION_MODE", "bypassPermissions")
+	t.Setenv("CCDP_PERMISSION_MODE", "auto")
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{
   "model":"file-model",
-  "permission_mode":"default"
+  "permission_mode":"manual"
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestLoadFromEnvironmentOverridesFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.APIKey != "env-key" || cfg.BaseURL != "https://env.example/v1" ||
-		cfg.Model != "env-model" || cfg.PermissionMode != "bypassPermissions" {
+		cfg.Model != "env-model" || cfg.PermissionMode != "auto" {
 		t.Fatalf("environment did not win over file: %+v", cfg)
 	}
 }
@@ -125,7 +125,7 @@ func TestLoadFromMerge(t *testing.T) {
 	content := `{
 		"providers": {"custom": {"base_url":"https://custom.example/v1", "wire_api":"chat", "models":{"custom-model":{}}}},
 		"model": "custom/custom-model",
-		"permission_mode": "acceptEdits",
+		"permission_mode": "manual",
 		"tools": [{"name": "fmt", "description": "fmt", "command": "gofmt"}]
 	}`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
@@ -139,7 +139,7 @@ func TestLoadFromMerge(t *testing.T) {
 	if cfg.ResolveProvider(cfg.Model).BaseURL != "https://custom.example/v1" || cfg.Model != "custom/custom-model" {
 		t.Errorf("custom values not merged: %+v", cfg)
 	}
-	if cfg.PermissionMode != "acceptEdits" {
+	if cfg.PermissionMode != "manual" {
 		t.Errorf("mode = %q", cfg.PermissionMode)
 	}
 	if len(cfg.Tools) != 1 || cfg.Tools[0].Name != "fmt" {

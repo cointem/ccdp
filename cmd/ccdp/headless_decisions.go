@@ -1,18 +1,18 @@
 package main
 
 import (
-	"ccdp/internal/protocol"
 	"context"
 	"fmt"
+
+	"ccdp/internal/protocol"
 )
 
 // A headless session has no human decision channel. Snapshots and events use
 // the same decision handler, so replay/resync neither loses nor duplicates a
-// refusal. Versioned plans are distinct decisions even when their ID is reused.
+// refusal.
 type headlessDecisionKey struct {
-	kind    protocol.CommandType
-	id      string
-	version uint64
+	kind protocol.CommandType
+	id   string
 }
 
 type headlessDecisions struct {
@@ -40,12 +40,6 @@ func (d *headlessDecisions) snapshot(ctx context.Context, view protocol.SessionV
 			return err
 		}
 	}
-	if p := view.Plan; p != nil {
-		key := headlessDecisionKey{kind: protocol.CommandApprovePlan, id: p.ID, version: p.Version}
-		if err := d.submit(ctx, key, protocol.Command{Type: key.kind, Plan: &protocol.ApprovePlan{PlanID: p.ID, PlanVersion: p.Version, Approve: false}}); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -60,9 +54,7 @@ func (d *headlessDecisions) submit(ctx context.Context, key headlessDecisionKey,
 	}
 	if receipt.Rejected() {
 		// Another observer may settle a decision before its snapshot is consumed.
-		// A stale plan is obsolete, but any other refusal remains an actual error.
-		obsolete := receipt.Error != nil && (receipt.Error.Code == protocol.ErrorNotFound ||
-			key.kind == protocol.CommandApprovePlan && receipt.Error.Code == protocol.ErrorStaleRevision)
+		obsolete := receipt.Error != nil && receipt.Error.Code == protocol.ErrorNotFound
 		if !obsolete {
 			return receiptError(receipt)
 		}
@@ -81,7 +73,7 @@ func (w *headlessWatch) decisionHandler(client protocol.SessionClient, sessionID
 }
 
 func (w *headlessWatch) childDecision(ctx context.Context, client protocol.SessionClient, child protocol.ChildSession, format outputFormat) error {
-	if child.Approval == nil && child.Question == nil && child.Plan == nil {
+	if child.Approval == nil && child.Question == nil {
 		return nil
 	}
 	provider, ok := client.(interface {
@@ -102,7 +94,7 @@ func (w *headlessWatch) childDecision(ctx context.Context, client protocol.Sessi
 		d = &headlessDecisions{client: owner, sessionID: child.SessionID, format: format, handled: map[headlessDecisionKey]bool{}}
 		w.childDecisions[child.SessionID] = d
 	}
-	return d.snapshot(ctx, protocol.SessionView{Approval: child.Approval, Question: child.Question, Plan: child.Plan})
+	return d.snapshot(ctx, protocol.SessionView{Approval: child.Approval, Question: child.Question})
 }
 
 func (w *headlessWatch) childSnapshotDecisions(ctx context.Context, client protocol.SessionClient, format outputFormat) error {

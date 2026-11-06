@@ -34,7 +34,7 @@ func TestWebProxyUsesUpstreamDNSAndChecksRedirects(t *testing.T) {
 		t.Fatal("private redirect reached proxy")
 	}
 	// Exercise the public tool entry point, not only its HTTP helper.
-	ctx := rgCtx(t.TempDir())
+	ctx := rgCtx(t, t.TempDir())
 	ctx.HostNetworkAllowed = true
 	ctx.Sandbox.NetworkProxy = proxy.URL
 	ctx.Args = map[string]any{"url": "http://public.invalid/"}

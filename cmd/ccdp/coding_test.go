@@ -46,7 +46,7 @@ func testReviewCLIReport(t *testing.T, partial bool) {
 	if partial {
 		wantCode, wantText = 2, "未覆盖"
 	}
-	if code := runCodingCLI([]string{"review", "-d", root, "--config-file", path, "--permission-mode", "bypass"}, &out, &diagnostics); code != wantCode {
+	if code := runCodingCLI([]string{"review", "-d", root, "--config-file", path, "--mode", "auto"}, &out, &diagnostics); code != wantCode {
 		t.Fatalf("exit %d: %s; %s", code, diagnostics.String(), out.String())
 	}
 	if !strings.Contains(out.String(), wantText) || strings.Contains(out.String(), "review_session_id") {
@@ -66,7 +66,7 @@ func TestCodingCLIUsesDurableOperation(t *testing.T) {
 		t.Fatal(e)
 	}
 	var out, err bytes.Buffer
-	code := runCodingCLI([]string{"index", "status", "-d", root, "--config-file", path}, &out, &err)
+	code := runCodingCLI([]string{"index", "status", "-d", root, "--config-file", path, "--mode", "auto"}, &out, &err)
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, err.String())
 	}

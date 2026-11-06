@@ -25,8 +25,7 @@ type queryRuntimeSnapshot struct {
 	sandboxDetail string
 	sandboxRev    uint64
 	sandboxLimits bool
-	plugins       []string
-	pending       []string
+	providers     []string
 	mcpNames      []string
 	mcpTools      map[string][]string
 	skills        []skills.Skill
@@ -65,8 +64,8 @@ func (a *Agent) Query(ctx context.Context, kind protocol.QueryKind) (protocol.Qu
 		text, err = a.projectMemoryReport(snapshot.cfg)
 	case protocol.QueryMCP:
 		text = formatQueryMap(snapshot.mcpTools)
-	case protocol.QueryPlugins:
-		text = formatQueryPlugins(snapshot)
+	case protocol.QueryProviders:
+		text = formatQueryProviders(snapshot)
 	case protocol.QuerySkills:
 		text = formatQuerySkills(snapshot.skills)
 	case protocol.QueryGitHub:
@@ -128,11 +127,6 @@ func (a *Agent) captureQuerySnapshot(ctx context.Context) *queryRuntimeSnapshot 
 	} else {
 		sandboxDetail = "sandbox policy is unavailable"
 	}
-	var plugins, pending []string
-	if a.services.host != nil {
-		plugins = a.services.host.Names()
-		pending = a.services.host.Pending()
-	}
 	var mcpNames []string
 	mcpTools := map[string][]string{}
 	if a.services.mcp != nil {
@@ -151,8 +145,7 @@ func (a *Agent) captureQuerySnapshot(ctx context.Context) *queryRuntimeSnapshot 
 	}
 	return &queryRuntimeSnapshot{view: view, cfg: cfg, sandboxReady: sandboxReady,
 		sandboxDetail: sandboxDetail, sandboxRev: sandboxRevision,
-		sandboxLimits: limits, plugins: append([]string(nil), plugins...),
-		pending: append([]string(nil), pending...), mcpNames: append([]string(nil), mcpNames...),
+		sandboxLimits: limits, providers: a.services.models.Names(), mcpNames: append([]string(nil), mcpNames...),
 		mcpTools: mcpTools, skills: loadedSkills, permissions: permissionSnapshot}
 }
 
@@ -182,7 +175,6 @@ func formatQueryConfig(s *queryRuntimeSnapshot) string {
 	fmt.Fprintf(&b, "read/write roots: %s\n", strings.Join(append([]string{cfg.Workspace}, cfg.AdditionalDirectories...), ", "))
 	fmt.Fprintf(&b, "read-only roots: %s\n", strings.Join(cfg.AdditionalReadOnlyDirectories, ", "))
 	fmt.Fprintf(&b, "denied roots: %s\n", strings.Join(cfg.DisallowedDirectories, ", "))
-	fmt.Fprintf(&b, "plan mode:     %v\n", s.view.Settings.ExecutionMode == protocol.ExecutionModePlan)
 	fmt.Fprintf(&b, "workspace:     %s\n", cfg.Workspace)
 	fmt.Fprintf(&b, "context_window:%d\n", s.view.Settings.ContextWindow)
 	fmt.Fprintf(&b, "compact_thr:   %.0f%%\n", cfg.CompactThreshold*100)
@@ -193,7 +185,7 @@ func formatQueryConfig(s *queryRuntimeSnapshot) string {
 		b.WriteString("project memory writes: disabled (no session persistence)\n")
 	}
 	fmt.Fprintf(&b, "tools:         %d\n", len(s.view.Catalog.Tools))
-	fmt.Fprintf(&b, "plugins:       %d\n", len(s.plugins))
+	fmt.Fprintf(&b, "providers:     %d\n", len(s.providers))
 	fmt.Fprintf(&b, "mcp servers:   %d\n", len(s.mcpNames))
 	fmt.Fprintf(&b, "skills:        %d\n", len(s.skills))
 	path := cfg.SourcePath()
@@ -283,21 +275,14 @@ func formatQueryPermissions(s *queryRuntimeSnapshot) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func formatQueryPlugins(s *queryRuntimeSnapshot) string {
+func formatQueryProviders(s *queryRuntimeSnapshot) string {
 	if s == nil {
 		return ""
 	}
-	var b strings.Builder
-	for _, name := range s.plugins {
-		b.WriteString(name + "\n")
+	if len(s.providers) == 0 {
+		return "(none)"
 	}
-	for _, name := range s.pending {
-		fmt.Fprintf(&b, "%s (pending)\n", name)
-	}
-	if len(s.plugins) == 0 && len(s.pending) == 0 {
-		b.WriteString("(none)\n")
-	}
-	return strings.TrimRight(b.String(), "\n")
+	return strings.Join(s.providers, "\n")
 }
 
 func formatQuerySkills(all []skills.Skill) string {

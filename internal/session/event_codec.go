@@ -38,6 +38,17 @@ func decodeEvent(w wireEvent) (Event, error) {
 	}
 	var event Event
 	switch w.Type {
+	case EventTypeProcessRegistered:
+		event = &ProcessRegistered{}
+	case EventTypeProcessStarted:
+		event = &ProcessStarted{}
+	case EventTypeProcessFinished:
+		event = &ProcessFinished{}
+	case EventTypeProcessReleased:
+		event = &ProcessReleased{}
+	case EventTypeProcessResultsProjected:
+		event = &ProcessResultsProjected{}
+
 	case EventTypeDeliveryRecorded:
 		event = &DeliveryRecorded{}
 	case EventTypeRestoreRecorded:
@@ -70,8 +81,6 @@ func decodeEvent(w wireEvent) (Event, error) {
 		event = &SettingsChanged{}
 	case EventTypeGoalChanged:
 		event = &GoalChanged{}
-	case EventTypeWorkflowChanged:
-		event = &WorkflowChanged{}
 	case EventTypeTurnStarted:
 		event = &TurnStarted{}
 	case EventTypeTurnFinished:

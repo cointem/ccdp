@@ -39,7 +39,7 @@ func codeAgent(t *testing.T, code string, configure func(*config.Config)) (*Agen
 	cfg.SessionDir = t.TempDir()
 	cfg.MaxParallelTools = 1
 	cfg.MaxResultSizeBytes = 8192
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	if configure != nil {
 		configure(&cfg)
 	}
@@ -67,7 +67,7 @@ func finishCode(t *testing.T, a *Agent, events <-chan protocol.EventView) {
 	drainUntil(t, events, 20*time.Second, func(e protocol.EventView) bool { return e.Kind == protocol.EventTurnDone })
 }
 
-func TestCodeModeDefaultAndReload(t *testing.T) {
+func TestCodeModeManualAndReload(t *testing.T) {
 	a := newRuntimeAgent(t)
 	if _, ok := a.services.registry.Get("RunCode"); ok != codemode.Available {
 		t.Fatal("RunCode must be registered by default")
@@ -187,7 +187,7 @@ func TestCodeModeHardDenyAndNoRecursiveControl(t *testing.T) {
 }
 
 func TestCodeModeFrozenDirectory(t *testing.T) {
-	a, _, _ := codeAgent(t, `text("unused")`, nil)
+	a, _, _ := codeAgent(t, `text("unused")`, func(cfg *config.Config) { cfg.AlwaysAllow = []string{"Frozen"} })
 	old := &codeFixtureTool{name: "Frozen", text: "old"}
 	a.services.registry.Register(old)
 	lease := a.services.registry.Acquire()
@@ -208,7 +208,7 @@ func TestCodeModeBashHandleSurvivesCell(t *testing.T) {
 	defer lease.Close()
 	jc := toolJournalContextForStep(testToolStep(t, a))
 	jc.toolLease, jc.allowedTools = lease, []string{"Bash", "Process"}
-	summary, err := a.runCode(context.Background(), messages.ToolCall{ID: "background"}, jc, `await tools.Bash({command:"sleep 0.2; printf ready",yield_ms:0});`, 5*time.Second)
+	summary, err := a.runCode(context.Background(), messages.ToolCall{ID: "background"}, jc, `await tools.Bash({command:"sleep 0.2; printf ready",background:true});`, 5*time.Second)
 	if err != nil {
 		t.Fatalf("%+v %v", summary, err)
 	}
@@ -216,7 +216,7 @@ func TestCodeModeBashHandleSurvivesCell(t *testing.T) {
 		t.Fatalf("missing retained handle: %+v", summary)
 	}
 	id := summary.Processes[0]
-	result, failed := executeTestTool(t, a, messages.ToolCall{ID: "follow-process", Name: "Process", Arguments: map[string]any{"id": id, "action": "read", "wait_ms": 1000}})
+	result, failed := executeTestTool(t, a, messages.ToolCall{ID: "follow-process", Name: "Process", Arguments: map[string]any{"id": id, "action": "wait"}})
 	if failed || !strings.Contains(result, "ready") {
 		t.Fatalf("%s failed=%v", result, failed)
 	}

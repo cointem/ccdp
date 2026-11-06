@@ -26,6 +26,7 @@ func TestMemorySessionSwitchPreservesChildHistoryArtifactsAndContinuation(t *tes
 	t.Cleanup(server.Close)
 	cfg := isolatedTestConfig(t, "memory-child-model")
 	cfg.BaseURL = server.URL
+	cfg.AlwaysAllow = []string{"OutputFixture"}
 	cfg.MaxResultSizeBytes = 1024
 	image := inputPNG(t, 123)
 	imagePath := filepath.Join(cfg.Workspace, "capture.png")

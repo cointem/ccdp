@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -34,9 +33,7 @@ func (a *Agent) queueStateOwnedLocked() {
 // one owner-ordered batch, captured under the state lock. No other publication
 // can interleave between the terminal snapshot and its event. If a queued input was
 // already admitted, a busy reservation for its next turn is published after
-// TurnDone and the caller must drain it. No eventView call is made here: it
-// would re-enter a.mu and a second, delayed conversion could broadcast an old
-// TurnDone after a new user message has started.
+// TurnDone and the caller must drain it. The event and snapshot share this exact state boundary.
 func (a *Agent) publishTerminal(turnID protocol.TurnID) bool {
 	a.mu.Lock()
 	a.flushStreamsLocked()
@@ -50,17 +47,17 @@ func (a *Agent) publishTerminal(turnID protocol.TurnID) bool {
 		a.lifecycle.phase = protocol.PhaseIdle
 	}
 	a.lifecycle.settling = false
-	canDrain := !a.capabilities.settingsPreparing && !a.capabilities.capabilityRevoking && !a.lifecycle.closing && !a.lifecycle.closed && !a.turn.interruptFlag && a.services.persistenceErr == nil && (a.hasTurnStartingInputLocked() || a.goalRunnableLocked())
+	canDrain := !a.capabilities.settingsPreparing && !a.lifecycle.closing && !a.lifecycle.closed && !a.turn.interruptFlag && a.services.persistenceErr == nil && (a.hasTurnStartingInputLocked() || a.goalRunnableLocked())
 	a.refreshSnapshotLocked()
 	view := a.stateLocked()
 	rev := view.Revision
 	done := protocol.EventView{
-		Kind:           protocol.EventTurnDone,
-		SessionID:      protocol.SessionID(a.conversation.sessionID),
-		TurnID:         turnID,
-		StepID:         protocol.StepID(fmt.Sprintf("%d", a.sequences.stepSeq)),
-		Phase:          a.lifecycle.phase,
-		Workflow:       a.lifecycle.workflow,
+		Kind:      protocol.EventTurnDone,
+		SessionID: protocol.SessionID(a.conversation.sessionID),
+		TurnID:    turnID,
+		StepID:    protocol.StepID(fmt.Sprintf("%d", a.sequences.stepSeq)),
+		Phase:     a.lifecycle.phase,
+
 		PermissionMode: string(a.services.perms.CurrentMode()),
 	}
 	state := protocol.Update{Type: protocol.UpdateState, Cursor: protocol.Cursor{LogSeq: rev.LogSeq, ViewGeneration: rev.ViewGeneration}, Revision: rev, State: &view}
@@ -83,10 +80,29 @@ func (a *Agent) publishTerminal(turnID protocol.TurnID) bool {
 	return canDrain
 }
 
-func (a *Agent) publishEvent(ev Event) {
-	view := a.eventView(ev)
+func (a *Agent) publishEvent(view protocol.EventView) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	view.SessionID = protocol.SessionID(a.conversation.sessionID)
+	if view.TurnID == "" {
+		view.TurnID = protocol.TurnID(fmt.Sprintf("%d", a.sequences.turnSeq))
+	}
+	if view.StepID == "" {
+		view.StepID = protocol.StepID(fmt.Sprintf("%d", a.sequences.stepSeq))
+	}
+	view.Phase = a.lifecycle.phase
+	view.PermissionMode = string(a.services.perms.CurrentMode())
+	if view.Tool != nil {
+		view.CallID = view.Tool.ID
+	} else if view.Approval != nil {
+		view.CallID = protocol.CallID(view.Approval.ID)
+	}
+	if view.Kind == protocol.EventError && view.Error == "" {
+		view.Error = view.Text
+	}
+	defer func() {
+		a.mu.Unlock()
+		a.writeTrace(view)
+	}()
 	streaming := (view.Kind == protocol.EventStream && view.Text != "") || view.Kind == protocol.EventReasoning || view.Kind == protocol.EventToolProgress
 	if !streaming {
 		a.flushStreamsLocked()
@@ -101,7 +117,7 @@ func (a *Agent) publishEvent(ev Event) {
 		a.flushStreamsLocked()
 		return
 	}
-	if a.publications.streamTimer == nil && a.owner != nil {
+	if a.publications.streamTimer == nil {
 		a.publications.streamTimerGeneration++
 		generation := a.publications.streamTimerGeneration
 		a.publications.streamTimer = time.AfterFunc(delay, func() {
@@ -148,77 +164,4 @@ func (a *Agent) flushStreamsLocked() {
 	for _, view := range pending {
 		a.publishViewLocked(view)
 	}
-}
-
-// eventView projects an internal runtime event into the typed Watch protocol.
-func (a *Agent) eventView(ev Event) protocol.EventView {
-	a.mu.Lock()
-	turnID := protocol.TurnID(ev.TurnID)
-	if turnID == "" {
-		turnID = protocol.TurnID(fmt.Sprintf("%d", a.sequences.turnSeq))
-	}
-	view := protocol.EventView{SessionID: protocol.SessionID(a.conversation.sessionID), TurnID: turnID, StepID: protocol.StepID(fmt.Sprintf("%d", a.sequences.stepSeq)), Phase: a.lifecycle.phase, Workflow: a.lifecycle.workflow, MessageID: ev.MessageID, Text: ev.Text}
-	mode := a.services.perms.CurrentMode()
-	a.mu.Unlock()
-	view.PermissionMode = string(mode)
-	switch ev.Type {
-	case EventGoalChanged:
-		view.Kind = protocol.EventGoalChanged
-		view.Goal = protocol.CloneGoal(ev.Goal)
-	case EventStatus:
-		view.Kind = protocol.EventStatus
-	case EventUserMsg:
-		view.Kind = protocol.EventUserMessage
-	case EventStream:
-		view.Kind = protocol.EventStream
-	case EventReasoning:
-		view.Kind = protocol.EventReasoning
-	case EventToolStart:
-		view.Kind = protocol.EventToolStarted
-	case EventToolStream:
-		view.Kind = protocol.EventToolProgress
-	case EventToolResult:
-		view.Kind = protocol.EventToolResult
-	case EventApproval:
-		view.Kind = protocol.EventApprovalRequest
-	case EventQuestion:
-		view.Kind = protocol.EventQuestionRequest
-		view.Question = protocol.CloneQuestionRequest(ev.Question)
-	case EventPlan:
-		view.Kind = protocol.EventPlanReady
-	case EventError:
-		view.Kind, view.Error = protocol.EventError, ev.Text
-	case EventTurnDone:
-		view.Kind = protocol.EventTurnDone
-	case EventUsage:
-		view.Kind = protocol.EventUsage
-	case EventPlanModeChanged:
-		view.Kind = protocol.EventStateChanged
-		if ev.PlanMode {
-			view.ExecutionMode = protocol.ExecutionModePlan
-		} else {
-			view.ExecutionMode = protocol.ExecutionModeExecute
-		}
-	case EventModeChanged, EventSandboxChanged, EventHistoryChanged, EventHistoryCleared, EventCompacted, EventSessionChanged:
-		view.Kind = protocol.EventStateChanged
-	default:
-		view.Kind = protocol.EventStateChanged
-	}
-	if ev.Tool != nil {
-		args, _ := json.Marshal(ev.Tool.Args)
-		view.Tool = &protocol.ToolView{ID: protocol.CallID(ev.Tool.ID), Name: ev.Tool.Name, Status: ev.Tool.Status, Args: args, Output: ev.Tool.Output, ParentCallID: protocol.CallID(ev.Tool.ParentCallID), ChildIndex: ev.Tool.ChildIndex}
-		view.CallID = protocol.CallID(ev.Tool.ID)
-	}
-	if ev.Approval != nil {
-		view.Approval = &protocol.ApprovalView{ID: ev.Approval.ID, Tool: ev.Approval.Tool,
-			Reason: ev.Approval.Reason, Args: approvalArgsView(ev.Approval), Capabilities: append([]protocol.CapabilityRequest(nil), ev.Approval.Capabilities...)}
-		view.CallID = protocol.CallID(ev.Approval.ID)
-	}
-	if ev.Plan != nil {
-		view.Plan = &protocol.PlanView{ID: ev.Plan.ID, Text: ev.Plan.Plan, Version: planViewVersion}
-	}
-	if ev.Usage != nil {
-		view.Usage = &protocol.UsageSnapshot{InputTokens: ev.Usage.InputTokens, OutputTokens: ev.Usage.OutputTokens, CachedTokens: ev.Usage.CachedTokens, Cache: ev.Usage.Cache, TurnCount: ev.Usage.TurnCount}
-	}
-	return view
 }

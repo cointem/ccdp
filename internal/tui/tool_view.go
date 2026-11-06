@@ -15,15 +15,17 @@ import (
 // the complete sanitized output; the renderer chooses a bounded preview while
 // readers and copy/export paths can still use the original historyCell.text.
 type toolPresentation struct {
-	ParentCallID string
-	ChildIndex   int
-	ID           string
-	Name         string
-	Status       string
-	Args         map[string]any
-	Arguments    string
-	Output       string
-	Truncated    bool
+	ParentCallID  string
+	ChildIndex    int
+	ID            string
+	Name          string
+	Status        string
+	Args          map[string]any
+	Arguments     string
+	Output        string
+	Truncated     bool
+	Process       *protocol.ProcessState
+	ProcessMerged bool
 	// Agent holds the child session spawned by a SpawnAgent call, resolved by
 	// ParentCallID. It drives the compact agent marker so the child's final
 	// answer never floods the parent transcript as ordinary tool output.
@@ -44,7 +46,7 @@ func toolPresentationFromItem(item *historyCell) toolPresentation {
 	return toolPresentation{ID: sanitizeANSI(item.toolID), Name: sanitizeANSI(item.toolName),
 		ParentCallID: item.parentCallID, ChildIndex: item.childIndex,
 		Status: sanitizeANSI(item.status), Args: args, Arguments: sanitizeANSI(item.toolArgsRaw),
-		Output: item.cleanText(), Truncated: item.toolTruncated, Agent: item.agent}
+		Output: item.cleanText(), Truncated: item.toolTruncated, Agent: item.agent, Process: item.process, ProcessMerged: item.processMerged}
 }
 
 // renderToolView is shared by the transcript and typed protocol projection.
@@ -81,6 +83,12 @@ func (m *Model) renderToolView(item *historyCell, width int) string {
 }
 
 func renderToolPresentation(p toolPresentation, width int) string {
+	if !p.Expanded && p.Name == "Process" && p.ProcessMerged && protocol.ToolTerminal(p.Status) && !toolStatusIsFailure(p.Status) {
+		action, _ := p.Args["action"].(string)
+		if action == "read" || action == "wait" {
+			return ""
+		}
+	}
 	if p.ParentCallID != "" {
 		index := p.ChildIndex
 		p.ParentCallID = ""
@@ -105,13 +113,43 @@ func renderToolPresentation(p toolPresentation, width int) string {
 		name = "Tool"
 	}
 	meta := toolArgumentSummary(p.Name, p.Args, p.Arguments)
+	settled := protocol.ToolTerminal(p.Status)
+	if p.Process != nil && p.Name == "Bash" && !toolStatusIsFailure(p.Status) {
+		p.Status = processPresentationStatus(*p.Process)
+	}
+	if p.Process != nil && settled && !p.Expanded {
+		p.Output = sanitizeANSI(p.Process.Output)
+		if p.Process.Tail != "" {
+			p.Output = "…\n" + sanitizeANSI(p.Process.Tail)
+		}
+		p.Truncated = p.Process.Truncated
+	}
 	switch strings.ToLower(p.Name) {
 	case "bash":
 		name = "Ran"
 		if !protocol.ToolTerminal(p.Status) {
 			name = "Running"
 		}
+		if p.Status == "background" {
+			name = "Background"
+		}
 		meta = strings.TrimPrefix(meta, "$ ")
+	case "process":
+		action, _ := p.Args["action"].(string)
+		switch action {
+		case "read", "wait":
+			name = "Waiting for"
+			if protocol.ToolTerminal(p.Status) {
+				name = "Checked"
+			}
+		case "write":
+			name = "Sent input to"
+		case "stop":
+			name = "Stopped"
+		}
+		if p.Process != nil && p.Process.Command != "" {
+			meta = sanitizeANSI(p.Process.Command)
+		}
 	case "write":
 		name = "Wrote"
 	case "edit":
@@ -130,6 +168,8 @@ func renderToolPresentation(p toolPresentation, width int) string {
 		mark, stateStyle, stateText = "■", styleStatus, "stopped"
 	case "unknown":
 		mark, stateStyle, stateText = "?", styleToolErr, "outcome unknown"
+	case "background":
+		mark, stateStyle, stateText = "•", styleToolRun, ""
 	}
 	first := stateStyle.Render(mark) + " " + styleAssistant.Bold(true).Render(name)
 	if stateText != "done" && stateText != "" && !(name == "Running" && stateText == "running") {
@@ -206,6 +246,26 @@ func renderToolPresentation(p toolPresentation, width int) string {
 	return strings.Join(rows, "\n")
 }
 
+func processPresentationStatus(p protocol.ProcessState) string {
+	switch p.Status {
+	case "registered", "running":
+		if p.Background {
+			return "background"
+		}
+		return "running"
+	case "unknown":
+		return "unknown"
+	case "cancelled", "stopped", "interrupted":
+		return "cancelled"
+	case "timed_out":
+		return "error"
+	}
+	if p.ExitCode != nil && *p.ExitCode != 0 {
+		return "error"
+	}
+	return "success"
+}
+
 func boundedToolLines(lines []string, maxRows int, tail bool) ([]string, bool) {
 	if maxRows <= 0 {
 		maxRows = 1
@@ -270,6 +330,11 @@ func toolArgumentSummary(name string, args map[string]any, raw string) string {
 		return ""
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "computer":
+		if actions, ok := args["actions"].([]any); ok && value("operation") == "act" {
+			return fmt.Sprintf("act · %d actions", len(actions))
+		}
+		return value("operation")
 	case "runcode":
 		if description := value("description"); description != "" {
 			return description
@@ -462,8 +527,6 @@ func agentMarkerStatus(status string) (string, lipgloss.Style, string) {
 		return "■", styleStatus, "stopped"
 	case "waiting_question":
 		return "◆", styleAgentRun, "needs answer"
-	case "waiting_plan":
-		return "◆", styleAgentRun, "needs plan decision"
 	case "waiting_approval":
 		return "◆", styleAgentRun, "needs approval"
 	case "started":

@@ -175,7 +175,7 @@ func (w *headlessWatch) resync(lifetimeCtx, startupCtx context.Context, marker p
 }
 
 // runHeadlessClient drives one or more prompts through SessionClient without
-// the TUI. Input, approval, plan decisions, and cancellation use Submit.
+// the TUI. Input, approval, and cancellation use Submit.
 // Returns process exit code (0 success, 1 runtime/LLM error, 2 timeout, 130 signal).
 func runHeadlessClient(client protocol.SessionClient, prompts []string, format outputFormat, timeoutSec int) int {
 	return runHeadlessClientWithGoal(client, prompts, format, timeoutSec, nil)
@@ -565,8 +565,12 @@ func consumeHeadlessTurn(ctx, lifetimeCtx context.Context, watch *headlessWatch,
 			if format == outStreamJSON && ev.Tool != nil {
 				emitJSONLine(map[string]any{"type": "tool_result", "tool": ev.Tool.Name, "status": ev.Tool.Status, "output": ev.Tool.Output})
 			}
-		case protocol.EventApprovalRequest, protocol.EventQuestionRequest, protocol.EventPlanReady:
-			if err := decisions.snapshot(ctx, protocol.SessionView{Approval: ev.Approval, Question: ev.Question, Plan: ev.Plan}); err != nil {
+		case protocol.EventToolPhase:
+			if format == outStreamJSON && ev.Tool != nil {
+				emitJSONLine(map[string]any{"type": "tool_phase", "call_id": ev.Tool.ID, "tool": ev.Tool.Name, "phase": ev.Tool.Phase, "status": ev.Tool.Status, "failure": ev.Tool.Failure})
+			}
+		case protocol.EventApprovalRequest, protocol.EventQuestionRequest:
+			if err := decisions.snapshot(ctx, protocol.SessionView{Approval: ev.Approval, Question: ev.Question}); err != nil {
 				return err
 			}
 		case protocol.EventTurnDone:

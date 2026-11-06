@@ -9,6 +9,7 @@ import (
 
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func TestInputAdmissionSubmitCancellationAfterEnqueueIsUnknown(t *testing.T) {
@@ -173,7 +174,7 @@ func TestInputAdmissionDurableInputKeepsScheduledReceipt(t *testing.T) {
 			}
 			// Read the authoritative log directly, bypassing the injected error:
 			// recovery must retain exactly one pending or delivered user input.
-			snapshot, err := SessionSnapshotProjection(store.Store, a.SessionID())
+			snapshot, err := archive.FromStore(store.Store, a.SessionID())
 			if err != nil {
 				t.Fatal(err)
 			}

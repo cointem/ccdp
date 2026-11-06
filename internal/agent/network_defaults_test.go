@@ -21,7 +21,7 @@ func TestWorkerInheritsNetworkBaseline(t *testing.T) {
 				}
 				cfg.NetworkAccess = enabled
 				cfg.NetworkProxy = "http://127.0.0.1:7897"
-				cfg.PermissionMode = string(permissions.ModeDefault)
+				cfg.PermissionMode = string(permissions.ModeManual)
 				provider := &policyTestProvider{name: cfg.Model}
 				models := plugin.NewModelRegistry()
 				models.Register(provider)
@@ -59,7 +59,7 @@ func TestWorkerInheritsNetworkBaseline(t *testing.T) {
 						if err != nil || len(requested) != 0 || !policy.NetworkAllowed() {
 							t.Fatalf("%s did not inherit network: requests=%v err=%v", name, requested, err)
 						}
-					} else if err == nil {
+					} else if err == nil && (len(requested) == 0 || policy.NetworkAllowed()) {
 						t.Fatalf("%s bypassed disabled network", name)
 					}
 				}
@@ -110,7 +110,7 @@ func TestChildRoleAndWorkspacePreserveSessionNetworkGrant(t *testing.T) {
 						if err != nil || len(requested) != 0 || !policy.NetworkAllowed() {
 							t.Fatalf("lost inherited network grant: %v %v", requested, err)
 						}
-					} else if err == nil {
+					} else if err == nil && (len(requested) == 0 || policy.NetworkAllowed()) {
 						t.Fatal("one-shot parent grant leaked to non-interactive child")
 					}
 				})

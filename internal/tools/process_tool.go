@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"ccdp/internal/protocol"
 )
 
 type ProcessTool struct{}
@@ -16,23 +18,19 @@ type ProcessTool struct{}
 func NewProcessTool() *ProcessTool { return &ProcessTool{} }
 func (*ProcessTool) Name() string  { return "Process" }
 func (*ProcessTool) Description() string {
-	return "Read output from an existing Bash process by byte offset without consuming it. Continue with id=process_id, action=read, offset=next_offset; add wait_ms to wait for new output. Write stdin when started with stdin=pipe or tty=true (eof closes pipe input), or stop and release the handle. Waiting never reruns a command. log_path is an absolute path readable by Read (which uses line offsets). Logs retain at most 32 MiB; loss is reported in warning. Only the latest 32 completed handles and temporary logs are retained; stop or session close deletes logs. Save lasting results as files."
+	return "Inspect or control an owned background command using its opaque string id. read returns an immediate output snapshot; offset and next_offset are bytes. wait blocks once until completion with UI progress; do not poll for status. Completion is delivered automatically at the next model boundary. write sends stdin (eof closes pipe input); stop terminates and releases the handle. Cancellation of an observation leaves background work running. Prefer Read on log_path for earlier logs; retained logs expire after stop, eviction or session close."
 }
 func (*ProcessTool) Parameters() map[string]any {
-	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"id": map[string]any{"type": "integer"}, "action": map[string]any{"type": "string", "enum": []string{"read", "write", "stop"}}, "offset": map[string]any{"default": 0, "type": "integer", "minimum": 0}, "limit_bytes": map[string]any{"default": 51200, "type": "integer", "minimum": 4, "maximum": 51200}, "wait_ms": map[string]any{"default": 0, "type": "integer", "minimum": 0, "maximum": 10000}, "input": map[string]any{"type": "string"}, "eof": map[string]any{"default": false, "type": "boolean"}}, "required": []string{"id", "action"}}
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
+		"id":          map[string]any{"type": "string", "minLength": 1},
+		"action":      map[string]any{"type": "string", "enum": []string{"read", "wait", "write", "stop"}},
+		"offset":      map[string]any{"type": "integer", "minimum": 0, "description": "Only for read; raw log byte offset."},
+		"limit_bytes": map[string]any{"type": "integer", "minimum": 4, "maximum": 51200, "description": "Only for read."},
+		"input":       map[string]any{"type": "string", "description": "Only for write."}, "eof": map[string]any{"type": "boolean", "description": "Only for write; close pipe input."},
+	}, "required": []string{"id", "action"}}
 }
 
-type processView struct {
-	Truncated bool   `json:"truncated,omitempty"`
-	ID        int    `json:"process_id"`
-	Status    string `json:"status"`
-	ExitCode  *int   `json:"exit_code,omitempty"`
-	Output    string `json:"output"`
-	Offset    int    `json:"offset"`
-	Next      int    `json:"next_offset"`
-	Log       string `json:"log_path"`
-	Warning   string `json:"warning,omitempty"`
-}
+type processView = protocol.ProcessOutput
 
 func startCommand(ctx *Context) (string, error) {
 	if ctx.Context != nil && ctx.Context.Err() != nil {
@@ -45,13 +43,13 @@ func startCommand(ctx *Context) (string, error) {
 	if strings.TrimSpace(command) == "" {
 		return "", fmt.Errorf("Bash: command required")
 	}
-	yield, e := boundedInt(ctx.Args, "yield_ms", 1000, 0, 10000)
-	if e != nil {
-		return "", e
-	}
+	background := BoolArg(ctx.Args, "background", false) || BoolArg(ctx.Args, "tty", false) || StringArg(ctx.Args, "stdin", "closed") == "pipe"
 	timeout := ctx.Timeout
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
+	}
+	if background {
+		timeout = 0
 	}
 	if raw := ctx.Args["timeout_ms"]; raw != nil {
 		milliseconds, err := boundedInt(ctx.Args, "timeout_ms", 0, 0, 3600000)
@@ -61,6 +59,7 @@ func startCommand(ctx *Context) (string, error) {
 		timeout = time.Duration(milliseconds) * time.Millisecond
 	}
 	dir := ctx.WorkingDir
+	var e error
 	if raw := StringArg(ctx.Args, "cwd", ""); raw != "" {
 		dir, e = ctx.ResolveRead(raw)
 		if e != nil {
@@ -83,16 +82,32 @@ func startCommand(ctx *Context) (string, error) {
 	if tty && input == "pipe" {
 		return "", fmt.Errorf("Bash: tty=true already supplies terminal input; do not combine with stdin=pipe")
 	}
-	id, mp, e := m.startManaged(owner, command, dir, ctx.Sandbox, tty, input == "pipe", timeout)
+	id, mp, e := m.startManaged(owner, command, dir, ctx.Sandbox, tty, input == "pipe", timeout, &commandTracking{info: protocol.ProcessInfo{Owner: m.owner, Generation: m.generation, Origin: ctx.ProcessOrigin, Command: truncateUTF8(command, 2000), Description: truncateUTF8(StringArg(ctx.Args, "description", ""), 320), Background: background, Cwd: dir, Environment: ctx.Resources.environmentDir}, events: ctx.ProcessEvent})
 	if e != nil {
 		return "", e
 	}
-	limit := 51200
-	out, err := mp.view(ctx, id, 0, limit, yield)
+	if !background {
+		if err := mp.waitForeground(ctx); err != nil {
+			_, _, stopErr := mp.stop()
+			out, _ := mp.view(ctx, id, 0, 8192)
+			if stopErr != nil {
+				return out, fmt.Errorf("%w; stopping command: %v", err, stopErr)
+			}
+			return out, err
+		}
+	}
+	out, err := mp.view(ctx, id, 0, 8192)
 	if err != nil {
-		// The session owns this process as soon as startManaged succeeds.
-		// Preserve its handle when a code cell/turn cancels the initial wait.
-		out, _ = mp.view(ctx, id, 0, limit, 0)
+		// Never leave a command running when its initial handle cannot be
+		// delivered (for example, an output budget smaller than the metadata).
+		_, exited, stopErr := mp.stop()
+		if exited {
+			m.Remove(id)
+		}
+		if stopErr != nil {
+			return "", fmt.Errorf("Bash: process %s started but its result could not be delivered: %w; stopping command: %v", id, err, stopErr)
+		}
+		return "", fmt.Errorf("Bash: process %s started, then was stopped and released because its result could not be delivered: %w", id, err)
 	}
 	return out, err
 }
@@ -112,29 +127,44 @@ func (*ProcessTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 		if e != nil {
 			return "", e
 		}
-		id, e := IntArgChecked(ctx.Args, "id", 0)
-		if e != nil {
-			return "", e
+		id, ok := ctx.Args["id"].(string)
+		if !ok || id == "" {
+			return "", fmt.Errorf("Process: id must be a nonempty string")
+		}
+		action := StringArg(ctx.Args, "action", "")
+		allowed := map[string]bool{"id": true, "action": true}
+		if action == "read" {
+			allowed["offset"], allowed["limit_bytes"] = true, true
+		}
+		if action == "write" {
+			allowed["input"], allowed["eof"] = true, true
+		}
+		for key := range ctx.Args {
+			if !allowed[key] {
+				return "", fmt.Errorf("Process: %s is not valid for action %s", key, action)
+			}
 		}
 		mp, e := m.Get(id)
 		if e != nil {
 			return "", e
 		}
 		switch StringArg(ctx.Args, "action", "") {
+		case "wait":
+			if err := mp.waitForeground(ctx); err != nil {
+				return "", err
+			}
+			out, err := mp.view(ctx, id, 0, 8192)
+			return out, err
 		case "read":
 			offset, e := boundedInt(ctx.Args, "offset", 0, 0, int(^uint(0)>>1))
 			if e != nil {
 				return "", e
 			}
-			limit, e := boundedInt(ctx.Args, "limit_bytes", 51200, 4, 51200)
+			limit, e := boundedInt(ctx.Args, "limit_bytes", 8192, 4, 51200)
 			if e != nil {
 				return "", e
 			}
-			wait, e := boundedInt(ctx.Args, "wait_ms", 0, 0, 10000)
-			if e != nil {
-				return "", e
-			}
-			return mp.view(ctx, id, offset, limit, wait)
+			return mp.view(ctx, id, offset, limit)
 		case "write":
 			input, ok := ctx.Args["input"].(string)
 			eof := BoolArg(ctx.Args, "eof", false)
@@ -155,64 +185,60 @@ func (*ProcessTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 					return "", e
 				}
 			}
-			data, err := json.Marshal(map[string]any{"process_id": id, "status": "input_sent", "bytes_sent": len(input), "eof": eof})
+			view := protocol.ProcessOutput{ID: id, Status: "input_sent", BytesSent: len(input), EOF: eof}
+			ctx.recordProcess(view, false)
+			data, err := json.Marshal(view)
 			return string(data), err
 		case "stop":
 			_, exited, err := mp.stop()
 			if !exited {
-				return "", fmt.Errorf("Process: process %d did not exit after stop: %v", id, err)
+				return "", fmt.Errorf("Process: process %s did not exit after stop: %v", id, err)
 			}
-			output, viewErr := mp.viewResult(ctx, id, 0, 51200, 0, true)
+			output, viewErr := mp.viewResult(ctx, id, 0, 8192, true)
 			if viewErr == nil {
 				m.Remove(id)
 			}
 			return output, viewErr
 		default:
-			return "", fmt.Errorf("Process: action must be read, write, or stop")
+			return "", fmt.Errorf("Process: action must be read, wait, write, or stop")
 		}
 	})
 	return processResult(result), err
 }
-func (mp *managedProcess) view(ctx *Context, id, offset, limit, wait int) (string, error) {
-	return mp.viewResult(ctx, id, offset, limit, wait, false)
+func (mp *managedProcess) view(ctx *Context, id string, offset, limit int) (string, error) {
+	return mp.viewResult(ctx, id, offset, limit, false)
 }
 
 // Releasing views describe the state after the caller removes the handle/log,
 // rather than advertising a continuation that cannot work once stop returns.
-func (mp *managedProcess) viewResult(ctx *Context, id, offset, limit, wait int, releasing bool) (string, error) {
+func (mp *managedProcess) viewResult(ctx *Context, id string, offset, limit int, releasing bool) (string, error) {
 	call := ctx.Context
 	if call == nil {
 		call = context.Background()
 	}
-	timer := time.NewTimer(time.Duration(wait) * time.Millisecond)
-	defer timer.Stop()
-	for {
-		mp.mu.Lock()
-		total, exited, ch := mp.total, mp.exited, mp.changed
-		mp.mu.Unlock()
-		if int64(offset) > total {
-			return "", fmt.Errorf("Process: offset %d exceeds output end %d", offset, total)
-		}
-		if int64(offset) < total || exited || wait == 0 {
-			break
-		}
-		select {
-		case <-ch:
-		case <-mp.done:
-		case <-timer.C:
-			wait = 0
-		case <-call.Done():
-			return "", call.Err()
-		}
+	if err := call.Err(); err != nil {
+		return "", err
 	}
 	mp.mu.Lock()
-	v := processView{ID: id, Status: "running", Offset: offset, Next: offset, Log: mp.logPath}
+	if int64(offset) > mp.total {
+		total := mp.total
+		mp.mu.Unlock()
+		return "", fmt.Errorf("Process: offset %d exceeds output end %d", offset, total)
+	}
+	v := mp.identity.ProcessOutput
+	v.ID, v.Status, v.Offset, v.Next, v.Log = id, "running", offset, offset, mp.logPath
 	size, total := mp.logSize, mp.total
-	exited, perr, reason := mp.exited, mp.err, mp.reason
+	exited, perr, reason := false, mp.err, mp.reason
+	select {
+	case <-mp.done:
+		exited = true
+	default:
+	}
 	logErr := mp.logErr
-	tail := string(mp.buf)
+	tail := string(mp.tail.Tail(2048))
 	mp.mu.Unlock()
 	if exited {
+		v.ResultID = "result." + id
 		code := 0
 		if perr != nil {
 			code = 1
@@ -285,12 +311,22 @@ func (mp *managedProcess) viewResult(ctx *Context, id, offset, limit, wait int, 
 			v.Next = v.Offset + n
 		}
 		v.Truncated = int64(v.Next) < total || size < total
+		v.Tail = ""
+		if exited && perr != nil && offset == 0 && v.Truncated {
+			n := min(2048, len(tail), int(total)-v.Next)
+			tailBytes := tail[len(tail)-n:]
+			for len(tailBytes) > 0 && tailBytes[0]&0xc0 == 0x80 {
+				tailBytes = tailBytes[1:]
+			}
+			v.Tail = strings.ToValidUTF8(tailBytes, "�")
+		}
 		v.Warning = baseWarning
 		if releasing {
 			v.Warning += " Process handle and temporary log released; any output omitted from this response is no longer available through Process or log_path."
 		} else if int64(v.Next) < size {
-			v.Warning += fmt.Sprintf(" More retained output: use Process id=%d action=read offset=%d (bytes); or Read file_path=%q offset=1 (lines).", id, v.Next, v.Log)
+			v.Warning += fmt.Sprintf(" More retained output, if needed: Read file_path=%q (lines); or Process id=%s action=read offset=%d (bytes).", v.Log, id, v.Next)
 		}
+		ctx.recordProcess(v, v.Terminal() && StringArg(ctx.Args, "action", "") != "read" && StringArg(ctx.Args, "action", "") != "write")
 		data, err := json.Marshal(v)
 		return data, n, err
 	}

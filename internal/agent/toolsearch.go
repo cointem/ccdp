@@ -21,10 +21,9 @@ type toolSearchTool struct {
 func (t *toolSearchTool) Name() string { return "ToolSearch" }
 
 func (t *toolSearchTool) Description() string {
-	return `Discover a tool whose schema is not shown inline. Call this with the exact
-tool name (preferred) or a few keywords. Returns the tool's description and
-JSON schema so you can call it. Discovered tools stay available for the rest
-of the session.`
+	return `Load a tool by exact name or an unambiguous keyword match. Its schema
+appears in the next tool catalog and stays available for this session.
+Ambiguous queries return up to five candidates; choose an exact name.`
 }
 
 func (t *toolSearchTool) Parameters() map[string]any {
@@ -93,14 +92,14 @@ func (t *toolSearchTool) Execute(ctx *tools.Context, args map[string]any) (tools
 		for i, n := range matches {
 			definition, _ := lease.Definition(n)
 			if err := definition.ValidationError(); err != nil {
-				if name != "" {
+				if name != "" || len(matches) == 1 {
 					return "", fmt.Errorf("ToolSearch: %s is unavailable because its schema is invalid: %w", n, err)
 				}
 				fmt.Fprintf(&sb, "%s: unavailable (invalid schema)\n", n)
 				continue
 			}
 			description := definition.Description
-			if name == "" {
+			if name == "" && len(matches) > 1 {
 				if i >= 5 {
 					break
 				}
@@ -108,7 +107,7 @@ func (t *toolSearchTool) Execute(ctx *tools.Context, args map[string]any) (tools
 				continue
 			}
 			parameters := definition.Parameters
-			schema, err := json.MarshalIndent(parameters, "  ", "  ")
+			schema, err := json.Marshal(parameters)
 			if err != nil {
 				return "", fmt.Errorf("ToolSearch: encode %s schema: %w", n, err)
 			}
@@ -122,7 +121,7 @@ func (t *toolSearchTool) Execute(ctx *tools.Context, args map[string]any) (tools
 			if i > 0 {
 				sb.WriteString("\n\n")
 			}
-			fmt.Fprintf(&sb, "Name: %s\nDescription: %s\nSchema:\n  %s", n, description, schema)
+			fmt.Fprintf(&sb, "Loaded %s: %s\nIts complete schema is available in the next tool catalog.", n, description)
 			// Make the discovered tool available for the rest of the session.
 			if err := t.ag.persistToolDiscovery(lease.Version(), n, description, parameters); err != nil {
 				return "", err
@@ -152,18 +151,6 @@ func (a *Agent) isDiscovered(name string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.discovery.discovered[name]
-}
-
-// inlineToolNames returns the names of tools injected directly (all non-deferred).
-func (a *Agent) inlineToolNames() []string {
-	var names []string
-	for _, n := range a.services.registry.Names() {
-		if a.discovery.deferTools[n] && !a.isDiscovered(n) {
-			continue
-		}
-		names = append(names, n)
-	}
-	return names
 }
 
 // toolSchemas returns the tool declarations to inject this request: all

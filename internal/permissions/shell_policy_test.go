@@ -18,7 +18,7 @@ func TestReadOnlyArgumentPolicies(t *testing.T) {
 		"git diff --no-ext-diff --no-textconv", "git grep --open-files-in-pager=helper pattern",
 	} {
 		t.Run(command, func(t *testing.T) {
-			m := NewManager(ModeDefault, Policy{})
+			m := NewManager(ModeManual, Policy{})
 			if d, why := m.Check("Bash", map[string]any{"command": command}, KindShell); d != DecisionAsk {
 				t.Fatalf("got %s (%s), want ask", d, why)
 			}
@@ -33,7 +33,7 @@ func TestReadOnlyArgumentPolicies(t *testing.T) {
 		"echo hello | cat", "ls && cat file", "ls; pwd", "echo 'a; b > c $(literal)'",
 	} {
 		t.Run(command, func(t *testing.T) {
-			m := NewManager(ModeDefault, Policy{})
+			m := NewManager(ModeManual, Policy{})
 			if d, why := m.Check("Bash", map[string]any{"command": command}, KindShell); d != DecisionAllow {
 				t.Fatalf("got %s (%s), want allow", d, why)
 			}
@@ -42,7 +42,7 @@ func TestReadOnlyArgumentPolicies(t *testing.T) {
 }
 
 func TestRuleMatchingUsesTheSameShellBoundary(t *testing.T) {
-	m := NewManager(ModeDefault, Policy{AlwaysAllow: []string{"Bash:echo*", "Bash:cat*", "Bash:ls*"}})
+	m := NewManager(ModeManual, Policy{AlwaysAllow: []string{"Bash:echo*", "Bash:cat*", "Bash:ls*"}})
 	for _, command := range []string{
 		`echo "$(touch marker)"`, "echo \"`touch marker`\"", `echo ${x:-$(touch marker)}`,
 		`echo "$((1 + $(touch marker)))"`, `echo "a\q$(touch marker)"`,
@@ -62,7 +62,7 @@ func TestRuleMatchingUsesTheSameShellBoundary(t *testing.T) {
 			t.Errorf("%q: got %s (%s)", command, d, why)
 		}
 	}
-	// Explicit full-command consent and bypass remain available for shell work
+	// Explicit full-command consent remains available for shell work
 	// outside the conservative grammar. The analysis does not ban shell syntax.
 	command := `echo "$(date)"`
 	m.RememberAllow(CommandKey(command))
@@ -114,13 +114,13 @@ func TestTypedGitArgumentPolicies(t *testing.T) {
 
 func TestStaticShellQuotingCannotBypassHardDenials(t *testing.T) {
 	for _, command := range []string{`'git' 'push' '-f' 'origin'`, `g"it" pu'sh' --force origin`, `echo ok && 'git' 'push' '-f' origin`} {
-		m := NewManager(ModeBypass, Policy{})
+		m := NewManager(ModeAuto, Policy{})
 		if d, _ := m.Check("Bash", map[string]any{"command": command}, KindShell); d != DecisionDeny {
 			t.Errorf("force push escaped deny: %q", command)
 		}
 	}
 	for _, command := range []string{`'git' 'push' 'origin'`, `g"it" pu'sh' origin`, `echo ok; 'git' 'push' origin`} {
-		m := NewManager(ModeBypass, Policy{AlwaysDeny: []string{"Bash:git push*"}})
+		m := NewManager(ModeAuto, Policy{AlwaysDeny: []string{"Bash:git push*"}})
 		if d, _ := m.Check("Bash", map[string]any{"command": command}, KindShell); d != DecisionDeny {
 			t.Errorf("rule escaped deny: %q", command)
 		}

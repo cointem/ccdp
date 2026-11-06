@@ -8,10 +8,25 @@ import (
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
+func TestResumeRejectsInvalidUsage(t *testing.T) {
+	cfg := testPersistenceConfig(t)
+	cfg.NoSessionPersistence = true
+	for _, usage := range []session.Usage{
+		{InputTokens: -1}, {OutputTokens: -1}, {CachedTokens: -1}, {TurnCount: -1},
+	} {
+		snapshot := &archive.Snapshot{ID: "invalid-usage", Workspace: cfg.Workspace, Model: cfg.Model, Usage: usage}
+		if a, err := Resume(&cfg, snapshot); err == nil {
+			a.Close()
+			t.Fatalf("resume accepted invalid counters: %+v", usage)
+		}
+	}
+}
+
 func TestAttemptUsageOverflowDoesNotCommitOrChangeState(t *testing.T) {
-	for _, initial := range []Usage{
+	for _, initial := range []protocol.UsageSnapshot{
 		{InputTokens: math.MaxInt},
 		{OutputTokens: math.MaxInt},
 		{TurnCount: math.MaxInt},
@@ -36,7 +51,7 @@ func TestAttemptUsageOverflowDoesNotCommitOrChangeState(t *testing.T) {
 
 func TestSharedAttemptUsageOverflowDoesNotCommit(t *testing.T) {
 	a, p, _ := newJournalAgent(t, true)
-	a.conversation.durable.Usage = sessionUsage(Usage{InputTokens: math.MaxInt})
+	a.conversation.durable.Usage = sessionUsage(protocol.UsageSnapshot{InputTokens: math.MaxInt})
 	cursor := p.CurrentCursor()
 	err := a.accountSharedAttempt(session.Attempt{SessionID: "child", AttemptID: "attempt", Usage: session.Usage{InputTokens: 1, TotalTokens: 1, TurnCount: 1}})
 	if err == nil || p.CurrentCursor() != cursor || a.Usage().InputTokens != math.MaxInt {

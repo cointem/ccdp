@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 
+	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 )
 
@@ -20,8 +21,11 @@ type Tool interface {
 // Result keeps execution output separate from its presentation and validation.
 // An invalid Data value does not undo an otherwise successful operation.
 type Result struct {
+	Image         *messages.ImageAttachment
+	Process       *protocol.ProcessOutput
+	CompletionIDs []string
 	Text          string
-	Data          json.RawMessage
+	Data          json.RawMessage `json:",omitempty"`
 	DataTruncated bool
 	DataError     string
 	Code          *protocol.CodeResult
@@ -42,4 +46,38 @@ type InputDefiner interface {
 // host capability; a name or an external JSON schema cannot grant it.
 type ProgramTool interface {
 	ProgramCallable() bool
+}
+
+// RegisterBuiltins installs the standard tools and optional web tools.
+func RegisterBuiltins(registry *Registry, enableWeb bool) {
+	builtins := []Tool{
+		NewBashTool(),
+		NewProcessTool(),
+		NewReadTool(),
+		NewWriteTool(),
+		NewEditTool(),
+		NewGlobTool(),
+		NewRgTool(),
+		NewCodeNavigateTool(),
+		NewLSTool(),
+		NewTodoWriteTool(),
+		NewCreateGoalTool(),
+		NewGetGoalTool(),
+		NewUpdateGoalTool(),
+		NewAgentTool("SpawnAgent"),
+		NewAgentTool("SendMessage"),
+		NewAgentTool("FollowupAgent"),
+		NewAgentTool("WaitAgent"),
+		NewAgentTool("ListAgents"),
+		NewAgentTool("ReadAgent"),
+		NewAgentTool("StopAgent"),
+		NewReadSkillTool(),
+	}
+	if enableWeb {
+		registry.RegisterIn("web", NewWebFetchTool())
+		registry.RegisterIn("web", NewWebSearchTool())
+	}
+	for _, t := range builtins {
+		registry.RegisterIn("builtin", t)
+	}
 }

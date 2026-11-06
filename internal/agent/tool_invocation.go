@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"ccdp/internal/codemode"
 	"ccdp/internal/config"
 	"ccdp/internal/events"
+	processExecution "ccdp/internal/execution"
 	"ccdp/internal/hooks"
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
@@ -47,17 +49,6 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 	if err := a.toolExecutionError(); err != nil {
 		return tooling.Result{Output: err.Error(), IsError: true}
 	}
-	// Guardian review (Codex's guardian): high-risk calls are reviewed by a
-	// read-only sub-agent before executing. Enabled via enable_guardian.
-	if cfg.GuardianEnabled() && toolKind(tool).NeedsReview() {
-		if err := a.guardianCheck(tc, turnCtx); err != nil {
-			a.emit(toolEvent(tc, "denied", err.Error()))
-			return tooling.Result{Output: err.Error(), IsError: true}
-		}
-	}
-	if err := a.toolExecutionError(); err != nil {
-		return tooling.Result{Output: err.Error(), IsError: true}
-	}
 	if err := a.admitToolStart(tc, tool, execution); err != nil {
 		return tooling.Result{Output: err.Error(), IsError: true}
 	}
@@ -71,7 +62,7 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 			raw = string(encoded)
 		}
 		preview := raw
-		if !journal.program && codeResult == nil {
+		if !journal.program && codeResult == nil && execution.result.Process == nil {
 			preview = a.toolOutputPreview(raw, cfg.MaxResultSizeBytes)
 			execution.displayTruncated = preview != raw
 		}
@@ -81,7 +72,7 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 		if execution.displayTruncated {
 			preview = a.toolOutputPreview(raw, cfg.MaxResultSizeBytes, execution.outputID)
 		}
-		result := tooling.Result{Output: preview, IsError: failed, Code: codeResult,
+		result := tooling.Result{Process: execution.result.Process, CompletionIDs: execution.result.CompletionIDs, Output: preview, IsError: failed, Code: codeResult,
 			Data: execution.result.Data, DataTruncated: execution.result.DataTruncated,
 			DisplayTruncated: execution.displayTruncated, DataError: execution.result.DataError, OutputID: execution.outputID}
 		if journal.program {
@@ -112,11 +103,14 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 		return result
 	}
 	a.services.evbus.Emit(events.TopicToolPreExecute, events.ToolEvent{ToolName: tc.Name, Args: tc.Arguments, Status: "running"})
-	a.emit(Event{Type: EventToolStart, Tool: &ToolEvent{ID: tc.ID, Name: tc.Name, Args: tc.Arguments, ParentCallID: tc.ParentCallID, ChildIndex: tc.ChildIndex}})
+	started := toolEvent(tc, "running", "")
+	started.Kind = protocol.EventToolStarted
+	a.emit(started)
 	a.emit(toolEvent(tc, "running", ""))
 	a.emitStatus("%s running…", tc.Name)
 	start := time.Now()
 	tctx := a.buildToolContext(tc, turnCtx, cfg, sb, resources, skills)
+	a.bindProcessEvents(tctx, tc, journal)
 	a.bindProjectMemoryInvocation(tctx, cfg, journal.turnID)
 	if journal.program {
 		tctx.OutputLimit = codemode.MaxResult
@@ -146,6 +140,11 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 		}
 		out = execution.result.Text
 		codeResult = execution.result.Code
+		if codeResult != nil {
+			for _, p := range codeResult.Completed {
+				execution.result.CompletionIDs = append(execution.result.CompletionIDs, p.ID)
+			}
+		}
 		if err == nil {
 			if dataErr := journal.toolLease.ValidateOutput(tc.Name, execution.result.Data); dataErr != nil && execution.result.DataError == "" {
 				execution.result.DataError = dataErr.Error()
@@ -160,7 +159,12 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 	elapsed := time.Since(start).Round(time.Millisecond)
 	status := "ok"
 	if err != nil {
-		if turnCtx != nil && turnCtx.Err() != nil {
+		var unknown *processExecution.OutcomeUnknownError
+		if errors.As(err, &unknown) {
+			execution.setStatus("unknown")
+		} else if errors.Is(err, processExecution.ErrEnvironmentUnavailable) {
+			execution.failure = &protocol.ToolFailure{Code: "environment_unavailable", DecisionSource: "environment", ExecutionStarted: "no", RetryClass: "after_environment_change"}
+		} else if turnCtx != nil && turnCtx.Err() != nil {
 			execution.setStatus("cancelled")
 		}
 		status = err.Error()
@@ -168,8 +172,8 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 	a.logv("tool %s %s in %s", tc.Name, status, elapsed)
 
 	// Invalidate the workspace model after anything that may have changed files.
-	switch toolKind(tool) {
-	case permissions.KindWrite, permissions.KindShell, permissions.KindProcess, permissions.KindUnknown:
+	switch invocationKind(tool, tc.Arguments) {
+	case permissions.KindWrite, permissions.KindShell, permissions.KindProcess, permissions.KindProcessStop, permissions.KindUnknown, permissions.KindComputer:
 		workspace.Invalidate(cfg.Workspace)
 	}
 
@@ -240,6 +244,9 @@ func (a *Agent) buildToolContext(tc messages.ToolCall, turnCtx context.Context, 
 		tctx.Args[name] = value
 	}
 	tctx.HostNetworkAllowed = sb != nil && sb.NetworkAllowed()
+	if cfg.ComputerUseEnabled && a.children.childState == nil && resources != nil {
+		tctx.Computer = resources.Computer()
+	}
 	tctx.Timeout = cfg.BashTimeout()
 	tctx.ReplaceTodos = a.replaceTodos
 	tctx.ReadOutput = a.readOutput

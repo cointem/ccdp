@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 
@@ -15,7 +16,6 @@ type decisionKind uint8
 
 const (
 	decisionTool decisionKind = iota
-	decisionPlan
 	decisionQuestion
 )
 
@@ -28,7 +28,7 @@ type decisionRequest struct {
 	call         messages.ToolCall
 	reason       string
 	capabilities []protocol.CapabilityRequest
-	plan         *PlanRequest
+	accessKey    string
 	question     *protocol.QuestionRequest
 	result       chan decisionResult
 }
@@ -37,7 +37,6 @@ func (*decisionRequest) ownerControlMessage() {}
 
 type decisionResult struct {
 	approval approvalAnswer
-	plan     bool
 	answer   protocol.AnswerQuestion
 	err      error
 }
@@ -112,6 +111,15 @@ func (a *Agent) activateDecision() {
 		}
 		switch request.kind {
 		case decisionTool:
+			if request.accessKey != "" {
+				a.mu.Lock()
+				answer, cached := a.decisions.resourceDecisions[request.accessKey]
+				a.mu.Unlock()
+				if cached {
+					request.result <- decisionResult{approval: answer}
+					continue
+				}
+			}
 			key := permissions.SessionKey(request.call.Name, request.call.Arguments)
 			a.mu.Lock()
 			approved, cached := a.decisions.approvalCache[key]
@@ -129,29 +137,16 @@ func (a *Agent) activateDecision() {
 			if len(request.capabilities) > 0 {
 				reason = strings.TrimSpace(reason + "\n" + formatCapabilityRequests(request.capabilities))
 			}
-			pending := &ApprovalRequest{ID: request.call.ID, Tool: request.call.Name, Command: prettyArgs(request.call.Arguments), Reason: reason, Capabilities: append([]protocol.CapabilityRequest(nil), request.capabilities...), journalID: fact.ApprovalID}
+			args, _ := json.Marshal(request.call.Arguments)
+			pending := &protocol.ApprovalView{ID: request.call.ID, CallID: protocol.CallID(request.call.ID), Tool: request.call.Name, Args: args, Reason: reason, Capabilities: append([]protocol.CapabilityRequest(nil), request.capabilities...), PolicyRev: fact.PolicyRevision}
 			a.mu.Lock()
 			a.decisions.pendingApproval = pending
+			a.decisions.approvalJournalID = fact.ApprovalID
 			a.decisions.approvalResp = make(chan approvalAnswer, 1)
 			a.decisions.approvalResolving = false
 			a.mu.Unlock()
 			a.owner.activeDecision = request
-			a.emit(Event{Type: EventApproval, Approval: pending})
-		case decisionPlan:
-			fact := session.WorkflowState{Phase: string(protocol.WorkflowAwaitingDecision), PlanID: request.plan.ID, PlanVersion: planViewVersion}
-			if err := a.persistWorkflowFact(fact); err != nil {
-				request.result <- decisionResult{err: err}
-				continue
-			}
-			a.mu.Lock()
-			a.plan.pendingPlan = request.plan
-			a.plan.planResp = make(chan bool, 1)
-			a.lifecycle.workflow = protocol.WorkflowAwaitingDecision
-			a.mu.Unlock()
-			a.owner.activeDecision = request
-			a.publishState()
-			a.emit(Event{Type: EventPlan, Plan: request.plan})
-			a.emitStatus("plan ready — approve (y) to execute, deny (n) to reject")
+			a.emit(protocol.EventView{Kind: protocol.EventApprovalRequest, Approval: pending})
 		case decisionQuestion:
 			a.mu.Lock()
 			a.decisions.pendingQuestion = request.question
@@ -159,7 +154,7 @@ func (a *Agent) activateDecision() {
 			a.mu.Unlock()
 			a.owner.activeDecision = request
 			a.publishState()
-			a.emit(Event{Type: EventQuestion, Question: protocol.CloneQuestionRequest(request.question)})
+			a.emit(protocol.EventView{Kind: protocol.EventQuestionRequest, Question: request.question})
 		}
 	}
 }
@@ -174,6 +169,9 @@ func (a *Agent) finishPendingDecision(kind decisionKind, result decisionResult) 
 	a.mu.Lock()
 	switch kind {
 	case decisionTool:
+		if result.err == nil && request.accessKey != "" && (!result.approval.approve || result.approval.capabilityScope == protocol.CapabilityScopeSession) {
+			a.cacheResourceDecisionLocked(request.accessKey, result.approval)
+		}
 		if result.err == nil && len(request.capabilities) == 0 {
 			if a.decisions.approvalCache == nil {
 				a.decisions.approvalCache = make(map[string]bool)
@@ -181,8 +179,7 @@ func (a *Agent) finishPendingDecision(kind decisionKind, result decisionResult) 
 			a.decisions.approvalCache[permissions.SessionKey(request.call.Name, request.call.Arguments)] = result.approval.approve
 		}
 		a.decisions.pendingApproval, a.decisions.approvalResp, a.decisions.approvalResolving = nil, nil, false
-	case decisionPlan:
-		a.plan.pendingPlan, a.plan.planResp = nil, nil
+		a.decisions.approvalJournalID = ""
 	case decisionQuestion:
 		a.decisions.pendingQuestion, a.decisions.questionResp = nil, nil
 	}
@@ -192,6 +189,19 @@ func (a *Agent) finishPendingDecision(kind decisionKind, result decisionResult) 
 	a.refreshSnapshotOwned()
 	request.result <- result
 	a.activateDecision()
+}
+
+func (a *Agent) cacheResourceDecisionLocked(key string, answer approvalAnswer) {
+	if len(a.decisions.resourceDecisions) >= 128 {
+		for old := range a.decisions.resourceDecisions {
+			delete(a.decisions.resourceDecisions, old)
+			break
+		}
+	}
+	if a.decisions.resourceDecisions == nil {
+		a.decisions.resourceDecisions = map[string]approvalAnswer{}
+	}
+	a.decisions.resourceDecisions[key] = answer
 }
 
 func (a *Agent) cancelDecision(request *decisionRequest) {
@@ -211,27 +221,12 @@ func (a *Agent) cancelDecision(request *decisionRequest) {
 	switch request.kind {
 	case decisionTool:
 		a.mu.Lock()
-		id := a.decisions.pendingApproval.journalID
+		id := a.decisions.approvalJournalID
 		a.mu.Unlock()
 		if err := a.persistApprovalResolved(session.ApprovalResolution{ApprovalID: id, Decision: "cancel", Reason: "interrupted", ResolvedBy: "runtime"}); err != nil {
 			result.err = err
 		}
 		a.emitStatus("approval skipped (interrupted)")
-	case decisionPlan:
-		a.mu.Lock()
-		drafting := a.plan.planMode
-		a.mu.Unlock()
-		if drafting {
-			err := a.persistWorkflowFact(session.WorkflowState{Phase: string(protocol.WorkflowDrafting), PlanID: request.plan.ID, PlanVersion: planViewVersion})
-			if err != nil {
-				result.err = err
-			} else {
-				a.mu.Lock()
-				a.lifecycle.workflow = protocol.WorkflowDrafting
-				a.mu.Unlock()
-			}
-		}
-		a.emitStatus("plan approval skipped (interrupted)")
 	}
 	a.finishPendingDecision(request.kind, result)
 }

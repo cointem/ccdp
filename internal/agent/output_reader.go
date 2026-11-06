@@ -77,6 +77,10 @@ func sessionOutputReference(records []session.Record, id string) (session.BlobRe
 	}
 	for _, record := range records {
 		switch e := session.EventPointer(record.Event).(type) {
+		case *session.ProcessFinished:
+			if ref, ok := match(&e.Result); ok {
+				return ref, true
+			}
 		case *session.ToolFinished:
 			if ref, ok := match(e.RawOutput); ok {
 				return ref, true

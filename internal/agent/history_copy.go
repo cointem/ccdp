@@ -11,6 +11,7 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/messages"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/session/journal"
 )
 
@@ -84,7 +85,7 @@ func copyHistory(ctx context.Context, source historyArtifactSource, destination 
 	return copied, nil
 }
 
-// stageHistorySession keeps a partially initialized log out of ListSessions.
+// stageHistorySession keeps a partially initialized log out of archive.List.
 // The sole publication is the final directory rename after all writes close.
 func stageHistorySession(ctx context.Context, cfg config.Config) (config.Config, func() error, func(), error) {
 	if ctx == nil {
@@ -154,7 +155,7 @@ func newForkAgent(cfg *config.Config, opts Options, source historyArtifactSource
 	if err != nil {
 		return nil, err
 	}
-	initial, err := snapshotFromRecords(records, cfg.SessionID)
+	initial, err := archive.FromRecords(records, cfg.SessionID)
 	if err != nil {
 		return nil, err
 	}

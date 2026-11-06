@@ -6,9 +6,10 @@ import (
 )
 
 type quiescenceRequested struct {
-	ctx      context.Context
-	closeMCP bool
-	result   chan quiescenceResult
+	ctx          context.Context
+	closeMCP     bool
+	allowPending bool
+	result       chan quiescenceResult
 }
 type quiescenceResult struct {
 	scope *sandboxQuiescence
@@ -24,11 +25,10 @@ type quiescenceAborted struct {
 
 func (quiescenceAborted) ownerControlMessage() {}
 
-func (a *Agent) requestQuiescence(ctx context.Context, closeMCP bool) (*sandboxQuiescence, error) {
-	if a.owner == nil {
-		return a.beginSandboxQuiescence(ctx, closeMCP)
-	}
-	r := quiescenceRequested{ctx, closeMCP, make(chan quiescenceResult, 1)}
+func (a *Agent) requestQuiescence(ctx context.Context, closeMCP bool, allowPending ...bool) (*sandboxQuiescence, error) {
+	allow := len(allowPending) > 0 && allowPending[0]
+
+	r := quiescenceRequested{ctx: ctx, closeMCP: closeMCP, allowPending: allow, result: make(chan quiescenceResult, 1)}
 	a.ensureRun()
 	select {
 	case a.owner.control <- r:
@@ -43,10 +43,6 @@ func (a *Agent) requestQuiescence(ctx context.Context, closeMCP bool) (*sandboxQ
 	}
 }
 func (a *Agent) abortQuiescence(revision uint64) {
-	if a.owner == nil {
-		a.abortQuiescenceOwned(revision)
-		return
-	}
 	r := quiescenceAborted{revision, make(chan struct{})}
 	select {
 	case a.owner.control <- r:
@@ -61,14 +57,13 @@ func (a *Agent) abortQuiescence(revision uint64) {
 func (a *Agent) abortQuiescenceOwned(revision uint64) {
 	a.mu.Lock()
 	uncertain := a.services.sandbox != nil && a.services.sandbox.ExternalExecutionPossible()
-	resources := a.services.resources
 	resume := !uncertain && a.capabilities.capabilityRevision == revision
 	if resume {
-		a.capabilities.capabilityRevoking = false
 		a.capabilities.capabilityRevision++
+		a.capabilities.revocationRevision++
 	}
 	a.mu.Unlock()
-	if resume && resources != nil && resources.Processes != nil {
-		resources.Processes.ResumeAfterRevocation()
+	if resume {
+		_ = a.resumeSandboxAdmission()
 	}
 }

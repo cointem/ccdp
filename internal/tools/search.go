@@ -41,7 +41,12 @@ func (t *GlobTool) Parameters() map[string]any {
 	}
 }
 
-func (t *GlobTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+func (*GlobTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeFileWorker(ctx, "Glob", args)
+}
+
+// executeGlob runs only inside the fixed file worker.
+func executeGlob(ctx *Context, args map[string]any) (Result, error) {
 	return executeText(ctx, args, func(ctx *Context) (string, error) {
 		if err := ctx.checkResources(); err != nil {
 			return "", err
@@ -438,7 +443,12 @@ func (t *LSTool) Parameters() map[string]any {
 	}
 }
 
-func (t *LSTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+func (*LSTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeFileWorker(ctx, "LS", args)
+}
+
+// executeLS runs only inside the fixed file worker.
+func executeLS(ctx *Context, args map[string]any) (Result, error) {
 	return executeText(ctx, args, func(ctx *Context) (string, error) {
 		if err := ctx.checkResources(); err != nil {
 			return "", err

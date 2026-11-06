@@ -9,8 +9,7 @@ import (
 )
 
 // hardAdmitTool resolves the frozen tool implementation and applies the
-// non-overridable admission gates: child/guardian hard policy, plan-mode
-// mutation block, explicit hard denies, strict-sandbox network blocks, and
+// non-overridable admission gates: child/guardian hard policy, explicit hard denies, strict-sandbox network blocks, and
 // config-level custom-tool permissions. These must run before any hook,
 // permission override, or Tool.Run; a name a custom/plugin scope can shadow is
 // never used to classify capability. configuredAllow reports the custom "allow" setting; it does not bypass hooks.
@@ -24,17 +23,18 @@ func (a *Agent) hardAdmitTool(tc messages.ToolCall, journal toolJournalContext) 
 		a.emit(toolEvent(tc, "error", "unknown tool "+tc.Name))
 		return nil, fmt.Sprintf("Error: unknown tool %q", tc.Name), false, true
 	}
+	if _, desktop := tool.(*tools.ComputerTool); desktop {
+		a.mu.Lock()
+		enabled := a.services.cfg.ComputerUseEnabled && a.children.childState == nil
+		a.mu.Unlock()
+		if !enabled {
+			return nil, "permission denied: Computer requires an explicitly enabled root session", false, true
+		}
+	}
 	if purpose, _, _, child := ChildRuntime(a); child && (purpose == childPurposeGuardian || a.children.childState.readOnlyWorkspace) && (!readOnlyImplementation(tool) || (purpose == childPurposeGuardian && toolKind(tool) != permissions.KindRead)) && !(isTaskChild(purpose) && childMessageTool(tool)) {
 		reason := fmt.Sprintf("guardian hard deny: tool %q is not the built-in read-only implementation", tc.Name)
 		a.emit(toolEvent(tc, "denied", reason))
 		return nil, fmt.Sprintf("permission denied: %s", reason), false, true
-	}
-	// Plan mode hard-blocks mutating tools even if the model somehow calls one.
-	// Capability is determined from the frozen concrete implementation, never
-	// from a name that a custom/plugin scope can shadow.
-	if a.inPlanMode() && !planAllowedImplementation(tool) {
-		a.emit(toolEvent(tc, "denied", "blocked in plan mode"))
-		return nil, fmt.Sprintf("blocked in plan mode: %s modifies state; only built-in read-only tools are available until the plan is approved", tc.Name), false, true
 	}
 	// Explicit hard denials are checked before any custom permission, Go-hook,
 	// or shell-hook allow path. Hooks can add an approval requirement, but they

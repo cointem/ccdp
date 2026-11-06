@@ -3,16 +3,14 @@ package tui
 import (
 	"encoding/json"
 	"fmt"
-
 	"strings"
-
 	"time"
 
 	"ccdp/internal/protocol"
 )
 
 // handleProtocolEvent updates transient presentation only. Confirmed model,
-// mode, sandbox and plan state continues to come from snapshots.
+// mode and sandbox state continue to come from snapshots.
 func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 	if ev.SessionID != "" && ev.SessionID.String() != m.sessionID {
 		return
@@ -119,16 +117,6 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 		if ev.Question != nil {
 			m.notifyUser("ccdp has a question", "waiting for your answer")
 		}
-	case protocol.EventPlanReady:
-		if ev.Plan != nil {
-			m.clearDecisionNotices()
-			m.addReport(historyCell{kind: "system", text: "── plan proposed ──"})
-			m.addReport(historyCell{kind: "assistant", text: ev.Plan.Text})
-			m.approval = &approvalPrompt{ID: ev.Plan.ID, Tool: "Plan", Command: ev.Plan.Text, Reason: "Approve this plan and start executing?"}
-			m.approvalState.Offset = 0
-			m.addNotice(Notice{Severity: NoticeDecision, Text: "awaiting plan approval…", Sticky: true})
-			m.notifyUser("ccdp needs your decision", "a plan is ready to approve")
-		}
 	case protocol.EventUsage:
 		if ev.Usage != nil {
 			m.usage = protocol.UsageSnapshot{InputTokens: ev.Usage.InputTokens, OutputTokens: ev.Usage.OutputTokens, CachedTokens: ev.Usage.CachedTokens, Cache: ev.Usage.Cache, TurnCount: ev.Usage.TurnCount}
@@ -140,11 +128,20 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 		} else if m.interruptRequested {
 			outcome = protocol.TurnCancelled
 		}
+		if terminal := m.snapshot.LastTurn; terminal != nil && canonicalUITurn(terminal.TurnID) == canonicalUITurn(ev.TurnID) {
+			outcome, ev.Error = terminal.Status, terminal.Error
+		}
 		m.finishInputOperations(ev.TurnID, outcome, ev.Error)
 		m.busy, m.streaming, m.turnDone = false, false, true
 		m.clearTransientNotices()
-		m.finishActivity("", ActivityCompleted, "")
-		m.turnFailed = m.turnFailed || m.interruptRequested
+		phase := ActivityCompleted
+		if outcome == protocol.TurnCancelled {
+			phase = ActivityCancelled
+		} else if outcome != protocol.TurnSucceeded {
+			phase = ActivityFailed
+		}
+		m.finishActivity("", phase, ev.Error)
+		m.turnFailed = outcome != protocol.TurnSucceeded
 		if goal := m.snapshot.Goal; goal != nil {
 			if goal.Status != protocol.GoalActive {
 				m.notifyUser("ccdp goal "+string(goal.Status), goal.Reason)

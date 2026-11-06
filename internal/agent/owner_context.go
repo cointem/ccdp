@@ -26,9 +26,7 @@ func historySource(history []messages.Message) string {
 
 func (a *Agent) replaceHistoryFromWorker(request historyReplacementPrepared) error {
 	request.history = messages.Clone(request.history)
-	if a.owner == nil {
-		return a.installHistoryReplacement(request)
-	}
+
 	request.result = make(chan error, 1)
 	a.ensureRun()
 	select {

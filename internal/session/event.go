@@ -23,7 +23,6 @@ const (
 	EventTypeCommandScheduled     EventType = "CommandScheduled"
 	EventTypeCommandCompleted     EventType = "CommandCompleted"
 	EventTypeSettingsChanged      EventType = "SettingsChanged"
-	EventTypeWorkflowChanged      EventType = "WorkflowChanged"
 	EventTypeGoalChanged          EventType = "GoalChanged"
 	EventTypeTurnStarted          EventType = "TurnStarted"
 	EventTypeTurnFinished         EventType = "TurnFinished"

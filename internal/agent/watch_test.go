@@ -157,7 +157,7 @@ func TestM1WatchResyncSnapshotRetainsFailedTurn(t *testing.T) {
 	cfg.SessionDir = dir + "/sessions"
 	cfg.BaseURL = server.URL
 	cfg.APIKey = "test-key"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)

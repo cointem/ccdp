@@ -254,9 +254,6 @@ type mailboxAdmission struct {
 func (mailboxAdmission) ownerControlMessage() {}
 
 func (a *Agent) admitInputFromWorker(normalized protocol.Command) (protocol.Receipt, error) {
-	if a.owner == nil {
-		return a.applySubmitInput(normalized), nil
-	}
 	a.ensureRun()
 	request := mailboxAdmission{command: normalized, result: make(chan protocol.Receipt, 1)}
 	select {

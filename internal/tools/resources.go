@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"sync"
 
+	"ccdp/internal/computer"
+	"ccdp/internal/execution"
+	"ccdp/internal/runtimepath"
 	"ccdp/internal/sandbox"
 )
 
@@ -15,15 +18,24 @@ import (
 // the runtime when a session is opened and closed with that session.  Tools
 // must receive the same value in Context for the lifetime of a session.
 type Resources struct {
-	owner       string
-	sessionDir  string
-	ownerCtx    context.Context
-	ownerCancel context.CancelFunc
-	scratchDir  string
+	owner          string
+	sessionDir     string
+	ownerCtx       context.Context
+	ownerCancel    context.CancelFunc
+	scratchDir     string
+	environmentDir string
+	ownerToken     string
+	initErr        error
 
 	// Exactly one owner-owned instance of each mutable session resource.
 	Processes *ProcessManager
 	Files     *FileState
+	// The controller is owned only by the root session; children inherit its ID.
+	executor        *execution.Controller
+	executorID      string
+	fileWorkersOnce sync.Once
+	fileWorkers     chan *fileWorker
+	computer        *computer.Controller
 
 	mu       sync.RWMutex
 	closed   bool
@@ -35,15 +47,16 @@ type Resources struct {
 // an identity boundary and sessionDir is the durable directory for retained
 // tool artifacts. Both values are explicit to prevent accidental reuse
 // of a parent/root directory as a session scope.
-func NewResources(owner, sessionDir string) *Resources {
-	return NewResourcesWithContext(owner, sessionDir, context.Background())
+func NewResources(owner, sessionDir string, runtimeRoot ...string) *Resources {
+	return NewResourcesWithContext(owner, sessionDir, context.Background(), "", runtimeRoot...)
 }
 
 // NewResourcesWithContext creates an owner-scoped resource container whose
 // long-lived process lifetime is bound to ownerCtx. The context is captured at
 // construction and cannot be replaced while resources are in use; Close also
-// cancels the derived context before reclaiming individual resources.
-func NewResourcesWithContext(owner, sessionDir string, ownerCtx context.Context) *Resources {
+// cancels the derived context before reclaiming individual resources. An empty
+// executorID creates a root controller; child owners inherit their root ID.
+func NewResourcesWithContext(owner, sessionDir string, ownerCtx context.Context, executorID string, runtimeRoot ...string) *Resources {
 	if owner == "" {
 		owner = "session"
 	}
@@ -51,16 +64,41 @@ func NewResourcesWithContext(owner, sessionDir string, ownerCtx context.Context)
 		ownerCtx = context.Background()
 	}
 	ownerCtx, ownerCancel := context.WithCancel(ownerCtx)
-	scratch, _ := os.MkdirTemp("", "ccdp-session-")
-	r := &Resources{owner: owner, sessionDir: sessionDir, ownerCtx: ownerCtx, ownerCancel: ownerCancel, scratchDir: scratch}
-	r.Processes = NewProcessManager(owner)
-	if sessionDir != "" {
-		r.Processes.logDir = filepath.Join(sessionDir, "processes")
-	} else {
-		r.Processes.logDir = scratch
+	r := &Resources{owner: owner, sessionDir: sessionDir, ownerCtx: ownerCtx, ownerCancel: ownerCancel}
+	if executorID == "" {
+		r.executor = execution.NewController(runtimeRoot...)
+		executorID = r.executor.ID
+	}
+	r.executorID = executorID
+	r.ownerToken, r.initErr = runtimepath.ID()
+	if r.initErr == nil {
+		r.environmentDir, r.initErr = execution.NewEnvironment(executorID, r.ownerToken)
+	}
+	if r.initErr == nil {
+		r.scratchDir = filepath.Join(r.environmentDir, "scratch")
+	}
+	r.Processes = NewProcessManager(owner, executorID, r.ownerToken)
+	if r.initErr == nil {
+		r.Processes.logDir = filepath.Join(r.environmentDir, "logs")
 	}
 	r.Files = NewFileState(owner)
 	return r
+}
+
+// ExecutorID binds this owner to its root session tree's execution service.
+func (r *Resources) ExecutorID() string { return r.executorID }
+
+// Computer is injected only into an explicitly enabled root invocation.
+func (r *Resources) Computer() *computer.Controller {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	if r.computer == nil {
+		r.computer = computer.NewController()
+	}
+	return r.computer
 }
 
 // ScratchDir returns the private, session-scoped execution scratch root. It is
@@ -72,6 +110,47 @@ func (r *Resources) ScratchDir() string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.scratchDir
+}
+
+// ReplaceScratch installs a prepared environment after all managed work has
+// joined. The old directory may still be used by unconfirmed descendants and
+// is deliberately retained; existing process output handles stay readable.
+func (r *Resources) ReplaceScratch(path string) {
+	r.mu.Lock()
+	r.scratchDir = path
+	r.environmentDir = filepath.Dir(path)
+	r.mu.Unlock()
+	r.Processes.mu.Lock()
+	r.Processes.logDir = filepath.Join(filepath.Dir(path), "logs")
+	r.Processes.mu.Unlock()
+}
+
+func (r *Resources) NewScratch() (string, error) {
+	root, err := execution.NewEnvironment(r.executorID, r.ownerToken)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "scratch"), nil
+}
+
+func (r *Resources) BindSandbox(sb *sandbox.Sandbox) {
+	if sb == nil {
+		return
+	}
+	sb.ExecutorID = r.executorID
+	execution.BindPrivateRoots(sb)
+	sb.AddScratchDir(r.ScratchDir())
+	if dir := r.SessionDir(); dir != "" {
+		sb.AddArtifactRoot(filepath.Join(dir, "outputs"))
+	}
+	r.Processes.mu.Lock()
+	logs := r.Processes.logDir
+	r.Processes.mu.Unlock()
+	if logs != "" {
+		sb.AddArtifactRoot(logs)
+		sb.AddReadOnlyDir(logs)
+	}
+	execution.BindDevelopmentCache(sb)
 }
 
 // Owner returns the immutable scope identifier carried by this container.
@@ -128,6 +207,9 @@ func (r *Resources) CheckOpen() error {
 	if r == nil {
 		return fmt.Errorf("tools: missing session resources")
 	}
+	if r.initErr != nil {
+		return fmt.Errorf("execution resources: %w", r.initErr)
+	}
 	if r.Closed() {
 		return fmt.Errorf("tools: session resources for %q are closed", r.Owner())
 	}
@@ -144,9 +226,13 @@ func (r *Resources) Close() error {
 		r.mu.Lock()
 		r.closed = true
 		ownerCancel := r.ownerCancel
+		desktop := r.computer
 		r.mu.Unlock()
 		if ownerCancel != nil {
 			ownerCancel()
+		}
+		if desktop != nil {
+			desktop.Close()
 		}
 		var closeErr error
 		if r.Processes != nil {
@@ -155,8 +241,14 @@ func (r *Resources) Close() error {
 		if r.Files != nil {
 			r.Files.Close()
 		}
-		if r.scratchDir != "" && closeErr == nil {
-			if err := os.RemoveAll(r.scratchDir); err != nil && closeErr == nil {
+		r.closeFileWorkers()
+		if r.executor != nil {
+			if err := r.executor.Close(); err != nil && closeErr == nil {
+				closeErr = err
+			}
+		}
+		if r.environmentDir != "" && closeErr == nil {
+			if err := os.RemoveAll(r.environmentDir); err != nil && closeErr == nil {
 				closeErr = fmt.Errorf("remove session execution scratch: %w", err)
 			}
 		}
@@ -175,6 +267,10 @@ func (r *Resources) Context(parent context.Context, workingDir string, sb *sandb
 	if parent == nil {
 		parent = context.Background()
 	}
+	if sb != nil {
+		sb = sb.Snapshot()
+		r.BindSandbox(sb)
+	}
 	return &Context{
 		Context:    parent,
 		WorkingDir: workingDir,
@@ -184,21 +280,4 @@ func (r *Resources) Context(parent context.Context, workingDir string, sb *sandb
 		Owner:      r.Owner(),
 		Args:       map[string]any{},
 	}
-}
-
-// BindResources returns a copy of c bound to r.  It is useful when a runtime
-// has a common base context and wants an invocation-specific argument map.
-func BindResources(c *Context, r *Resources) *Context {
-	if c == nil {
-		c = &Context{}
-	}
-	copyCtx := *c
-	copyCtx.Resources = r
-	if r != nil {
-		copyCtx.Owner = r.Owner()
-		if copyCtx.SessionDir == "" {
-			copyCtx.SessionDir = r.SessionDir()
-		}
-	}
-	return &copyCtx
 }

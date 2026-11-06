@@ -44,7 +44,7 @@ func TestExternalCommandFailureExplainsGitStatus(t *testing.T) {
 }
 
 func TestTypedGitAuthorizationPreservesDenials(t *testing.T) {
-	a := &Agent{services: sessionServices{perms: permissions.NewManager(permissions.ModeDefault, permissions.Policy{})}}
+	a := &Agent{services: sessionServices{perms: permissions.NewManager(permissions.ModeManual, permissions.Policy{})}}
 	argv := []string{"git", "status", "--short"}
 	if err := a.authorizeGitQuery(context.Background(), "query", argv); err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestTypedGitAuthorizationPreservesDenials(t *testing.T) {
 }
 
 func TestTypedMutatingGitCannotQuoteAwayHardDenials(t *testing.T) {
-	a := &Agent{services: sessionServices{perms: permissions.NewManager(permissions.ModeBypass, permissions.Policy{})}}
+	a := &Agent{services: sessionServices{perms: permissions.NewManager(permissions.ModeAuto, permissions.Policy{})}}
 	force := formatExternalCommand([]string{"git", "push", "-f", "origin"})
 	if err := a.precheckCommand("Bash", map[string]any{"command": force}, permissions.KindShell); err == nil {
 		t.Fatal("quoted force push bypassed hard deny")

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"ccdp/internal/config"
+	"ccdp/internal/messages"
 	"ccdp/internal/tools"
 )
 
@@ -119,7 +120,12 @@ func TestDeferredToolNotInjected(t *testing.T) {
 	if !found {
 		t.Fatal("discovered tool schema missing")
 	}
-	update := step.history[len(step.history)-1].ToolUpdate
+	var update *messages.ToolUpdate
+	for _, m := range step.history {
+		if m.ToolUpdate != nil {
+			update = m.ToolUpdate
+		}
+	}
 	if update == nil || len(update.Added) != 1 || update.Added[0].Name != "my-fmt" {
 		t.Fatalf("missing discovery delta: %+v", update)
 	}
@@ -141,8 +147,8 @@ func TestToolSearchRun(t *testing.T) {
 	if !strings.Contains(out, "my-fmt") || strings.Contains(out, "Schema:") {
 		t.Errorf("search output missing tool details: %.200s", out)
 	}
-	if ag.isDiscovered("my-fmt") {
-		t.Error("keyword summaries must not load schemas")
+	if !ag.isDiscovered("my-fmt") {
+		t.Error("unambiguous keyword match must load the schema")
 	}
 
 	// Exact-name search also works.
@@ -184,7 +190,7 @@ func TestBuildRequestSections(t *testing.T) {
 		t.Fatal("no messages")
 	}
 	sys, _ := req.Messages[0].Content.(string)
-	for _, want := range []string{"# Environment", "- Date:", "- Timezone:", "# Repository layout", "# Project instructions"} {
+	for _, want := range []string{"# Environment", "- Date:", "- Timezone:", "# Project instructions"} {
 		// Project instructions only present when an AGENTS.md exists.
 		if want == "# Project instructions" {
 			continue

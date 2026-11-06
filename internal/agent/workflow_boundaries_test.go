@@ -97,13 +97,13 @@ func TestRegressionCodeRestoreRetryPreservesNewConversation(t *testing.T) {
 	}
 	id := deliveryID(t, out)
 	tc := a.services.resources.Context(ctx, root, a.services.sandbox)
-	tc.Args = map[string]any{"command": "sleep 30", "yield_ms": 0}
+	tc.Args = map[string]any{"command": "sleep 30", "background": true}
 	raw, err := executeToolText(tools.NewBashTool(), tc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var proc struct {
-		ID int `json:"process_id"`
+		ID string `json:"process_id"`
 	}
 	if err = json.Unmarshal([]byte(raw), &proc); err != nil {
 		t.Fatal(err)

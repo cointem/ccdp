@@ -57,7 +57,7 @@ func TestOldSchemaIsRejectedWithoutChangingLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := bytes.Replace(data, []byte(fmt.Sprintf(`"schema_version":%d`, SchemaVersion)), []byte(`"schema_version":2`), 1)
+	old := bytes.Replace(data, []byte(fmt.Sprintf(`"schema_version":%d`, SchemaVersion)), []byte(fmt.Sprintf(`"schema_version":%d`, SchemaVersion-1)), 1)
 	if err := os.WriteFile(path, old, 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -2,7 +2,6 @@ package tui
 
 import (
 	"reflect"
-
 	"time"
 
 	"ccdp/internal/permissions"
@@ -65,7 +64,6 @@ func (m *Model) applySnapshot(snapshot protocol.SessionView) {
 	if snapshot.Settings.Permission.Mode != "" {
 		m.mode = permissions.Mode(snapshot.Settings.Permission.Mode)
 	}
-	m.planMode = snapshot.Settings.ExecutionMode == protocol.ExecutionModePlan
 	incomingActivity := m.activityForSnapshot(snapshot)
 	if sameProgress && incomingActivity.Phase == previousActivity.Phase && !previousActivity.UpdatedAt.IsZero() {
 		incomingActivity.UpdatedAt = previousActivity.UpdatedAt
@@ -112,8 +110,6 @@ func (m *Model) applySnapshot(snapshot protocol.SessionView) {
 	m.setQuestion(snapshot.Question)
 	if snapshot.Approval != nil {
 		m.approval = approvalRequestFromView(snapshot.Approval)
-	} else if snapshot.Plan != nil {
-		m.approval = &approvalPrompt{ID: snapshot.Plan.ID, Tool: "Plan", Command: snapshot.Plan.Text, Reason: "Approve this plan and start executing?"}
 	} else {
 		m.approval = nil
 		m.clearDecisionNotices()

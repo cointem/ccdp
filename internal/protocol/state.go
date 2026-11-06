@@ -16,7 +16,6 @@ type SessionState struct {
 	SessionID         SessionID          `json:"session_id"`
 	Revision          Revision           `json:"revision"`
 	Phase             RuntimePhase       `json:"phase"`
-	Workflow          WorkflowState      `json:"workflow"`
 	Busy              bool               `json:"busy"`
 	WorkLabel         string             `json:"work_label,omitempty"`
 	WorkStartedAt     time.Time          `json:"work_started_at,omitempty"`
@@ -30,7 +29,6 @@ type SessionState struct {
 	MessagesTokens    int                `json:"messages_tokens,omitempty"`
 	PendingInputs     []InputView        `json:"pending_inputs,omitempty"`
 	Approval          *ApprovalView      `json:"approval,omitempty"`
-	Plan              *PlanView          `json:"plan,omitempty"`
 	Tasks             []TaskView         `json:"tasks,omitempty"`
 	LastTurn          *TurnOutcome       `json:"last_turn,omitempty"`
 }
@@ -47,7 +45,6 @@ func (v *SessionView) ApplyState(s SessionState) {
 	v.SessionID = s.SessionID
 	v.Revision = s.Revision
 	v.Phase = s.Phase
-	v.Workflow = s.Workflow
 	v.Busy = s.Busy
 	v.WorkLabel = s.WorkLabel
 	v.WorkStartedAt = s.WorkStartedAt
@@ -61,7 +58,7 @@ func (v *SessionView) ApplyState(s SessionState) {
 	v.MessagesTokens = s.MessagesTokens
 	v.PendingInputs = s.PendingInputs
 	v.Approval = s.Approval
-	v.Plan = s.Plan
+
 	v.Tasks = s.Tasks
 	v.LastTurn = s.LastTurn
 }
@@ -69,17 +66,17 @@ func (v *SessionView) ApplyState(s SessionState) {
 // State returns the ordinary-update projection without copying history or catalog.
 func (v SessionView) State() SessionState {
 	return SessionState{
-		HistoryLength:     v.HistoryLength,
-		OutstandingWork:   v.OutstandingWork,
-		Goal:              v.Goal,
-		Question:          v.Question,
-		RunID:             v.RunID,
-		Transcript:        v.Transcript,
-		TranscriptMore:    v.TranscriptMore,
-		SessionID:         v.SessionID,
-		Revision:          v.Revision,
-		Phase:             v.Phase,
-		Workflow:          v.Workflow,
+		HistoryLength:   v.HistoryLength,
+		OutstandingWork: v.OutstandingWork,
+		Goal:            v.Goal,
+		Question:        v.Question,
+		RunID:           v.RunID,
+		Transcript:      v.Transcript,
+		TranscriptMore:  v.TranscriptMore,
+		SessionID:       v.SessionID,
+		Revision:        v.Revision,
+		Phase:           v.Phase,
+
 		Busy:              v.Busy,
 		WorkLabel:         v.WorkLabel,
 		WorkStartedAt:     v.WorkStartedAt,
@@ -93,8 +90,8 @@ func (v SessionView) State() SessionState {
 		MessagesTokens:    v.MessagesTokens,
 		PendingInputs:     v.PendingInputs,
 		Approval:          v.Approval,
-		Plan:              v.Plan,
-		Tasks:             v.Tasks,
-		LastTurn:          v.LastTurn,
+
+		Tasks:    v.Tasks,
+		LastTurn: v.LastTurn,
 	}
 }

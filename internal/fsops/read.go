@@ -72,15 +72,14 @@ func OpenAuthorizedRegular(root, path string, authorize func(string) (string, er
 }
 
 func openCanonicalRegular(path string) (*os.File, error) {
-	const dirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
-	dir, err := unix.Open(string(filepath.Separator), dirFlags, 0)
+	dir, err := unix.Open(string(filepath.Separator), directorySearchFlags, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
 	defer func() { _ = unix.Close(dir) }()
 	parts := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
 	for _, part := range parts[:len(parts)-1] {
-		next, err := unix.Openat(dir, part, dirFlags, 0)
+		next, err := unix.Openat(dir, part, directorySearchFlags, 0)
 		if err != nil {
 			return nil, &os.PathError{Op: "open", Path: path, Err: err}
 		}

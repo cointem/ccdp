@@ -108,7 +108,6 @@ func LanguageQuery(ctx context.Context, root, path, operation string, line, char
 	}
 	defer stdout.Close()
 	cmd.SetStderr(io.Discard)
-	sb.MarkExternalExecution()
 	if e = cmd.Start(); e != nil {
 		return nil, e
 	}

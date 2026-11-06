@@ -8,6 +8,7 @@ import (
 
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 // Reconcile the child's durable outbox with the parent's catalog. This is a
@@ -50,8 +51,12 @@ func (s *SessionSupervisor) readChildOutboxes() {
 			}
 		}
 		if !found {
-			if snapshot, err := snapshotFromRecords(records, string(r.fact.Child.SessionID)); err == nil {
-				u, b := snapshot.Usage, r.fact.UsageBaseline
+			if snapshot, err := archive.FromRecords(records, string(r.fact.Child.SessionID)); err == nil {
+				u, err := usageFromSession(snapshot.Usage)
+				if err != nil {
+					continue
+				}
+				b := r.fact.UsageBaseline
 				r.fact.Child.Run.Usage = protocol.UsageSnapshot{InputTokens: max(0, u.InputTokens-b.InputTokens), OutputTokens: max(0, u.OutputTokens-b.OutputTokens), CachedTokens: max(0, u.CachedTokens-b.CachedTokens), TurnCount: max(0, u.TurnCount-b.TurnCount)}
 			}
 		}

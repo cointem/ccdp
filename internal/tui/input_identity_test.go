@@ -29,9 +29,11 @@ func TestInputOperationMatchesIdentityNotRepeatedText(t *testing.T) {
 func TestInputEventMatchesIdentityWithChangedText(t *testing.T) {
 	m := astraModel(t, 80, 24)
 	m.registerOperation(protocol.NewSubmitInput("new-command", "acceptance-root", "new-input", "", protocol.InputSteer), "message")
-	m.associateInputOperationFromEvent(protocol.EventView{Kind: protocol.EventUserMessage, MessageID: protocol.InputMessageID("other-input"), TurnID: "1"})
-	if m.operations["new-command"].TurnID != "" {
-		t.Fatal("unrelated image input matched")
+	for _, id := range []string{"", protocol.InputMessageID("other-input")} {
+		m.associateInputOperationFromEvent(protocol.EventView{Kind: protocol.EventUserMessage, MessageID: id, TurnID: "1"})
+		if m.operations["new-command"].TurnID != "" {
+			t.Fatalf("input without matching identity claimed operation: %q", id)
+		}
 	}
 	m.associateInputOperationFromEvent(protocol.EventView{Kind: protocol.EventUserMessage, MessageID: protocol.InputMessageID("new-input"), TurnID: "2", Text: "image locator"})
 	m.finishInputOperations("2", protocol.TurnSucceeded, "")

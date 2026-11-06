@@ -26,6 +26,11 @@ func (t *catalogRuntimeTool) Execute(ctx *tools.Context, args map[string]any) (t
 
 func TestStepToolUpdatesPersistAndFreeze(t *testing.T) {
 	a := newRuntimeAgent(t)
+	for _, removed := range []string{"EnterPlanMode", "ExitPlanMode"} {
+		if _, ok := a.services.registry.Get(removed); ok {
+			t.Fatalf("removed tool %s remains in the model catalog", removed)
+		}
+	}
 	if err := a.appendHistory(messages.Message{Role: messages.RoleUser, Content: "inspect"}); err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +39,7 @@ func TestStepToolUpdatesPersistAndFreeze(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.releaseStepContext(step)
-	if step.history[len(step.history)-1].ToolUpdate == nil || !step.history[len(step.history)-1].ToolUpdate.Initial {
+	if lastToolUpdate(step.history) == nil || !lastToolUpdate(step.history).Initial {
 		t.Fatal("initial catalog missing")
 	}
 	count := len(a.History())
@@ -53,7 +58,7 @@ func TestStepToolUpdatesPersistAndFreeze(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := a.buildRequestForStep(step)
-	update := step.history[len(step.history)-1].ToolUpdate
+	update := lastToolUpdate(step.history)
 	if update == nil || len(update.Added) != 1 || update.Added[0].Name != "CatalogTest" {
 		t.Fatalf("missing addition: %+v", update)
 	}
@@ -70,7 +75,7 @@ func TestStepToolUpdatesPersistAndFreeze(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	update = step.history[len(step.history)-1].ToolUpdate
+	update = lastToolUpdate(step.history)
 	if update == nil || len(update.Removed) != 1 || len(update.Added) != 1 || update.Added[0].Description != "second" {
 		t.Fatalf("bad redefinition: %+v", update)
 	}
@@ -80,7 +85,7 @@ func TestStepToolUpdatesPersistAndFreeze(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	update = step.history[len(step.history)-1].ToolUpdate
+	update = lastToolUpdate(step.history)
 	if update == nil || len(update.Removed) != 1 || len(update.Added) != 0 {
 		t.Fatalf("bad removal: %+v", update)
 	}
@@ -104,7 +109,7 @@ func TestStepToolUpdatesPersistAndFreeze(t *testing.T) {
 	}
 }
 
-func TestStepToolCatalogRestartAfterCompactionAndPlanChange(t *testing.T) {
+func TestStepToolCatalogRestartAfterCompaction(t *testing.T) {
 	a := newRuntimeAgent(t)
 	step, err := a.beginStepChecked()
 	if err != nil {
@@ -119,26 +124,17 @@ func TestStepToolCatalogRestartAfterCompactionAndPlanChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !step.history[len(step.history)-1].ToolUpdate.Initial {
+	if !lastToolUpdate(step.history).Initial {
 		t.Fatal("no replacement baseline after compaction")
 	}
 	a.releaseStepContext(step)
-	a.mu.Lock()
-	a.plan.planMode = true
-	a.mu.Unlock()
-	step, err = a.beginStepChecked()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a.releaseStepContext(step)
-	current, _ := messages.CurrentTools(step.history)
-	req := a.buildRequestForStep(step)
-	if len(current) != len(req.Tools) {
-		t.Fatalf("plan catalog has %d tools, request has %d", len(current), len(req.Tools))
-	}
-	for _, def := range req.Tools {
-		if !def.PlanAllowed {
-			t.Fatal("unsafe tool advertised in plan")
+}
+
+func lastToolUpdate(history []messages.Message) *messages.ToolUpdate {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].ToolUpdate != nil {
+			return history[i].ToolUpdate
 		}
 	}
+	return nil
 }

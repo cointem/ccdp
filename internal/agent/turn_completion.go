@@ -7,6 +7,13 @@ import (
 	"ccdp/internal/protocol"
 )
 
+type turnStopError struct {
+	status protocol.TurnOutcomeStatus
+	reason string
+}
+
+func (e *turnStopError) Error() string { return e.reason }
+
 // settleTurnLocked records the terminal outcome while the turn still owns the
 // lifecycle lock. This is deliberately done before publishState and TurnDone:
 // a watcher must never observe Busy=false with a running LastTurn, and an old
@@ -24,7 +31,7 @@ func (a *Agent) settleTurnLocked(turnID protocol.TurnID, saveErr error) {
 	case a.services.persistenceErr != nil:
 		outcome.Status = protocol.TurnFailed
 		outcome.Error = "session persistence failed: " + a.services.persistenceErr.Error()
-	case outcome.Status == protocol.TurnFailed:
+	case outcome.Status == protocol.TurnFailed || outcome.Status == protocol.TurnLimited || outcome.Status == protocol.TurnBlocked:
 		// Preserve the provider/tool error already observed for this turn.
 	case outcome.Status == protocol.TurnCancelled || a.turn.interruptFlag || a.lifecycle.closing || a.lifecycle.closed || a.turn.turnCtx != nil && a.turn.turnCtx.Err() != nil:
 		outcome.Status = protocol.TurnCancelled
@@ -46,7 +53,7 @@ func (a *Agent) handleStreamError(streamErr error, allowFallback bool) bool {
 		return false
 	}
 	if isRequestJournalFailure(streamErr) {
-		a.emit(Event{Type: EventError, Text: "request journal error: " + streamErr.Error()})
+		a.emit(protocol.EventView{Kind: protocol.EventError, Text: "request journal error: " + streamErr.Error()})
 		return false
 	}
 	if a.interrupted() {
@@ -62,7 +69,7 @@ func (a *Agent) handleStreamError(streamErr error, allowFallback bool) bool {
 			return true
 		}
 	}
-	a.emit(Event{Type: EventError, Text: "LLM error: " + streamErr.Error()})
+	a.emit(protocol.EventView{Kind: protocol.EventError, Text: "LLM error: " + streamErr.Error()})
 	return false
 }
 
@@ -102,7 +109,7 @@ func (a *Agent) completeTurn(completion turnCompleted) {
 	a.settleTurnLocked(turnID, saveErr)
 	a.mu.Unlock()
 	if saveErr != nil {
-		a.emit(Event{Type: EventError, TurnID: string(turnID), Text: "session persistence failed: " + saveErr.Error()})
+		a.emit(protocol.EventView{Kind: protocol.EventError, TurnID: turnID, Text: "session persistence failed: " + saveErr.Error()})
 	}
 	// If a queued input was present at the terminal boundary, publishTerminal
 	// keeps busy=true as a reservation and returns true. If none was present,
@@ -139,7 +146,7 @@ func (a *Agent) launchQueuedTurn(completedTurnSeq uint64) bool {
 	if err != nil {
 		a.markPersistenceFailure(err)
 		a.idleAfterTurn()
-		a.emit(Event{Type: EventError, Text: "queued input delivery failed: " + err.Error()})
+		a.emit(protocol.EventView{Kind: protocol.EventError, Text: "queued input delivery failed: " + err.Error()})
 		a.publishState()
 		return false
 	}

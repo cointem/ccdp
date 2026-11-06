@@ -197,7 +197,7 @@ func (a *Agent) Fork(keep int) (string, error) {
 // under one lock: identity, config, split history spans, usage, binding, root
 // context, and the request-journal metadata. keep is clamped to the history
 // bounds.
-func (a *Agent) snapshotForkSource(keep int) (oldID string, sourceCfg config.Config, prefix, suffix []messages.Message, usage Usage, sourceBinding modelBinding, rootCtx context.Context, metadata requestJournalMetadata, clampedKeep int) {
+func (a *Agent) snapshotForkSource(keep int) (oldID string, sourceCfg config.Config, prefix, suffix []messages.Message, usage protocol.UsageSnapshot, sourceBinding modelBinding, rootCtx context.Context, metadata requestJournalMetadata, clampedKeep int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	oldID = a.conversation.sessionID

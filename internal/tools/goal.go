@@ -1,10 +1,11 @@
 package tools
 
 import (
-	"ccdp/internal/protocol"
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"ccdp/internal/protocol"
 )
 
 // GoalControl is supplied by the runtime for the invoking session. It owns
@@ -28,7 +29,7 @@ func (*GetGoalTool) Name() string    { return "GetGoal" }
 func (*UpdateGoalTool) Name() string { return "UpdateGoal" }
 
 func (*CreateGoalTool) Description() string {
-	return `Create a persistent goal and keep working until it is complete, paused, blocked or limited. Use only when the user or governing instructions explicitly request a persistent goal; do not infer one from an ordinary task. Supply token_budget only when a token budget was explicitly requested. An unfinished goal cannot be replaced. This does not grant any additional permissions or bypass plan approval.`
+	return `Create a persistent goal and keep working until it is complete, paused, blocked or limited. Use only when the user or governing instructions explicitly request a persistent goal; do not infer one from an ordinary task. Supply token_budget only when a token budget was explicitly requested. An unfinished goal cannot be replaced. This does not grant any additional permissions.`
 }
 
 func (*GetGoalTool) Description() string {

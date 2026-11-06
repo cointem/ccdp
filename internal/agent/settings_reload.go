@@ -42,8 +42,8 @@ func (a *Agent) reloadSettingsContext(ctx context.Context, workspace string) err
 	if err := a.commitSettingsCandidateContext(ctx, candidate); err != nil {
 		return err
 	}
-	a.emit(Event{Type: EventModeChanged, Mode: candidate.mode})
-	a.emit(Event{Type: EventSandboxChanged})
+	a.emit(protocol.EventView{Kind: protocol.EventStateChanged, PermissionMode: string(candidate.mode)})
+	a.emit(protocol.EventView{Kind: protocol.EventStateChanged})
 	return nil
 }
 
@@ -67,20 +67,6 @@ func (a *Agent) TrustProject() error {
 		return err
 	}
 	return nil
-}
-
-// RevokeProjectTrust removes the explicit external authorization. Current
-// bindings remain until an idle ReloadSettings publishes the now-safe
-// candidate; this avoids mutating a live step in place.
-func (a *Agent) RevokeProjectTrust() error {
-	a.mu.Lock()
-	workspace := a.services.cfg.Workspace
-	store := a.services.trustStore
-	a.mu.Unlock()
-	if store == nil {
-		store = config.DefaultTrustStore()
-	}
-	return store.RevokeProject(workspace)
 }
 
 // trustProjectContext applies or revokes project trust and publishes the

@@ -14,9 +14,13 @@ import (
 // CodeWorker uses a separate deny-by-default profile, never the workspace
 // profile (which deliberately allows host reads). There is no shell, network,
 // project/session read, filesystem write, or process-fork permission.
-func CodeWorker(ctx context.Context, executable string, args ...string) (*Process, error) {
-	var err error
-	executable, err = filepath.EvalSymlinks(executable)
+func CodeWorker(ctx context.Context, args ...string) (*Process, error) {
+	id, _ := ctx.Value(controllerContextKey{}).(string)
+	c := controllerFor(id)
+	if c == nil {
+		return nil, ErrEnvironmentUnavailable
+	}
+	executable, err := c.Binary()
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +31,14 @@ func CodeWorker(ctx context.Context, executable string, args ...string) (*Proces
 	p := newProcess(exec.CommandContext(ctx, sandbox.BackendPath, append([]string{"-p", profile, "--", executable}, args...)...))
 	p.cmd.Dir = "/"
 	p.cmd.Env = []string{"LANG=C", "TZ=UTC", "GOMAXPROCS=2"}
-	return p, nil
+	return bindController(p, ctx, &sandbox.Sandbox{ExecutorID: id}), nil
+}
+
+type controllerContextKey struct{}
+
+// WithController routes infrastructure workers through the root executor.
+func WithController(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, controllerContextKey{}, id)
 }
 
 func CodeWorkerProfile(executable string) (string, error) {

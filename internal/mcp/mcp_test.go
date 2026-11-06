@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"ccdp/internal/testenv"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"ccdp/internal/sandbox"
 	"ccdp/internal/tools"
 )
 
@@ -77,7 +77,7 @@ func newTestServer(t *testing.T, name string) *Client {
 		Env:     map[string]string{fakeServerEnv: "1"},
 	}
 	c := NewClient(name, cfg)
-	c.SetSandbox(sandbox.New(t.TempDir()))
+	c.SetSandbox(testenv.Sandbox(t, t.TempDir()))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.Start(ctx); err != nil {
@@ -160,7 +160,7 @@ func TestManagerRegisterTools(t *testing.T) {
 	}
 
 	m := NewManager()
-	m.SetSandbox(sandbox.New(t.TempDir()))
+	m.SetSandbox(testenv.Sandbox(t, t.TempDir()))
 	if err := m.StartChecked(context.Background(), map[string]ServerConfig{
 		"fake": {
 			Command: os.Args[0],
@@ -200,7 +200,7 @@ func TestManagerRegisterTools(t *testing.T) {
 
 func TestManagerStartCheckedRollsBackAllCandidates(t *testing.T) {
 	m := NewManager()
-	m.SetSandbox(sandbox.New(t.TempDir()))
+	m.SetSandbox(testenv.Sandbox(t, t.TempDir()))
 	err := m.StartChecked(context.Background(), map[string]ServerConfig{
 		"broken":          {Command: "/definitely/not/a/real/mcp-server"},
 		"missing-command": {},
@@ -221,7 +221,7 @@ func TestManagerRefreshKeepsOldStepBindingAlive(t *testing.T) {
 	}
 	server := ServerConfig{Command: os.Args[0], Args: []string{"-test.run=TestManagerRefreshKeepsOldStepBindingAlive"}, Env: map[string]string{fakeServerEnv: "1"}}
 	m := NewManager()
-	m.SetSandbox(sandbox.New(t.TempDir()))
+	m.SetSandbox(testenv.Sandbox(t, t.TempDir()))
 	if err := m.StartChecked(context.Background(), map[string]ServerConfig{"fake": server}); err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestManagerPrepareAbortDoesNotPublishCandidate(t *testing.T) {
 	}
 	server := ServerConfig{Command: os.Args[0], Args: []string{"-test.run=TestManagerPrepareAbortDoesNotPublishCandidate"}, Env: map[string]string{fakeServerEnv: "1"}}
 	m := NewManager()
-	m.SetSandbox(sandbox.New(t.TempDir()))
+	m.SetSandbox(testenv.Sandbox(t, t.TempDir()))
 	if err := m.StartChecked(context.Background(), map[string]ServerConfig{"fake": server}); err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestManagerStartsSSEWithoutCommand(t *testing.T) {
 	defer srv.Close()
 
 	// The in-process SSE transport connects only to this loopback test server.
-	sb := sandbox.New(t.TempDir())
+	sb := testenv.Sandbox(t, t.TempDir())
 	sb.SetAllowNetwork(true)
 	m := NewManager()
 	m.SetSandbox(sb)

@@ -31,6 +31,8 @@ type historyCell struct {
 	toolArgs      map[string]any
 	toolArgsRaw   string
 	toolTruncated bool
+	process       *protocol.ProcessState
+	processMerged bool
 
 	// agent carries the child session spawned by a SpawnAgent tool call,
 	// resolved by ParentCallID == toolID from the routing directory. It is

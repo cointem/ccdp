@@ -76,7 +76,7 @@ func Drive(ctx context.Context, child ChildRuntime, input protocol.Command, boun
 		}
 		output := child.RunOutput(previous)
 		switch view.LastTurn.Status {
-		case protocol.TurnFailed:
+		case protocol.TurnFailed, protocol.TurnLimited, protocol.TurnBlocked:
 			return output, errors.New(view.LastTurn.Error)
 		case protocol.TurnCancelled:
 			return output, context.Canceled

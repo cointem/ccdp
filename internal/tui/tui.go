@@ -68,7 +68,6 @@ type Model struct {
 
 	modelName    string
 	mode         permissions.Mode
-	planMode     bool
 	tasksVisible bool // ctrl+t toggles the working task checklist panel
 	sessionID    string
 	workspace    string
@@ -152,7 +151,6 @@ const (
 	selectorVerbosity   selectorActionKind = "verbosity"
 	selectorModel       selectorActionKind = "model"
 	selectorMode        selectorActionKind = "mode"
-	selectorPlan        selectorActionKind = "plan"
 	selectorRewind      selectorActionKind = "rewind"
 	selectorResume      selectorActionKind = "resume"
 	selectorAgent       selectorActionKind = "agent"

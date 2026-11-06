@@ -2,9 +2,10 @@ package tui
 
 import (
 	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestTransientPanelsPreserveBaseFrame(t *testing.T) {
@@ -15,7 +16,7 @@ func TestTransientPanelsPreserveBaseFrame(t *testing.T) {
 			m.startSelectorAt("Model", []SelectorOption{{ID: "one", Label: "one"}, {ID: "two", Label: "two"}}, 0, true, selectorAction{Kind: selectorModel})
 		},
 		"permission": func(m *Model) {
-			m.startSelectorAt("Permission", []SelectorOption{{ID: "edits", Label: "edits"}}, 0, true, selectorAction{Kind: selectorMode})
+			m.startSelectorAt("Permission", []SelectorOption{{ID: "manual", Label: "manual"}}, 0, true, selectorAction{Kind: selectorMode})
 		},
 		"effort":  func(m *Model) { m.startGenerationSelector("effort") },
 		"context": func(m *Model) { m.showContextDetail = true },

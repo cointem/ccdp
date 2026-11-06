@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"sync"
 	"time"
@@ -18,24 +17,24 @@ import (
 )
 
 type Binding struct {
-	ReadOnly bool
-	Process  bool // trusted host implementation owns session process handles
-	Run      func(context.Context, int, map[string]any) Result
+	Concurrent func(map[string]any) bool
+	Process    bool // trusted host implementation owns session process handles
+	Run        func(context.Context, int, map[string]any) Result
 }
 type Options struct {
 	Code        string
 	Timeout     time.Duration
 	MaxParallel int
 	Bindings    map[string]Binding
-	// Executable/Arguments allow embedders to provide their worker entry point.
-	// They are host configuration, never model-controlled tool arguments.
-	Executable string
-	Arguments  []string
 }
 type Summary = protocol.CodeResult
 type completion struct {
-	request frame
+	request queuedCall
 	result  Result
+}
+type queuedCall struct {
+	frame
+	concurrent bool
 }
 type incoming struct {
 	frame frame
@@ -68,7 +67,7 @@ func (b *boundedDiagnostic) String() string { b.mu.Lock(); defer b.mu.Unlock(); 
 // A parent never consumes one of its children's worker permits.
 func Run(parent context.Context, o Options) (summary Summary, err error) {
 	summary.Outputs = []json.RawMessage{}
-	processes := map[int]bool{}
+	processes := map[string]bool{}
 	defer func() {
 		if err != nil {
 			summary.Error = err.Error()
@@ -81,7 +80,7 @@ func Run(parent context.Context, o Options) (summary Summary, err error) {
 				summary.Processes = append(summary.Processes, id)
 			}
 		}
-		sort.Ints(summary.Processes)
+		sort.Strings(summary.Processes)
 	}()
 	if len(o.Code) == 0 || len(o.Code) > MaxCode {
 		return summary, fmt.Errorf("code must contain 1..%d bytes", MaxCode)
@@ -98,18 +97,9 @@ func Run(parent context.Context, o Options) (summary Summary, err error) {
 	if o.MaxParallel > 16 {
 		o.MaxParallel = 16
 	}
-	ctx, cancel := withBudget(parent, o.Timeout)
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	if o.Executable == "" {
-		o.Executable, err = os.Executable()
-		if err != nil {
-			return summary, err
-		}
-	}
-	if len(o.Arguments) == 0 {
-		o.Arguments = []string{WorkerArgument}
-	}
-	p, err := execution.CodeWorker(ctx, o.Executable, o.Arguments...)
+	p, err := execution.CodeWorker(ctx, WorkerArgument)
 	if err != nil {
 		return summary, err
 	}
@@ -128,6 +118,10 @@ func Run(parent context.Context, o Options) (summary Summary, err error) {
 	if err = p.Start(); err != nil {
 		return summary, err
 	}
+	// Executor preparation has its own bounded startup. Charge only the
+	// running cell against its wall-clock budget, as for shell invocations.
+	ctx, cancelBudget := withBudget(ctx, o.Timeout)
+	defer cancelBudget()
 	defer func() {
 		cancel()
 		if stopErr := p.Stop("code cell ended"); stopErr != nil {
@@ -189,7 +183,7 @@ func Run(parent context.Context, o Options) (summary Summary, err error) {
 		}
 	}()
 	finished := make(chan completion, 16)
-	queue := []frame{}
+	queue := []queuedCall{}
 	gate := tooling.Barrier{Limit: o.MaxParallel}
 	nextID := 1
 	closing := false
@@ -216,9 +210,9 @@ func Run(parent context.Context, o Options) (summary Summary, err error) {
 			}
 		}
 	}
-	launch := func(f frame) {
+	launch := func(f queuedCall) {
 		binding := o.Bindings[f.Name]
-		gate.Start(binding.ReadOnly)
+		gate.Start(f.concurrent)
 		go func() {
 			var r Result
 			defer func() {
@@ -242,7 +236,7 @@ func Run(parent context.Context, o Options) (summary Summary, err error) {
 		if !closing && ctx.Err() != nil {
 			closeCell(context.Cause(ctx))
 		}
-		for !closing && len(queue) > 0 && gate.CanStart(o.Bindings[queue[0].Name].ReadOnly) {
+		for !closing && len(queue) > 0 && gate.CanStart(queue[0].concurrent) {
 			f := queue[0]
 			queue = queue[1:]
 			launch(f)
@@ -290,7 +284,8 @@ func Run(parent context.Context, o Options) (summary Summary, err error) {
 				}
 				nextID++
 				summary.Calls++
-				queue = append(queue, f)
+				classify := o.Bindings[f.Name].Concurrent
+				queue = append(queue, queuedCall{frame: f, concurrent: classify != nil && classify(f.Args)})
 			case "emit":
 				value, encodeErr := json.Marshal(f.Value)
 				if len(f.Value) == 0 || encodeErr != nil {
@@ -319,7 +314,7 @@ func Run(parent context.Context, o Options) (summary Summary, err error) {
 				closeCell(errors.New("unexpected worker message"))
 			}
 		case c := <-finished:
-			gate.Finish(o.Bindings[c.request.Name].ReadOnly)
+			gate.Finish(c.request.concurrent)
 			switch c.result.Status {
 			case "success":
 			case "denied":
@@ -331,12 +326,19 @@ func Run(parent context.Context, o Options) (summary Summary, err error) {
 			default:
 				summary.Failed++
 			}
-			var process struct {
-				ID     int    `json:"process_id"`
-				Status string `json:"status"`
-			}
-			if o.Bindings[c.request.Name].Process && json.Unmarshal(c.result.Data, &process) == nil && process.ID > 0 {
-				processes[process.ID] = process.Status == "running"
+			if p := c.result.Process; o.Bindings[c.request.Name].Process && p != nil {
+				processes[p.ID] = !p.Terminal()
+				if len(c.result.CompletionIDs) > 0 {
+					duplicate := false
+					for _, old := range summary.Completed {
+						if old.ID == p.ID {
+							duplicate = true
+						}
+					}
+					if !duplicate {
+						summary.Completed = append(summary.Completed, p.Reference())
+					}
+				}
 			}
 			b, e := json.Marshal(c.result)
 			if e != nil || len(b) > MaxResult {

@@ -53,12 +53,12 @@ func TestBashCreatedFileRemainsReadableAfterSettingsChanges(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			tctx := a.buildToolContext(messages.ToolCall{}, ctx, a.configSnapshot(), policy, a.services.resources, nil)
-			result, err := tools.NewBashTool().Execute(tctx, map[string]any{"command": `printf 'written by bash\n' > "$TMPDIR/read-back.txt"; printf 'retained log\n'`, "yield_ms": 1000})
+			result, err := tools.NewBashTool().Execute(tctx, map[string]any{"command": `printf 'written by bash\n' > "$TMPDIR/read-back.txt"; printf 'retained log\n'`})
 			if err != nil {
 				t.Fatal(err)
 			}
 			var process struct {
-				ID       int    `json:"process_id"`
+				ID       string `json:"process_id"`
 				Status   string `json:"status"`
 				ExitCode *int   `json:"exit_code"`
 				Log      string `json:"log_path"`
@@ -71,7 +71,7 @@ func TestBashCreatedFileRemainsReadableAfterSettingsChanges(t *testing.T) {
 				if process.Status != "running" {
 					break
 				}
-				result, err = tools.NewProcessTool().Execute(tctx, map[string]any{"id": process.ID, "action": "read", "offset": process.Next, "wait_ms": 1000})
+				result, err = tools.NewProcessTool().Execute(tctx, map[string]any{"id": process.ID, "action": "read", "offset": process.Next})
 				if err != nil {
 					t.Fatal(err)
 				}

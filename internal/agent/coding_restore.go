@@ -227,7 +227,7 @@ func (a *Agent) runRestore(ctx context.Context, cmd protocol.Command) (string, e
 		a.services.resources.Files.Clear()
 	}
 	workspace.Invalidate(binding.Plan.Root)
-	a.emit(Event{Type: EventHistoryChanged, Text: "restored " + binding.Mode + " to " + binding.Point.ID})
+	a.emit(protocol.EventView{Kind: protocol.EventStateChanged, Text: "restored " + binding.Mode + " to " + binding.Point.ID})
 	a.publishState()
 	return "restored " + binding.Mode + " to " + binding.Point.ID, nil
 }

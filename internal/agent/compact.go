@@ -10,6 +10,7 @@ import (
 	"ccdp/internal/hooks"
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
+	"ccdp/internal/protocol"
 )
 
 type compactFailureState struct {
@@ -168,7 +169,7 @@ func (a *Agent) reduceContext(ctx context.Context, manual bool, req *llm.Complet
 		if err := a.replaceHistoryFromWorker(historyReplacementPrepared{ctx: ctx, history: candidate, source: source, compact: true}); err != nil {
 			return false, err
 		}
-		a.emit(Event{Type: EventCompacted})
+		a.emit(protocol.EventView{Kind: protocol.EventStateChanged})
 		a.emitStatus("older tool outputs shortened; original output remains available with ReadOutput")
 		a.runHookWithJournal(ctx, hooks.EventPostCompact, func(hctx context.Context) hooks.Output { return a.services.hooks.PostCompact(hctx) })
 		return true, nil
@@ -210,7 +211,7 @@ func compactHistorySpans(history []messages.Message, keep, budget int) (head, to
 	// Preserve the latest real user input verbatim even if a long current turn
 	// moved its completed tool groups into the summary.
 	for i := len(history) - 1; i >= headLen; i-- {
-		if history[i].Role != messages.RoleUser || strings.HasPrefix(history[i].Content, summaryPrefix) {
+		if history[i].Role != messages.RoleUser || history[i].InternalSource != "" || strings.HasPrefix(history[i].Content, summaryPrefix) {
 			continue
 		}
 		if i < cut {
@@ -272,7 +273,7 @@ func (a *Agent) commitCompactionWithOutputs(hctx context.Context, head []message
 		return err
 	}
 
-	a.emit(Event{Type: EventCompacted})
+	a.emit(protocol.EventView{Kind: protocol.EventStateChanged})
 	a.emitStatus("context compacted (kept last %d messages)", keep)
 	a.services.evbus.Emit(events.TopicCompacted, events.MessageEvent{Role: "system", Content: summary})
 	a.runHookWithJournal(hctx, hooks.EventPostCompact, func(hookCtx context.Context) hooks.Output {

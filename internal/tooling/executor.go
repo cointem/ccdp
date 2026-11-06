@@ -16,6 +16,9 @@ type Invocation interface {
 }
 
 type Result struct {
+	Process          *protocol.ProcessOutput
+	CompletionIDs    []string
+	Failure          *protocol.ToolFailure
 	Output           string
 	Code             *protocol.CodeResult
 	IsError          bool

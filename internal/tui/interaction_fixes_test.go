@@ -16,30 +16,14 @@ func TestCyclePermissionModeImmediateResponse(t *testing.T) {
 	m.client = &recordingClient{snapshot: m.snapshot}
 	m.layout()
 
-	// Initial mode is default
-	if m.mode != permissions.ModeDefault && m.mode != "" {
-		t.Fatalf("expected default mode initially, got %v", m.mode)
-	}
-
-	// Press Shift+Tab (mode cycle)
-	cmd := m.cyclePermissionMode()
-	if cmd == nil {
-		t.Fatal("cyclePermissionMode should return submitCommand cmd")
-	}
-	if m.mode != permissions.ModeAcceptEdits {
-		t.Fatalf("expected acceptEdits after first cycle, got %v", m.mode)
-	}
-
-	// Cycle again -> bypass
-	m.cyclePermissionMode()
-	if m.mode != permissions.ModeBypass {
-		t.Fatalf("expected bypass after second cycle, got %v", m.mode)
-	}
-
-	// Cycle again -> default
-	m.cyclePermissionMode()
-	if m.mode != permissions.ModeDefault {
-		t.Fatalf("expected default after third cycle, got %v", m.mode)
+	m.mode = permissions.ModeManual
+	for _, want := range []permissions.Mode{permissions.ModeAuto, permissions.ModeManual, permissions.ModeAuto} {
+		if cmd := m.cyclePermissionMode(); cmd == nil {
+			t.Fatal("cyclePermissionMode should return submitCommand cmd")
+		}
+		if m.mode != want {
+			t.Fatalf("expected %s immediately after cycle, got %s", want, m.mode)
+		}
 	}
 }
 
@@ -109,7 +93,7 @@ func TestMouseClickInteractions(t *testing.T) {
 	if m.picker == nil || m.picker.action.Kind != selectorModel {
 		t.Fatal("model label must open model selector")
 	}
-	if m.mode != permissions.ModeDefault && m.mode != "" {
+	if m.mode != permissions.ModeManual && m.mode != "" {
 		t.Fatal("model click changed permissions")
 	}
 	m.picker = nil
@@ -214,16 +198,16 @@ func TestModeCyclePositionStability(t *testing.T) {
 	m := astraModel(t, 100, 24)
 	m.layout()
 
-	// Mode 1: default
+	// Initial mode: manual
 	line1 := sanitizeANSI(m.renderPersistentStatus())
 	idxModel1 := strings.Index(line1, "deepseek-chat")
 
-	// Mode 2: acceptEdits
+	// Switch to auto
 	m.cyclePermissionMode()
 	line2 := sanitizeANSI(m.renderPersistentStatus())
 	idxModel2 := strings.Index(line2, "deepseek-chat")
 
-	// Mode 3: bypass
+	// Switch back to manual
 	m.cyclePermissionMode()
 	line3 := sanitizeANSI(m.renderPersistentStatus())
 	idxModel3 := strings.Index(line3, "deepseek-chat")

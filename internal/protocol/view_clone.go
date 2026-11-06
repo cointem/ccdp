@@ -10,6 +10,7 @@ func CloneSessionView(v SessionView) SessionView {
 	v.Transcript = slices.Clone(v.Transcript)
 	for i := range v.Transcript {
 		v.Transcript[i].Args = slices.Clone(v.Transcript[i].Args)
+		v.Transcript[i].Process = CloneProcessState(v.Transcript[i].Process)
 	}
 	v.History = slices.Clone(v.History)
 	for i := range v.History {
@@ -23,10 +24,6 @@ func CloneSessionView(v SessionView) SessionView {
 		copy.Args = slices.Clone(copy.Args)
 		copy.Capabilities = slices.Clone(copy.Capabilities)
 		v.Approval = &copy
-	}
-	if v.Plan != nil {
-		copy := *v.Plan
-		v.Plan = &copy
 	}
 	if v.LastTurn != nil {
 		copy := *v.LastTurn
@@ -78,29 +75,13 @@ func CloneUpdate(u Update) Update {
 		u.Receipt = &receipt
 	}
 	if u.Event != nil {
-		event := *u.Event
-		view := CloneSessionView(SessionView{Goal: event.Goal, Question: event.Question, Approval: event.Approval, Plan: event.Plan})
-		event.Goal, event.Question, event.Approval, event.Plan = view.Goal, view.Question, view.Approval, view.Plan
-		if event.Transcript != nil {
-			item := *event.Transcript
-			item.Args = slices.Clone(item.Args)
-			event.Transcript = &item
-		}
-		if event.Tool != nil {
-			tool := *event.Tool
-			tool.Args = slices.Clone(tool.Args)
-			event.Tool = &tool
-		}
-		if event.Usage != nil {
-			usage := *event.Usage
-			event.Usage = &usage
-		}
+		event := CloneEventView(*u.Event)
 		u.Event = &event
 	}
 	if u.Child != nil {
 		child := *u.Child
-		view := CloneSessionView(SessionView{Question: child.Session.Question, Approval: child.Session.Approval, Plan: child.Session.Plan})
-		child.Session.Question, child.Session.Approval, child.Session.Plan = view.Question, view.Approval, view.Plan
+		view := CloneSessionView(SessionView{Question: child.Session.Question, Approval: child.Session.Approval})
+		child.Session.Question, child.Session.Approval = view.Question, view.Approval
 		if child.Update != nil {
 			update := CloneUpdate(*child.Update)
 			child.Update = &update
@@ -108,4 +89,32 @@ func CloneUpdate(u Update) Update {
 		u.Child = &child
 	}
 	return u
+}
+
+// CloneEventView freezes an event before it crosses a runtime or subscriber boundary.
+func CloneEventView(event EventView) EventView {
+	view := CloneSessionView(SessionView{Goal: event.Goal, Question: event.Question, Approval: event.Approval})
+	event.Goal, event.Question, event.Approval = view.Goal, view.Question, view.Approval
+	if event.Transcript != nil {
+		item := *event.Transcript
+		item.Args = slices.Clone(item.Args)
+		item.Process = CloneProcessState(item.Process)
+		event.Transcript = &item
+	}
+	if event.Tool != nil {
+		tool := *event.Tool
+		tool.Progress = CloneProcessProgress(tool.Progress)
+		tool.Args = slices.Clone(tool.Args)
+		if tool.Failure != nil {
+			failure := *tool.Failure
+			failure.Resources = slices.Clone(failure.Resources)
+			tool.Failure = &failure
+		}
+		event.Tool = &tool
+	}
+	if event.Usage != nil {
+		usage := *event.Usage
+		event.Usage = &usage
+	}
+	return event
 }

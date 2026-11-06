@@ -19,9 +19,7 @@ func (requestPrepared) ownerControlMessage() {}
 
 func (a *Agent) admitPreparedRequest(ctx context.Context, manifest session.RequestManifest) error {
 	request := requestPrepared{ctx: ctx, manifest: manifest, result: make(chan error, 1)}
-	if a.owner == nil {
-		return a.commitPreparedRequest(request)
-	}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- request:

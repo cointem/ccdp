@@ -79,9 +79,6 @@ func (a *Agent) waitAgentEvent(ctx context.Context) (string, error) {
 				if row.Question != nil {
 					interactionID = "question:" + row.Question.ID
 				}
-				if row.Plan != nil {
-					interactionID = "plan:" + row.Plan.ID
-				}
 				if interactionID != "" {
 					a.mu.Lock()
 					if a.inbox.agentAttention == nil {

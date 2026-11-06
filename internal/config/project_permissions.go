@@ -62,9 +62,6 @@ func (c Config) SaveProjectPermission(mode string) error {
 	if err != nil {
 		return err
 	}
-	if parsed == permissions.ModePlan {
-		return fmt.Errorf("plan is not a project permission policy")
-	}
 	path, root, err := c.projectPermissionPath()
 	if err != nil {
 		return err
@@ -102,12 +99,9 @@ func (c *Config) ApplyProjectPermission() error {
 	if err != nil {
 		return err
 	}
-	if saved.Root != root || mode == permissions.ModePlan {
+	if saved.Root != root {
 		return fmt.Errorf("invalid project permission record: %s", path)
 	}
-	// Plan is an independent workflow; preserve its explicit startup selection.
-	if c.PermissionMode != string(permissions.ModePlan) {
-		c.PermissionMode = string(mode)
-	}
+	c.PermissionMode = string(mode)
 	return nil
 }

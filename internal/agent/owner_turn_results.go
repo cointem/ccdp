@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -46,9 +47,7 @@ func (turnNoteRecorded) ownerControlMessage() {}
 
 func (a *Agent) finishTurnOutcome(sequence uint64, turnErr error, duration time.Duration) error {
 	request := turnOutcomePrepared{sequence: sequence, err: turnErr, duration: duration, result: make(chan error, 1)}
-	if a.owner == nil {
-		return a.settleTurnOutcome(request)
-	}
+
 	select {
 	case a.owner.control <- request:
 	case <-a.owner.done:
@@ -73,6 +72,10 @@ func (a *Agent) settleTurnOutcome(request turnOutcomePrepared) error {
 	}
 	if request.err != nil {
 		a.lifecycle.lastTurn.Status, a.lifecycle.lastTurn.Error = protocol.TurnFailed, request.err.Error()
+		var stop *turnStopError
+		if errors.As(request.err, &stop) {
+			a.lifecycle.lastTurn.Status = stop.status
+		}
 	}
 	a.settleTurnLocked(turnID, nil)
 	result := *a.lifecycle.lastTurn
@@ -86,6 +89,8 @@ func (a *Agent) settleTurnOutcome(request turnOutcomePrepared) error {
 		outcome = "error"
 	case protocol.TurnCancelled:
 		outcome = "cancelled"
+	case protocol.TurnLimited, protocol.TurnBlocked:
+		outcome = string(result.Status)
 	}
 	return a.persistTurnFinished(fmt.Sprintf("turn-%d", request.sequence), outcome, result.Error, request.duration)
 }
@@ -119,9 +124,6 @@ func (a *Agent) selectFallback() string {
 	return fallback.model
 }
 func (a *Agent) requestFallback() string {
-	if a.owner == nil {
-		return a.selectFallback()
-	}
 	request := fallbackRequested{result: make(chan string, 1)}
 	a.ensureRun()
 	select {
@@ -145,10 +147,6 @@ func (a *Agent) recordTurnNote(request turnNoteRecorded) {
 	a.mu.Unlock()
 }
 func (a *Agent) postTurnNote(request turnNoteRecorded) {
-	if a.owner == nil {
-		a.recordTurnNote(request)
-		return
-	}
 	request.done = make(chan struct{})
 	a.ensureRun()
 	select {

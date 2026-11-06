@@ -15,6 +15,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/sessionview"
 )
 
@@ -76,7 +77,7 @@ func TestSupervisorMemoryContinueRetainsHistoryAndCommandIdentity(t *testing.T) 
 	cfg.SessionDir = filepath.Join(cfg.Workspace, "never-created")
 	cfg.NoSessionPersistence = true
 	cfg.Model = "memory-model"
-	cfg.PermissionMode = "bypassPermissions"
+	cfg.PermissionMode = "auto"
 	registry := plugin.NewModelRegistry()
 	registry.Register(p)
 	registry.Route(cfg.Model, p.Name())
@@ -173,7 +174,7 @@ func TestSupervisorRecoversDurableOutboxWithoutExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		snap, err := LoadSession(cfg.SessionDir, rootID)
+		snap, err := archive.Load(cfg.SessionDir, rootID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -337,7 +338,7 @@ func TestTranscriptLiveToolEventUsesDurableStepIdentity(t *testing.T) {
 	}
 	defer sub.Close()
 	initial := <-sub.Updates()
-	a.publishEvent(Event{Type: EventToolStart, Tool: &ToolEvent{ID: "call", Name: "Read"}})
+	a.emit(protocol.EventView{Kind: protocol.EventToolStarted, Tool: &protocol.ToolView{ID: "call", Name: "Read"}})
 	update := <-sub.Updates()
 	if update.Event == nil || update.Event.Transcript == nil || update.Event.Transcript.ID != "tool:turn-1:step-2:call" {
 		t.Fatalf("event did not join durable tool identity: %+v", update.Event)
@@ -415,7 +416,7 @@ func TestTranscriptRestoredToolResultSettlesQueuedCall(t *testing.T) {
 func TestChildRowLockedEnrichesApprovalForEventStream(t *testing.T) {
 	ag := newRuntimeAgent(t)
 	ag.mu.Lock()
-	ag.decisions.pendingApproval = &ApprovalRequest{ID: "ap-1", Tool: "Bash", Reason: "needs review"}
+	ag.decisions.pendingApproval = &protocol.ApprovalView{ID: "ap-1", Tool: "Bash", Reason: "needs review"}
 	ag.mu.Unlock()
 
 	s := &SessionSupervisor{}

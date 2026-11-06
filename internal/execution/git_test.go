@@ -1,7 +1,6 @@
 package execution
 
 import (
-	"ccdp/internal/sandbox"
 	"context"
 	"os"
 	"os/exec"
@@ -238,7 +237,7 @@ func TestReadOnlyGitQueryBlocksCleanFilterAndInheritedTrace(t *testing.T) {
 	}
 	trace := filepath.Join(root, "inherited-trace")
 	t.Setenv("GIT_TRACE", trace)
-	policy := sandbox.New(root)
+	policy := testSandbox(t, root)
 	policy.SetAllowNetwork(true)
 	blocked, err := RunReadOnlyGit(context.Background(), []string{"git", "diff"}, Request{Dir: root, Sandbox: policy})
 	if err != nil {

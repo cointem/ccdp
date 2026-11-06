@@ -1,6 +1,9 @@
 package tools
 
-import "encoding/json"
+import (
+	"ccdp/internal/protocol"
+	"encoding/json"
+)
 
 // executeText is an implementation helper, not a second tool interface.
 // It collects text and declared data from a single operation.
@@ -66,5 +69,16 @@ func processResult(result Result) Result {
 func (*BashTool) OutputSchema() map[string]any    { return processOutputSchema() }
 func (*ProcessTool) OutputSchema() map[string]any { return processOutputSchema() }
 func processOutputSchema() map[string]any {
-	return objectOutput(map[string]any{"process_id": scalarOutput("integer"), "status": scalarOutput("string"), "exit_code": scalarOutput("integer"), "output": scalarOutput("string"), "offset": scalarOutput("integer"), "next_offset": scalarOutput("integer"), "log_path": scalarOutput("string"), "truncated": scalarOutput("boolean"), "warning": scalarOutput("string")})
+	return objectOutput(map[string]any{"process_id": scalarOutput("string"), "result_id": scalarOutput("string"), "output_id": scalarOutput("string"), "status": scalarOutput("string"), "bytes_sent": scalarOutput("integer"), "eof": scalarOutput("boolean"), "exit_code": scalarOutput("integer"), "output": scalarOutput("string"), "output_tail": scalarOutput("string"), "offset": scalarOutput("integer"), "next_offset": scalarOutput("integer"), "log_path": scalarOutput("string"), "truncated": scalarOutput("boolean"), "warning": scalarOutput("string")})
+}
+
+func (ctx *Context) recordProcess(p protocol.ProcessOutput, claim bool) {
+	if ctx.dataResult == nil {
+		return
+	}
+	ctx.dataResult.Process = protocol.CloneProcessOutput(&p)
+	ctx.dataResult.CompletionIDs = nil
+	if claim && p.ResultID != "" {
+		ctx.dataResult.CompletionIDs = []string{p.ID}
+	}
 }

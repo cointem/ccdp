@@ -8,18 +8,18 @@ import (
 	"ccdp/internal/session"
 )
 
-func usageFromSession(u session.Usage) (Usage, error) {
+func usageFromSession(u session.Usage) (protocol.UsageSnapshot, error) {
 	for _, v := range []int64{u.InputTokens, u.OutputTokens, u.CachedTokens, u.TurnCount} {
 		if v < 0 || int64(int(v)) != v {
-			return Usage{}, fmt.Errorf("agent: usage counter %d is outside runtime range", v)
+			return protocol.UsageSnapshot{}, fmt.Errorf("agent: usage counter %d is outside runtime range", v)
 		}
 	}
-	return Usage{InputTokens: int(u.InputTokens), OutputTokens: int(u.OutputTokens), CachedTokens: int(u.CachedTokens), TurnCount: int(u.TurnCount), Cache: u.Cache}, nil
+	return protocol.UsageSnapshot{InputTokens: int(u.InputTokens), OutputTokens: int(u.OutputTokens), CachedTokens: int(u.CachedTokens), TurnCount: int(u.TurnCount), Cache: u.Cache}, nil
 }
 
 // addRuntimeUsage uses the same checked reducer as replay. Build a candidate
 // before committing so overflow never lands in the journal or live projection.
-func addRuntimeUsage(total Usage, delta session.Usage, includeCache bool) (Usage, error) {
+func addRuntimeUsage(total protocol.UsageSnapshot, delta session.Usage, includeCache bool) (protocol.UsageSnapshot, error) {
 	if !includeCache {
 		delta.Cache = protocol.CacheStats{}
 	}

@@ -53,7 +53,7 @@ func TestExtraReviewMCPReloadAfterSandboxReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	if len(a.MCPServers()) != 1 {
+	if len(a.services.mcp.Names()) != 1 {
 		t.Fatal("fixture MCP did not start")
 	}
 	for i, allow := range []bool{false, true} {
@@ -66,7 +66,7 @@ func TestExtraReviewMCPReloadAfterSandboxReset(t *testing.T) {
 	if err = a.ReloadSettings(); err != nil {
 		t.Fatal(err)
 	}
-	if len(a.MCPServers()) != 1 {
+	if len(a.services.mcp.Names()) != 1 {
 		t.Fatal("reload leaves configured MCP permanently disconnected after policy reset")
 	}
 	_, _ = a.Snapshot(context.Background())

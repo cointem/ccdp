@@ -36,14 +36,14 @@ func TestBusyModeCommandSubmitsWithoutRevision(t *testing.T) {
 		Revision:  protocol.Revision{LogSeq: 60},
 		Settings: protocol.SettingsSnapshot{
 			Model:      protocol.ModelBinding{Model: "deepseek-chat"},
-			Permission: protocol.PermissionPolicy{Mode: "default"},
+			Permission: protocol.PermissionPolicy{Mode: "manual"},
 		},
 	}
 	rec := &recordingClient{snapshot: m.snapshot}
 	m.client = rec
 	m.busy = true
 
-	runSlash(t, &m, "/mode acceptEdits")
+	runSlash(t, &m, "/mode auto")
 
 	var found *protocol.Command
 	for i := range rec.submits {
@@ -68,13 +68,13 @@ func TestBusyModeSelectorActionSubmits(t *testing.T) {
 	m.snapshot = protocol.SessionView{
 		SessionID: protocol.SessionID(m.sessionID),
 		Revision:  protocol.Revision{LogSeq: 60},
-		Settings:  protocol.SettingsSnapshot{Permission: protocol.PermissionPolicy{Mode: "default"}},
+		Settings:  protocol.SettingsSnapshot{Permission: protocol.PermissionPolicy{Mode: "manual"}},
 	}
 	rec := &recordingClient{snapshot: m.snapshot}
 	m.client = rec
 	m.busy = true
 
-	if cmd := m.executeSelectorAction(selectorAction{Kind: selectorMode}, "bypassPermissions"); cmd != nil {
+	if cmd := m.executeSelectorAction(selectorAction{Kind: selectorMode}, "auto"); cmd != nil {
 		_ = cmd()
 	}
 	var found *protocol.Command

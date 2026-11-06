@@ -129,7 +129,7 @@ func (a *Agent) accountRecoveredOwnAttempt(entry accountingAttempt) error {
 	}
 	a.mu.Lock()
 	a.mu.Unlock()
-	a.emit(Event{Type: EventUsage, Usage: &u})
+	a.emit(protocol.EventView{Kind: protocol.EventUsage, Usage: &u})
 	a.emitStatus("recovered request %s; token usage estimated conservatively for %d input and %d output tokens", entry.attempt.RequestID, charge.InputTokens, charge.OutputTokens)
 	return nil
 }

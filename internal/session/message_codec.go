@@ -15,6 +15,7 @@ import (
 func EncodeMessage(message messages.Message) (Message, error) {
 	result := Message{ToolUpdate: messages.CloneToolUpdate(message.ToolUpdate), ProviderOrigin: message.ProviderOrigin, ProviderWire: message.ProviderWire, ProviderContent: messages.CloneProviderBlocks(message.ProviderContent), InternalSource: message.InternalSource, StreamSegments: append([]messages.StreamSegment(nil), message.StreamSegments...), ReasoningContent: message.ReasoningContent, MessageID: message.ID, Role: string(message.Role), CreatedAt: message.CreatedAt}
 	result.ImagesFrozen = message.ImagesFrozen
+	result.ContextKey = message.ContextKey
 	for _, ref := range message.SourceOutputs {
 		result.SourceOutputs = append(result.SourceOutputs, BlobRef{Hash: ref.Hash, Size: ref.Size, MediaType: ref.MediaType})
 	}
@@ -69,6 +70,7 @@ func EncodeMessage(message messages.Message) (Message, error) {
 func DecodeMessage(message Message) (messages.Message, error) {
 	result := messages.Message{ToolUpdate: messages.CloneToolUpdate(message.ToolUpdate), ProviderOrigin: message.ProviderOrigin, ProviderWire: message.ProviderWire, ProviderContent: messages.CloneProviderBlocks(message.ProviderContent), InternalSource: message.InternalSource, StreamSegments: append([]messages.StreamSegment(nil), message.StreamSegments...), ReasoningContent: message.ReasoningContent, ID: message.MessageID, Role: messages.Role(message.Role), CreatedAt: message.CreatedAt}
 	result.ImagesFrozen = message.ImagesFrozen
+	result.ContextKey = message.ContextKey
 	for _, ref := range message.SourceOutputs {
 		result.SourceOutputs = append(result.SourceOutputs, messages.OutputReference{Hash: ref.Hash, Size: ref.Size, MediaType: ref.MediaType})
 	}

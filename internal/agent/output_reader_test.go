@@ -204,7 +204,7 @@ func TestContextPreparationCountsWholeRequestAndCanSkipSummary(t *testing.T) {
 		}
 	}
 	cfg := a.configSnapshot()
-	req := a.buildRequestFromConfig(cfg, a.currentSandbox().Snapshot(), cfg.Model, "instructions", a.History(), false, nil)
+	req := a.buildRequestFromConfig(cfg, a.currentSandbox().Snapshot(), cfg.Model, "instructions", a.History(), nil)
 	req.MaxTokens = intPtr(512)
 	if !a.needsContextPreparation(req) {
 		t.Fatal("large frozen request not recognized")

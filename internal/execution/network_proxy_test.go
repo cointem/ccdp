@@ -8,8 +8,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"ccdp/internal/sandbox"
 )
 
 func TestSandboxedCommandsUsePolicyProxy(t *testing.T) {
@@ -21,7 +19,7 @@ func TestSandboxedCommandsUsePolicyProxy(t *testing.T) {
 	}))
 	defer upstream.Close()
 	root := t.TempDir()
-	policy := sandbox.New(root)
+	policy := testSandbox(t, root)
 	policy.AllowNetwork = true
 	policy.NetworkProxy = upstream.URL
 	req := Request{Context: context.Background(), Dir: root, Sandbox: policy, Timeout: 5 * time.Second}
@@ -54,7 +52,7 @@ func TestSandboxedCommandsUsePolicyProxy(t *testing.T) {
 }
 
 func TestDisabledNetworkDoesNotCreateProxy(t *testing.T) {
-	policy := sandbox.New(t.TempDir())
+	policy := testSandbox(t, t.TempDir())
 	policy.NetworkProxy = "invalid proxy"
 	env, cleanup, err := prepareProcessEnvironment([]string{"HTTP_PROXY=http://127.0.0.1:99"}, policy)
 	if err != nil {

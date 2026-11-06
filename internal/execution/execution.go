@@ -126,8 +126,6 @@ func StartArgv(req StartRequest) (*Process, error) {
 		return nil, err
 	}
 	argv := append([]string(nil), req.Argv...)
-	argv, procEnv = preferNativeGit(argv, "", procEnv, req.Dir)
-	argv, procEnv = preferNativeCLTPython(argv, "", procEnv, req.Dir, nativeCLTPythonPath())
 	addExecutionReadRoots(policy, argv, "", req.Dir, procEnv)
 	profile, err := processProfile(policy, argv, req.readOnlyQuery)
 	if err != nil {
@@ -145,7 +143,10 @@ func StartArgv(req StartRequest) (*Process, error) {
 	cmd.cmd.Dir = req.Dir
 	cmd.cmd.Env = procEnv
 	cmd.cleanup = cleanupScratch
-	return cmd, nil
+	if !req.readOnlyQuery {
+		cmd.executionPolicy = policy
+	}
+	return bindController(cmd, ctx, policy), nil
 }
 
 // StartShell creates a fixed /bin/sh invocation inside Seatbelt for a
@@ -166,8 +167,6 @@ func StartShell(ctx context.Context, command, dir string, env []string, policy *
 	if err != nil {
 		return nil, err
 	}
-	_, procEnv = preferNativeGit(nil, command, procEnv, dir)
-	_, procEnv = preferNativeCLTPython(nil, command, procEnv, dir, nativeCLTPythonPath())
 	addExecutionReadRoots(policy, nil, command, dir, procEnv)
 	prepared, err := sandbox.PrepareCommandContext(ctx, policy, command)
 	if err != nil {
@@ -183,7 +182,8 @@ func StartShell(ctx context.Context, command, dir string, env []string, policy *
 	cmd.cmd.Dir = dir
 	cmd.cmd.Env = procEnv
 	cmd.cleanup = cleanupScratch
-	return cmd, nil
+	cmd.executionPolicy = policy
+	return bindController(cmd, ctx, policy), nil
 }
 
 // SanitizedEnvironment removes common credential-bearing variables before a
@@ -283,7 +283,9 @@ func Run(req Request) (Result, error) {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	cctx, cancel := context.WithTimeout(base, timeout)
+	// Preparation has its own bounded profile probes. The command's timeout
+	// starts only when the process is dispatched, after environment setup.
+	cctx, cancel := context.WithCancel(base)
 	defer cancel()
 	if req.Sandbox == nil {
 		return Result{}, fmt.Errorf("execution: sandbox policy is unavailable")
@@ -297,8 +299,7 @@ func Run(req Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	argv, procEnv := preferNativeGit(req.Argv, req.Command, procEnv, req.Dir)
-	argv, procEnv = preferNativeCLTPython(argv, req.Command, procEnv, req.Dir, nativeCLTPythonPath())
+	argv := append([]string(nil), req.Argv...)
 	defer cleanupScratch()
 	addExecutionReadRoots(policy, argv, req.Command, req.Dir, procEnv)
 	var cmd *Process
@@ -338,13 +339,15 @@ func Run(req Request) (Result, error) {
 		}
 		cmd = newProcess(exec.CommandContext(cctx, sandbox.BackendPath, "-p", profile, "--", "/bin/sh", "-c", command))
 	}
+	cmd = bindController(cmd, cctx, policy)
+	cmd.SetTimeout(timeout)
 	cmd.cmd.Dir = req.Dir
 	cmd.cmd.Env = procEnv
 	if req.Input != nil {
 		cmd.cmd.Stdin = req.Input
 	}
-	if err := cctx.Err(); err == nil {
-		policy.MarkExternalExecution()
+	if !req.readOnlyQuery {
+		cmd.executionPolicy = policy
 	}
 
 	limit := req.OutputLimit
@@ -485,7 +488,7 @@ func Run(req Request) (Result, error) {
 	// timed out; only classify it as timed out when the command itself returned
 	// an error (the process was still running when cancellation was observed).
 	processFailed := runErr != nil && !benignPipeClose(runErr) && !errors.Is(runErr, exec.ErrWaitDelay)
-	if cctx.Err() == context.DeadlineExceeded && processFailed {
+	if (cmd.Reason() == "timed_out" || cctx.Err() == context.DeadlineExceeded) && processFailed {
 		res.TimedOut = true
 		res.ExitCode = -1
 		res.Output += fmt.Sprintf("\n[command timed out after %s]", timeout)
@@ -494,16 +497,28 @@ func Run(req Request) (Result, error) {
 	if runErr == nil || benignPipeClose(runErr) || errors.Is(runErr, exec.ErrWaitDelay) {
 		return res, nil
 	}
-	if ee, ok := runErr.(*exec.ExitError); ok {
+	if ee, ok := runErr.(interface{ ExitCode() int }); ok {
 		res.ExitCode = ee.ExitCode()
 		return res, nil
 	}
 	return res, fmt.Errorf("execution: %w", runErr)
 }
 
-func prepareProcessEnvironment(env []string, policy *sandbox.Sandbox) ([]string, func(), error) {
+func prepareProcessEnvironment(env []string, policy *sandbox.Sandbox) (prepared []string, release func(), prepareErr error) {
 	if policy == nil {
 		return nil, nil, fmt.Errorf("execution: sandbox policy is unavailable")
+	}
+	if err := CheckEnvironment(policy); err != nil {
+		return nil, nil, err
+	}
+	revision := policy.Revision
+	defer func() { reportPreparationFailure(policy, revision, prepareErr) }()
+	controller := controllerFor(policy.ExecutorID)
+	if controller == nil {
+		return nil, nil, ErrEnvironmentUnavailable
+	}
+	if err := controller.Protect(policy); err != nil {
+		return nil, nil, err
 	}
 	entries := append([]string(nil), env...)
 	if env == nil {
@@ -513,38 +528,46 @@ func prepareProcessEnvironment(env []string, policy *sandbox.Sandbox) ([]string,
 	}
 	var scratch string
 	for _, root := range policy.Snapshot().ScratchDirs {
-		if info, err := os.Stat(root); err == nil && info.IsDir() {
-			scratch = root
-			break
+		// A missing owned scratch is repaired once, before dispatch, using
+		// the same stable path. Never substitute a throwaway HOME/cache.
+		if err := os.Mkdir(root, 0700); err != nil && !os.IsExist(err) {
+			return nil, nil, fmt.Errorf("%w: prepare owned scratch: %v", ErrEnvironmentUnavailable, err)
 		}
+		scratch = root
+		break
 	}
-	var cleanup func()
 	if scratch == "" {
-		var err error
-		scratch, err = os.MkdirTemp("", "ccdp-sandbox-")
-		if err != nil {
-			return nil, nil, fmt.Errorf("execution: create invocation scratch directory: %w", err)
-		}
-		policy.AddExecutionScratchDir(scratch)
-		cleanup = func() { _ = os.RemoveAll(scratch) }
+		return nil, nil, fmt.Errorf("%w: missing session scratch directory", ErrEnvironmentUnavailable)
 	}
-	cache := filepath.Join(scratch, "cache")
-	if err := os.MkdirAll(cache, 0o700); err != nil {
-		if cleanup != nil {
-			cleanup()
-		}
-		return nil, nil, fmt.Errorf("execution: initialize invocation cache: %w", err)
+	cleanup := func() {}
+	cache, err := prepareDevelopmentCache(policy)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: initialize project cache: %v", ErrEnvironmentUnavailable, err)
 	}
-	entries = setEnvironment(entries, "HOME", scratch)
+	if environmentValue(entries, "HOME") == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			entries = setEnvironment(entries, "HOME", home)
+		}
+	}
 	entries = setEnvironment(entries, "TMPDIR", scratch)
 	entries = setEnvironment(entries, "TMP", scratch)
 	entries = setEnvironment(entries, "TEMP", scratch)
 	entries = setEnvironment(entries, "XDG_CACHE_HOME", cache)
 	entries = setEnvironment(entries, "GOCACHE", filepath.Join(cache, "go-build"))
+	entries = setEnvironment(entries, "GOMODCACHE", filepath.Join(cache, "go-mod"))
+	entries = setEnvironment(entries, "GOTMPDIR", scratch)
 	entries = setEnvironment(entries, "npm_config_cache", filepath.Join(cache, "npm"))
 	entries = setEnvironment(entries, "PIP_CACHE_DIR", filepath.Join(cache, "pip"))
-	if cleanup == nil {
-		cleanup = func() {}
+	entries = setEnvironment(entries, "UV_CACHE_DIR", filepath.Join(cache, "uv"))
+	entries = setEnvironment(entries, "npm_config_store_dir", filepath.Join(cache, "pnpm"))
+	entries = setEnvironment(entries, "CARGO_HOME", filepath.Join(cache, "cargo"))
+	if environmentValue(entries, "RUSTUP_HOME") == "" {
+		entries = setEnvironment(entries, "RUSTUP_HOME", filepath.Join(environmentValue(entries, "HOME"), ".rustup"))
+	}
+	entries, err = prepareToolConfiguration(entries, policy)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
 	}
 	if policy.AllowNetwork && policy.NetworkProxy != "" {
 		gateway, err := netguard.StartGateway(policy.NetworkProxy)
@@ -588,105 +611,6 @@ func filterHostDelegationEnvironment(entries []string) []string {
 	return filtered
 }
 
-const nativeGitPath = "/Library/Developer/CommandLineTools/usr/bin/git"
-
-// preferNativeGit avoids Apple's /usr/bin/git xcrun launcher when it is the
-// selected executable. xcrun creates a database under the host's
-// DARWIN_USER_TEMP_DIR (which ignores TMPDIR), so allowing that host directory
-// would expose unrelated user temporary data. The actual selected CLT binary
-// is already covered by the narrow developer-toolchain read root.
-func preferNativeGit(argv []string, command string, env []string, dir string) ([]string, []string) {
-	if executableFile(nativeGitPath) == "" {
-		return argv, env
-	}
-	path := environmentValue(env, "PATH")
-	if path == "" {
-		path = os.Getenv("PATH")
-	}
-	if len(argv) > 0 {
-		resolved := resolveExecutable(argv[0], path, dir)
-		if resolved == "/usr/bin/git" {
-			argv = append([]string(nil), argv...)
-			argv[0] = nativeGitPath
-		}
-		return argv, env
-	}
-	for _, name := range shellCommandNames(command) {
-		if filepath.Base(name) == "git" && resolveExecutable(name, path, dir) == "/usr/bin/git" {
-			return argv, prependPath(env, filepath.Dir(nativeGitPath), path)
-		}
-	}
-	return argv, env
-}
-
-const nativeCLTPythonShimPath = "/Library/Developer/CommandLineTools/usr/bin/python3"
-
-// preferNativeCLTPython bypasses Apple's /usr/bin/python3 launcher when it
-// resolves to the Command Line Tools shim. That launcher asks xcrun to locate
-// the runtime and writes an xcrun database under DARWIN_USER_TEMP_DIR, outside
-// the per-invocation TMPDIR. The direct framework interpreter avoids that host
-// temporary state; addExecutionReadRoots then authorizes only its versioned
-// Python.framework runtime root.
-func preferNativeCLTPython(argv []string, command string, env []string, dir, nativePath string) ([]string, []string) {
-	if nativePath == "" {
-		return argv, env
-	}
-	nativePath = executableFile(nativePath)
-	if nativePath == "" || pythonFrameworkVersionRoot(nativePath) == "" {
-		return argv, env
-	}
-	path := environmentValue(env, "PATH")
-	if path == "" {
-		path = os.Getenv("PATH")
-	}
-	if len(argv) > 0 {
-		resolved := resolveExecutable(argv[0], path, dir)
-		if isSystemPython3Shim(resolved) && nativePythonSupportsName(filepath.Base(argv[0]), nativePath) {
-			argv = append([]string(nil), argv...)
-			argv[0] = nativePath
-		}
-		return argv, env
-	}
-	for _, name := range shellCommandNames(command) {
-		resolved := resolveExecutable(name, path, dir)
-		if isSystemPython3Shim(resolved) && nativePythonSupportsName(filepath.Base(name), nativePath) {
-			return argv, prependPath(env, filepath.Dir(nativePath), path)
-		}
-	}
-	return argv, env
-}
-
-func nativeCLTPythonPath() string {
-	path := executableFile(nativeCLTPythonShimPath)
-	if path == "" || pythonFrameworkVersionRoot(path) == "" {
-		return ""
-	}
-	return path
-}
-
-func isSystemPython3Shim(path string) bool {
-	if filepath.Dir(filepath.Clean(path)) != "/usr/bin" {
-		return false
-	}
-	name := filepath.Base(path)
-	if name == "python3" {
-		return true
-	}
-	if !strings.HasPrefix(name, "python3.") {
-		return false
-	}
-	for _, digit := range strings.TrimPrefix(name, "python3.") {
-		if digit < '0' || digit > '9' {
-			return false
-		}
-	}
-	return len(name) > len("python3.")
-}
-
-func nativePythonSupportsName(name, nativePath string) bool {
-	return name == "python3" || filepath.Base(name) == filepath.Base(nativePath)
-}
-
 func environmentValue(env []string, key string) string {
 	prefix := key + "="
 	for _, entry := range env {
@@ -695,17 +619,6 @@ func environmentValue(env []string, key string) string {
 		}
 	}
 	return ""
-}
-
-func prependPath(env []string, first, existing string) []string {
-	var entries []string
-	for _, entry := range filepath.SplitList(existing) {
-		if entry != first && entry != "" {
-			entries = append(entries, entry)
-		}
-	}
-	entries = append([]string{first}, entries...)
-	return setEnvironment(env, "PATH", strings.Join(entries, string(os.PathListSeparator)))
 }
 
 func setEnvironment(entries []string, key, value string) []string {
@@ -798,8 +711,6 @@ func resolveExecutable(name, searchPath, dir string) string {
 	path, _ := executable.Resolve(name, searchPath, dir)
 	return path
 }
-
-func executableFile(path string) string { return executable.File(path) }
 
 func executableReadRoot(executable, workspace string) string {
 	executable = filepath.Clean(executable)
@@ -1008,16 +919,7 @@ func RunArgv(ctx context.Context, argv []string, req Request) (Result, error) {
 }
 
 func verifyProfileContext(ctx context.Context, profile string) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	probe := exec.CommandContext(probeCtx, sandbox.BackendPath, "-p", profile, "--", "/bin/sh", "-c", "true")
-	if output, err := probe.CombinedOutput(); err != nil {
-		return fmt.Errorf("execution: Seatbelt rejected the profile: %w (%s)", err, strings.TrimSpace(string(output)))
-	}
-	return nil
+	return sandbox.VerifyProfile(ctx, profile, "/bin/sh", "-c", "true")
 }
 
 func sendProgress(ctx context.Context, progress chan<- string, line string) {

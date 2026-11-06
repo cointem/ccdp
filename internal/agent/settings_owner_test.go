@@ -16,7 +16,7 @@ func TestSettingsDrainKeepsOwnerResponsiveAndPreservesQueuedRevision(t *testing.
 	entered := make(chan struct{})
 	var enteredOnce sync.Once
 	a.mu.Lock()
-	a.capabilities.capabilityGrants["test"] = protocol.CapabilityRequest{Kind: "network"}
+	a.capabilities.capabilityGrants["test"] = protocol.CapabilityRequest{Kind: "network", Access: "outbound"}
 	a.turn.turnCancel = func() { enteredOnce.Do(func() { close(entered) }) }
 	a.lifecycle.turnWG.Add(1)
 	a.mu.Unlock()

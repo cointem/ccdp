@@ -53,8 +53,9 @@ func (j *deliveryJob) prepareAndCommitCandidate(ctx context.Context) (string, er
 	} else if err := validateDeliveryCandidate(dir); err != nil {
 		return "", fmt.Errorf("delivery candidate unavailable: %w", err)
 	}
-	candidatePolicy := sandbox.New(dir)
-	candidatePolicy.AllowNetwork = policy.NetworkAllowed()
+	candidatePolicy := policy.Snapshot()
+	candidatePolicy.Workspace = sandbox.New(dir).Workspace
+	candidatePolicy.AdditionalDirs = nil
 	candidatePolicy.AddReadOnlyDir(plan.Root)
 	run := func(argv ...string) (execution.Result, error) {
 		return j.exec(ctx, dir, candidatePolicy, argv, nil, nil)

@@ -76,6 +76,16 @@ func ApplyOutputBudget(calls []messages.ToolCall, results []Result, perResultLim
 			}
 			budget.Truncated = budget.Truncated || shortened
 			projected[i].DisplayTruncated = projected[i].DisplayTruncated || shortened
+		} else if projected[i].Process != nil {
+			p, encoded := protocol.FitProcessOutput(*projected[i].Process, int(outputLimit))
+			if encoded == "" {
+				omit()
+				continue
+			}
+			projected[i].Process = &p
+			out = encoded
+			projected[i].DisplayTruncated = projected[i].DisplayTruncated || p.Truncated
+			budget.Truncated = budget.Truncated || p.Truncated
 		} else if int64(len(out)) > outputLimit {
 			budget.Truncated = true
 			projected[i].DisplayTruncated = true

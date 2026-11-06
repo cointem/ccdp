@@ -8,37 +8,15 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
-
-// SessionSnapshotProjection replays committed facts into the session view.
-func SessionSnapshotProjection(store session.ReadOnlyStore, id string) (*SessionSnapshot, error) {
-	if store == nil {
-		return nil, errors.New("agent: nil session store")
-	}
-	records, err := session.ReadAll(store)
-	if err != nil {
-		return nil, err
-	}
-	return snapshotFromRecords(records, id)
-}
-
-func (p *sessionPersistence) snapshotFromOwnedStore(id string) (*SessionSnapshot, error) {
-	if p == nil {
-		return nil, errors.New("agent: nil session persistence")
-	}
-	records, err := session.ReadAll(p)
-	if err != nil {
-		return nil, err
-	}
-	return snapshotFromRecords(records, id)
-}
 
 // populateMemoryResume seeds the per-process MemoryStore used by
 // --no-session-persistence Resume. There is no disk log to replay in that
 // mode, so the caller's explicit snapshot must be converted into the same
 // typed facts that a JSONL replay would expose before the owned-store replay
 // boundary runs. It is intentionally a no-op for JSONL stores.
-func (p *sessionPersistence) populateMemoryResume(snapshot *SessionSnapshot) error {
+func (p *sessionPersistence) populateMemoryResume(snapshot *archive.Snapshot) error {
 	if p == nil {
 		return errors.New("agent: nil session persistence")
 	}
@@ -79,7 +57,7 @@ func (p *sessionPersistence) populateMemoryResume(snapshot *SessionSnapshot) err
 		CreatedAt     time.Time
 		UpdatedAt     time.Time
 		History       []messages.Message
-		Usage         Usage
+		Usage         session.Usage
 		PendingInputs []protocol.InputView
 		ParentID      string
 		BranchPoint   int

@@ -1,16 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"testing"
+
 	"ccdp/internal/agent"
 	"ccdp/internal/config"
 	"ccdp/internal/llm"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
-	"context"
-	"errors"
-	"path/filepath"
-	"strings"
-	"testing"
 )
 
 type reviewFailWithChildProvider struct{}
@@ -20,7 +22,7 @@ func (*reviewFailWithChildProvider) Stream(ctx context.Context, req llm.Completi
 	var latest string
 	var toolResult bool
 	for _, m := range req.Messages {
-		if m.Role == "user" {
+		if m.Role == "user" && !strings.HasPrefix(fmt.Sprint(m.Content), "<runtime_context ") {
 			latest, _ = m.Content.(string)
 		}
 		if m.Role == "tool" {
@@ -41,7 +43,7 @@ func TestReviewHeadlessFailureWithChildReturnsFailure(t *testing.T) {
 	cfg.Workspace = t.TempDir()
 	cfg.SessionDir = filepath.Join(cfg.Workspace, "sessions")
 	cfg.Model = "review-headless"
-	cfg.PermissionMode = "bypassPermissions"
+	cfg.PermissionMode = "auto"
 	cfg.EnableProjectMemory = false
 	p := &reviewFailWithChildProvider{}
 	r := plugin.NewModelRegistry()
@@ -53,7 +55,7 @@ func TestReviewHeadlessFailureWithChildReturnsFailure(t *testing.T) {
 	}
 	defer a.Close()
 	out, code := captureHeadlessStdout(t, func() int {
-		return runHeadlessClient(protocolOnlyClient{SessionClient: a}, []string{"parent"}, outJSON, 2)
+		return runHeadlessClient(protocolOnlyClient{SessionClient: a}, []string{"parent"}, outJSON, 10)
 	})
 	snapshot, _ := a.Snapshot(context.Background())
 	t.Logf("settled parent=%+v pending=%d outstanding=%d", snapshot.LastTurn, len(snapshot.PendingInputs), snapshot.OutstandingWork)

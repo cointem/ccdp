@@ -46,7 +46,7 @@ func (a *Agent) publishGoal() {
 		a.cancelGoalChildren(g.ID)
 	}
 	a.publishState()
-	a.emit(Event{Type: EventGoalChanged, Goal: g})
+	a.emit(protocol.EventView{Kind: protocol.EventGoalChanged, Goal: g})
 }
 
 func (a *Agent) applyGoalCommand(cmd protocol.Command) protocol.Receipt {
@@ -353,7 +353,7 @@ func (a *Agent) finishGoalTurnOwned() {
 			case stopped:
 				g.Status = protocol.GoalPaused
 				g.Reason = "execution interrupted"
-			case outcome != nil && outcome.Status == protocol.TurnFailed:
+			case outcome != nil && (outcome.Status == protocol.TurnFailed || outcome.Status == protocol.TurnBlocked || outcome.Status == protocol.TurnLimited):
 				g.Status = protocol.GoalBlocked
 				g.Reason = outcome.Error
 			case calls == 0:
@@ -414,7 +414,7 @@ func (a *Agent) reportStoppedGoal() {
 		a.markPersistenceFailure(err)
 		return
 	}
-	a.emit(Event{Type: EventStream, Text: text})
+	a.emit(protocol.EventView{Kind: protocol.EventStream, Text: text})
 }
 
 type goalToolControl struct {

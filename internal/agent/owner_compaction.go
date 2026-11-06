@@ -15,10 +15,7 @@ func (a *Agent) rememberCompactFailure(key string, reason error) {
 		return
 	}
 	request := compactionFailed{key: key, reason: reason.Error(), done: make(chan struct{})}
-	if a.owner == nil {
-		a.rememberCompactFailureOwned(request)
-		return
-	}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- request:

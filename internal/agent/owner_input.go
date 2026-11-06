@@ -120,7 +120,7 @@ func (a *Agent) applySubmitInput(cmd protocol.Command) protocol.Receipt {
 		a.rememberSeenInput(inputID, inputDigest, r)
 		return r
 	}
-	if a.turn.busy || a.lifecycle.settling || a.capabilities.settingsPreparing || a.capabilities.capabilityRevoking || input.Strategy == protocol.InputMessage {
+	if a.turn.busy || a.lifecycle.settling || a.capabilities.settingsPreparing || input.Strategy == protocol.InputMessage {
 		if a.inbox.inputAttachments == nil {
 			a.inbox.inputAttachments = make(map[protocol.InputID]frozenInputAttachments)
 		}

@@ -7,6 +7,7 @@ import (
 
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/session/journal"
 )
 
@@ -30,7 +31,7 @@ func TestTranscriptReadersShareLiveAndArchivedRecoveryBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer.Close()
-	initial, err := snapshotFromRecords(records, cfg.SessionID)
+	initial, err := archive.FromRecords(records, cfg.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}

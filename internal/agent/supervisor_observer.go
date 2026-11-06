@@ -52,7 +52,7 @@ func (c *managedClient) Snapshot(ctx context.Context) (protocol.SessionView, err
 		// A closed runtime is still a readable session. Preserve its settings,
 		// but expose the settled run as idle and load the bounded transcript.
 		view.Busy, view.Closing, view.Phase = false, false, protocol.PhaseIdle
-		view.Approval, view.Question, view.Plan = nil, nil, nil
+		view.Approval, view.Question = nil, nil
 		if view.Transcript == nil {
 			page, err := c.supervisor.ReadTranscript(ctx, row.SessionID, 0, sessionview.Window)
 			if err != nil {
@@ -105,12 +105,12 @@ func (c *managedClient) Snapshot(ctx context.Context) (protocol.SessionView, err
 					maxOutputTokens = *s.MaxOutputTokens
 				}
 				view.Settings = protocol.SettingsSnapshot{
-					Workspace:     s.Workspace,
-					Revision:      changed.Revision,
-					Model:         protocol.ModelBinding{Model: s.Model, Provider: s.Provider, Endpoint: s.Endpoint},
-					ExecutionMode: protocol.ExecutionMode(s.ExecutionMode),
-					Permission:    protocol.PermissionPolicy{Mode: s.PermissionPolicy, AlwaysAllow: s.AlwaysAllow, AlwaysDeny: s.AlwaysDeny, Revision: changed.Revision},
-					Sandbox: protocol.SandboxPolicy{NetworkAccess: s.NetworkAccess,
+					Workspace: s.Workspace,
+					Revision:  changed.Revision,
+					Model:     protocol.ModelBinding{Model: s.Model, Provider: s.Provider, Endpoint: s.Endpoint},
+
+					Permission: protocol.PermissionPolicy{Mode: s.PermissionPolicy, AlwaysAllow: s.AlwaysAllow, AlwaysDeny: s.AlwaysDeny, Revision: changed.Revision},
+					Sandbox: protocol.SandboxPolicy{NetworkAccess: s.NetworkAccess, LocalDevelopmentNetwork: s.LocalDevelopmentNetwork,
 						AdditionalDirectories:         s.AdditionalDirectories,
 						AdditionalReadOnlyDirectories: s.AdditionalReadOnlyDirectories,
 						DisallowedDirectories:         s.DisallowedDirectories, Revision: changed.Revision},
@@ -221,7 +221,7 @@ func (c *managedClient) Submit(ctx context.Context, cmd protocol.Command) (proto
 		if r.opts.NonInteractive {
 			return protocol.Receipt{}, errors.New("approval channel unavailable")
 		}
-	case protocol.CommandInterrupt, protocol.CommandAnswerQuestion, protocol.CommandApprovePlan:
+	case protocol.CommandInterrupt, protocol.CommandAnswerQuestion:
 	case protocol.CommandStop:
 		r.cancel()
 		return protocol.Receipt{CommandID: cmd.ID, SessionID: row.SessionID, Status: protocol.ReceiptApplied}, nil

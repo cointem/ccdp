@@ -19,8 +19,8 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 	if err := os.MkdirAll(bDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	a := NewResources("session-a", filepath.Join(root, "sessions", "a"))
-	b := NewResources("session-b", filepath.Join(root, "sessions", "b"))
+	a := NewResources("session-a", filepath.Join(root, "sessions", "a"), t.TempDir()+"/runtime")
+	b := NewResources("session-b", filepath.Join(root, "sessions", "b"), t.TempDir()+"/runtime")
 	t.Cleanup(func() {
 		_ = a.Close()
 		_ = b.Close()
@@ -45,7 +45,7 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 	}
 
 	// The two managers intentionally allocate distinct scope-tagged handles.
-	aCtx.Args = map[string]any{"command": "sleep 30"}
+	aCtx.Args = map[string]any{"command": "sleep 30", "background": true}
 	startedA, err := executeToolText(NewBashTool(), aCtx)
 	if err != nil {
 		t.Fatalf("A ProcessStart: %v", err)
@@ -58,10 +58,10 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 	}
 	bPID := extractPID(t, startedB)
 	if aPID == bPID {
-		t.Fatalf("scope-tagged handles unexpectedly collided: A=%d B=%d", aPID, bPID)
+		t.Fatalf("scope-tagged handles unexpectedly collided: A=%s B=%s", aPID, bPID)
 	}
-	bCtx.Args = map[string]any{"id": aPID, "action": "read", "wait_ms": 0}
-	if _, err := executeToolText(NewProcessTool(), bCtx); err == nil || !strings.Contains(err.Error(), "another session") {
+	bCtx.Args = map[string]any{"id": aPID, "action": "read"}
+	if _, err := executeToolText(NewProcessTool(), bCtx); err == nil || !strings.Contains(err.Error(), "stale_process") {
 		t.Fatalf("B accepted A's process handle: %v", err)
 	}
 	// Closing A must not touch B. Write a marker to B after closing A and read it
@@ -72,11 +72,11 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 	if _, err := executeToolText(NewProcessTool(), aCtx); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("closed A accepted a new process operation: %v", err)
 	}
-	bCtx.Args = map[string]any{"id": bPID, "action": "write", "input": "marker-from-b\n"}
+	bCtx.Args = map[string]any{"id": bPID, "action": "write", "input": "marker-from-b\n", "eof": true}
 	if _, err := executeToolText(NewProcessTool(), bCtx); err != nil {
 		t.Fatalf("B process was killed by closing A: %v", err)
 	}
-	bCtx.Args = map[string]any{"id": bPID, "action": "read", "wait_ms": 1000}
+	bCtx.Args = map[string]any{"id": bPID, "action": "wait"}
 	output, err := executeToolText(NewProcessTool(), bCtx)
 	if err != nil || !strings.Contains(output, "marker-from-b") {
 		t.Fatalf("B output after A close = %q, %v", output, err)
@@ -88,7 +88,7 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 }
 
 func TestResourcesCloseIdempotent(t *testing.T) {
-	r := NewResources("close-test", t.TempDir())
+	r := NewResources("close-test", t.TempDir(), t.TempDir()+"/runtime")
 	first := r.Close()
 	second := r.Close()
 	if (first == nil) != (second == nil) {
@@ -100,7 +100,7 @@ func TestResourcesCloseIdempotent(t *testing.T) {
 }
 
 func TestResourcesOwnSessionExecutionScratch(t *testing.T) {
-	r := NewResources("scratch-test", t.TempDir())
+	r := NewResources("scratch-test", t.TempDir(), t.TempDir()+"/runtime")
 	scratch := r.ScratchDir()
 	if scratch == "" {
 		t.Fatal("session scratch directory was not created")

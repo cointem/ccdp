@@ -11,6 +11,7 @@ import (
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/testenv"
 )
 
 func TestDelegatedResultsResumeSameParentTurnWithoutReadOrWait(t *testing.T) {
@@ -28,7 +29,7 @@ func TestDelegatedResultsResumeSameParentTurnWithoutReadOrWait(t *testing.T) {
 			if m.Role == "tool" {
 				toolResults++
 			}
-			if m.Role == "user" {
+			if isTaskMessage(m) {
 				text, _ := m.Content.(string)
 				if first == "" {
 					first = text
@@ -180,7 +181,7 @@ func TestCancelParentWaitingForDelegatedWork(t *testing.T) {
 	p.stream = func(ctx context.Context, req llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
 		hasToolResult := false
 		for _, message := range req.Messages {
-			if message.Role == "user" && message.Content == "blocked-child" {
+			if isTaskMessage(message) && message.Content == "blocked-child" {
 				<-ctx.Done()
 				return llm.StreamResult{}, ctx.Err()
 			}
@@ -194,6 +195,7 @@ func TestCancelParentWaitingForDelegatedWork(t *testing.T) {
 		return llm.StreamResult{Text: "waiting for child", FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
+	testenv.Prepare(t, a.services.sandbox)
 	go a.Run()
 	submitChildRuntimeTestInput(t, a, "cancel-wait", "parent-task")
 	waitParentPhase(t, a, protocol.PhaseWaitingAgents)

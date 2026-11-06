@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ func (p *backgroundTestProvider) Stream(ctx context.Context, req llm.CompletionR
 	var latest string
 	var toolResult bool
 	for _, m := range req.Messages {
-		if m.Role == "user" {
+		if m.Role == "user" && !strings.HasPrefix(fmt.Sprint(m.Content), "<runtime_context ") {
 			latest, _ = m.Content.(string)
 		}
 		if m.Role == "tool" {
@@ -60,7 +61,7 @@ func TestHeadlessWaitsForBackgroundDeliveryAndEmitsTypedChildEvents(t *testing.T
 			cfg.Workspace = t.TempDir()
 			cfg.SessionDir = filepath.Join(cfg.Workspace, "sessions")
 			cfg.Model = "background-model"
-			cfg.PermissionMode = "bypassPermissions"
+			cfg.PermissionMode = "auto"
 			cfg.EnableProjectMemory = false
 			registry := plugin.NewModelRegistry()
 			registry.Register(p)

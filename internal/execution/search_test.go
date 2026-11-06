@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"ccdp/internal/executable"
-	"ccdp/internal/sandbox"
 )
 
 func TestRgSnapshotProfileBlocksOutsideFilesAndSymlinks(t *testing.T) {
@@ -32,7 +31,7 @@ func TestRgSnapshotProfileBlocksOutsideFilesAndSymlinks(t *testing.T) {
 	if err := os.Symlink(outside, alias); err != nil {
 		t.Fatal(err)
 	}
-	policy := sandbox.New(root)
+	policy := testSandbox(t, root)
 	for _, path := range []string{inside, outside, alias} {
 		res, err := RunReadOnlySearch(context.Background(), []string{"--no-config", "--no-ignore", "needle", "--", path}, Request{Dir: snapshot, Sandbox: policy}, io.Discard, snapshot)
 		if err != nil {

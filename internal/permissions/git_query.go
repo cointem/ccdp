@@ -31,7 +31,7 @@ func (m *Manager) CheckReadOnlyGit(argv []string) (Decision, string) {
 			return decision, reason
 		}
 	}
-	// These adapters have read capability even in plan mode: Git helpers and
+	// These adapters have read capability: Git helpers and
 	// pager/environment overrides are disabled at their execution boundary.
 	return DecisionAllow, "read-only Git query with isolated execution"
 }

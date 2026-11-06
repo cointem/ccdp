@@ -214,7 +214,7 @@ const (
 	QueryPermissions QueryKind = "permissions"
 	QueryMemory      QueryKind = "memory"
 	QueryMCP         QueryKind = "mcp"
-	QueryPlugins     QueryKind = "plugins"
+	QueryProviders   QueryKind = "providers"
 	QuerySkills      QueryKind = "skills"
 	QueryStatus      QueryKind = "status"
 	QueryGitHub      QueryKind = "github"

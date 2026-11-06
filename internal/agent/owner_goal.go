@@ -34,9 +34,6 @@ type goalTransitionResult struct {
 }
 
 func (a *Agent) requestGoalTransition(request goalTransitionRequested) goalTransitionResult {
-	if a.owner == nil {
-		return a.applyGoalTransition(request)
-	}
 	request.result = make(chan goalTransitionResult, 1)
 	a.ensureRun()
 	select {
@@ -107,9 +104,7 @@ type goalAttemptCompleted struct {
 func (goalAttemptCompleted) ownerControlMessage() {}
 func (a *Agent) settleGoalAttempt(manifest session.RequestManifest, attempt session.Attempt) error {
 	request := goalAttemptCompleted{manifest: manifest, attempt: attempt, result: make(chan error, 1)}
-	if a.owner == nil {
-		return a.accountGoalFinishedOwned(manifest, attempt, true)
-	}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- request:
@@ -131,9 +126,6 @@ type sharedAttemptCompleted struct {
 
 func (sharedAttemptCompleted) ownerControlMessage() {}
 func (a *Agent) settleSharedAttempt(attempt session.Attempt) error {
-	if a.owner == nil {
-		return a.accountSharedAttempt(attempt)
-	}
 	a.ensureRun()
 	request := sharedAttemptCompleted{attempt: attempt, result: make(chan error, 1)}
 	select {

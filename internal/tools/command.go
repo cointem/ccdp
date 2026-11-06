@@ -64,7 +64,7 @@ func (t *CommandTool) Execute(ctx *Context, args map[string]any) (Result, error)
 		}
 		runCtx, cancel := context.WithCancel(call)
 		defer cancel()
-		id, mp, err := m.startManaged(runCtx, t.command, ctx.WorkingDir, ctx.Sandbox, false, true, timeout)
+		id, mp, err := m.startManaged(runCtx, t.command, ctx.WorkingDir, ctx.Sandbox, false, true, timeout, nil)
 		if err != nil {
 			return "", err
 		}
@@ -78,7 +78,7 @@ func (t *CommandTool) Execute(ctx *Context, args map[string]any) (Result, error)
 		case <-runCtx.Done():
 			_, _, _ = mp.stop()
 		}
-		out, err := mp.view(ctx, id, 0, min(51200, max(4, (ctx.outputLimit()-2048)/6)), 0)
+		out, err := mp.view(ctx, id, 0, min(51200, max(4, (ctx.outputLimit()-2048)/6)))
 		if err != nil {
 			return "", err
 		}

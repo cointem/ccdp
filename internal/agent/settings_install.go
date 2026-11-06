@@ -7,8 +7,6 @@ import (
 
 	"ccdp/internal/codemode"
 	"ccdp/internal/mcp"
-	"ccdp/internal/permissions"
-	"ccdp/internal/protocol"
 	"ccdp/internal/session"
 	"ccdp/internal/tools"
 )
@@ -20,10 +18,7 @@ type settingsCandidateInstall struct {
 	candidate                             *settingsCandidate
 	binding                               modelBinding
 	settings                              session.Settings
-	workflow                              session.WorkflowState
 	nextRevision                          uint64
-	planMode                              bool
-	permissionMode                        permissions.Mode
 	policyTightened, sandboxPolicyChanged bool
 	mcpCandidate                          *mcp.RefreshCandidate
 	manager                               *mcp.Manager
@@ -52,14 +47,13 @@ func (a *Agent) installSettingsCandidate(input settingsCandidateInstall) error {
 	if stale {
 		return fmt.Errorf("settings changed while candidate was being prepared")
 	}
-	candidate, binding, settings, workflow := input.candidate, input.binding, input.settings, input.workflow
+	candidate, binding, settings := input.candidate, input.binding, input.settings
 	nextRevision, mcpCandidate := input.nextRevision, input.mcpCandidate
-	planMode, permissionMode := input.planMode, input.permissionMode
 	policyTightened, sandboxPolicyChanged := input.policyTightened, input.sandboxPolicyChanged
-	// SettingsChanged/WorkflowChanged are committed before any executable
+	// Settings are committed before any executable
 	// extension is made visible. A journal failure therefore cannot leave a
 	// live candidate whose durable state says the old settings were active.
-	if err := a.persistSettingsWorkflowFact(settings, nextRevision, &workflow); err != nil {
+	if err := a.persistSettingsFact(settings, nextRevision); err != nil {
 		return err
 	}
 
@@ -119,26 +113,28 @@ func (a *Agent) installSettingsCandidate(input settingsCandidateInstall) error {
 		a.modelsState.activeModel = binding.model
 	}
 	a.services.sandbox = candidate.sandbox
-	a.plan.planMode = planMode
-	a.plan.planBaseMode = permissionMode
-	a.lifecycle.workflow = protocol.WorkflowState(workflow.Phase)
-	a.services.cfg.PermissionMode = string(permissionMode)
+	if candidate.freshScratch != "" && a.services.resources != nil {
+		a.services.resources.ReplaceScratch(candidate.freshScratch)
+	}
+	a.services.cfg.PermissionMode = string(candidate.mode)
 	a.sequences.settingsRev = nextRevision
 	if policyTightened {
 		clear(a.capabilities.capabilityGrants)
 		a.capabilities.capabilityRevision++
-		a.capabilities.capabilityRevoking = false
+		a.capabilities.revocationRevision++
 	} else if sandboxPolicyChanged {
 		a.capabilities.capabilityRevision++
+		a.capabilities.revocationRevision++
 	}
-	resources := a.services.resources
 	a.mu.Unlock()
-	if policyTightened && resources != nil && resources.Processes != nil {
-		resources.Processes.ResumeAfterRevocation()
+	if policyTightened {
+		if err := a.resumeSandboxAdmission(); err != nil {
+			return err
+		}
 	}
 	a.services.hooks.Update(cloneHookConfig(candidate.hooks))
 	policy := candidate.cfg.PermissionPolicy()
-	a.syncSettingsPolicy(permissionMode, &policy)
+	a.syncSettingsPolicy(candidate.mode, &policy)
 
 	return nil
 }

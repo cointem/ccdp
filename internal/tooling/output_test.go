@@ -21,7 +21,7 @@ func TestCodeOutputFitsSmallResultBudget(t *testing.T) {
 }
 
 func TestCodeOutputBudgetCountsArraySeparators(t *testing.T) {
-	code := protocol.CodeResult{Calls: 4, Denied: 1, Processes: []int{123}, Outputs: make([]json.RawMessage, 20000)}
+	code := protocol.CodeResult{Calls: 4, Denied: 1, Processes: []string{"123"}, Outputs: make([]json.RawMessage, 20000)}
 	for i := range code.Outputs {
 		code.Outputs[i] = json.RawMessage("1")
 	}
@@ -45,7 +45,7 @@ func TestCodeOutputBudgetCountsArraySeparators(t *testing.T) {
 
 func TestCodeOutputBudgetCountsEscapedErrorAndPreservesHandles(t *testing.T) {
 	code := protocol.CodeResult{
-		Calls: 2, Failed: 1, Processes: []int{4294967297},
+		Calls: 2, Failed: 1, Processes: []string{"4294967297"},
 		Outputs: []json.RawMessage{json.RawMessage(`"` + strings.Repeat("x", 27500) + `"`)},
 		Error:   strings.Repeat("出错<&>", 2000), Note: strings.Repeat("hook context ", 100),
 	}
@@ -156,5 +156,17 @@ func TestOutputBudgetKeepsPreviewOfJSONText(t *testing.T) {
 	rows, budget, err := ApplyOutputBudget([]messages.ToolCall{{ID: "parent"}}, []Result{{Output: `{"value":"` + strings.Repeat("large", 100) + `"}`, Status: "success"}}, 100, 0, 0)
 	if err != nil || !budget.Truncated || rows[0].Output == "" || !rows[0].DisplayTruncated || rows[0].IsError || rows[0].Status != "success" || !strings.Contains(rows[0].Output, "ReadOutput") {
 		t.Fatalf("%+v %+v", rows, budget)
+	}
+}
+
+func TestProcessWriteProjectionKeepsAcknowledgement(t *testing.T) {
+	p := protocol.ProcessOutput{ID: "p.test", Status: "input_sent", BytesSent: 7, EOF: true}
+	rows, _, err := ApplyOutputBudget([]messages.ToolCall{{ID: "write"}}, []Result{{Process: &p, Status: "success"}}, 1024, 1024, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got protocol.ProcessOutput
+	if err := json.Unmarshal([]byte(rows[0].Output), &got); err != nil || got.BytesSent != 7 || !got.EOF {
+		t.Fatalf("write acknowledgement lost: %s %v", rows[0].Output, err)
 	}
 }

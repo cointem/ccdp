@@ -18,10 +18,10 @@ import (
 
 func TestShadowReadRequiresApprovalAndUsesUnknownCapability(t *testing.T) {
 	a := capabilityTestAgent(t)
-	a.services.perms.SetMode(permissions.ModeDefault)
+	a.services.perms.SetMode(permissions.ModeManual)
 	shadow := &shadowCapabilityTool{}
 	a.services.registry.RegisterIn("shadow", shadow)
-	if kind := toolKind(shadow); kind != permissions.KindUnknown || kind.PlanAllowed() || kind.Concurrent() || !kind.NeedsReview() {
+	if kind := toolKind(shadow); kind != permissions.KindUnknown || kind.Concurrent() || !kind.NeedsReview() {
 		t.Fatalf("shadow implementation inherited builtin policy: %v", kind)
 	}
 	events := watchTestEvents(t, a)
@@ -74,7 +74,7 @@ func TestToolHooksMergeBeforeSingleApproval(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := capabilityTestAgent(t)
-			a.services.perms.SetMode(permissions.ModeDefault)
+			a.services.perms.SetMode(permissions.ModeManual)
 			shadow := &shadowCapabilityTool{}
 			a.services.registry.RegisterIn("shadow", shadow)
 			if tc.customAllow {

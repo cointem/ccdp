@@ -8,15 +8,14 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 )
 
 const BackendPath = "/usr/bin/sandbox-exec"
@@ -26,25 +25,33 @@ const BackendPath = "/usr/bin/sandbox-exec"
 type Sandbox struct {
 	Workspace string
 	Revision  uint64
+	// ExecutorID binds this policy to the trusted root-session controller.
+	// It is runtime authority, never accepted from persisted configuration.
+	ExecutorID      string `json:"-"`
+	SingleUse       bool   `json:"-"`
+	QuarantineStore string `json:"-"`
 
 	AdditionalDirs   []string
 	ReadOnlyDirs     []string
 	DisallowedDirs   []string
+	CredentialDirs   []string
+	PrivateRoots     []string
+	ArtifactRoots    []string
+	RuntimeReadFiles []string
 	ProtectedDirs    []string
 	ProtectedEntries []string
 	ScratchDirs      []string
+	CacheDir         string
 	// ExecutionReadRoots are narrow, invocation-specific install roots needed
 	// to load the selected executable and its bundled runtime files. They are
 	// derived by execution and are not persistent user directory grants.
-	ExecutionReadRoots []string
-	// ExecutionScratchDirs are per-invocation temporary roots. They are not
-	// durable path grants and do not change the persisted policy revision.
-	ExecutionScratchDirs []string
-	Limits               *Limits
-	NetworkProxy         string
-	AllowNetwork         bool
-	LocalServices        []LocalService
-	executionGuard       *ExecutionGuard
+	ExecutionReadRoots      []string
+	Limits                  *Limits
+	NetworkProxy            string
+	AllowNetwork            bool
+	LocalDevelopmentNetwork bool
+	LocalServices           []LocalService
+	executionGuard          *ExecutionGuard
 
 	mu sync.RWMutex
 }
@@ -57,24 +64,93 @@ type Sandbox struct {
 type ExecutionGuard struct {
 	mu                sync.Mutex
 	externalExecution bool
+	scopes            [][]string
 }
 
-func (g *ExecutionGuard) MarkExternalExecution() {
+func (g *ExecutionGuard) MarkExternalExecution(roots ...string) {
 	if g == nil {
 		return
 	}
 	g.mu.Lock()
-	g.externalExecution = true
+	if g.externalExecution {
+		g.mu.Unlock()
+		return
+	}
+	if len(roots) == 0 {
+		g.externalExecution = true
+	} else {
+		// Keep connected authorization scopes together: a process launched in
+		// one workspace may also retain a once-granted writable directory.
+		merged := canonicalRoots(roots)
+		for i := 0; i < len(g.scopes); {
+			if scopesOverlap(merged, g.scopes[i]) {
+				merged = canonicalRoots(append(merged, g.scopes[i]...))
+				g.scopes = append(g.scopes[:i], g.scopes[i+1:]...)
+				i = 0
+			} else {
+				i++
+			}
+		}
+		g.scopes = append(g.scopes, merged)
+		if len(g.scopes) > 1024 || len(merged) > 1024 {
+			g.externalExecution = true
+		}
+	}
 	g.mu.Unlock()
 }
 
-func (g *ExecutionGuard) ExternalExecutionPossible() bool {
+func scopesOverlap(left, right []string) bool {
+	for _, a := range left {
+		for _, b := range right {
+			if a != "" && b != "" && (pathWithin(a, b) || pathWithin(b, a)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ExecutionRoots includes previously granted resources that a descendant may
+// still hold, even after the originating once grant has left the invocation.
+func (s *Sandbox) ExecutionRoots() []string {
+	policy := s.Snapshot()
+	roots := canonicalRoots(append([]string{policy.Workspace}, policy.AdditionalDirs...))
+	g := policy.executionGuard
+	if g == nil {
+		return roots
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, scope := range g.scopes {
+		if scopesOverlap(roots, scope) {
+			roots = canonicalRoots(append(roots, scope...))
+		}
+	}
+	return roots
+}
+
+func (g *ExecutionGuard) ExternalExecutionPossible(roots ...string) bool {
 	if g == nil {
 		return false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.externalExecution
+	if g.externalExecution {
+		return true
+	}
+	if len(roots) == 0 {
+		return len(g.scopes) > 0
+	}
+	for _, scope := range g.scopes {
+		for _, a := range scope {
+			for _, b := range roots {
+				if pathWithin(a, canonicalRoot(b)) || pathWithin(canonicalRoot(b), a) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // MarkExternalExecution records that an execution path launched an arbitrary
@@ -85,8 +161,9 @@ func (s *Sandbox) MarkExternalExecution() {
 	}
 	s.mu.RLock()
 	guard := s.executionGuard
+	roots := append([]string{s.Workspace}, s.AdditionalDirs...)
 	s.mu.RUnlock()
-	guard.MarkExternalExecution()
+	guard.MarkExternalExecution(roots...)
 }
 
 // ExternalExecutionPossible reports whether a local process has run under this
@@ -97,8 +174,9 @@ func (s *Sandbox) ExternalExecutionPossible() bool {
 	}
 	s.mu.RLock()
 	guard := s.executionGuard
+	roots := append([]string{s.Workspace}, s.AdditionalDirs...)
 	s.mu.RUnlock()
-	return guard.ExternalExecutionPossible()
+	return guard.ExternalExecutionPossible(roots...)
 }
 
 // ExecutionGuard returns the session-shared witness used when rebuilding
@@ -152,7 +230,7 @@ func PolicyTightened(current, next *Sandbox) bool {
 	}
 	old := current.Snapshot()
 	newPolicy := next.Snapshot()
-	if old.NetworkProxy != newPolicy.NetworkProxy || old.AllowNetwork && !newPolicy.AllowNetwork {
+	if old.NetworkProxy != newPolicy.NetworkProxy || old.AllowNetwork && !newPolicy.AllowNetwork || old.LocalDevelopmentNetwork && !newPolicy.LocalDevelopmentNetwork {
 		return true
 	}
 	oldWrite := append([]string{old.Workspace}, old.AdditionalDirs...)
@@ -164,6 +242,26 @@ func PolicyTightened(current, next *Sandbox) bool {
 	}
 	for _, denied := range newPolicy.DisallowedDirs {
 		if !rootCovered(denied, old.DisallowedDirs) {
+			return true
+		}
+	}
+	for _, denied := range newPolicy.CredentialDirs {
+		if !rootCovered(denied, old.CredentialDirs) {
+			return true
+		}
+	}
+	for _, root := range newPolicy.PrivateRoots {
+		if !rootCovered(root, old.PrivateRoots) {
+			return true
+		}
+	}
+	for _, path := range old.RuntimeReadFiles {
+		if !slices.Contains(newPolicy.RuntimeReadFiles, path) {
+			return true
+		}
+	}
+	for _, root := range old.ArtifactRoots {
+		if !rootCovered(root, newPolicy.ArtifactRoots) {
 			return true
 		}
 	}
@@ -267,12 +365,19 @@ func (s *Sandbox) Snapshot() *Sandbox {
 	defer s.mu.RUnlock()
 	out := &Sandbox{
 		Workspace: s.Workspace, Revision: s.Revision,
-		executionGuard: s.executionGuard,
-		AdditionalDirs: append([]string(nil), s.AdditionalDirs...), ReadOnlyDirs: append([]string(nil), s.ReadOnlyDirs...),
+		QuarantineStore: s.QuarantineStore,
+		PrivateRoots:    append([]string(nil), s.PrivateRoots...), ArtifactRoots: append([]string(nil), s.ArtifactRoots...),
+		RuntimeReadFiles:        append([]string(nil), s.RuntimeReadFiles...),
+		SingleUse:               s.SingleUse,
+		ExecutorID:              s.ExecutorID,
+		LocalDevelopmentNetwork: s.LocalDevelopmentNetwork,
+		executionGuard:          s.executionGuard,
+		AdditionalDirs:          append([]string(nil), s.AdditionalDirs...), ReadOnlyDirs: append([]string(nil), s.ReadOnlyDirs...),
 		DisallowedDirs: append([]string(nil), s.DisallowedDirs...), ProtectedDirs: append([]string(nil), s.ProtectedDirs...),
+		CredentialDirs:   append([]string(nil), s.CredentialDirs...),
 		ProtectedEntries: append([]string(nil), s.ProtectedEntries...),
-		ScratchDirs:      append([]string(nil), s.ScratchDirs...), ExecutionReadRoots: append([]string(nil), s.ExecutionReadRoots...),
-		ExecutionScratchDirs: append([]string(nil), s.ExecutionScratchDirs...), AllowNetwork: s.AllowNetwork, NetworkProxy: s.NetworkProxy,
+		ScratchDirs:      append([]string(nil), s.ScratchDirs...), CacheDir: s.CacheDir, ExecutionReadRoots: append([]string(nil), s.ExecutionReadRoots...),
+		AllowNetwork: s.AllowNetwork, NetworkProxy: s.NetworkProxy,
 		LocalServices: append([]LocalService(nil), s.LocalServices...),
 	}
 	if s.Limits != nil {
@@ -306,7 +411,45 @@ func (s *Sandbox) NetworkAllowed() bool {
 func (s *Sandbox) AddDir(dir string)           { s.addRoot(&s.AdditionalDirs, dir) }
 func (s *Sandbox) AddReadOnlyDir(dir string)   { s.addRoot(&s.ReadOnlyDirs, dir) }
 func (s *Sandbox) AddDisallowedDir(dir string) { s.addRoot(&s.DisallowedDirs, dir) }
-func (s *Sandbox) AddScratchDir(dir string)    { s.addRoot(&s.ScratchDirs, dir) }
+func (s *Sandbox) AddCredentialDir(dir string) { s.addRoot(&s.CredentialDirs, dir) }
+func (s *Sandbox) AddArtifactRoot(dir string)  { s.addRoot(&s.ArtifactRoots, dir) }
+func (s *Sandbox) AddPrivateRoot(dir string) {
+	if dir != "" {
+		s.addRoot(&s.PrivateRoots, dir)
+	}
+}
+func (s *Sandbox) AddRuntimeReadFile(path string) {
+	if path != "" {
+		s.addRoot(&s.RuntimeReadFiles, path)
+	}
+}
+
+// ResolveConfigurationRead is for fixed, credential-filtering host adapters.
+// Explicit user denials still apply; only the built-in credential exclusions
+// can be read by this trusted path. It is never exposed as a model tool.
+func (s *Sandbox) ResolveConfigurationRead(path string) (string, error) {
+	copy := s.Snapshot()
+	copy.CredentialDirs = nil
+	return copy.ResolveRead(path)
+}
+func (s *Sandbox) AddScratchDir(dir string) { s.addRoot(&s.ScratchDirs, dir) }
+
+func (s *Sandbox) SetCacheDir(dir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.CacheDir != dir {
+		s.CacheDir = dir
+		s.Revision++
+	}
+}
+
+func (s *Sandbox) privateWritableRootsLocked() []string {
+	roots := append([]string(nil), s.ScratchDirs...)
+	if s.CacheDir != "" {
+		roots = append(roots, s.CacheDir)
+	}
+	return roots
+}
 
 // AddProtectedDir preserves the caller-visible entry as well as its resolved
 // target. A symlink to a control file must not let a tool unlink the symlink
@@ -409,26 +552,6 @@ func (s *Sandbox) AddExecutionReadRoot(dir string) {
 		}
 	}
 	s.ExecutionReadRoots = append(s.ExecutionReadRoots, abs)
-}
-
-// AddExecutionScratchDir grants a dedicated scratch directory to one
-// detached invocation without changing the durable policy revision.
-func (s *Sandbox) AddExecutionScratchDir(dir string) {
-	if s == nil {
-		return
-	}
-	abs := s.absDir(dir)
-	if abs == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, existing := range s.ExecutionScratchDirs {
-		if existing == abs {
-			return
-		}
-	}
-	s.ExecutionScratchDirs = append(s.ExecutionScratchDirs, abs)
 }
 
 func (s *Sandbox) addRoot(target *[]string, dir string) {
@@ -573,8 +696,15 @@ func (s *Sandbox) InWorkspace(path string) bool {
 		return false
 	}
 	s.mu.RLock()
+	privateWritable := s.privateWritableRootsLocked()
+	for _, root := range s.PrivateRoots {
+		if pathWithin(root, resolved) && !rootCovered(resolved, privateWritable) {
+			s.mu.RUnlock()
+			return false
+		}
+	}
 	roots := append([]string{s.Workspace}, s.AdditionalDirs...)
-	roots = append(roots, s.ScratchDirs...)
+	roots = append(roots, privateWritable...)
 	s.mu.RUnlock()
 	for _, root := range roots {
 		if pathWithin(root, resolved) {
@@ -664,13 +794,30 @@ func isMultiplyLinkedRegularFile(path string) bool {
 func (s *Sandbox) blockedByDisallowed(path string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if len(s.DisallowedDirs) == 0 {
+	if len(s.DisallowedDirs) == 0 && len(s.CredentialDirs) == 0 && len(s.PrivateRoots) == 0 {
 		return false
 	}
 	// Normalize directory aliases without following the leaf: a symlink
 	// inside a denied directory is still denied when its target is readable.
 	canonicalEntry := filepath.Join(canonicalRoot(filepath.Dir(path)), filepath.Base(path))
-	for _, root := range s.DisallowedDirs {
+	for _, privateRoot := range s.PrivateRoots {
+		if pathWithin(canonicalRoot(privateRoot), canonicalEntry) || pathWithin(privateRoot, path) {
+			artifact := false
+			for _, root := range append(append([]string(nil), s.ArtifactRoots...), s.privateWritableRootsLocked()...) {
+				if pathWithin(canonicalRoot(root), canonicalEntry) {
+					artifact = true
+					break
+				}
+			}
+			for _, file := range s.RuntimeReadFiles {
+				artifact = artifact || canonicalEntry == canonicalRoot(file)
+			}
+			if !artifact {
+				return true
+			}
+		}
+	}
+	for _, root := range append(append([]string(nil), s.DisallowedDirs...), s.CredentialDirs...) {
 		if pathWithin(root, path) || pathWithin(root, canonicalEntry) {
 			return true
 		}
@@ -734,17 +881,6 @@ func (s *Sandbox) Prefix() string {
 		return ""
 	}
 	return strings.Join(parts, " && ") + " &&"
-}
-
-func VerifyDir(workspace string) error {
-	info, err := os.Stat(workspace)
-	if err != nil {
-		return fmt.Errorf("workspace: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("workspace %s is not a directory", workspace)
-	}
-	return nil
 }
 
 func (s *Sandbox) BackendError() error {
@@ -818,17 +954,20 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	workspace := s.Workspace
 	additional := append([]string(nil), s.AdditionalDirs...)
 	readOnly := append([]string(nil), s.ReadOnlyDirs...)
-	disallowed := append([]string(nil), s.DisallowedDirs...)
+	disallowed := append(append([]string(nil), s.DisallowedDirs...), s.CredentialDirs...)
+	privateRoots, artifactRoots := append([]string(nil), s.PrivateRoots...), append([]string(nil), s.ArtifactRoots...)
+	runtimeFiles := append([]string(nil), s.RuntimeReadFiles...)
 	protected := append([]string(nil), s.ProtectedDirs...)
 	protectedEntries := append([]string(nil), s.ProtectedEntries...)
-	scratch := append([]string(nil), s.ScratchDirs...)
-	executionScratch := append([]string(nil), s.ExecutionScratchDirs...)
+	scratch := s.privateWritableRootsLocked()
 	executionReadRoots := append([]string(nil), s.ExecutionReadRoots...)
 	allowNetwork := s.AllowNetwork
+	localDevelopment := s.LocalDevelopmentNetwork
 	localServices := append([]LocalService(nil), s.LocalServices...)
 	s.mu.RUnlock()
 	if readOnlyExecutable != "" {
 		allowNetwork, localServices = false, nil
+		localDevelopment = false
 	}
 	if workspace == "" {
 		return "", fmt.Errorf("sandbox: profile has no workspace root")
@@ -840,7 +979,6 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	protected = cleanRoots(protected)
 	protectedEntries = cleanRoots(protectedEntries)
 	scratch = canonicalRoots(scratch)
-	executionScratch = canonicalRoots(executionScratch)
 	executionReadRoots = canonicalRoots(executionReadRoots)
 
 	var b strings.Builder
@@ -865,10 +1003,7 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 		fmt.Fprintf(&b, "(deny file-write* (subpath %s))\n", sbplQuote(root))
 	}
 	writeDenied := append(append(append([]string(nil), disallowed...), protected...), readOnly...)
-	writableRoots := append(append(append([]string{workspace}, additional...), scratch...), executionScratch...)
-	for _, ancestor := range protectedWritableAncestors(writableRoots, writeDenied) {
-		fmt.Fprintf(&b, "(deny file-write-unlink (require-all (literal %s) (vnode-type DIRECTORY)))\n", sbplQuote(ancestor))
-	}
+	writableRoots := append(append([]string{workspace}, additional...), scratch...)
 	fmt.Fprintf(&b, "(allow file-read* (require-all (literal %s)%s))\n", sbplQuote("/private/var/select/sh"), sbplDenyPredicates(disallowed))
 
 	for _, root := range append(toolchainRoots(), executionReadRoots...) {
@@ -883,7 +1018,6 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	metadataRoots := append([]string{workspace}, additional...)
 	metadataRoots = append(metadataRoots, readOnly...)
 	metadataRoots = append(metadataRoots, scratch...)
-	metadataRoots = append(metadataRoots, executionScratch...)
 	metadataRoots = append(metadataRoots, executionReadRoots...)
 	for _, parent := range exactAncestors(metadataRoots) {
 		fmt.Fprintf(&b, "(allow file-read-metadata file-test-existence (require-all (literal %s)%s))\n", sbplQuote(parent), sbplDenyPredicates(disallowed))
@@ -897,7 +1031,7 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	for _, root := range readOnly {
 		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
 	}
-	for _, root := range append(scratch, executionScratch...) {
+	for _, root := range scratch {
 		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
 		fmt.Fprintf(&b, "(allow file-write* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(writeDenied))
 	}
@@ -917,6 +1051,11 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 		b.WriteString("(allow network-outbound (require-all (remote tcp) (require-not (remote ip \"localhost:*\"))))\n")
 		b.WriteString("(allow network-outbound (require-all (remote udp) (require-not (remote ip \"localhost:*\"))))\n")
 	}
+	if localDevelopment {
+		b.WriteString("(allow network-outbound (remote tcp \"localhost:*\"))\n")
+		b.WriteString("(allow network-bind (require-all (local tcp) (local ip \"localhost:*\")))\n")
+		b.WriteString("(allow network-inbound (local tcp \"localhost:*\"))\n")
+	}
 	for _, service := range localServices {
 		selector := fmt.Sprintf("localhost:%d", service.Port)
 		if service.Direction == "connect" {
@@ -935,6 +1074,44 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	// renamed or removed, even when its parent is another writable root.
 	for _, root := range canonicalRoots(writableRoots) {
 		fmt.Fprintf(&b, "(deny file-write-unlink (require-all (literal %s) (vnode-type DIRECTORY)))\n", sbplQuote(root))
+	}
+	// Seatbelt rules are ordered. Private restrictions must also constrain
+	// broad workspace/toolchain grants above, including future sibling owners.
+	for _, privateRoot := range privateRoots {
+		privateRoot = canonicalRoot(privateRoot)
+		artifactRoots = canonicalRoots(artifactRoots)
+		allowedRoots := append(append([]string(nil), artifactRoots...), scratch...)
+		var artifactParents []string
+		for _, parent := range exactAncestors(append(append([]string(nil), allowedRoots...), runtimeFiles...)) {
+			if pathWithin(privateRoot, parent) && !rootCovered(parent, allowedRoots) {
+				artifactParents = append(artifactParents, parent)
+			}
+		}
+		fmt.Fprintf(&b, "(deny file-write* (require-all (subpath %s)", sbplQuote(privateRoot))
+		for _, root := range scratch {
+			fmt.Fprintf(&b, " (require-not (subpath %s))", sbplQuote(root))
+		}
+		b.WriteString("))\n")
+		fmt.Fprintf(&b, "(deny file-read* (require-all (subpath %s)", sbplQuote(privateRoot))
+		for _, root := range allowedRoots {
+			fmt.Fprintf(&b, " (require-not (subpath %s))", sbplQuote(root))
+		}
+		for _, file := range runtimeFiles {
+			fmt.Fprintf(&b, " (require-not (literal %s))", sbplQuote(canonicalRoot(file)))
+		}
+		// Authorized output reads must lstat/open their exact ancestors. Permit
+		// that metadata traversal without exposing directory listings, xattrs,
+		// session journals or another owner's outputs.
+		for _, parent := range artifactParents {
+			fmt.Fprintf(&b, " (require-not (literal %s))", sbplQuote(parent))
+		}
+		b.WriteString("))\n")
+		for _, parent := range artifactParents {
+			fmt.Fprintf(&b, "(deny file-read-data file-read-xattr (literal %s))\n", sbplQuote(parent))
+		}
+	}
+	for _, ancestor := range protectedWritableAncestors(writableRoots, append(append([]string(nil), writeDenied...), privateRoots...)) {
+		fmt.Fprintf(&b, "(deny file-write-unlink (require-all (literal %s) (vnode-type DIRECTORY)))\n", sbplQuote(ancestor))
 	}
 	return b.String(), nil
 }
@@ -1052,10 +1229,6 @@ func sbplDenyPredicates(roots []string) string {
 	return b.String()
 }
 
-func PrepareCommand(s *Sandbox, command string) (string, error) {
-	return PrepareCommandContext(context.Background(), s, command)
-}
-
 func PrepareCommandContext(ctx context.Context, s *Sandbox, command string) (string, error) {
 	if s == nil {
 		return "", fmt.Errorf("sandbox: policy is unavailable")
@@ -1070,14 +1243,8 @@ func PrepareCommandContext(ctx context.Context, s *Sandbox, command string) (str
 	if err != nil {
 		return "", err
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	probe := exec.CommandContext(probeCtx, BackendPath, "-p", profile, "--", "/bin/sh", "-c", "true")
-	if output, err := probe.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("sandbox: Seatbelt rejected the profile: %w (%s)", err, strings.TrimSpace(string(output)))
+	if err := VerifyProfile(ctx, profile, "/bin/sh", "-c", "true"); err != nil {
+		return "", err
 	}
 	return command, nil
 }

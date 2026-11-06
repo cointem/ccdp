@@ -10,6 +10,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func TestSettledChildInputRetryDoesNotStartContinuation(t *testing.T) {
@@ -119,8 +120,8 @@ func TestSettledChildInputRetryDoesNotStartContinuation(t *testing.T) {
 					if err := a.CloseContext(context.Background()); err != nil {
 						t.Fatal(err)
 					}
-					var snapshot *SessionSnapshot
-					snapshot, err = LoadSession(cfg.SessionDir, a.SessionID())
+					var snapshot *archive.Snapshot
+					snapshot, err = archive.Load(cfg.SessionDir, a.SessionID())
 					if err == nil {
 						reopened, err = Resume(&cfg, snapshot)
 					}

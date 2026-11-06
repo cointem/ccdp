@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"ccdp/internal/config"
+	"ccdp/internal/execution"
 	"ccdp/internal/llm"
 	"ccdp/internal/mcp"
 	"ccdp/internal/messages"
@@ -68,19 +68,22 @@ func (a *Agent) beginStepChecked() (stepRuntime, error) {
 	if err := a.loadStepExternalContext(&step); err != nil {
 		return stepRuntime{}, err
 	}
+	if len(step.contextMessages) > 0 {
+		if err := a.appendHistoryForStep(fmt.Sprintf("step-%d", step.step), step.contextMessages...); err != nil {
+			a.releaseStepContext(step)
+			return stepRuntime{}, err
+		}
+		step.history = append(step.history, step.contextMessages...)
+		step.contextMessages = nil
+	}
 	return step, nil
 }
 
 func (a *Agent) captureStepOwned() (stepRuntime, error) {
 	a.settingsCommitMu.Lock()
 	a.mu.Lock()
-	revoking := a.capabilities.capabilityRevoking
 	closing := a.lifecycle.closing || a.lifecycle.closed
 	a.mu.Unlock()
-	if revoking {
-		a.settingsCommitMu.Unlock()
-		return stepRuntime{}, errors.New("sandbox capability revocation is in progress")
-	}
 	if closing {
 		a.settingsCommitMu.Unlock()
 		return stepRuntime{}, errors.New("session is closing")
@@ -94,6 +97,7 @@ func (a *Agent) captureStepOwned() (stepRuntime, error) {
 		return stepRuntime{}, err
 	}
 	step.goalPrompt = a.goalPrompt()
+	step.todoPrompt = a.todoSection()
 	a.mu.Lock()
 	a.toolsTokensEstimate = estimateToolsTokens(step.tools)
 	a.mu.Unlock()
@@ -128,7 +132,7 @@ func (a *Agent) captureStepRuntime() (stepRuntime, *tools.Lease) {
 	step := stepRuntime{binding: a.modelsState.activeBinding, cfg: cloneConfig(a.services.cfg), history: messages.Clone(a.historyLocked()),
 		turn: a.sequences.turnSeq, step: a.sequences.stepSeq, settingsRev: a.sequences.settingsRev, contextRev: a.sequences.contextRev,
 		catalogVersion: a.sequences.catalogVersion, sessionID: a.conversation.sessionID, sessionStartAt: a.conversation.sessionStartAt,
-		skillStore: a.services.skills, isolated: a.children.childState != nil, plan: a.plan.planMode, modelSwitchMsg: a.conversation.modelSwitchMsg, interruptNote: a.turnMemory.interruptNote, toolLease: lease, mcpLease: mcpLease}
+		skillStore: a.services.skills, isolated: a.children.childState != nil, modelSwitchMsg: a.conversation.modelSwitchMsg, interruptNote: a.turnMemory.interruptNote, toolLease: lease, mcpLease: mcpLease}
 	step.policy = a.services.sandbox.Snapshot()
 	var frozenModels *plugin.ModelRegistry
 	if a.services.models != nil {
@@ -165,6 +169,14 @@ func (a *Agent) captureStepRuntime() (stepRuntime, *tools.Lease) {
 // cannot change the request after admission. An input-load failure releases the
 // frozen state and is reported as a user-retryable stepInputError.
 func (a *Agent) loadStepExternalContext(step *stepRuntime) error {
+	a.mu.Lock()
+	blocked := a.capabilities.capabilityRevoking
+	a.mu.Unlock()
+	if blocked || execution.CheckEnvironment(step.policy) != nil {
+		step.systemBlocks = buildSystemBlocks(step.cfg, step.sessionStartAt, step.sessionID, "", "")
+		step.loadRuntimeContext("", true)
+		return nil
+	}
 	instructions, inputErr := workspace.LoadInstructionsChecked(step.cfg.Workspace, step.policy.ResolveRead)
 	if inputErr != nil {
 		a.releaseStepContext(*step)
@@ -180,18 +192,13 @@ func (a *Agent) loadStepExternalContext(step *stepRuntime) error {
 		}
 		step.skillsSection = skillStore.SkillsSection()
 	}
-	step.systemBlocks = a.buildSystemBlocks(step.cfg, step.sessionStartAt, step.sessionID, step.plan, step.modelSwitchMsg, step.interruptNote, step.instructions, step.skillsSection, step.history, step.policy)
+	step.systemBlocks = buildSystemBlocks(step.cfg, step.sessionStartAt, step.sessionID, step.instructions, step.skillsSection)
 	memory, inputErr := projectMemorySection(step.cfg)
 	if inputErr != nil {
 		a.releaseStepContext(*step)
 		return &stepInputError{err: fmt.Errorf("load project memory: %w", inputErr)}
 	}
-	if memory != "" {
-		step.systemBlocks = append(step.systemBlocks, llm.SystemBlock{Text: memory})
-	}
-	if step.goalPrompt != "" {
-		step.systemBlocks = append(step.systemBlocks, llm.SystemBlock{Text: step.goalPrompt})
-	}
+	step.loadRuntimeContext(memory, false)
 	return nil
 }
 
@@ -199,10 +206,7 @@ func (a *Agent) loadStepExternalContext(step *stepRuntime) error {
 // snapshot once the request has finished or preparation must be rebuilt.
 func (a *Agent) releaseStepContext(step stepRuntime) {
 	releaseStepLease(step)
-	if a.owner == nil {
-		a.clearStepContext(step.turn, step.step)
-		return
-	}
+
 	request := stepReleased{turn: step.turn, step: step.step, done: make(chan struct{})}
 	select {
 	case a.owner.control <- request:
@@ -217,29 +221,30 @@ func (a *Agent) releaseStepContext(step stepRuntime) {
 }
 
 type stepRuntime struct {
-	policy         *sandbox.Sandbox
-	goalPrompt     string
-	systemBlocks   []llm.SystemBlock
-	skillStore     *skills.Store
-	isolated       bool
-	binding        modelBinding
-	cfg            config.Config
-	history        []messages.Message
-	turn           uint64
-	step           uint64
-	settingsRev    uint64
-	contextRev     uint64
-	catalogVersion uint64
-	sessionID      string
-	sessionStartAt time.Time
-	plan           bool
-	modelSwitchMsg string
-	interruptNote  bool
-	instructions   string
-	skillsSection  string
-	tools          []llm.ToolDef
-	toolLease      *tools.Lease
-	mcpLease       *mcp.StepLease
+	policy          *sandbox.Sandbox
+	goalPrompt      string
+	todoPrompt      string
+	contextMessages []messages.Message
+	systemBlocks    []llm.SystemBlock
+	skillStore      *skills.Store
+	isolated        bool
+	binding         modelBinding
+	cfg             config.Config
+	history         []messages.Message
+	turn            uint64
+	step            uint64
+	settingsRev     uint64
+	contextRev      uint64
+	catalogVersion  uint64
+	sessionID       string
+	sessionStartAt  time.Time
+	modelSwitchMsg  string
+	interruptNote   bool
+	instructions    string
+	skillsSection   string
+	tools           []llm.ToolDef
+	toolLease       *tools.Lease
+	mcpLease        *mcp.StepLease
 }
 
 // stepInputError marks a bounded external prompt input (instructions, skill
@@ -266,7 +271,11 @@ func (e *stepInputError) Unwrap() error {
 // buildRequestForStep forces the request model to the binding captured before
 // context construction.
 func (a *Agent) buildRequestForStep(step stepRuntime) llm.CompletionRequest {
-	req := a.buildRequestFromConfig(step.cfg, step.policy, step.binding.model, joinSystemBlocks(step.systemBlocks), step.history, step.plan, step.tools)
+	history := step.history
+	if len(step.contextMessages) > 0 {
+		history = append(append([]messages.Message(nil), history...), step.contextMessages...)
+	}
+	req := a.buildRequestFromConfig(step.cfg, step.policy, step.binding.model, joinSystemBlocks(step.systemBlocks), history, step.tools)
 	req.SystemBlocks = append([]llm.SystemBlock(nil), step.systemBlocks...)
 	return req
 }
@@ -316,7 +325,21 @@ func (a *Agent) toolDefsSnapshotFromLease(lease *tools.Lease) []llm.ToolDef {
 		discovered[name] = value
 	}
 	a.mu.Unlock()
+	a.mu.Lock()
+	blocked := a.capabilities.capabilityRevoking
+	policy := a.services.sandbox.Snapshot()
+	a.mu.Unlock()
+	blocked = blocked || execution.CheckEnvironment(policy) != nil
 	schemas := lease.SchemasFiltered(func(name string) bool {
+		if blocked {
+			tool, _ := lease.Get(name)
+			_, process := tool.(*tools.ProcessTool)
+			_, desktop := tool.(*tools.ComputerTool)
+			if !controlTool(tool, nil) && !process && !desktop {
+				return false
+			}
+		}
+
 		if a.children.childState != nil && a.children.childState.allowed != nil && !a.children.childState.allowed[name] {
 			return false
 		}
@@ -335,13 +358,22 @@ func (a *Agent) toolDefsSnapshotFromLease(lease *tools.Lease) []llm.ToolDef {
 			continue
 		}
 		tool, _ := lease.Get(name)
-		if _, codeEnabled := lease.Get("RunCode"); codeEnabled {
-			if def, ok := lease.Definition(name); ok && def.OutputSchema != nil {
-				dataSchema, _ := json.Marshal(def.OutputSchema)
-				description += "\nRunCode result.data schema: " + string(dataSchema)
+		if blocked {
+			if _, process := tool.(*tools.ProcessTool); process {
+				parameters = cloneMap(parameters)
+				if properties, ok := parameters["properties"].(map[string]any); ok {
+					if action, ok := properties["action"].(map[string]any); ok {
+						action["enum"] = []any{"read", "wait", "stop"}
+					}
+				}
 			}
 		}
-		defs = append(defs, llm.ToolDef{Type: "function", PlanAllowed: planAllowedImplementation(tool), Function: llm.FuncDef{
+		if _, codeEnabled := lease.Get("RunCode"); codeEnabled {
+			if def, ok := lease.Definition(name); ok && def.OutputSchema != nil {
+				description += "\nRunCode result.data: " + outputShape(def.OutputSchema)
+			}
+		}
+		defs = append(defs, llm.ToolDef{Type: "function", Function: llm.FuncDef{
 			Name: name, Description: description, Parameters: cloneMap(parameters),
 		}})
 	}

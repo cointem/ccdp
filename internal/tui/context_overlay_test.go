@@ -26,7 +26,7 @@ func TestContextPopoverAnchoredAndDoesNotMoveFrame(t *testing.T) {
 	for _, width := range []int{40, 80, 120, 200} {
 		t.Run(fmt.Sprint(width), func(t *testing.T) {
 			m := astraModel(t, width, 30)
-			m.snapshot.Settings.Permission.Mode = "bypassPermissions"
+			m.snapshot.Settings.Permission.Mode = "auto"
 			m.snapshot.Settings.ReasoningEffort = "high"
 			for i := 0; i < 50; i++ {
 				m.items = append(m.items, historyCell{kind: "assistant", text: fmt.Sprintf("RECORD_%02d", i)})
@@ -37,7 +37,7 @@ func TestContextPopoverAnchoredAndDoesNotMoveFrame(t *testing.T) {
 				m.handleMouse(tea.MouseMsg{X: x, Y: y, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 				m.syncViewportHeight()
 			}
-			click("bypass")
+			click("auto")
 			if m.showContextDetail {
 				t.Fatal("permission label opened context")
 			}
@@ -103,7 +103,7 @@ func TestContextPopoverAnchorsOverEmptyRows(t *testing.T) {
 			m.textarea.SetValue("")
 			m.snapshot.Settings.Model.Model = "gpt-5.5"
 			m.snapshot.Settings.ReasoningEffort = ""
-			m.snapshot.Settings.Permission.Mode = "bypassPermissions"
+			m.snapshot.Settings.Permission.Mode = "auto"
 			m.snapshot.ContextUsedTokens = 0
 			m.layout()
 			before := stripANSI(m.View())
@@ -134,7 +134,7 @@ func TestContextPopoverAnchorsOverEmptyRows(t *testing.T) {
 }
 
 func TestPermissionFooterClickOpensCurrentMode(t *testing.T) {
-	for _, tc := range []struct{ mode, label string }{{"default", "manual"}, {"acceptEdits", "edits"}, {"bypassPermissions", "bypass"}} {
+	for _, tc := range []struct{ mode, label string }{{"auto", "auto"}, {"manual", "manual"}} {
 		t.Run(tc.label, func(t *testing.T) {
 			m := astraModel(t, 80, 24)
 			m.snapshot.Settings.Permission.Mode = tc.mode
@@ -145,7 +145,7 @@ func TestPermissionFooterClickOpensCurrentMode(t *testing.T) {
 			if m.showContextDetail || m.picker == nil || m.picker.action.Kind != selectorMode {
 				t.Fatal("wrong click target")
 			}
-			if len(m.picker.Options) != 4 {
+			if len(m.picker.Options) != 2 {
 				t.Fatalf("permission choices: %d", len(m.picker.Options))
 			}
 			if got := m.picker.Options[m.picker.Index].ID; got != tc.mode {

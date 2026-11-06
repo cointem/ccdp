@@ -9,13 +9,16 @@ import (
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/supervision"
 )
 
 type childFinalization struct {
-	request supervision.FinishRequest
-	digest  string
-	result  supervision.FinishResult
+	request    supervision.FinishRequest
+	digest     string
+	result     supervision.FinishResult
+	snapshotID string
+	captureErr error
 }
 
 // FinishRun admits exactly one frozen finalization request before Close starts.
@@ -56,6 +59,23 @@ func (a *Agent) FinishRun(ctx context.Context, request supervision.FinishRequest
 	}
 }
 
+// Capture after workloads have joined but before their private environment and
+// executor are released. Outbox publication still waits for all cleanup errors.
+func (a *Agent) captureChildResult() {
+	a.mu.Lock()
+	pending := a.finalization
+	if pending == nil || pending.request.Capture == nil {
+		a.mu.Unlock()
+		return
+	}
+	workspace, policy := a.services.cfg.Workspace, a.services.sandbox.Snapshot()
+	a.mu.Unlock()
+	id, err := pending.request.Capture.Capture(context.Background(), workspace, policy)
+	a.mu.Lock()
+	pending.snapshotID, pending.captureErr = id, err
+	a.mu.Unlock()
+}
+
 func (a *Agent) finalizeChildOutbox(cleanupErr error) error {
 	a.mu.Lock()
 	pending := a.finalization
@@ -77,18 +97,9 @@ func (a *Agent) finalizeChildOutbox(cleanupErr error) error {
 	}
 	addFailure(cleanupErr)
 	output := request.Output
-	if request.Capture != nil {
-		a.mu.Lock()
-		workspace, policy := a.services.cfg.Workspace, a.services.sandbox
-		if policy != nil {
-			policy = policy.Snapshot()
-		}
-		a.mu.Unlock()
-		id, err := request.Capture.Capture(context.Background(), workspace, policy)
-		addFailure(err)
-		if err == nil {
-			fact.Child.ResultSnapshotID, fact.Child.MergeStatus = id, "pending_merge"
-		}
+	addFailure(pending.captureErr)
+	if pending.snapshotID != "" {
+		fact.Child.ResultSnapshotID, fact.Child.MergeStatus = pending.snapshotID, "pending_merge"
 	}
 	supervision.SetOutcome(&fact, output, failure, request.SaveError, request.Outcome, request.Cancelled, time.Now().UTC())
 	done := make(chan error, 1)
@@ -145,7 +156,7 @@ func (c workspaceResultCapture) Capture(ctx context.Context, workspace string, p
 	return snapshot.ID, err
 }
 
-func (s *SessionSupervisor) finishChild(r *managedRun, child supervision.ChildRuntime, initial *SessionSnapshot, output string, executionErr error, executionCtx context.Context) (supervision.FinishResult, error) {
+func (s *SessionSupervisor) finishChild(r *managedRun, child supervision.ChildRuntime, initial *archive.Snapshot, output string, executionErr error, executionCtx context.Context) (supervision.FinishResult, error) {
 	r.mu.Lock()
 	request := supervision.FinishRequest{Fact: r.fact, Output: output, Outcome: r.reviewOutcome, Cancelled: executionCtx.Err() != nil || errors.Is(executionErr, context.Canceled)}
 	r.mu.Unlock()
@@ -157,8 +168,11 @@ func (s *SessionSupervisor) finishChild(r *managedRun, child supervision.ChildRu
 		request.SaveError = saveErr.Error()
 	}
 	if initial != nil {
-		u := initial.Usage
-		request.Baseline = protocol.UsageSnapshot{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CachedTokens: u.CachedTokens, TurnCount: u.TurnCount}
+		baseline, err := usageFromSession(initial.Usage)
+		if err != nil {
+			return supervision.FinishResult{}, err
+		}
+		request.Baseline = baseline
 	}
 	if request.Fact.Child.BaselineID != "" {
 		request.Capture = r.parent.childResultCapture()

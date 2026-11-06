@@ -6,12 +6,12 @@ import (
 	"time"
 
 	"ccdp/internal/config"
-
 	"ccdp/internal/protocol"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/supervision"
 )
 
-func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text string, initial *SessionSnapshot) {
+func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text string, initial *archive.Snapshot) {
 	defer s.directory.WorkerDone()
 	slots := r.parent.childSlotsForRun(r.fact.Child.Purpose)
 	acquired := false
@@ -186,7 +186,7 @@ func (b childRunBoundary) FinishIfIdle(ctx context.Context, prior protocol.TurnI
 	if err != nil {
 		return view, false, err
 	}
-	done := b.run.commandsInFlight == 0 && !view.Busy && view.LastTurn != nil && view.LastTurn.TurnID != prior && (!hasTurnStartingInput(view.PendingInputs) || view.LastTurn.Status == protocol.TurnCancelled || view.LastTurn.Status == protocol.TurnFailed)
+	done := b.run.commandsInFlight == 0 && !view.Busy && view.LastTurn != nil && view.LastTurn.TurnID != prior && (!hasTurnStartingInput(view.PendingInputs) || view.LastTurn.Status != protocol.TurnSucceeded)
 	if done {
 		b.run.fact.Child.Run.FinishedAt = time.Now().UTC()
 		b.run.fact.Child.Run.Status = "settling"

@@ -43,7 +43,7 @@ func TestModeChangeWhileBusyThroughRunLoop(t *testing.T) {
 	cfg.SessionDir = dir + "/sessions"
 	cfg.BaseURL = server.URL
 	cfg.APIKey = "k"
-	cfg.PermissionMode = string(permissions.ModeDefault)
+	cfg.PermissionMode = string(permissions.ModeManual)
 	ag, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +66,7 @@ func TestModeChangeWhileBusyThroughRunLoop(t *testing.T) {
 	go func() {
 		rcpt, err := ag.Submit(context.Background(), protocol.Command{
 			ID: "repro-mode", SessionID: sid, Type: protocol.CommandSetPermissionPolicy,
-			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeBypass)}},
+			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeAuto)}},
 		})
 		if err != nil {
 			t.Errorf("mode submit error: %v", err)
@@ -91,7 +91,7 @@ func TestModeChangeWhileBusyThroughRunLoop(t *testing.T) {
 	// its own config and the change governs the next gate evaluation.
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	if ag.services.cfg.PermissionMode != string(permissions.ModeBypass) {
+	if ag.services.cfg.PermissionMode != string(permissions.ModeAuto) {
 		t.Fatalf("permission mode did not apply immediately: %s", ag.services.cfg.PermissionMode)
 	}
 }

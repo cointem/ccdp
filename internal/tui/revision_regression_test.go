@@ -60,7 +60,7 @@ func TestModePickerKeepsRevisionAfterCommandCompletion(t *testing.T) {
 				}
 			}
 			drain()
-			for _, line := range []string{"/mode", "/mode", "/mode plan", "/mode default", "/plan on", "/plan off", "/sandbox", "/clear", "/mode"} {
+			for _, line := range []string{"/mode", "/mode", "/mode auto", "/mode manual", "/sandbox", "/clear", "/mode"} {
 				next, cmd := m.runCommand(line)
 				m = modelValue(t, next)
 				if line == "/mode" {

@@ -14,6 +14,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/plugin"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func TestProviderContentSurvivesDurableRequestReconstruction(t *testing.T) {
@@ -44,7 +45,7 @@ func TestProviderContentSurvivesDurableRequestReconstruction(t *testing.T) {
 	history := messages.Clone([]messages.Message{restored, messages.NewToolResult(original.ToolCalls[0], "contents", false)})
 	cfg := a.configSnapshot()
 	cfg.WireAPI = "anthropic"
-	req := a.buildRequestFromConfig(cfg, a.currentSandbox().Snapshot(), cfg.Model, "test", history, false, nil)
+	req := a.buildRequestFromConfig(cfg, a.currentSandbox().Snapshot(), cfg.Model, "test", history, nil)
 	found := false
 	for _, message := range req.Messages {
 		if message.Role == "assistant" {
@@ -106,7 +107,7 @@ func TestProviderContentAgentResumeAndFork(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{originalID, child} {
-		snapshot, err := LoadSession(cfg.SessionDir, id)
+		snapshot, err := archive.Load(cfg.SessionDir, id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -118,7 +119,7 @@ func TestProviderContentAgentResumeAndFork(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		req := resumed.buildRequestFromConfig(cfg, resumed.currentSandbox().Snapshot(), cfg.Model, "resumed", resumed.History(), false, nil)
+		req := resumed.buildRequestFromConfig(cfg, resumed.currentSandbox().Snapshot(), cfg.Model, "resumed", resumed.History(), nil)
 		found := false
 		for _, message := range req.Messages {
 			if len(message.ProviderContent) > 0 {

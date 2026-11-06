@@ -13,6 +13,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/tools"
 )
 
@@ -139,7 +140,7 @@ func TestGoalAccountingRecoversNestedChildCompletionOnce(t *testing.T) {
 	if got.TokensUsed != 87 || got.ModelCalls != 1 || !got.TokensEstimated {
 		t.Fatalf("recovery accounting: %+v", got)
 	}
-	snap, err := p.snapshotFromOwnedStore(a.SessionID())
+	snap, err := archive.FromStore(p, a.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +167,7 @@ func TestGoalEstimatesToolArgumentsAndPreservesInternalSource(t *testing.T) {
 	if restored.InternalSource != "goal" {
 		t.Fatal("internal source lost")
 	}
-	events, err := memoryResumeEvents(SessionSnapshot{ID: "internal", CreatedAt: time.Now(), History: []messages.Message{message}})
+	events, err := memoryResumeEvents(archive.Snapshot{ID: "internal", CreatedAt: time.Now(), History: []messages.Message{message}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +176,7 @@ func TestGoalEstimatesToolArgumentsAndPreservesInternalSource(t *testing.T) {
 	if _, err := store.Commit(session.Beginning, session.Batch{TransactionID: "resume", Events: events}); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := SessionSnapshotProjection(store, "internal")
+	snapshot, err := archive.FromStore(store, "internal")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +231,7 @@ func TestGoalRecoveryIgnoresUnrelatedChildrenAndBlocksOnlyAffectedGoal(t *testin
 			if err := p.Close(); err != nil {
 				t.Fatal(err)
 			}
-			snapshot, err := LoadSession(cfg.SessionDir, a.SessionID())
+			snapshot, err := archive.Load(cfg.SessionDir, a.SessionID())
 			if err != nil {
 				t.Fatal(err)
 			}

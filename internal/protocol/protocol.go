@@ -86,12 +86,10 @@ const (
 	CommandSetGeneration       CommandType = "set_generation"
 	CommandAnswerQuestion      CommandType = "answer_question"
 	CommandSetModel            CommandType = "set_model"
-	CommandSetExecutionMode    CommandType = "set_execution_mode"
 	CommandSetPermissionPolicy CommandType = "set_permission_policy"
 	CommandSetSandboxPolicy    CommandType = "set_sandbox_policy"
 	CommandRevokeCapabilities  CommandType = "revoke_capabilities"
 	CommandApproveTool         CommandType = "approve_tool"
-	CommandApprovePlan         CommandType = "approve_plan"
 	CommandInterrupt           CommandType = "interrupt"
 	CommandStop                CommandType = "stop"
 	CommandClearConversation   CommandType = "clear_conversation"
@@ -122,13 +120,6 @@ const (
 	InputMessage InputStrategy = "message"
 )
 
-type ExecutionMode string
-
-const (
-	ExecutionModeExecute ExecutionMode = "execute"
-	ExecutionModePlan    ExecutionMode = "plan"
-)
-
 // PermissionPolicy is a credential-free view of permission settings. Mode is
 // a string to keep protocol independent from the permissions implementation.
 type PermissionPolicy struct {
@@ -140,6 +131,7 @@ type PermissionPolicy struct {
 
 type SandboxPolicy struct {
 	NetworkAccess                 bool     `json:"network_access"`
+	LocalDevelopmentNetwork       bool     `json:"local_development_network"`
 	AdditionalDirectories         []string `json:"additional_directories,omitempty"`
 	AdditionalReadOnlyDirectories []string `json:"additional_read_only_directories,omitempty"`
 	DisallowedDirectories         []string `json:"disallowed_directories,omitempty"`
@@ -203,10 +195,6 @@ type SetModel struct {
 	Model string `json:"model"`
 }
 
-type SetExecutionMode struct {
-	Mode ExecutionMode `json:"mode"`
-}
-
 type SetPermissionPolicy struct {
 	Policy PermissionPolicy `json:"policy"`
 }
@@ -220,12 +208,6 @@ type ApproveTool struct {
 	Approve         bool            `json:"approve"`
 	Remember        bool            `json:"remember,omitempty"`
 	CapabilityScope CapabilityScope `json:"capability_scope,omitempty"`
-}
-
-type ApprovePlan struct {
-	PlanID      string `json:"plan_id"`
-	PlanVersion uint64 `json:"plan_version,omitempty"`
-	Approve     bool   `json:"approve"`
 }
 
 type RemoveMessages struct {
@@ -254,12 +236,10 @@ type Command struct {
 
 	Input              *SubmitInput          `json:"input,omitempty"`
 	Model              *SetModel             `json:"model,omitempty"`
-	ExecutionMode      *SetExecutionMode     `json:"execution_mode,omitempty"`
 	PermissionPolicy   *SetPermissionPolicy  `json:"permission_policy,omitempty"`
 	SandboxPolicy      *SetSandboxPolicy     `json:"sandbox_policy,omitempty"`
 	RevokeCapabilities *RevokeCapabilities   `json:"revoke_capabilities,omitempty"`
 	Approval           *ApproveTool          `json:"approval,omitempty"`
-	Plan               *ApprovePlan          `json:"plan,omitempty"`
 	Remove             *RemoveMessages       `json:"remove,omitempty"`
 	Rewind             *RewindConversation   `json:"rewind,omitempty"`
 	Fork               *Fork                 `json:"fork,omitempty"`
@@ -303,9 +283,6 @@ func (c Command) Normalize() (Command, error) {
 	if c.Model != nil {
 		payloads++
 	}
-	if c.ExecutionMode != nil {
-		payloads++
-	}
 	if c.PermissionPolicy != nil {
 		payloads++
 	}
@@ -316,9 +293,6 @@ func (c Command) Normalize() (Command, error) {
 		payloads++
 	}
 	if c.Approval != nil {
-		payloads++
-	}
-	if c.Plan != nil {
 		payloads++
 	}
 	if c.Remove != nil {
@@ -438,15 +412,6 @@ func (c Command) Normalize() (Command, error) {
 		if strings.TrimSpace(c.Model.Model) == "" {
 			return Command{}, errors.New("protocol: model is required")
 		}
-	case CommandSetExecutionMode:
-		if err := requirePayload(c.ExecutionMode != nil); err != nil {
-			return Command{}, err
-		}
-		mode := *c.ExecutionMode
-		c.ExecutionMode = &mode
-		if c.ExecutionMode.Mode != ExecutionModeExecute && c.ExecutionMode.Mode != ExecutionModePlan {
-			return Command{}, fmt.Errorf("protocol: unknown execution mode %q", c.ExecutionMode.Mode)
-		}
 	case CommandSetPermissionPolicy:
 		if err := requirePayload(c.PermissionPolicy != nil); err != nil {
 			return Command{}, err
@@ -488,15 +453,6 @@ func (c Command) Normalize() (Command, error) {
 		}
 		if c.Approval.CapabilityScope != "" && c.Approval.CapabilityScope != CapabilityScopeOnce && c.Approval.CapabilityScope != CapabilityScopeSession {
 			return Command{}, fmt.Errorf("protocol: unknown capability scope %q", c.Approval.CapabilityScope)
-		}
-	case CommandApprovePlan:
-		if err := requirePayload(c.Plan != nil); err != nil {
-			return Command{}, err
-		}
-		plan := *c.Plan
-		c.Plan = &plan
-		if c.Plan.PlanID == "" {
-			return Command{}, errors.New("protocol: plan_id is required")
 		}
 	case CommandRemoveMessages:
 		if err := requirePayload(c.Remove != nil); err != nil {
@@ -572,7 +528,7 @@ func (c Command) Normalize() (Command, error) {
 		query := *c.Query
 		c.Query = &query
 		switch query.Kind {
-		case QueryConfig, QueryDoctor, QueryPermissions, QueryMemory, QueryMCP, QueryPlugins, QuerySkills, QueryStatus, QueryGitHub, QueryGoal:
+		case QueryConfig, QueryDoctor, QueryPermissions, QueryMemory, QueryMCP, QueryProviders, QuerySkills, QueryStatus, QueryGitHub, QueryGoal:
 		default:
 			return Command{}, fmt.Errorf("protocol: unknown query kind %q", query.Kind)
 		}
@@ -755,14 +711,6 @@ const (
 	PhaseClosed          RuntimePhase = "closed"
 )
 
-type WorkflowState string
-
-const (
-	WorkflowOff              WorkflowState = "off"
-	WorkflowDrafting         WorkflowState = "drafting"
-	WorkflowAwaitingDecision WorkflowState = "awaiting_decision"
-)
-
 type ModelBinding struct {
 	Model          string `json:"model"`
 	Provider       string `json:"provider"`
@@ -776,7 +724,6 @@ type SettingsSnapshot struct {
 	Verbosity        string           `json:"verbosity,omitempty"`
 	Revision         uint64           `json:"revision"`
 	Model            ModelBinding     `json:"model"`
-	ExecutionMode    ExecutionMode    `json:"execution_mode"`
 	Permission       PermissionPolicy `json:"permission"`
 	Sandbox          SandboxPolicy    `json:"sandbox"`
 	ContextWindow    int              `json:"context_window"`
@@ -842,6 +789,8 @@ const (
 	TurnSucceeded TurnOutcomeStatus = "succeeded"
 	TurnFailed    TurnOutcomeStatus = "failed"
 	TurnCancelled TurnOutcomeStatus = "cancelled"
+	TurnLimited   TurnOutcomeStatus = "limit_reached"
+	TurnBlocked   TurnOutcomeStatus = "blocked"
 )
 
 type TurnOutcome struct {
@@ -886,12 +835,6 @@ type ApprovalView struct {
 	PolicyRev    uint64              `json:"policy_revision,omitempty"`
 }
 
-type PlanView struct {
-	ID      string `json:"id"`
-	Version uint64 `json:"version"`
-	Text    string `json:"text"`
-}
-
 // EventKind identifies transient, displayable runtime activity carried by a
 // Watch subscription. It is intentionally separate from UpdateType: a client
 // can render progress while retaining the latest state Snapshot as the
@@ -909,7 +852,6 @@ const (
 	EventToolResult        EventKind = "tool_result"
 	EventApprovalRequest   EventKind = "approval_request"
 	EventQuestionRequest   EventKind = "question_request"
-	EventPlanReady         EventKind = "plan_ready"
 	EventError             EventKind = "error"
 	EventTurnDone          EventKind = "turn_done"
 	EventUsage             EventKind = "usage"
@@ -918,39 +860,40 @@ const (
 )
 
 type ToolView struct {
-	ParentCallID CallID          `json:"parent_call_id,omitempty"`
-	ChildIndex   int             `json:"child_index,omitempty"`
-	ID           CallID          `json:"id"`
-	Name         string          `json:"name"`
-	Status       string          `json:"status"`
-	Args         json.RawMessage `json:"args,omitempty"`
-	Output       string          `json:"output,omitempty"`
+	Progress     *ProcessProgress `json:"progress,omitempty"`
+	Failure      *ToolFailure     `json:"failure,omitempty"`
+	Phase        ExecutionPhase   `json:"phase,omitempty"`
+	ParentCallID CallID           `json:"parent_call_id,omitempty"`
+	ChildIndex   int              `json:"child_index,omitempty"`
+	ID           CallID           `json:"id"`
+	Name         string           `json:"name"`
+	Status       string           `json:"status"`
+	Args         json.RawMessage  `json:"args,omitempty"`
+	Output       string           `json:"output,omitempty"`
 }
 
-// EventView is the typed projection of a legacy agent event. It contains no
+// EventView is the runtime activity shared by Watch and diagnostics. It contains no
 // provider credentials or mutable runtime pointers and is safe to retain
 // after the update has been delivered.
 type EventView struct {
-	Goal           *Goal            `json:"goal,omitempty"`
-	Question       *QuestionRequest `json:"question,omitempty"`
-	Transcript     *TranscriptItem  `json:"transcript,omitempty"`
-	Kind           EventKind        `json:"kind"`
-	SessionID      SessionID        `json:"session_id,omitempty"`
-	TurnID         TurnID           `json:"turn_id,omitempty"`
-	StepID         StepID           `json:"step_id,omitempty"`
-	AttemptID      AttemptID        `json:"attempt_id,omitempty"`
-	CallID         CallID           `json:"call_id,omitempty"`
-	MessageID      string           `json:"message_id,omitempty"`
-	Text           string           `json:"text,omitempty"`
-	Tool           *ToolView        `json:"tool,omitempty"`
-	Approval       *ApprovalView    `json:"approval,omitempty"`
-	Plan           *PlanView        `json:"plan,omitempty"`
-	Phase          RuntimePhase     `json:"phase,omitempty"`
-	Workflow       WorkflowState    `json:"workflow,omitempty"`
-	ExecutionMode  ExecutionMode    `json:"execution_mode,omitempty"`
-	PermissionMode string           `json:"permission_mode,omitempty"`
-	Usage          *UsageSnapshot   `json:"usage,omitempty"`
-	Error          string           `json:"error,omitempty"`
+	Goal       *Goal            `json:"goal,omitempty"`
+	Question   *QuestionRequest `json:"question,omitempty"`
+	Transcript *TranscriptItem  `json:"transcript,omitempty"`
+	Kind       EventKind        `json:"kind"`
+	SessionID  SessionID        `json:"session_id,omitempty"`
+	TurnID     TurnID           `json:"turn_id,omitempty"`
+	StepID     StepID           `json:"step_id,omitempty"`
+	AttemptID  AttemptID        `json:"attempt_id,omitempty"`
+	CallID     CallID           `json:"call_id,omitempty"`
+	MessageID  string           `json:"message_id,omitempty"`
+	Text       string           `json:"text,omitempty"`
+	Tool       *ToolView        `json:"tool,omitempty"`
+	Approval   *ApprovalView    `json:"approval,omitempty"`
+	Phase      RuntimePhase     `json:"phase,omitempty"`
+
+	PermissionMode string         `json:"permission_mode,omitempty"`
+	Usage          *UsageSnapshot `json:"usage,omitempty"`
+	Error          string         `json:"error,omitempty"`
 }
 
 // TaskView projects one working task for read-only rendering. Status mirrors
@@ -965,6 +908,10 @@ type TaskView struct {
 // grants are deliberately separate from Settings so replay can never turn a
 // former approval into a current authorization.
 type SandboxRuntimeView struct {
+	ScratchDir                string              `json:"scratch_dir,omitempty"`
+	EnvironmentID             string              `json:"environment_id,omitempty"`
+	State                     string              `json:"state,omitempty"`
+	Detail                    string              `json:"detail,omitempty"`
 	NetworkProxy              string              `json:"network_proxy,omitempty"`
 	SessionGrants             []CapabilityRequest `json:"session_grants,omitempty"`
 	RevocationPending         bool                `json:"revocation_pending,omitempty"`
@@ -984,8 +931,8 @@ type SessionView struct {
 	SessionID       SessionID        `json:"session_id"`
 	Revision        Revision         `json:"revision"`
 	Phase           RuntimePhase     `json:"phase"`
-	Workflow        WorkflowState    `json:"workflow"`
-	Busy            bool             `json:"busy"`
+
+	Busy bool `json:"busy"`
 	// WorkStartedAt is the runtime start of the current turn or exclusive operation.
 	WorkLabel         string             `json:"work_label,omitempty"`
 	WorkStartedAt     time.Time          `json:"work_started_at,omitempty"`
@@ -1004,7 +951,6 @@ type SessionView struct {
 	History        []MessageView `json:"history,omitempty"`
 	PendingInputs  []InputView   `json:"pending_inputs,omitempty"`
 	Approval       *ApprovalView `json:"approval,omitempty"`
-	Plan           *PlanView     `json:"plan,omitempty"`
 	Tasks          []TaskView    `json:"tasks,omitempty"`
 	LastTurn       *TurnOutcome  `json:"last_turn,omitempty"`
 }

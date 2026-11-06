@@ -2,9 +2,10 @@ package tui
 
 import (
 	"fmt"
-	"github.com/charmbracelet/lipgloss"
 	"os"
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 // layout recomputes viewport/input sizes after a resize.
@@ -103,7 +104,7 @@ func (m *Model) headerPresentation() string {
 				if row.Run.Active() {
 					active++
 				}
-				if row.Approval != nil || row.Question != nil || row.Plan != nil {
+				if row.Approval != nil || row.Question != nil {
 					approvals++
 				}
 			}

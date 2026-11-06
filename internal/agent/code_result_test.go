@@ -148,7 +148,7 @@ func TestCodeResultExhaustedBudgetContinuesWithoutRepeatingEffects(t *testing.T)
 
 func TestCodeModeArgumentPermissionKeepsBinding(t *testing.T) {
 	a, _, _ := codeAgent(t, "", func(cfg *config.Config) {
-		cfg.PermissionMode = string(permissions.ModeDefault)
+		cfg.PermissionMode = string(permissions.ModeManual)
 		cfg.AlwaysAllow = []string{"Write:result.txt"}
 	})
 	a.children.childState = &childRuntimeState{

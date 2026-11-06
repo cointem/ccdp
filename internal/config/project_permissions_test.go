@@ -19,7 +19,7 @@ func TestProjectPermissionsRememberAndIsolate(t *testing.T) {
 	cfg := Default()
 	cfg.SessionDir = filepath.Join(base, "sessions")
 	cfg.Workspace = repo
-	if cfg.PermissionMode != "acceptEdits" {
+	if cfg.PermissionMode != "auto" {
 		t.Fatal(cfg.PermissionMode)
 	}
 	if err := cfg.SaveProjectPermission("manual"); err != nil {
@@ -41,15 +41,15 @@ func TestProjectPermissionsRememberAndIsolate(t *testing.T) {
 	if err := cfg.ApplyProjectPermission(); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PermissionMode != "default" {
+	if cfg.PermissionMode != "manual" {
 		t.Fatal("subdirectory did not inherit project preference")
 	}
 	cfg.Workspace = other
-	cfg.PermissionMode = "acceptEdits"
+	cfg.PermissionMode = "manual"
 	if err := cfg.ApplyProjectPermission(); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PermissionMode != "acceptEdits" {
+	if cfg.PermissionMode != "manual" {
 		t.Fatal("permission leaked to other project")
 	}
 	cfg.Workspace = repo
@@ -57,20 +57,27 @@ func TestProjectPermissionsRememberAndIsolate(t *testing.T) {
 	if err := cfg.ApplyProjectPermission(); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PermissionMode != "acceptEdits" {
+	if cfg.PermissionMode != "manual" {
 		t.Fatal("project overrode CLI")
 	}
 }
 
-func TestPermissionNamesRemainCompatible(t *testing.T) {
-	for name, want := range map[string]string{"manual": "default", "default": "default", "edits": "acceptEdits", "acceptEdits": "acceptEdits", "bypass": "bypassPermissions", "bypassPermissions": "bypassPermissions"} {
+func TestPermissionNamesAreCanonical(t *testing.T) {
+	for _, name := range []string{"auto", "manual"} {
 		cfg := Default()
 		cfg.PermissionMode = name
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if cfg.PermissionMode != want {
-			t.Fatalf("%s normalized to %s", name, cfg.PermissionMode)
+		if cfg.PermissionMode != name {
+			t.Fatalf("%s changed to %s", name, cfg.PermissionMode)
+		}
+	}
+	for _, name := range []string{"edits", "bypass", "plan", "default", "acceptEdits", "bypassPermissions"} {
+		cfg := Default()
+		cfg.PermissionMode = name
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("retired permission name %q was accepted", name)
 		}
 	}
 }
@@ -103,7 +110,7 @@ func TestSandboxProtectsProjectPermissionRecords(t *testing.T) {
 	if err := cfg.ApplyProjectPermission(); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PermissionMode != "default" {
+	if cfg.PermissionMode != "manual" {
 		t.Fatalf("host permission persistence broken: %s", cfg.PermissionMode)
 	}
 }

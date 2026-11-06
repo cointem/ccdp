@@ -1,10 +1,12 @@
 package tui
 
 import (
-	"ccdp/internal/protocol"
-	tea "github.com/charmbracelet/bubbletea"
 	"strconv"
 	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"ccdp/internal/protocol"
 )
 
 // handleApprovalKey resolves an approval modal.
@@ -58,9 +60,7 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.approvalCursor = m.selectedApprovalChoice()
-		if m.approval.Tool == "Plan" {
-			approve = m.approvalCursor == 0
-		} else if len(m.approval.Capabilities) > 0 {
+		if len(m.approval.Capabilities) > 0 {
 			switch m.approvalCursor {
 			case 1:
 				approve, capabilityScope = true, protocol.CapabilityScopeSession
@@ -93,20 +93,6 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		approval := *m.approval
 		m.pendingApprovalKey = m.approvalKey()
-		if approval.Tool == "Plan" {
-			cmd := protocol.Command{Type: protocol.CommandApprovePlan,
-				Plan: &protocol.ApprovePlan{PlanID: approval.ID, Approve: approve}}
-			if m.snapshot.Plan != nil {
-				cmd.Plan.PlanVersion = m.snapshot.Plan.Version
-			}
-			m.approvalPending = true
-			m.pendingApprovalCommand = cmd.ID
-			if cmd.ID == "" {
-				cmd.ID = nextUICommandID()
-				m.pendingApprovalCommand = cmd.ID
-			}
-			return m, m.submitCommand(cmd, "plan decision submitted")
-		}
 		cmd := protocol.Command{Type: protocol.CommandApproveTool,
 			Approval: &protocol.ApproveTool{ApprovalID: approval.ID, Approve: approve, Remember: remember, CapabilityScope: capabilityScope}}
 		m.approvalPending = true
@@ -120,15 +106,8 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// approvalChoiceCount reports how many ↑↓ choices the approval modal offers:
-// 2 for a Plan approval (approve/deny), 3 for a tool approval (allow once /
-// always allow / deny).
-func approvalChoiceCount(req *approvalPrompt) int {
-	if req != nil && req.Tool == "Plan" {
-		return 2
-	}
-	return 3
-}
+// Allow once, allow for the session, or deny.
+const approvalChoiceCount = 3
 
 // handlePickerKey resolves the interactive list picker.
 func (m *Model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

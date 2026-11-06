@@ -3,22 +3,24 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 
 	"ccdp/internal/config"
+	"ccdp/internal/execution"
 	"ccdp/internal/hooks"
 	"ccdp/internal/mcp"
 	"ccdp/internal/permissions"
 	"ccdp/internal/plugin"
-	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 	"ccdp/internal/session"
 )
 
 type settingsCandidate struct {
 	workspaceChange bool
+	freshScratch    string
 	cfg             config.Config
 	// sourceSandboxRevision binds preparation to the live policy generation it
 	// observed. A candidate must not overwrite a policy published while its
@@ -97,21 +99,9 @@ func (a *Agent) prepareSettingsCandidate(workspace string) (*settingsCandidate, 
 		}
 		customPerms[name] = strings.ToLower(spec.Permission)
 	}
-	var binding modelBinding
-	if active.model != "" {
-		var modelRegistry *plugin.ModelRegistry
-		if models != nil {
-			modelRegistry = models.Clone()
-		}
-		binding, err = providerBinding(effective, modelRegistry, active.model, active.version+1)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		// Package tests and embedders may construct a minimal Agent without an
-		// active binding. The commit path retains that compatibility and will
-		// leave its current provider untouched.
-		binding = active
+	binding, err := providerBinding(effective, models.Clone(), active.model, active.version+1)
+	if err != nil {
+		return nil, err
 	}
 	return &settingsCandidate{cfg: effective, binding: binding, mode: mode, sandbox: sb,
 		sourceSandboxRevision: sourceSandboxRevision, sourceSettingsRevision: sourceSettingsRevision,
@@ -142,13 +132,14 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	a.settingsCommitMu.Lock()
 	defer a.settingsCommitMu.Unlock()
 	a.mu.Lock()
-	if a.capabilities.capabilityRevoking {
+	independentWorkspace := candidate.workspaceChange && a.services.sandbox != nil && !samePath(a.services.sandbox.Workspace, candidate.cfg.Workspace)
+	if a.capabilities.capabilityRevoking && !independentWorkspace {
 		a.mu.Unlock()
 		return fmt.Errorf("sandbox capability revocation is in progress")
 	}
 	oldCfg := a.services.cfg.Clone()
 	oldSandbox := a.services.sandbox
-	sandboxPolicyChanged := oldCfg.NetworkProxy != candidate.cfg.NetworkProxy || oldCfg.NetworkAccess != candidate.cfg.NetworkAccess ||
+	sandboxPolicyChanged := oldCfg.Workspace != candidate.cfg.Workspace || oldCfg.NetworkProxy != candidate.cfg.NetworkProxy || oldCfg.NetworkAccess != candidate.cfg.NetworkAccess || oldCfg.LocalDevelopmentNetwork != candidate.cfg.LocalDevelopmentNetwork ||
 		!equalStringSlice(oldCfg.AdditionalDirectories, candidate.cfg.AdditionalDirectories) ||
 		!equalStringSlice(oldCfg.AdditionalReadOnlyDirectories, candidate.cfg.AdditionalReadOnlyDirectories) ||
 		!equalStringSlice(oldCfg.DisallowedDirectories, candidate.cfg.DisallowedDirectories)
@@ -162,34 +153,7 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	}
 	oldMCP := cloneMCPConfig(oldCfg.MCPServers)
 	binding := candidate.binding
-	if binding.client == nil {
-		// Keep compatibility with hand-built Agents/tests that construct a
-		// candidate directly. Even on that path, adapt the frozen provider to
-		// the candidate's effective operator limits before the next step.
-		binding = a.modelsState.activeBinding
-		binding.client = providerWithOperatorCaps(candidate.cfg, candidate.cfg.Model, binding.client)
-	}
-	if binding.model == "" {
-		binding.model = a.modelsState.activeBinding.model
-	}
-	planMode := a.plan.planMode || candidate.mode == permissions.ModePlan
-	permissionMode := candidate.mode
-	if planMode {
-		permissionMode = a.plan.planBaseMode
-		if permissionMode == "" || permissionMode == permissions.ModePlan {
-			permissionMode = permissions.ModeDefault
-		}
-	}
-	candidate.binding = binding
-	settings := a.settingsForCandidateLocked(candidate, permissionMode, planMode)
-	workflow := session.WorkflowState{Phase: string(a.lifecycle.workflow)}
-	if planMode {
-		if workflow.Phase == "" || workflow.Phase == string(protocol.WorkflowOff) {
-			workflow.Phase = string(protocol.WorkflowDrafting)
-		}
-	} else {
-		workflow = session.WorkflowState{Phase: string(protocol.WorkflowOff)}
-	}
+	settings := a.settingsForCandidateLocked(candidate)
 	nextRevision := a.sequences.settingsRev + 1
 	if nextRevision == 0 {
 		nextRevision = 1
@@ -201,16 +165,43 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	var quiescenceRevision uint64
 	durable := false
 	policyPublished := false
+	defer func() {
+		if !policyPublished && candidate.freshScratch != "" {
+			_ = os.RemoveAll(filepath.Dir(candidate.freshScratch))
+		}
+	}()
 	if policyTightened {
 		// Tightening always invalidates and joins old work. The sticky witness
 		// controls whether success can be confirmed, not whether this protocol
 		// runs at all.
-		revision, err := a.quiesceForSandboxSettingsChange(ctx, false)
-		if err != nil {
+		a.settingsCommitMu.Unlock()
+		scope, err := a.requestQuiescence(ctx, false, independentWorkspace)
+		if err == nil {
+			err = scope.drain()
+		}
+		a.settingsCommitMu.Lock()
+		if err != nil && !(independentWorkspace && scope != nil && scope.managedStopped && execution.CheckEnvironment(candidate.sandbox) == nil) {
 			return fmt.Errorf("sandbox settings change cannot be confirmed because old-policy descendants may remain: %w", err)
 		}
+		if independentWorkspace && oldSandbox.ExternalExecutionPossible() {
+			// An independent workspace must not reuse caches writable by an
+			// old detached descendant. Retain old logs for Process.read, but
+			// deny direct access and prepare a fresh scratch before MCP starts.
+			fresh, prepareErr := a.services.resources.NewScratch()
+			if prepareErr != nil {
+				return prepareErr
+			}
+			candidate.freshScratch = fresh
+			for _, root := range candidate.sandbox.ScratchDirs {
+				candidate.sandbox.DisallowedDirs = append(candidate.sandbox.DisallowedDirs, root)
+			}
+			candidate.sandbox.ScratchDirs = nil
+			candidate.sandbox.AddScratchDir(fresh)
+			candidate.sandbox.AddReadOnlyDir(filepath.Join(filepath.Dir(fresh), "logs"))
+			candidate.sandbox.AddArtifactRoot(filepath.Join(filepath.Dir(fresh), "logs"))
+		}
 		quiesced = true
-		quiescenceRevision = revision
+		quiescenceRevision = scope.revision
 	}
 	defer func() {
 		if !quiesced || durable || policyPublished {
@@ -247,8 +238,7 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 	// Hand the complete candidate to the owner after preparation. The worker
 	// owns Abort until the owner acknowledges durable installation.
 	install := settingsCandidateInstall{ctx: ctx, candidate: candidate, binding: binding,
-		settings: settings, workflow: workflow, nextRevision: nextRevision,
-		planMode: planMode, permissionMode: permissionMode,
+		settings: settings, nextRevision: nextRevision,
 		policyTightened: policyTightened, sandboxPolicyChanged: sandboxPolicyChanged,
 		mcpCandidate: mcpCandidate, manager: manager, capabilityRevision: capabilityRevision,
 		result: make(chan error, 1)}
@@ -284,7 +274,7 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 // credential-free session settings projection. It intentionally uses the
 // currently active provider binding for model identity: reload/cd do not
 // silently switch a live model just because a project file changed.
-func (a *Agent) settingsForCandidateLocked(candidate *settingsCandidate, permissionMode permissions.Mode, planMode bool) session.Settings {
+func (a *Agent) settingsForCandidateLocked(candidate *settingsCandidate) session.Settings {
 	settings := a.sessionSettingsLocked()
 	if candidate == nil {
 		return settings
@@ -301,10 +291,11 @@ func (a *Agent) settingsForCandidateLocked(candidate *settingsCandidate, permiss
 		settings.Provider = binding.provider
 		settings.Endpoint, _ = sanitizeRequestEndpoint(binding.endpoint)
 	}
-	settings.PermissionPolicy = string(permissionMode)
+	settings.PermissionPolicy = string(candidate.mode)
 	settings.AlwaysAllow = append([]string(nil), candidate.cfg.AlwaysAllow...)
 	settings.AlwaysDeny = append([]string(nil), candidate.cfg.AlwaysDeny...)
 	settings.NetworkAccess = candidate.cfg.NetworkAccess
+	settings.LocalDevelopmentNetwork = candidate.cfg.LocalDevelopmentNetwork
 	settings.AdditionalDirectories = append([]string(nil), candidate.cfg.AdditionalDirectories...)
 	settings.AdditionalReadOnlyDirectories = append([]string(nil), candidate.cfg.AdditionalReadOnlyDirectories...)
 	settings.DisallowedDirectories = append([]string(nil), candidate.cfg.DisallowedDirectories...)
@@ -320,10 +311,6 @@ func (a *Agent) settingsForCandidateLocked(candidate *settingsCandidate, permiss
 	settings.Verbosity = candidate.cfg.Verbosity
 	settings.GenerationOptionsSet = true
 	settings.MaxToolOutputBytesPerTurn = candidate.cfg.MaxToolOutputBytesPerTurn
-	settings.ExecutionMode = "execute"
-	if planMode {
-		settings.ExecutionMode = "plan"
-	}
 	return settings
 }
 

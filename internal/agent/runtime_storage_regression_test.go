@@ -14,6 +14,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func TestExtraReviewForkPreservesImageBlobs(t *testing.T) {
@@ -32,7 +33,7 @@ func TestExtraReviewForkPreservesImageBlobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(cfg.SessionDir, id)
+	snapshot, err := archive.Load(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,43 +171,35 @@ func TestReviewManualCheckpointAttributesLaterRecordedWrites(t *testing.T) {
 }
 
 func TestReviewRound3ChildInteractionWakesParent(t *testing.T) {
-	for _, kind := range []string{"question", "plan"} {
-		t.Run(kind, func(t *testing.T) {
-			root := newRuntimeAgent(t)
-			child := newRuntimeAgent(t)
-			child.mu.Lock()
-			if kind == "question" {
-				child.decisions.pendingQuestion = &protocol.QuestionRequest{ID: "question1", Questions: clarificationQuestions()}
-			} else {
-				child.plan.pendingPlan = &PlanRequest{ID: "plan1", Plan: "implement feature"}
-			}
-			child.mu.Unlock()
-			s := root.services.supervisor
-			r := &managedRun{agent: child, parent: root, fact: session.ChildRunRecorded{Child: protocol.ChildSession{
-				SessionID: protocol.SessionID(child.conversation.sessionID), ParentSessionID: protocol.SessionID(root.conversation.sessionID), Purpose: childPurposeTask,
-				Run: protocol.RunView{ID: "run1", Status: "running", WaitPolicy: "notify"},
-			}}}
-			s.directory.Restore(r.fact.Child, r, true)
-			defer func() {
-				s.directory.Forget(protocol.SessionID(child.conversation.sessionID))
-			}()
-			rows, err := s.ListChildren(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(rows) != 1 {
-				t.Fatalf("wrong child fixture: %+v", rows)
-			}
-			if rows[0].Run.Status == "running" {
-				t.Errorf("child blocked on %s still advertised as running", kind)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			defer cancel()
-			got, err := root.waitAgentEvent(ctx)
-			if err != nil || got != "attention" {
-				t.Errorf("parent did not learn child %s needs input: got=%q err=%v", kind, got, err)
-			}
-		})
+	root := newRuntimeAgent(t)
+	child := newRuntimeAgent(t)
+	child.mu.Lock()
+	child.decisions.pendingQuestion = &protocol.QuestionRequest{ID: "question1", Questions: clarificationQuestions()}
+	child.mu.Unlock()
+	s := root.services.supervisor
+	r := &managedRun{agent: child, parent: root, fact: session.ChildRunRecorded{Child: protocol.ChildSession{
+		SessionID: protocol.SessionID(child.conversation.sessionID), ParentSessionID: protocol.SessionID(root.conversation.sessionID), Purpose: childPurposeTask,
+		Run: protocol.RunView{ID: "run1", Status: "running", WaitPolicy: "notify"},
+	}}}
+	s.directory.Restore(r.fact.Child, r, true)
+	defer func() {
+		s.directory.Forget(protocol.SessionID(child.conversation.sessionID))
+	}()
+	rows, err := s.ListChildren(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("wrong child fixture: %+v", rows)
+	}
+	if rows[0].Run.Status == "running" {
+		t.Errorf("child blocked on %s still advertised as running", "question")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	got, err := root.waitAgentEvent(ctx)
+	if err != nil || got != "attention" {
+		t.Errorf("parent did not learn child %s needs input: got=%q err=%v", "question", got, err)
 	}
 }
 
@@ -227,7 +220,7 @@ func TestHistoryInitializationByteLimitAndFailurePublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := LoadSession(cfg.SessionDir, id)
+	loaded, err := archive.Load(cfg.SessionDir, id)
 	if err != nil || len(loaded.History) < 3 {
 		t.Fatalf("byte-batched fork: %v", err)
 	}

@@ -1,7 +1,7 @@
 package hooks
 
 import (
-	"ccdp/internal/sandbox"
+	"ccdp/internal/testenv"
 	"context"
 	"os"
 	"path/filepath"
@@ -14,7 +14,7 @@ func TestHookRunFreezesPolicyBeforePayloadMutation(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"additionalContext":"original policy"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	policy := sandbox.New(dir)
+	policy := testenv.Sandbox(t, dir)
 	m := NewManager(Config{EventPreToolUse: []HookSpec{{Command: "cat message"}}}, Options{Workspace: dir, Sandbox: policy, FailClosed: true})
 	out := m.Run(context.Background(), EventPreToolUse, func(*Input) { policy.AddDisallowedDir(path) })
 	if out.AdditionalContext != "original policy" {

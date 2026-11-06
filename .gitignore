@@ -20,5 +20,6 @@
 *.swp
 .trae/
 
-# Keep maintained contracts and workflow documentation.
+# Local design notes; publish the user guide.
 /docs/*
+!/docs/usage.md

@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-
 	"sort"
 	"strconv"
 	"strings"
@@ -36,11 +35,8 @@ func (m Model) permissionPolicy() protocol.PermissionPolicy {
 	return protocol.PermissionPolicy{Mode: string(m.mode)}
 }
 
-// cyclePermissionMode advances the permission mode through the approval-strictness
-// ring on shift+tab, mirroring the sibling CLIs. Plan is deliberately excluded: it
-// is an execution-mode dimension toggled by /plan, not a permission level, so a
-// mode outside the ring restarts at default. The change applies immediately; the
-// local mode updates optimistically and the next snapshot confirms it.
+// cyclePermissionMode toggles auto/manual on shift+tab. The local mode updates
+// immediately and the next snapshot confirms the change.
 func (m *Model) cyclePermissionMode() tea.Cmd {
 	// m.mode is refreshed from every authoritative snapshot, so cycling off it
 	// keeps rapid shift+tab presses chained correctly even before the round-trip
@@ -50,7 +46,7 @@ func (m *Model) cyclePermissionMode() tea.Cmd {
 	if current == "" && m.hasSnapshot {
 		current = permissions.Mode(m.snapshot.Settings.Permission.Mode)
 	}
-	ring := []permissions.Mode{permissions.ModeDefault, permissions.ModeAcceptEdits, permissions.ModeBypass}
+	ring := permissions.ValidModes
 	next := ring[0]
 	for i, mode := range ring {
 		if mode == current {
@@ -62,7 +58,7 @@ func (m *Model) cyclePermissionMode() tea.Cmd {
 	policy.Mode = string(next)
 	m.mode = next
 	return m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
-		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+next.Label())
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+string(next))
 }
 
 func (m Model) availableModels() []string {
@@ -113,14 +109,7 @@ func (m *Model) executeSelectorAction(action selectorAction, optionID string) te
 		policy := m.permissionPolicy()
 		policy.Mode = optionID
 		return m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
-			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+permissions.Mode(optionID).Label())
-	case selectorPlan:
-		mode := protocol.ExecutionModeExecute
-		if optionID == "on" || optionID == string(protocol.ExecutionModePlan) {
-			mode = protocol.ExecutionModePlan
-		}
-		return m.submitCommand(protocol.Command{Type: protocol.CommandSetExecutionMode,
-			ExecutionMode: &protocol.SetExecutionMode{Mode: mode}}, "plan mode → "+optionID)
+			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+optionID)
 	case selectorRewind:
 		keep, ok := parseRewindOption(optionID)
 		if !ok {

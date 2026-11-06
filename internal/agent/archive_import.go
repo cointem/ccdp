@@ -8,11 +8,12 @@ import (
 
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 // memoryResumeEvents maps a caller-owned snapshot to typed facts while
 // retaining existing message IDs and timestamps. This is the explicit in-memory resume path; disk sessions replay their JSONL log.
-func memoryResumeEvents(snapshot SessionSnapshot) ([]session.Event, error) {
+func memoryResumeEvents(snapshot archive.Snapshot) ([]session.Event, error) {
 	_, importedAt := resumeTimestamps(snapshot)
 	events := make([]session.Event, 0, len(snapshot.History)*2+len(snapshot.PendingInputs)+3)
 	events = appendResumeStateFacts(events, snapshot)
@@ -28,7 +29,7 @@ func memoryResumeEvents(snapshot SessionSnapshot) ([]session.Event, error) {
 }
 
 // resumeTimestamps reconciles the snapshot's creation and import timestamps.
-func resumeTimestamps(snapshot SessionSnapshot) (createdAt, importedAt time.Time) {
+func resumeTimestamps(snapshot archive.Snapshot) (createdAt, importedAt time.Time) {
 	createdAt = snapshot.CreatedAt
 	if createdAt.IsZero() {
 		createdAt = snapshot.UpdatedAt
@@ -45,16 +46,12 @@ func resumeTimestamps(snapshot SessionSnapshot) (createdAt, importedAt time.Time
 
 // appendResumeStateFacts restores workspace/model/usage/memory/tasks/workflow
 // state as durable facts.
-func appendResumeStateFacts(events []session.Event, snapshot SessionSnapshot) []session.Event {
+func appendResumeStateFacts(events []session.Event, snapshot archive.Snapshot) []session.Event {
 	if snapshot.Workspace != "" || snapshot.Model != "" {
 		events = append(events, session.SettingsChanged{Revision: 1, Settings: session.Settings{Workspace: snapshot.Workspace, Model: snapshot.Model}})
 	}
-	if snapshot.Usage != (Usage{}) {
-		events = append(events, session.UsageChanged{Revision: 1, Usage: session.Usage{
-			InputTokens: int64(snapshot.Usage.InputTokens), OutputTokens: int64(snapshot.Usage.OutputTokens),
-			CachedTokens: int64(snapshot.Usage.CachedTokens), Cache: snapshot.Usage.Cache, TotalTokens: int64(snapshot.Usage.InputTokens + snapshot.Usage.OutputTokens),
-			TurnCount: int64(snapshot.Usage.TurnCount),
-		}})
+	if snapshot.Usage != (session.Usage{}) {
+		events = append(events, session.UsageChanged{Revision: 1, Usage: snapshot.Usage})
 	}
 	if snapshot.Settings != nil {
 		events = append(events, session.SettingsChanged{Revision: 1, Settings: *snapshot.Settings})
@@ -78,9 +75,6 @@ func appendResumeStateFacts(events []session.Event, snapshot SessionSnapshot) []
 			events = append(events, session.GoalChanged{Goal: protocol.CloneGoal(snapshot.Goal), AccountingID: id})
 		}
 	}
-	if snapshot.Workflow != nil {
-		events = append(events, session.WorkflowChanged{Workflow: *snapshot.Workflow})
-	}
 	if len(snapshot.Tasks) > 0 {
 		events = append(events, session.TasksChanged{Revision: 1, Tasks: append([]session.Task(nil), snapshot.Tasks...)})
 	}
@@ -89,7 +83,7 @@ func appendResumeStateFacts(events []session.Event, snapshot SessionSnapshot) []
 
 // appendResumeHistoryEvents preserves complete messages using the same typed
 // history fact used by fork initialization, including user images and metadata.
-func appendResumeHistoryEvents(events *[]session.Event, snapshot SessionSnapshot) error {
+func appendResumeHistoryEvents(events *[]session.Event, snapshot archive.Snapshot) error {
 	for i, original := range snapshot.History {
 		message := original
 		if message.ID == "" {
@@ -105,7 +99,7 @@ func appendResumeHistoryEvents(events *[]session.Event, snapshot SessionSnapshot
 }
 
 // appendResumePendingInputs restores queued inputs as InputQueued facts.
-func appendResumePendingInputs(events []session.Event, snapshot SessionSnapshot, importedAt time.Time) []session.Event {
+func appendResumePendingInputs(events []session.Event, snapshot archive.Snapshot, importedAt time.Time) []session.Event {
 	for _, input := range snapshot.PendingInputs {
 		if (strings.TrimSpace(input.Text) == "" && len(snapshot.PendingAttachments[string(input.ID)]) == 0) || input.ID == "" {
 			continue

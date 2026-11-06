@@ -1,7 +1,7 @@
 package agent
 
 import (
-	"context"
+	"errors"
 
 	"ccdp/internal/mcp"
 	"ccdp/internal/permissions"
@@ -10,15 +10,6 @@ import (
 	"ccdp/internal/sandbox"
 	"ccdp/internal/session"
 )
-
-// This file owns the single admission path for every runtime-mutable setting:
-// permission policy, sandbox policy, execution (plan) mode, model and reasoning
-// effort/verbosity. Every change applies to live runtime state immediately, idle
-// or mid-turn. This is safe because each provider request freezes its own config
-// and binding at the step boundary (captureStepRuntime) and each authorization
-// gate reads the mode atomically, so writing live state can never disturb the
-// in-flight request or a decision already made — it only governs the next one.
-// This mirrors how the sibling CLIs flip permission mode or model mid-run.
 
 // settingsMutator applies one command's delta to a settings target. It returns an
 // error to reject the command before anything is persisted.
@@ -39,7 +30,7 @@ func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutato
 	defer a.settingsCommitMu.Unlock()
 
 	a.mu.Lock()
-	if a.capabilities.capabilityRevoking {
+	if a.capabilities.capabilityRevoking && (cmd.Type == protocol.CommandSetSandboxPolicy || cmd.Type == protocol.CommandSetWorkspace || cmd.Type == protocol.CommandTrustProject) {
 		a.mu.Unlock()
 		return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox capability revocation is in progress")
 	}
@@ -63,7 +54,7 @@ func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutato
 	// widening changes can safely govern future calls without invalidating older,
 	// more restrictive children.
 	a.mu.Lock()
-	sandboxChanged := target.NetworkAccess != a.services.cfg.NetworkAccess ||
+	sandboxChanged := target.NetworkAccess != a.services.cfg.NetworkAccess || target.LocalDevelopmentNetwork != a.services.cfg.LocalDevelopmentNetwork ||
 		!equalStringSlice(target.AdditionalDirectories, a.services.cfg.AdditionalDirectories) ||
 		!equalStringSlice(target.AdditionalReadOnlyDirectories, a.services.cfg.AdditionalReadOnlyDirectories) ||
 		!equalStringSlice(target.DisallowedDirectories, a.services.cfg.DisallowedDirectories)
@@ -72,6 +63,7 @@ func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutato
 	if sandboxChanged && oldSandbox != nil {
 		nextConfig := cloneConfig(&oldConfig)
 		nextConfig.NetworkAccess = target.NetworkAccess
+		nextConfig.LocalDevelopmentNetwork = target.LocalDevelopmentNetwork
 		nextConfig.AdditionalDirectories = cloneStringSlice(target.AdditionalDirectories)
 		nextConfig.AdditionalReadOnlyDirectories = cloneStringSlice(target.AdditionalReadOnlyDirectories)
 		nextConfig.DisallowedDirectories = cloneStringSlice(target.DisallowedDirectories)
@@ -137,8 +129,10 @@ func (a *Agent) applySettingsCommand(cmd protocol.Command, mutate settingsMutato
 	}
 	a.applySettingsSnapshot(target, binding, nextRevision)
 	if sandboxTightened {
-		a.finishSandboxSettingsChange(true)
 		committed = true
+		if err := a.finishSandboxSettingsChange(true); err != nil {
+			return a.rejectedReceipt(cmd, protocol.ErrorInternal, "settings saved; execution remains paused: "+err.Error())
+		}
 	} else if sandboxChanged {
 		a.mu.Lock()
 		manager, policy := a.services.mcp, a.services.sandbox
@@ -167,32 +161,16 @@ func sandboxQuiescenceOwner(name string) bool {
 	}
 }
 
-// quiesceForSandboxSettingsChange is called while settingsCommitMu is held.
-// It freezes publication/admission, then releases that lock while it joins old
-// work. ownerCtx identifies an asynchronous reload/cd/trust operation that is
-// itself performing the transaction; it must not cancel or wait on itself.
-// closeMCP is false for candidate publication, which refreshes MCP atomically
-// after the old in-flight turn has drained.
-func (a *Agent) quiesceForSandboxSettingsChange(ownerCtx context.Context, closeMCP bool) (uint64, error) {
-	a.settingsCommitMu.Unlock()
-	defer a.settingsCommitMu.Lock()
-	scope, err := a.requestQuiescence(ownerCtx, closeMCP)
-	if err != nil {
-		return 0, err
-	}
-	return scope.revision, scope.drain()
-}
-
 // finishSandboxSettingsChange makes the next execution use a fresh manager
 // bound to the installed snapshot. On a persistence failure, it restores the
 // previous snapshot and grants; on success, grants are cleared because the
 // user-visible authorization boundary changed.
-func (a *Agent) finishSandboxSettingsChange(clearGrants bool) {
+func (a *Agent) finishSandboxSettingsChange(clearGrants bool) error {
 	a.mu.Lock()
 	if a.services.sandbox == nil {
 		a.capabilities.capabilityRevoking = true
 		a.mu.Unlock()
-		return
+		return errors.New("sandbox policy is unavailable")
 	}
 	replacement := mcp.NewManager()
 	replacement.SetSandbox(a.services.sandbox.Snapshot())
@@ -207,13 +185,10 @@ func (a *Agent) finishSandboxSettingsChange(clearGrants bool) {
 	if clearGrants {
 		clear(a.capabilities.capabilityGrants)
 		a.capabilities.capabilityRevision++
+		a.capabilities.revocationRevision++
 	}
-	resources := a.services.resources
-	a.capabilities.capabilityRevoking = false
 	a.mu.Unlock()
-	if resources != nil && resources.Processes != nil {
-		resources.Processes.ResumeAfterRevocation()
-	}
+	return a.resumeSandboxAdmission()
 }
 
 // applySettingsSnapshot mutates live runtime state to match a target snapshot. It
@@ -227,19 +202,16 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 	permModeChanged := target.PermissionPolicy != a.services.cfg.PermissionMode
 	allowChanged := !equalStringSlice(target.AlwaysAllow, a.services.cfg.AlwaysAllow)
 	denyChanged := !equalStringSlice(target.AlwaysDeny, a.services.cfg.AlwaysDeny)
-	sandboxChanged := target.NetworkAccess != a.services.cfg.NetworkAccess ||
+	sandboxChanged := target.NetworkAccess != a.services.cfg.NetworkAccess || target.LocalDevelopmentNetwork != a.services.cfg.LocalDevelopmentNetwork ||
 		!equalStringSlice(target.AdditionalDirectories, a.services.cfg.AdditionalDirectories) ||
 		!equalStringSlice(target.AdditionalReadOnlyDirectories, a.services.cfg.AdditionalReadOnlyDirectories) ||
 		!equalStringSlice(target.DisallowedDirectories, a.services.cfg.DisallowedDirectories)
-	wantPlan := target.ExecutionMode == "plan"
-	planChanged := wantPlan != a.plan.planMode
 	permChanged := permModeChanged || allowChanged || denyChanged
 
 	mode, modeErr := permissions.ParseMode(target.PermissionPolicy)
-	if modeErr != nil || mode == permissions.ModePlan {
-		// The snapshot's PermissionPolicy is always a concrete base mode; fall back
-		// to default if it is empty or unexpectedly plan-valued.
-		mode = permissions.ModeDefault
+	if modeErr != nil {
+		// Invalid persisted policies cannot grant automatic execution.
+		mode = permissions.ModeManual
 	}
 
 	// generation
@@ -258,23 +230,14 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 	a.services.baseCfg.AlwaysAllow = cloneStringSlice(target.AlwaysAllow)
 	a.services.baseCfg.AlwaysDeny = cloneStringSlice(target.AlwaysDeny)
 
-	// execution mode / plan
-	a.plan.planMode = wantPlan
-	a.plan.planBaseMode = mode
-	if planChanged {
-		if wantPlan {
-			a.lifecycle.workflow = protocol.WorkflowDrafting
-		} else {
-			a.lifecycle.workflow = protocol.WorkflowOff
-		}
-	}
-
 	// sandbox
 	a.services.cfg.NetworkAccess = target.NetworkAccess
+	a.services.cfg.LocalDevelopmentNetwork = target.LocalDevelopmentNetwork
 	a.services.cfg.AdditionalDirectories = cloneStringSlice(target.AdditionalDirectories)
 	a.services.cfg.AdditionalReadOnlyDirectories = cloneStringSlice(target.AdditionalReadOnlyDirectories)
 	a.services.cfg.DisallowedDirectories = cloneStringSlice(target.DisallowedDirectories)
 	a.services.baseCfg.NetworkAccess = target.NetworkAccess
+	a.services.baseCfg.LocalDevelopmentNetwork = target.LocalDevelopmentNetwork
 	a.services.baseCfg.AdditionalDirectories = cloneStringSlice(target.AdditionalDirectories)
 	a.services.baseCfg.AdditionalReadOnlyDirectories = cloneStringSlice(target.AdditionalReadOnlyDirectories)
 	a.services.baseCfg.DisallowedDirectories = cloneStringSlice(target.DisallowedDirectories)
@@ -287,6 +250,7 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 		// backend snapshot Revision, which may start above settingsRev and later
 		// be replaced by it.
 		a.capabilities.capabilityRevision++
+		a.capabilities.revocationRevision++
 	}
 
 	// model
@@ -308,22 +272,19 @@ func (a *Agent) applySettingsSnapshot(target session.Settings, binding *modelBin
 			AlwaysDeny:  cloneStringSlice(target.AlwaysDeny),
 		}
 	}
-	if permChanged || sandboxChanged || planChanged {
+	if permChanged || sandboxChanged {
 		a.syncSettingsPolicy(mode, policy)
 	}
 	if modelChanged {
-		a.emit(Event{Type: EventModeChanged, Text: "model:" + binding.model})
+		a.emit(protocol.EventView{Kind: protocol.EventStateChanged, Text: "model:" + binding.model})
 		a.emitStatus("model switched to %s", binding.model)
 	}
-	if planChanged {
-		a.emit(Event{Type: EventPlanModeChanged, PlanMode: wantPlan})
-		a.emitStatus("plan mode %s", map[bool]string{true: "on", false: "off"}[wantPlan])
-	} else if permChanged {
-		a.emit(Event{Type: EventModeChanged, Mode: mode})
+	if permChanged {
+		a.emit(protocol.EventView{Kind: protocol.EventStateChanged, PermissionMode: string(mode)})
 		a.emitStatus("permission policy updated")
 	}
 	if sandboxChanged {
-		a.emit(Event{Type: EventSandboxChanged})
+		a.emit(protocol.EventView{Kind: protocol.EventStateChanged})
 		a.emitStatus("sandbox policy updated (network: %v, read/write roots: %d, read-only roots: %d)",
 			target.NetworkAccess, len(target.AdditionalDirectories), len(target.AdditionalReadOnlyDirectories))
 	}

@@ -19,7 +19,7 @@ import (
 
 const (
 	// SchemaVersion is the only JSONL format this implementation writes.
-	SchemaVersion uint32 = 3
+	SchemaVersion uint32 = 4
 	// DefaultMaxTransactionBytes prevents a JSONL line from becoming an
 	// accidental unbounded allocation.
 	DefaultMaxTransactionBytes int64 = 8 << 20
@@ -533,6 +533,30 @@ func eventDedupeKey(event Event) string {
 	case *AttemptFinished:
 		if e != nil {
 			return dedupeID(EventTypeAttemptFinished, e.Attempt.AttemptID)
+		}
+	case ProcessRegistered:
+		return dedupeID(EventTypeProcessRegistered, e.State.ID)
+	case *ProcessRegistered:
+		if e != nil {
+			return dedupeID(EventTypeProcessRegistered, e.State.ID)
+		}
+	case ProcessStarted:
+		return dedupeID(EventTypeProcessStarted, e.State.ID)
+	case *ProcessStarted:
+		if e != nil {
+			return dedupeID(EventTypeProcessStarted, e.State.ID)
+		}
+	case ProcessFinished:
+		return dedupeID(EventTypeProcessFinished, e.State.ID)
+	case *ProcessFinished:
+		if e != nil {
+			return dedupeID(EventTypeProcessFinished, e.State.ID)
+		}
+	case ProcessReleased:
+		return dedupeID(EventTypeProcessReleased, e.ID)
+	case *ProcessReleased:
+		if e != nil {
+			return dedupeID(EventTypeProcessReleased, e.ID)
 		}
 	case ToolStarted:
 		return dedupeID(EventTypeToolStarted, e.TurnID+"/"+e.StepID+"/"+e.Call.CallID)

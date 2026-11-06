@@ -32,7 +32,7 @@ func TestTypedEventsRoundTrip(t *testing.T) {
 	args := json.RawMessage(`{"path":"README.md"}`)
 	events := []Event{
 		SessionCreated{SessionID: "typed", FormatVersion: 1, CreatedAt: now},
-		SettingsChanged{Revision: 1, Settings: Settings{Model: "model", Provider: "provider", ExecutionMode: "execute"}},
+		SettingsChanged{Revision: 1, Settings: Settings{Model: "model", Provider: "provider"}},
 		TurnStarted{TurnID: "turn", StepID: "step"},
 		RequestPrepared{Manifest: RequestManifest{RequestID: "request", Model: "model", Provider: "provider", AdapterVersion: "v1", Messages: []Message{testMessage("m1", "hello")}, Digest: "digest"}},
 		AssistantCommitted{TurnID: "turn", Message: testMessage("m2", "answer"), ToolCalls: []ToolCall{{CallID: "call", ToolID: "read", Arguments: args}}},

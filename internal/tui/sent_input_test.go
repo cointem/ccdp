@@ -21,7 +21,7 @@ func TestConsumedInputStaysClearedAfterTurnFailure(t *testing.T) {
 					t.Fatal("submit did not clear composer")
 				}
 				m.applyReceipt(protocol.Receipt{CommandID: sent.ID, SessionID: sent.SessionID, Status: protocol.ReceiptScheduled}, "")
-				m.handleProtocolEvent(protocol.EventView{Kind: protocol.EventUserMessage, SessionID: sent.SessionID, TurnID: "1", Text: "sent message"})
+				m.handleProtocolEvent(protocol.EventView{Kind: protocol.EventUserMessage, SessionID: sent.SessionID, MessageID: protocol.InputMessageID(sent.Input.ID), TurnID: "1", Text: "sent message"})
 				m.textarea.SetValue(nextDraft)
 				if nextDraft != "" {
 					m.inputImages = []protocol.InputImage{clipboardPNG(t)}

@@ -12,6 +12,8 @@ type CellStore struct {
 }
 type cellSourceVersion struct {
 	kind, text, status, name, args string
+	process                        uint64
+	processMerged                  bool
 	truncated                      bool
 	textOffset                     int
 	revision                       uint64
@@ -25,7 +27,7 @@ func (s *CellStore) reconcileVersions() {
 		cell := &s.items[i]
 		key := itemIdentity(*cell, i)
 		source := cellSourceVersion{kind: cell.kind, text: cell.text, status: cell.status,
-			name: cell.toolName, args: cell.toolArgsRaw, truncated: cell.toolTruncated, textOffset: cell.textOffset}
+			name: cell.toolName, args: cell.toolArgsRaw, truncated: cell.toolTruncated, textOffset: cell.textOffset, process: processVersion(*cell), processMerged: cell.processMerged}
 		old := s.versions[key]
 		source.revision = old.revision
 		if source != old || source.revision == 0 {
@@ -81,6 +83,12 @@ func (m *CellStore) compose() {
 			m.positions[cell.messageID] = pos
 		}
 	}
+	for i := range m.items {
+		cell := &m.items[i]
+		if cell.toolName == "Process" && cell.process != nil {
+			_, cell.processMerged = m.positions[cell.process.Origin]
+		}
+	}
 	m.reconcileVersions()
 }
 
@@ -94,7 +102,10 @@ func (s *CellStore) replace(cell historyCell) bool {
 	if s.confirmedItems[pos.confirmed].messageID != cell.messageID || s.items[pos.display].messageID != cell.messageID {
 		return false
 	}
-	source := cellSourceVersion{kind: cell.kind, text: cell.text, status: cell.status, name: cell.toolName, args: cell.toolArgsRaw, truncated: cell.toolTruncated, textOffset: cell.textOffset}
+	if cell.toolName == "Process" && cell.process != nil {
+		_, cell.processMerged = s.positions[cell.process.Origin]
+	}
+	source := cellSourceVersion{kind: cell.kind, text: cell.text, status: cell.status, name: cell.toolName, args: cell.toolArgsRaw, truncated: cell.toolTruncated, textOffset: cell.textOffset, process: processVersion(cell), processMerged: cell.processMerged}
 	key := itemIdentity(cell, pos.display)
 	old := s.versions[key]
 	source.revision = old.revision
@@ -107,4 +118,11 @@ func (s *CellStore) replace(cell historyCell) bool {
 	s.confirmedItems[pos.confirmed] = cell
 	s.items[pos.display] = cell
 	return true
+}
+
+func processVersion(cell historyCell) uint64 {
+	if cell.process == nil {
+		return 0
+	}
+	return cell.process.Revision
 }

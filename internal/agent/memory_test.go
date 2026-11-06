@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"ccdp/internal/projectmemory"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/tools"
 )
 
@@ -109,7 +111,7 @@ func TestProjectMemoryFrozenWithStep(t *testing.T) {
 	if _, err = store.Update(context.Background(), e, e.Body); err != nil {
 		t.Fatal(err)
 	}
-	text := joinSystemBlocks(step.systemBlocks)
+	text := fmt.Sprint(a.buildRequestForStep(step).Messages)
 	if !strings.Contains(text, "Old title") || strings.Contains(text, "New title") {
 		t.Fatalf("step memory changed: %s", text)
 	}
@@ -150,7 +152,7 @@ func TestProjectMemorySettingSurvivesResumeAndReload(t *testing.T) {
 	cfg := a.configSnapshot()
 	id := a.SessionID()
 	a.Close()
-	snapshot, err := LoadSession(cfg.SessionDir, id)
+	snapshot, err := archive.Load(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}

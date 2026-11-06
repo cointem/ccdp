@@ -20,7 +20,7 @@ func TestProfileFinalization(t *testing.T) {
 	}
 	cfg := config.Default()
 	cfg.Workspace, cfg.SessionDir = root, t.TempDir()
-	cfg.PermissionMode = "bypass"
+	cfg.PermissionMode = "auto"
 	cfg.EnableGuardian = config.BoolPtr(false)
 	cfg.EnableProjectMemory = true
 	cfg.ProjectMemoryDir = t.TempDir()

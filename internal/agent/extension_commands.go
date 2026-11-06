@@ -40,9 +40,6 @@ func (a *Agent) applyExternalCommand(cmd protocol.Command) protocol.Receipt {
 	command := formatExternalCommand(argv)
 	readOnly := externalCommandReadOnly(argv)
 	if !readOnly {
-		if a.inPlanMode() {
-			return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "mutating external commands are unavailable in plan mode")
-		}
 	}
 	if err := a.precheckCommand("Bash", map[string]any{"command": command}, permissions.KindShell); err != nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, err.Error())
@@ -154,9 +151,6 @@ func (a *Agent) applyApplyCommand(cmd protocol.Command) protocol.Receipt {
 			}
 			return "plan submitted for normal approval", nil
 		}
-		if a.inPlanMode() {
-			return "", errors.New("patch application is unavailable in plan mode")
-		}
 		args := map[string]any{"command": "git apply --whitespace=nowarn -"}
 		if err := a.precheckCommand("Bash", args, permissions.KindShell); err != nil {
 			return "", err
@@ -197,9 +191,6 @@ func (a *Agent) applyCheckpointCommand(cmd protocol.Command) protocol.Receipt {
 			b, e := json.MarshalIndent(map[string]any{"recovery_points": points}, "", "  ")
 			return string(b), e
 		case protocol.CheckpointCreate:
-			if a.inPlanMode() {
-				return "", errors.New("checkpoint creation is unavailable in plan mode")
-			}
 			p, e := a.captureRecoveryPoint(ctx, string(cmd.ID), cmd.Checkpoint.Summary)
 			if e != nil {
 				return "", e
@@ -223,9 +214,6 @@ func (a *Agent) applyCheckpointCommand(cmd protocol.Command) protocol.Receipt {
 func (a *Agent) applyExportCommand(cmd protocol.Command) protocol.Receipt {
 	if cmd.Export == nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "export payload is required")
-	}
-	if a.inPlanMode() {
-		return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "export is unavailable in plan mode")
 	}
 	a.mu.Lock()
 	path := cmd.Export.Path
@@ -256,9 +244,6 @@ func (a *Agent) applyExportCommand(cmd protocol.Command) protocol.Receipt {
 func (a *Agent) applyInitCommand(cmd protocol.Command) protocol.Receipt {
 	if cmd.Init == nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "init payload is required")
-	}
-	if a.inPlanMode() {
-		return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "init is unavailable in plan mode")
 	}
 	a.mu.Lock()
 	path, err := a.commandPathLocked(filepath.Join(a.services.cfg.Workspace, workspace.InstructionFile), true)
@@ -319,9 +304,6 @@ func (a *Agent) applyWorkflowCommand(cmd protocol.Command) protocol.Receipt {
 		}
 		return a.scheduleOperation(cmd, "review", func(ctx context.Context) (string, error) { return a.launchReview(cmd) }, operationConcurrent)
 	case protocol.WorkflowRestore:
-		if a.inPlanMode() && cmd.Workflow.Action != "list" && cmd.Workflow.Action != "prepare" {
-			return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "restore is unavailable in plan mode")
-		}
 		return a.scheduleCommandOperation(cmd, "restore", func(ctx context.Context) (string, error) { return a.runRestore(ctx, cmd) })
 	case protocol.WorkflowMerge:
 		return a.scheduleCommandOperation(cmd, "merge child", func(ctx context.Context) (string, error) { return a.runMergeChild(ctx, cmd) })
@@ -341,9 +323,6 @@ func (a *Agent) applyWorkflowCommand(cmd protocol.Command) protocol.Receipt {
 			return fmt.Sprintf("%d files in the complete accessible inventory. Use Glob/LS for paths and Rg for text. CodeNavigate supports outline, definition and references when a trusted language server is configured.", len(paths)), nil
 		})
 	case protocol.WorkflowCommitPushPR:
-		if a.inPlanMode() {
-			return a.rejectedReceipt(cmd, protocol.ErrorInvalidState, "commit/push/PR is unavailable in plan mode")
-		}
 		return a.scheduleCommandOperation(cmd, "delivery", func(ctx context.Context) (string, error) {
 			if cmd.Workflow.Action == "apply" || cmd.Workflow.Action == "resume" {
 				return a.applyDelivery(ctx, cmd)

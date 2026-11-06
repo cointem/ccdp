@@ -7,6 +7,7 @@ import (
 
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func persistedTestGoal() *protocol.Goal {
@@ -34,7 +35,7 @@ func TestGoalPersistenceReplayAndClear(t *testing.T) {
 	}
 	original := protocol.CloneGoal(goal)
 	goal.Objective = "caller mutation"
-	snapshot, err := SessionSnapshotProjection(p, "goal-replay")
+	snapshot, err := archive.FromStore(p, "goal-replay")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,14 +43,14 @@ func TestGoalPersistenceReplayAndClear(t *testing.T) {
 		t.Fatalf("goal = %+v", snapshot.Goal)
 	}
 	snapshot.Goal.Objective = "snapshot mutation"
-	snapshot, err = SessionSnapshotProjection(p, "goal-replay")
+	snapshot, err = archive.FromStore(p, "goal-replay")
 	if err != nil || !reflect.DeepEqual(snapshot.Goal, original) {
 		t.Fatalf("snapshot alias: %+v, %v", snapshot, err)
 	}
 	if err := p.PersistGoal(nil); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err = SessionSnapshotProjection(p, "goal-replay")
+	snapshot, err = archive.FromStore(p, "goal-replay")
 	if err != nil || snapshot.Goal != nil {
 		t.Fatalf("clear = %+v, %v", snapshot.Goal, err)
 	}
@@ -57,7 +58,7 @@ func TestGoalPersistenceReplayAndClear(t *testing.T) {
 
 func TestGoalSnapshotResumePreservesAccounting(t *testing.T) {
 	goal := persistedTestGoal()
-	snapshot := SessionSnapshot{ID: "goal-resume", CreatedAt: goal.CreatedAt, UpdatedAt: goal.UpdatedAt, Goal: goal, GoalAccountingIDs: map[string]bool{"request-2": true, "request-1": true}}
+	snapshot := archive.Snapshot{ID: "goal-resume", CreatedAt: goal.CreatedAt, UpdatedAt: goal.UpdatedAt, Goal: goal, GoalAccountingIDs: map[string]bool{"request-2": true, "request-1": true}}
 	events, err := memoryResumeEvents(snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +68,7 @@ func TestGoalSnapshotResumePreservesAccounting(t *testing.T) {
 	if _, err := store.Commit(session.Beginning, session.Batch{TransactionID: "resume", Events: events}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := SessionSnapshotProjection(store, snapshot.ID)
+	got, err := archive.FromStore(store, snapshot.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +80,7 @@ func TestGoalSnapshotResumePreservesAccounting(t *testing.T) {
 	if _, err := store.Commit(store.CurrentCursor(), session.Batch{TransactionID: "next-goal", Events: []session.Event{session.GoalChanged{Goal: next, AccountingID: "next-request"}}}); err != nil {
 		t.Fatal(err)
 	}
-	got, err = SessionSnapshotProjection(store, snapshot.ID)
+	got, err = archive.FromStore(store, snapshot.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +107,7 @@ func TestGoalForkStartsPausedWithIndependentAccounting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(cfg.SessionDir, id)
+	snapshot, err := archive.Load(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,10 +135,10 @@ func TestGoalResumePausesAndAppliesPendingEdit(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := testPersistenceConfig(t)
 			goal := persistedTestGoal()
-			var snapshot *SessionSnapshot
+			var snapshot *archive.Snapshot
 			if memory {
 				cfg.NoSessionPersistence = true
-				snapshot = &SessionSnapshot{ID: "goal-resume-active", CreatedAt: goal.CreatedAt, UpdatedAt: goal.UpdatedAt, Goal: goal, GoalAccountingIDs: map[string]bool{"request-1": true}}
+				snapshot = &archive.Snapshot{ID: "goal-resume-active", CreatedAt: goal.CreatedAt, UpdatedAt: goal.UpdatedAt, Goal: goal, GoalAccountingIDs: map[string]bool{"request-1": true}}
 			} else {
 				p, err := openSessionPersistence(&cfg, "goal-resume-active", goal.CreatedAt)
 				if err != nil {
@@ -149,7 +150,7 @@ func TestGoalResumePausesAndAppliesPendingEdit(t *testing.T) {
 				if err = p.Close(); err != nil {
 					t.Fatal(err)
 				}
-				snapshot, err = LoadSession(cfg.SessionDir, "goal-resume-active")
+				snapshot, err = archive.Load(cfg.SessionDir, "goal-resume-active")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -167,7 +168,7 @@ func TestGoalResumePausesAndAppliesPendingEdit(t *testing.T) {
 			if got == nil || got.Status != protocol.GoalPaused || got.Objective != goal.PendingObjective || got.PendingObjective != "" || got.TokensUsed != goal.TokensUsed || got.ModelCalls != goal.ModelCalls || !ids["request-1"] || busy {
 				t.Fatalf("resume = %+v ids=%+v busy=%v", got, ids, busy)
 			}
-			persisted, err := a.persistenceHandle().snapshotFromOwnedStore(a.SessionID())
+			persisted, err := archive.FromStore(a.persistenceHandle(), a.SessionID())
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -32,17 +32,17 @@ type ReviewFinding struct {
 	Evidence    string `json:"evidence"`
 }
 type ReviewReport struct {
-	DurationMs     int64           `json:"duration_ms,omitempty"`
-	ID             string          `json:"id"`
-	SnapshotID     string          `json:"snapshot_id"`
-	BaseSnapshotID string          `json:"base_snapshot_id"`
-	Scope          string          `json:"scope"`
-	Status         string          `json:"status"`
-	Findings       []ReviewFinding `json:"findings"`
-	Reviewed       []string        `json:"reviewed"`
-	Skipped        []string        `json:"skipped"`
-	Summary        string          `json:"summary"`
-	Usage          Usage           `json:"usage"`
+	DurationMs     int64                  `json:"duration_ms,omitempty"`
+	ID             string                 `json:"id"`
+	SnapshotID     string                 `json:"snapshot_id"`
+	BaseSnapshotID string                 `json:"base_snapshot_id"`
+	Scope          string                 `json:"scope"`
+	Status         string                 `json:"status"`
+	Findings       []ReviewFinding        `json:"findings"`
+	Reviewed       []string               `json:"reviewed"`
+	Skipped        []string               `json:"skipped"`
+	Summary        string                 `json:"summary"`
+	Usage          protocol.UsageSnapshot `json:"usage"`
 }
 
 // codingGit preserves stdout bytes (including NUL and trailing newlines) and

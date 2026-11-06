@@ -12,13 +12,13 @@ func TestRegressionProcessSplitUTF8(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	p := &managedProcess{log: f, logPath: f.Name(), done: make(chan struct{}), changed: make(chan struct{})}
+	p := &managedProcess{log: f, logPath: f.Name(), done: make(chan struct{})}
 	b := []byte("中")
 	p.appendOutput(b[:1])
-	out, err := p.view(&Context{Context: context.Background()}, 1, 0, 100, 0)
+	out, err := p.view(&Context{Context: context.Background()}, "p.test", 0, 100)
 	first := decodeProcess(t, out, err)
 	p.appendOutput(b[1:])
-	out, err = p.view(&Context{Context: context.Background()}, 1, first.Next, 100, 0)
+	out, err = p.view(&Context{Context: context.Background()}, "p.test", first.Next, 100)
 	next := decodeProcess(t, out, err)
 	if first.Output+next.Output != "中" {
 		t.Fatalf("split rune corrupted: first=%+v next=%+v", first, next)
@@ -33,7 +33,7 @@ func TestProcessIncompleteUTF8AtPermanentLogEnd(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer f.Close()
-			p := &managedProcess{log: f, logPath: f.Name(), done: make(chan struct{}), changed: make(chan struct{})}
+			p := &managedProcess{log: f, logPath: f.Name(), done: make(chan struct{})}
 			offset := 0
 			if capped {
 				offset = maxProcessLog - 1
@@ -44,7 +44,10 @@ func TestProcessIncompleteUTF8AtPermanentLogEnd(t *testing.T) {
 			}
 			p.appendOutput([]byte{0xe4})
 			p.exited = !capped
-			out, err := p.view(&Context{Context: context.Background()}, 1, offset, 100, 0)
+			if p.exited {
+				close(p.done)
+			}
+			out, err := p.view(&Context{Context: context.Background()}, "p.test", offset, 100)
 			view := decodeProcess(t, out, err)
 			if view.Next != offset+1 || view.Output != "�" {
 				t.Fatalf("permanent incomplete byte stalled: %+v", view)

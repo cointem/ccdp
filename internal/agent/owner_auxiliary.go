@@ -40,10 +40,7 @@ func (a *Agent) commitAuxiliary(transactionID string, fact session.Event) (sessi
 		return session.CommitResult{}, err
 	}
 	r := auxiliaryFactPrepared{transactionID: transactionID, fact: frozen, result: make(chan auxiliaryCommitResult, 1)}
-	if a.owner == nil {
-		out := a.commitAuxiliaryOwned(r)
-		return out.commit, out.err
-	}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- r:
@@ -86,10 +83,7 @@ func (a *Agent) setDirectoryAccessOwned(r directoryAccessRequested) {
 }
 func (a *Agent) setDirectoryAccess(dir string, denied bool) {
 	r := directoryAccessRequested{dir: dir, denied: denied, done: make(chan struct{})}
-	if a.owner == nil {
-		a.setDirectoryAccessOwned(r)
-		return
-	}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- r:
@@ -109,9 +103,6 @@ type turnStartRequested struct {
 
 func (turnStartRequested) ownerControlMessage() {}
 func (a *Agent) startTurnJournal(turnID, stepID, inputID string) error {
-	if a.owner == nil {
-		return a.persistTurnStarted(turnID, stepID, inputID)
-	}
 	r := turnStartRequested{turnID, stepID, inputID, make(chan error, 1)}
 	select {
 	case a.owner.control <- r:

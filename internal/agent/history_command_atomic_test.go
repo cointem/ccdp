@@ -8,6 +8,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func historyCommandCases() []protocol.Command {
@@ -118,7 +119,7 @@ func TestHistoryCommandLostReceiptDoesNotRepeatAfterResume(t *testing.T) {
 			if err := a.CloseContext(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			snapshot, err := LoadSession(cfg.SessionDir, a.SessionID())
+			snapshot, err := archive.Load(cfg.SessionDir, a.SessionID())
 			if err != nil {
 				t.Fatal(err)
 			}

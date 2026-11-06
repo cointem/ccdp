@@ -3,7 +3,7 @@ package permissions
 import "testing"
 
 func TestWriteCapableCommandsRequireApproval(t *testing.T) {
-	m := NewManager(ModeDefault, Policy{})
+	m := NewManager(ModeManual, Policy{})
 	for _, command := range []string{
 		"touch marker", "env touch marker", "git diff",
 		"git diff --ext-diff", "git diff --textconv",

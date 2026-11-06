@@ -50,7 +50,7 @@ func TestNormalizeCopiesPolicyPayloadsAndPreservesExplicitEmpty(t *testing.T) {
 	allow := []string{"Read:*"}
 	deny := []string{}
 	command := Command{ID: "policy", SessionID: "session", Type: CommandSetPermissionPolicy,
-		PermissionPolicy: &SetPermissionPolicy{Policy: PermissionPolicy{Mode: "default", AlwaysAllow: allow, AlwaysDeny: deny}}}
+		PermissionPolicy: &SetPermissionPolicy{Policy: PermissionPolicy{Mode: "manual", AlwaysAllow: allow, AlwaysDeny: deny}}}
 	normalized, err := command.Normalize()
 	if err != nil {
 		t.Fatal(err)

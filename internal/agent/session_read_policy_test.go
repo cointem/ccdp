@@ -15,7 +15,7 @@ import (
 	"ccdp/internal/tools"
 )
 
-func TestSessionDataReadableButProtectedFromWrites(t *testing.T) {
+func TestOtherSessionDataIsPrivate(t *testing.T) {
 	for _, nested := range []bool{false, true} {
 		for _, rebuild := range []bool{false, true} {
 			t.Run(fmt.Sprintf("nested=%v/rebuild=%v", nested, rebuild), func(t *testing.T) {
@@ -39,19 +39,19 @@ func TestSessionDataReadableButProtectedFromWrites(t *testing.T) {
 					t.Fatal(err)
 				}
 				sb := makePolicy()
-				r := tools.NewResources("current", filepath.Join(sessions, "current"))
+				r := tools.NewResources("current", filepath.Join(sessions, "current"), t.TempDir()+"/runtime")
 				defer r.Close()
 				ctx := r.Context(nil, workspace, sb)
 				ctx.Args = map[string]any{"file_path": path}
-				if out, err := executeToolText(tools.NewReadTool(), ctx); err != nil || !strings.Contains(out, "saved output") {
-					t.Fatalf("session read: %q, %v", out, err)
+				if out, err := executeToolText(tools.NewReadTool(), ctx); err == nil {
+					t.Fatalf("other session data was exposed: %q", out)
 				}
 				ctx.Args = map[string]any{"file_path": path, "mode": "replace", "content": "changed"}
 				if _, err := executeToolText(tools.NewWriteTool(), ctx); err == nil {
 					t.Fatal("session state became writable")
 				}
 				cfg.DisallowedDirectories = []string{sessions}
-				ctx.Sandbox = makePolicy()
+				ctx = r.Context(nil, workspace, makePolicy())
 				ctx.Args = map[string]any{"file_path": path}
 				if _, err := executeToolText(tools.NewReadTool(), ctx); err == nil {
 					t.Fatal("explicit user denial was ignored")
@@ -65,7 +65,7 @@ func TestWebFetchContinuationReadableAfterSessionResume(t *testing.T) {
 	workspace := t.TempDir()
 	cfg := &config.Config{Workspace: workspace, SessionDir: filepath.Join(t.TempDir(), "sessions")}
 	sessionDir := filepath.Join(cfg.SessionDir, "current")
-	r := tools.NewResources("current", sessionDir)
+	r := tools.NewResources("current", sessionDir, t.TempDir()+"/runtime")
 	defer r.Close()
 	ctx := r.Context(nil, workspace, cfg.Sandbox())
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -91,7 +91,7 @@ func TestWebFetchContinuationReadableAfterSessionResume(t *testing.T) {
 	for _, resume := range []bool{false, true} {
 		if resume {
 			_ = r.Close()
-			r = tools.NewResources("current", sessionDir)
+			r = tools.NewResources("current", sessionDir, t.TempDir()+"/runtime")
 			defer r.Close()
 			ctx = r.Context(nil, workspace, buildSandbox(cfg, workspace))
 		}

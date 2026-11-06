@@ -16,6 +16,14 @@ func (p *State) Clone() *State {
 		return nil
 	}
 	q := *p
+	q.ProcessOrder = slices.Clone(p.ProcessOrder)
+	q.pendingProcesses = slices.Clone(p.pendingProcesses)
+	q.Processes = make(map[string]Process, len(p.Processes))
+	for id, v := range p.Processes {
+		v.State = *protocol.CloneProcessState(&v.State)
+		v.Result = cloneRef(v.Result)
+		q.Processes[id] = v
+	}
 	q.Settings = p.Settings.Clone()
 	q.History = messages.Clone(p.History)
 	q.historyStep = slices.Clone(p.historyStep)
@@ -79,6 +87,14 @@ func cloneStarted(v session.ToolStarted) session.ToolStarted {
 }
 
 func cloneFinished(v session.ToolFinished) session.ToolFinished {
+	v.Image = cloneRef(v.Image)
+	v.Process = protocol.CloneProcessOutput(v.Process)
+	v.CompletionIDs = slices.Clone(v.CompletionIDs)
+	if v.Failure != nil {
+		failure := *v.Failure
+		failure.Resources = append([]protocol.CapabilityRequest(nil), failure.Resources...)
+		v.Failure = &failure
+	}
 	if v.Call != nil {
 		call := *v.Call
 		call.Arguments = slices.Clone(call.Arguments)

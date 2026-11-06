@@ -2,9 +2,9 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"sort"
 
+	"ccdp/internal/execution"
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 )
@@ -47,11 +47,8 @@ func (a *Agent) snapshotLocked() protocol.SessionView {
 func (a *Agent) stateLocked() protocol.SessionState {
 	settings := a.settingsSnapshotLocked()
 	view := protocol.SessionState{SessionID: protocol.SessionID(a.conversation.sessionID), Revision: a.revisionLocked(),
-		Phase: a.lifecycle.phase, Workflow: a.lifecycle.workflow, Busy: a.turn.busy, Closing: a.lifecycle.closing,
-		Settings: settings, Usage: protocol.UsageSnapshot{
-			InputTokens: a.runtimeUsageLocked().InputTokens, OutputTokens: a.runtimeUsageLocked().OutputTokens,
-			CachedTokens: a.runtimeUsageLocked().CachedTokens, Cache: a.runtimeUsageLocked().Cache, TurnCount: a.runtimeUsageLocked().TurnCount,
-		}}
+		Phase: a.lifecycle.phase, Busy: a.turn.busy, Closing: a.lifecycle.closing,
+		Settings: settings, Usage: a.runtimeUsageLocked()}
 	view.HistoryLength = len(a.historyLocked())
 	if a.services.supervisor != nil && a.services.supervisor.root == a {
 		view.OutstandingWork = int(a.services.supervisor.directory.Outstanding())
@@ -63,6 +60,18 @@ func (a *Agent) stateLocked() protocol.SessionState {
 	view.Goal = protocol.CloneGoal(a.conversation.durable.Goal)
 	view.SandboxRuntime.NetworkProxy = a.services.cfg.NetworkProxy
 	view.SandboxRuntime.RevocationPending = a.capabilities.capabilityRevoking
+	view.SandboxRuntime.EnvironmentID = messages.StableID("environment", struct{ Executor, Owner, Workspace string }{a.services.cfg.ExecutorID, a.conversation.sessionID, a.services.cfg.Workspace})
+	if a.services.resources != nil {
+		view.SandboxRuntime.ScratchDir = a.services.resources.ScratchDir()
+	}
+	view.SandboxRuntime.State, view.SandboxRuntime.Detail = execution.EnvironmentStatus(a.services.sandbox)
+	if a.capabilities.capabilityRevoking {
+		view.SandboxRuntime.State = "quarantined"
+		view.SandboxRuntime.Detail = "execution cleanup is unconfirmed"
+		if a.services.sandbox != nil && a.services.sandbox.QuarantineStore != "" {
+			view.SandboxRuntime.Detail += "; quarantine store: " + a.services.sandbox.QuarantineStore
+		}
+	}
 	if a.services.sandbox != nil {
 		view.SandboxRuntime.ExternalExecutionPossible = a.services.sandbox.ExternalExecutionPossible()
 	}
@@ -73,14 +82,8 @@ func (a *Agent) stateLocked() protocol.SessionState {
 		return capabilityKey(view.SandboxRuntime.SessionGrants[i]) < capabilityKey(view.SandboxRuntime.SessionGrants[j])
 	})
 	view.PendingInputs = append([]protocol.InputView(nil), a.conversation.durable.PendingInputViews()...)
-	if a.decisions.pendingApproval != nil {
-		view.Approval = &protocol.ApprovalView{ID: a.decisions.pendingApproval.ID, Tool: a.decisions.pendingApproval.Tool,
-			Reason: a.decisions.pendingApproval.Reason, Args: approvalArgsView(a.decisions.pendingApproval), Capabilities: append([]protocol.CapabilityRequest(nil), a.decisions.pendingApproval.Capabilities...)}
-	}
-	view.Question = protocol.CloneQuestionRequest(a.decisions.pendingQuestion)
-	if a.plan.pendingPlan != nil {
-		view.Plan = &protocol.PlanView{ID: a.plan.pendingPlan.ID, Text: a.plan.pendingPlan.Plan, Version: planViewVersion}
-	}
+	decisions := protocol.CloneSessionView(protocol.SessionView{Approval: a.decisions.pendingApproval, Question: a.decisions.pendingQuestion})
+	view.Approval, view.Question = decisions.Approval, decisions.Question
 	if a.lifecycle.lastTurn != nil {
 		outcome := *a.lifecycle.lastTurn
 		view.LastTurn = &outcome
@@ -150,27 +153,13 @@ func (a *Agent) contextTokenBreakdownLocked() (used, messageTokens, toolTokens i
 	return used, messageTokens, toolTokens
 }
 
-func approvalArgsView(req *ApprovalRequest) json.RawMessage {
-	if req == nil || req.Command == "" {
-		return nil
-	}
-	if json.Valid([]byte(req.Command)) {
-		return append(json.RawMessage(nil), req.Command...)
-	}
-	b, err := json.Marshal(map[string]string{"command": req.Command})
-	if err != nil {
-		return nil
-	}
-	return b
-}
-
 func (a *Agent) settingsSnapshotLocked() protocol.SettingsSnapshot {
 	b := a.modelsState.activeBinding
 	return protocol.SettingsSnapshot{Revision: a.sequences.settingsRev, Workspace: a.services.cfg.Workspace,
-		Model:         protocol.ModelBinding{Model: b.model, Provider: b.provider, Endpoint: b.endpoint, BindingVersion: b.version},
-		ExecutionMode: map[bool]protocol.ExecutionMode{true: protocol.ExecutionModePlan, false: protocol.ExecutionModeExecute}[a.plan.planMode],
-		Permission:    protocol.PermissionPolicy{Mode: string(a.services.perms.CurrentMode()), AlwaysAllow: append([]string(nil), a.services.cfg.AlwaysAllow...), AlwaysDeny: append([]string(nil), a.services.cfg.AlwaysDeny...), Revision: a.sequences.settingsRev},
-		Sandbox: protocol.SandboxPolicy{NetworkAccess: a.services.cfg.NetworkAccess,
+		Model: protocol.ModelBinding{Model: b.model, Provider: b.provider, Endpoint: b.endpoint, BindingVersion: b.version},
+
+		Permission: protocol.PermissionPolicy{Mode: string(a.services.perms.CurrentMode()), AlwaysAllow: append([]string(nil), a.services.cfg.AlwaysAllow...), AlwaysDeny: append([]string(nil), a.services.cfg.AlwaysDeny...), Revision: a.sequences.settingsRev},
+		Sandbox: protocol.SandboxPolicy{NetworkAccess: a.services.cfg.NetworkAccess, LocalDevelopmentNetwork: a.services.cfg.LocalDevelopmentNetwork,
 			AdditionalDirectories:         append([]string(nil), a.services.cfg.AdditionalDirectories...),
 			AdditionalReadOnlyDirectories: append([]string(nil), a.services.cfg.AdditionalReadOnlyDirectories...),
 			DisallowedDirectories:         append([]string(nil), a.services.cfg.DisallowedDirectories...), Revision: a.sequences.settingsRev},

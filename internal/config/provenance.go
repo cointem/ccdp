@@ -73,7 +73,7 @@ var configFieldNames = []string{
 	"keep_after_compact", "bash_timeout_seconds", "max_turns",
 	"fallback_model",
 	"max_tool_output_bytes_per_turn", "enable_guardian", "enable_project_memory", "project_memory_dir", "memory_read_only", "memory_history",
-	"max_parallel_tools", "max_concurrent_agents", "code_mode_enabled", "sandbox_limits", "network_access", "network_proxy",
+	"max_parallel_tools", "max_concurrent_agents", "code_mode_enabled", "sandbox_limits", "network_access", "network_proxy", "local_development_network",
 	"additional_directories", "additional_read_only_directories", "disallowed_directories",
 	"hooks", "enable_web_tools", "tools", "mcp_servers", "session_dir",
 	"verbose", "debug", "session_id", "no_session_persistence", "review", "delivery", "automatic_checkpoints", "language_servers",
@@ -298,6 +298,8 @@ func (c *Config) ApplyCLIOverride(field string, value any) error {
 		err = setString(&c.NetworkProxy)
 	case "network_access":
 		err = setBool(&c.NetworkAccess)
+	case "local_development_network":
+		err = setBool(&c.LocalDevelopmentNetwork)
 	case "additional_directories":
 		err = setStrings(&c.AdditionalDirectories)
 	case "additional_read_only_directories":
@@ -418,6 +420,8 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			dst.NetworkProxy = src.NetworkProxy
 		case "network_access":
 			dst.NetworkAccess = src.NetworkAccess
+		case "local_development_network":
+			dst.LocalDevelopmentNetwork = src.LocalDevelopmentNetwork
 		case "additional_directories":
 			dst.AdditionalDirectories = append([]string(nil), src.AdditionalDirectories...)
 		case "additional_read_only_directories":
@@ -657,29 +661,33 @@ func ProjectExecutableFingerprint(root string, cfg Config) (string, error) {
 		return "", err
 	}
 	payload := struct {
-		Root                  string                              `json:"root"`
-		LanguageServers       map[string]workspace.LanguageServer `json:"language_servers"`
-		Delivery              DeliveryConfig                      `json:"delivery"`
-		Hooks                 map[string][]hooks.HookSpec         `json:"hooks"`
-		Tools                 []ToolSpec                          `json:"tools"`
-		MCPServers            map[string]mcp.ServerConfig         `json:"mcp_servers"`
-		AlwaysAllow           []string                            `json:"always_allow"`
-		EnableWebTools        *bool                               `json:"enable_web_tools"`
-		CodeModeEnabled       bool                                `json:"code_mode_enabled,omitempty"`
-		AdditionalDirectories []string                            `json:"additional_directories"`
-		NetworkAccess         bool                                `json:"network_access"`
+		Root                    string                              `json:"root"`
+		LanguageServers         map[string]workspace.LanguageServer `json:"language_servers"`
+		Delivery                DeliveryConfig                      `json:"delivery"`
+		Hooks                   map[string][]hooks.HookSpec         `json:"hooks"`
+		Tools                   []ToolSpec                          `json:"tools"`
+		MCPServers              map[string]mcp.ServerConfig         `json:"mcp_servers"`
+		AlwaysAllow             []string                            `json:"always_allow"`
+		EnableWebTools          *bool                               `json:"enable_web_tools"`
+		CodeModeEnabled         bool                                `json:"code_mode_enabled,omitempty"`
+		AdditionalDirectories   []string                            `json:"additional_directories"`
+		NetworkAccess           bool                                `json:"network_access"`
+		LocalDevelopmentNetwork bool                                `json:"local_development_network"`
+		EnvironmentVersion      int                                 `json:"environment_version"`
 	}{
-		Root:                  normalized,
-		Delivery:              cfg.Delivery.Clone(),
-		LanguageServers:       cloneLanguageServers(cfg.LanguageServers),
-		Hooks:                 cloneHookSpecs(cfg.Hooks),
-		Tools:                 cloneToolsForFingerprint(cfg.Tools),
-		MCPServers:            cloneMCPServers(cfg.MCPServers),
-		AlwaysAllow:           append([]string(nil), cfg.AlwaysAllow...),
-		EnableWebTools:        cloneBool(cfg.EnableWebTools),
-		CodeModeEnabled:       cfg.CodeModeEnabled,
-		AdditionalDirectories: append([]string(nil), cfg.AdditionalDirectories...),
-		NetworkAccess:         cfg.NetworkAccess,
+		Root:                    normalized,
+		Delivery:                cfg.Delivery.Clone(),
+		LanguageServers:         cloneLanguageServers(cfg.LanguageServers),
+		Hooks:                   cloneHookSpecs(cfg.Hooks),
+		Tools:                   cloneToolsForFingerprint(cfg.Tools),
+		MCPServers:              cloneMCPServers(cfg.MCPServers),
+		AlwaysAllow:             append([]string(nil), cfg.AlwaysAllow...),
+		EnableWebTools:          cloneBool(cfg.EnableWebTools),
+		CodeModeEnabled:         cfg.CodeModeEnabled,
+		AdditionalDirectories:   append([]string(nil), cfg.AdditionalDirectories...),
+		NetworkAccess:           cfg.NetworkAccess,
+		LocalDevelopmentNetwork: cfg.LocalDevelopmentNetwork,
+		EnvironmentVersion:      1,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

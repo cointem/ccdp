@@ -83,8 +83,6 @@ func (a *Agent) dispatchCommandForTurn(cmd protocol.Command, owned bool, cancell
 		return a.applyAnswerQuestion(normalized)
 	case protocol.CommandSetModel:
 		return a.applySetModel(normalized, owned)
-	case protocol.CommandSetExecutionMode:
-		return a.applyExecutionMode(normalized, owned)
 	case protocol.CommandSetPermissionPolicy:
 		return a.applyPermissionPolicy(normalized, owned)
 	case protocol.CommandSetSandboxPolicy:
@@ -93,8 +91,6 @@ func (a *Agent) dispatchCommandForTurn(cmd protocol.Command, owned bool, cancell
 		return a.applyRevokeCapabilities(normalized, owned)
 	case protocol.CommandApproveTool:
 		return a.applyApproveTool(normalized)
-	case protocol.CommandApprovePlan:
-		return a.applyApprovePlan(normalized)
 	case protocol.CommandInterrupt:
 		a.interrupt()
 		return a.receipt(normalized, protocol.ReceiptApplied, "", nil)
@@ -181,7 +177,7 @@ func (a *Agent) clearHistoryCommand(cmd protocol.Command) error {
 	a.turnMemory.tokenBaseline.promptTokens = 0
 	a.turnMemory.tokenBaseline.historyLen = 0
 	a.mu.Unlock()
-	a.emit(Event{Type: EventHistoryCleared})
+	a.emit(protocol.EventView{Kind: protocol.EventStateChanged})
 	a.emitStatus("history cleared")
 	a.publishState()
 	return nil
@@ -206,7 +202,7 @@ func (a *Agent) removeMessagesCommand(cmd protocol.Command) error {
 	a.turnMemory.tokenBaseline.promptTokens = 0
 	a.turnMemory.tokenBaseline.historyLen = 0
 	a.mu.Unlock()
-	a.emit(Event{Type: EventHistoryChanged, Text: fmt.Sprintf("removed last %d message(s)", n)})
+	a.emit(protocol.EventView{Kind: protocol.EventStateChanged, Text: fmt.Sprintf("removed last %d message(s)", n)})
 	a.publishState()
 	return nil
 }
@@ -231,7 +227,7 @@ func (a *Agent) rewindMessagesCommand(cmd protocol.Command) error {
 	a.turnMemory.tokenBaseline.promptTokens = 0
 	a.turnMemory.tokenBaseline.historyLen = 0
 	a.mu.Unlock()
-	a.emit(Event{Type: EventHistoryChanged, Text: fmt.Sprintf("rewound to message %d", n)})
+	a.emit(protocol.EventView{Kind: protocol.EventStateChanged, Text: fmt.Sprintf("rewound to message %d", n)})
 	a.publishState()
 	return nil
 }

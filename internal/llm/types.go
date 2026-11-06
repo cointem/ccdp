@@ -74,11 +74,6 @@ func (a ArgumentsJSON) String() string { return string(a) }
 type ToolDef struct {
 	Type     string  `json:"type"`
 	Function FuncDef `json:"function"`
-	// PlanAllowed is runtime metadata derived from the concrete registered
-	// implementation. It is intentionally omitted from provider JSON: a tool
-	// name alone must never grant plan-mode capability when a plugin/custom
-	// implementation shadows that name.
-	PlanAllowed bool `json:"-"`
 }
 
 // FuncDef is the JSON Schema-ish definition of a function.
@@ -199,13 +194,4 @@ type CompletionRequest struct {
 	TopP         *float64      `json:"top_p,omitempty"`
 	MaxTokens    *int          `json:"max_tokens,omitempty"`
 	Stream       bool          `json:"stream"`
-}
-
-// UnmarshalArgs parses raw JSON arguments from a tool call delta.
-func UnmarshalArgs(raw string) map[string]any {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(raw), &m); err != nil {
-		return map[string]any{}
-	}
-	return m
 }

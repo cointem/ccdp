@@ -10,6 +10,7 @@ import (
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func TestSharedAttemptImmediateIdempotentAndRecovered(t *testing.T) {
@@ -38,7 +39,7 @@ func TestSharedAttemptImmediateIdempotentAndRecovered(t *testing.T) {
 	if err := a.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := LoadSession(cfg.SessionDir, id)
+	snap, err := archive.Load(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +143,7 @@ func TestSharedTokenUsageTwoChildrenAndRootFinalAndResume(t *testing.T) {
 	if err := root.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := LoadSession(cfg.SessionDir, id)
+	snap, err := archive.Load(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +197,7 @@ func TestResumeReconcilesUncopiedDescendantAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		snap, err := LoadSession(cfg.SessionDir, id)
+		snap, err := archive.Load(cfg.SessionDir, id)
 		if err != nil {
 			t.Fatal(err)
 		}

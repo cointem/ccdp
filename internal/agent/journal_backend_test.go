@@ -39,6 +39,9 @@ func registerJournalBackend(t testing.TB, p *sessionPersistence, b *journalTestB
 	t.Cleanup(func() { journalTestBackends.Delete(p) })
 }
 func testNew(t testing.TB, cfg *config.Config) (*Agent, error) {
+	if cfg.RuntimeRoot == "" {
+		cfg.RuntimeRoot = t.TempDir() + "/runtime"
+	}
 	t.Helper()
 	backend := &journalTestBackend{}
 	a, err := newAgentWithOptions(cfg, nil, Options{journalBackend: backend.options()})
@@ -48,6 +51,9 @@ func testNew(t testing.TB, cfg *config.Config) (*Agent, error) {
 	return a, err
 }
 func testNewWithOptions(t testing.TB, cfg *config.Config, opts Options) (*Agent, error) {
+	if cfg.RuntimeRoot == "" {
+		cfg.RuntimeRoot = t.TempDir() + "/runtime"
+	}
 	t.Helper()
 	b := &journalTestBackend{}
 	opts.journalBackend = b.options()

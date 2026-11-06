@@ -5,15 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"ccdp/internal/execution"
+	"ccdp/internal/protocol"
+	"ccdp/internal/runtimepath"
 	"ccdp/internal/sandbox"
 )
 
@@ -21,10 +21,8 @@ import (
 // subprocesses (REPLs, dev servers, test watchers) across multiple tool calls.
 
 // maxProcOutput caps the buffered output per process (old lines are dropped).
-const maxProcOutput = 512 * 1024
+const maxProcOutput = 64 * 1024
 const maxProcessLog = 32 << 20
-
-const maxProcessWait = 30 * time.Second
 
 // Keep recent completed handles readable, without retaining an unbounded
 // collection of output buffers for the lifetime of the session.
@@ -34,49 +32,52 @@ const maxCompletedProcesses = 32
 // output buffer.
 type managedProcess struct {
 	mu         sync.Mutex
+	identity   protocol.ProcessState
+	events     func(protocol.ProcessEvent) (string, error)
+	persistErr error
 	log        *os.File
 	logPath    string
 	logSize    int64
 	total      int64
 	logErr     error
-	changed    chan struct{}
 	reason     string
 	tty        bool
 	cmd        *execution.Process
-	buf        []byte // bounded output buffer
+	tail       processBuffer
 	exited     bool
 	finishedAt time.Time
 	err        error
 	done       chan struct{}
 }
 
-// ProcessManager owns all background processes started by one Resources
-// owner. Handles include a manager scope tag, so an integer returned by one
-// session is rejected by every other manager even if both have a local id 1.
+// ProcessManager owns commands for one Resources owner. Opaque handles bind
+// both executor generation and owner, and never alias after runtime restart.
 type ProcessManager struct {
-	mu        sync.Mutex
-	owner     string
-	logDir    string
-	scope     uint32
-	next      uint32
-	starting  int
-	starts    sync.WaitGroup
-	procs     map[int]*managedProcess
-	closed    bool
-	revoking  bool
-	closeErr  error
-	closeDone chan struct{}
+	mu         sync.Mutex
+	owner      string
+	logDir     string
+	scope      string
+	generation string
+	starting   int
+	starts     sync.WaitGroup
+	finishes   sync.WaitGroup
+	procs      map[string]*managedProcess
+	closed     bool
+	revoking   bool
+	closeErr   error
+	closeDone  chan struct{}
 }
 
-var processScopeSequence atomic.Uint32
-
 // NewProcessManager creates an empty owner-scoped process manager.
-func NewProcessManager(owner string) *ProcessManager {
-	scope := processScopeSequence.Add(1) & 0x7fffffff
-	if scope == 0 {
-		scope = 1
+func NewProcessManager(owner, generation, scope string) *ProcessManager {
+	return &ProcessManager{owner: owner, generation: generation, scope: scope, procs: map[string]*managedProcess{}, closeDone: make(chan struct{})}
+}
+func (m *ProcessManager) newID() (string, error) {
+	nonce, err := runtimepath.ID()
+	if err != nil {
+		return "", err
 	}
-	return &ProcessManager{owner: owner, scope: scope, procs: map[int]*managedProcess{}, closeDone: make(chan struct{})}
+	return "p." + m.generation + "." + m.scope + "." + nonce, nil
 }
 
 // Owner returns the immutable scope identifier.
@@ -87,31 +88,6 @@ func (m *ProcessManager) Owner() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.owner
-}
-
-// CleanPreviousLogs requires the durable session writer lease and runs before
-// tools start. It never scans other sessions or age-based temporary paths.
-func (m *ProcessManager) CleanPreviousLogs() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.logDir == "" || m.starting != 0 || len(m.procs) != 0 {
-		return nil
-	}
-	entries, err := os.ReadDir(m.logDir)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.Type().IsRegular() && strings.HasPrefix(entry.Name(), "process-") && strings.HasSuffix(entry.Name(), ".log") {
-			if err := os.Remove(filepath.Join(m.logDir, entry.Name())); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // CheckOpen verifies that the manager can still admit a process operation.
@@ -130,14 +106,41 @@ func (m *ProcessManager) CheckOpen() error {
 	return nil
 }
 
-func (m *ProcessManager) startManaged(ctx context.Context, command, dir string, policy *sandbox.Sandbox, tty, pipe bool, timeout time.Duration) (int, *managedProcess, error) {
+type commandTracking struct {
+	info   protocol.ProcessInfo
+	events func(protocol.ProcessEvent) (string, error)
+}
+
+func (mp *managedProcess) fact(kind string) error {
+	if mp.events == nil {
+		return nil
+	}
+	mp.mu.Lock()
+	state := *protocol.CloneProcessState(&mp.identity)
+	mp.mu.Unlock()
+	if kind == "finished" {
+		state.ProcessOutput = mp.completion()
+	}
+	outputID, err := mp.events(protocol.ProcessEvent{Kind: kind, State: state})
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	if outputID != "" {
+		mp.identity.OutputID = outputID
+	}
+	if err != nil {
+		mp.persistErr = err
+	}
+	return err
+}
+
+func (m *ProcessManager) startManaged(ctx context.Context, command, dir string, policy *sandbox.Sandbox, tty, pipe bool, timeout time.Duration, tracking *commandTracking) (string, *managedProcess, error) {
 	if err := m.CheckOpen(); err != nil {
-		return 0, nil, err
+		return "", nil, err
 	}
 	m.mu.Lock()
 	if m.closed || m.revoking {
 		m.mu.Unlock()
-		return 0, nil, fmt.Errorf("process owner closed or revoking")
+		return "", nil, fmt.Errorf("process owner closed or revoking")
 	}
 	active := m.starting
 	for _, p := range m.procs {
@@ -149,7 +152,7 @@ func (m *ProcessManager) startManaged(ctx context.Context, command, dir string, 
 	}
 	if active >= 32 {
 		m.mu.Unlock()
-		return 0, nil, fmt.Errorf("process limit reached (32 active commands)")
+		return "", nil, fmt.Errorf("process limit reached (32 active commands)")
 	}
 	m.starting++
 	m.starts.Add(1)
@@ -157,27 +160,53 @@ func (m *ProcessManager) startManaged(ctx context.Context, command, dir string, 
 	m.mu.Unlock()
 	defer func() { m.mu.Lock(); m.starting--; m.mu.Unlock(); m.starts.Done() }()
 	if strings.TrimSpace(command) == "" {
-		return 0, nil, fmt.Errorf("empty command")
+		return "", nil, fmt.Errorf("empty command")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd, err := execution.StartShell(ctx, command, dir, execution.SanitizedEnvironmentFor(execution.EnvironmentCommand, os.Environ()), policy)
+	id, err := m.newID()
 	if err != nil {
-		return 0, nil, err
+		return "", nil, err
 	}
-	if logDir != "" {
-		if err = os.MkdirAll(logDir, 0700); err != nil {
-			execution.CleanupStartedProcess(cmd)
-			return 0, nil, err
-		}
+	if logDir == "" {
+		return "", nil, fmt.Errorf("process environment has no private log directory")
 	}
 	log, err := os.CreateTemp(logDir, "process-*.log")
 	if err != nil {
-		execution.CleanupStartedProcess(cmd)
-		return 0, nil, err
+		return "", nil, err
 	}
-	mp := &managedProcess{cmd: cmd, done: make(chan struct{}), changed: make(chan struct{}), log: log, logPath: log.Name(), tty: tty}
+	mp := &managedProcess{done: make(chan struct{}), log: log, logPath: log.Name(), tty: tty,
+		identity: protocol.ProcessState{ProcessOutput: protocol.ProcessOutput{ID: id, Status: "registered"}, Revision: 1}}
+	if tracking != nil {
+		mp.identity.ProcessInfo = tracking.info
+		mp.events = tracking.events
+	}
+	if err = mp.fact("registered"); err != nil {
+		log.Close()
+		os.Remove(log.Name())
+		return "", nil, err
+	}
+	fail := func(err error) (string, *managedProcess, error) {
+		mp.mu.Lock()
+		mp.err = err
+		mp.exited = true
+		mp.reason = "start_failed"
+		mp.finishedAt = time.Now().UTC()
+		mp.identity.FinishedAt = mp.finishedAt
+		mp.identity.Revision++
+		mp.mu.Unlock()
+		log.Close()
+		persistErr := mp.fact("finished")
+		close(mp.done)
+		mp.release()
+		return "", nil, errors.Join(err, persistErr)
+	}
+	cmd, err := execution.StartShell(ctx, command, dir, execution.SanitizedEnvironmentFor(execution.EnvironmentCommand, os.Environ()), policy)
+	if err != nil {
+		return fail(err)
+	}
+	mp.cmd = cmd
 	cmd.SetIO(nil, processSink{mp}, processSink{mp})
 	if tty {
 		err = cmd.SetTerminal(processSink{mp})
@@ -186,41 +215,49 @@ func (m *ProcessManager) startManaged(ctx context.Context, command, dir string, 
 	}
 	cmd.SetTimeout(timeout)
 	if err == nil {
-		policy.MarkExternalExecution()
 		err = cmd.Start()
 	}
 	if err != nil {
-		_ = log.Close()
-		_ = os.Remove(log.Name())
 		execution.CleanupStartedProcess(cmd)
-		return 0, nil, err
+		return fail(err)
 	}
+	mp.mu.Lock()
+	mp.identity.Status = "running"
+	mp.identity.StartedAt = time.Now().UTC()
+	mp.identity.Revision++
+	mp.mu.Unlock()
+	startErr := mp.fact("started")
+	m.mu.Lock()
+	m.procs[id] = mp
+	rejected := m.closed || m.revoking
+	m.mu.Unlock()
+	m.finishes.Add(1)
 	go func() {
+		defer m.finishes.Done()
 		waitErr := cmd.Wait()
 		mp.mu.Lock()
-		mp.err, mp.exited, mp.finishedAt, mp.reason = waitErr, true, time.Now(), cmd.Reason()
+		mp.err, mp.exited, mp.finishedAt, mp.reason = waitErr, true, time.Now().UTC(), cmd.Reason()
+		mp.identity.FinishedAt = mp.finishedAt
+		mp.identity.Revision++
 		_ = mp.log.Close()
 		mp.mu.Unlock()
+		_ = mp.fact("finished")
 		close(mp.done)
 		m.mu.Lock()
-		m.pruneExitedLocked()
+		evicted := m.pruneExitedLocked()
 		m.mu.Unlock()
-	}()
-	m.mu.Lock()
-	m.next++
-	id := int((uint64(m.scope) << 32) | uint64(m.next))
-	m.procs[id] = mp
-	if m.closed || m.revoking {
-		m.mu.Unlock()
-		if err := cmd.Stop("cancelled"); err != nil {
-			return 0, nil, err
+		for _, p := range evicted {
+			p.release()
 		}
-		<-mp.done
+	}()
+	if startErr != nil || rejected {
+		_, _, stopErr := mp.stop()
 		m.Remove(id)
-		return 0, nil, fmt.Errorf("process owner closed or revoking")
+		if rejected {
+			startErr = errors.Join(startErr, fmt.Errorf("process owner closed or revoking"))
+		}
+		return "", nil, errors.Join(startErr, stopErr)
 	}
-	m.pruneExitedLocked()
-	m.mu.Unlock()
 	return id, mp, nil
 }
 
@@ -245,7 +282,7 @@ func (m *ProcessManager) StopAll() error {
 	m.starts.Wait()
 	m.mu.Lock()
 	type owned struct {
-		id int
+		id string
 		mp *managedProcess
 	}
 	procs := make([]owned, 0, len(m.procs))
@@ -255,7 +292,7 @@ func (m *ProcessManager) StopAll() error {
 	m.mu.Unlock()
 
 	var stopErr error
-	failed := make(map[int]*managedProcess)
+	failed := make(map[string]*managedProcess)
 	for _, proc := range procs {
 		_, exited, err := proc.mp.stop()
 		if err != nil {
@@ -300,15 +337,21 @@ func (m *ProcessManager) Count() int {
 }
 
 // Caller holds m.mu. Eviction releases both the handle and its temporary log.
-func (m *ProcessManager) pruneExitedLocked() {
+func (m *ProcessManager) pruneExitedLocked() []*managedProcess {
+	var released []*managedProcess
 	type completed struct {
-		id int
+		id string
 		at time.Time
 	}
 	var exited []completed
 	for id, mp := range m.procs {
 		mp.mu.Lock()
-		done := mp.exited
+		done := false
+		select {
+		case <-mp.done:
+			done = true
+		default:
+		}
 		at := mp.finishedAt
 		mp.mu.Unlock()
 		if done {
@@ -322,9 +365,10 @@ func (m *ProcessManager) pruneExitedLocked() {
 		return exited[i].at.Before(exited[j].at)
 	})
 	for _, proc := range exited[:max(0, len(exited)-maxCompletedProcesses)] {
-		m.procs[proc.id].removeLog()
+		released = append(released, m.procs[proc.id])
 		delete(m.procs, proc.id)
 	}
+	return released
 }
 
 // ResumeAfterRevocation allows new starts after the owner has confirmed that
@@ -352,15 +396,7 @@ func (mp *managedProcess) appendOutput(fragment []byte) {
 		mp.logSize += int64(written)
 		mp.logErr = err
 	}
-	if mp.changed != nil {
-		close(mp.changed)
-		mp.changed = make(chan struct{})
-	}
-	mp.buf = append(mp.buf, fragment...)
-	if len(mp.buf) > maxProcOutput {
-		oldLen := len(mp.buf)
-		mp.buf = append([]byte(nil), mp.buf[oldLen-maxProcOutput:]...)
-	}
+	mp.tail.Write(fragment)
 	mp.mu.Unlock()
 }
 
@@ -374,14 +410,32 @@ func (mp *managedProcess) stop() (string, bool, error) {
 		return "", false, err
 	}
 	<-mp.done
-	return "", true, nil
+	mp.mu.Lock()
+	err := mp.persistErr
+	mp.mu.Unlock()
+	return "", true, err
+}
+
+func (mp *managedProcess) release() {
+	mp.removeLog()
+	mp.mu.Lock()
+	if mp.identity.Released {
+		mp.mu.Unlock()
+		return
+	}
+	mp.identity.Released = true
+	mp.identity.Revision++
+	mp.mu.Unlock()
+	_ = mp.fact("released")
 }
 
 func (mp *managedProcess) removeLog() {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 	if mp.exited && mp.logPath != "" {
-		_ = os.Remove(mp.logPath)
+		if err := os.Remove(mp.logPath); err == nil || os.IsNotExist(err) {
+			mp.logPath = ""
+		}
 	}
 }
 
@@ -418,7 +472,7 @@ func (m *ProcessManager) Close() error {
 		_, exited, err := mp.stop()
 		closeErr = errors.Join(closeErr, err)
 		if exited {
-			mp.removeLog()
+			mp.release()
 		}
 	}
 	m.mu.Lock()
@@ -430,50 +484,53 @@ func (m *ProcessManager) Close() error {
 			delete(m.procs, id)
 		}
 	}
+	m.mu.Unlock()
+	m.finishes.Wait()
+	m.mu.Lock()
 	m.closeErr = closeErr
 	close(m.closeDone)
 	m.mu.Unlock()
 	return closeErr
 }
 
-func (m *ProcessManager) belongs(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	return uint64(pid)>>32 == uint64(m.scope)
+func (m *ProcessManager) belongs(pid string) bool {
+	return strings.HasPrefix(pid, "p."+m.generation+"."+m.scope+".")
 }
 
 // Get returns a live process by a handle created by this manager.
-func (m *ProcessManager) Get(pid int) (*managedProcess, error) {
+func (m *ProcessManager) Get(pid string) (*managedProcess, error) {
 	if m == nil {
 		return nil, fmt.Errorf("process: nil manager")
 	}
+	if !strings.HasPrefix(pid, "p."+m.generation+".") {
+		return nil, fmt.Errorf("stale_process: handle belongs to a different runtime; do not retry")
+	}
 	if !m.belongs(pid) {
-		return nil, fmt.Errorf("process handle %d belongs to another session", pid)
+		return nil, fmt.Errorf("foreign_process: handle belongs to another owner")
 	}
 	m.mu.Lock()
 	mp, ok := m.procs[pid]
 	m.mu.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("no process %d (has it been stopped?)", pid)
+		return nil, fmt.Errorf("process_released: handle %s is no longer available", pid)
 	}
 	return mp, nil
 }
 
 // Remove forgets a stopped process handle.
-func (m *ProcessManager) Remove(pid int) {
-	if m == nil || !m.belongs(pid) {
-		return
-	}
+func (m *ProcessManager) Remove(pid string) {
 	m.mu.Lock()
-	if mp := m.procs[pid]; mp != nil {
-		mp.mu.Lock()
-		exited := mp.exited
-		mp.mu.Unlock()
-		if exited {
-			mp.removeLog()
+	mp := m.procs[pid]
+	if mp != nil {
+		select {
+		case <-mp.done:
 			delete(m.procs, pid)
+		default:
+			mp = nil
 		}
 	}
 	m.mu.Unlock()
+	if mp != nil {
+		mp.release()
+	}
 }

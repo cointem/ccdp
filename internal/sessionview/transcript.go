@@ -49,6 +49,7 @@ func toolEventTranscriptID(ev protocol.EventView) string {
 // The projection is fed at commit/publication, not through a lossy Watch.
 // Its mutex never calls back into Agent or persistence.
 type Transcript struct {
+	processes         map[string]protocol.ProcessState
 	buffers           map[string]*transcriptBuffer
 	pendingInputs     map[string]protocol.TranscriptItem
 	index             map[string]uint64
@@ -67,8 +68,9 @@ type Transcript struct {
 // Keep append work linear. Snapshots materialize only the visible tail; spare
 // capacity amortizes front removal rather than copying 256 KiB per token.
 type transcriptBuffer struct {
-	data   []byte
-	offset int64
+	data        []byte
+	offset      int64
+	processNext int64
 }
 
 func (t *Transcript) appendLive(item protocol.TranscriptItem, delta string) {
@@ -94,6 +96,7 @@ func (t *Transcript) appendLive(item protocol.TranscriptItem, delta string) {
 }
 
 func (t *Transcript) materialize(item protocol.TranscriptItem) protocol.TranscriptItem {
+	item.Process = protocol.CloneProcessState(item.Process)
 	if b := t.buffers[item.ID]; b != nil {
 		start := max(0, len(b.data)-TextLimit)
 		for start < len(b.data) && !utf8.RuneStart(b.data[start]) {
@@ -102,6 +105,10 @@ func (t *Transcript) materialize(item protocol.TranscriptItem) protocol.Transcri
 		item.Text = string(b.data[start:])
 		item.TextOffset = b.offset + int64(start)
 		item.Truncated = item.Truncated || item.TextOffset > 0
+		if item.Process != nil && !item.Process.Terminal() {
+			item.Process.Output, item.Process.Tail = item.Text, ""
+			item.Process.Truncated = item.Truncated
+		}
 	}
 	return item
 }
@@ -152,6 +159,7 @@ func (t *Transcript) put(item protocol.TranscriptItem) {
 		item.Truncated = item.Truncated || clipped
 	}
 	item.Args = append(json.RawMessage(nil), item.Args...)
+	item.Process = protocol.CloneProcessState(item.Process)
 	if len(item.Args) > ArgsLimit {
 		item.Args = nil
 		item.Truncated = true
@@ -249,6 +257,23 @@ func (t *Transcript) Facts(events []session.Event) {
 			t.applyToolStarted(b)
 		case session.EventTypeToolFinished:
 			t.applyToolFinished(b)
+		case session.EventTypeProcessRegistered, session.EventTypeProcessStarted, session.EventTypeProcessFinished:
+			var e struct {
+				State protocol.ProcessState `json:"state"`
+			}
+			if json.Unmarshal(b, &e) == nil {
+				t.updateProcess(e.State)
+			}
+		case session.EventTypeProcessReleased:
+			var e session.ProcessReleased
+			if json.Unmarshal(b, &e) == nil {
+				if p, ok := t.processes[e.ID]; ok {
+					p.Released = true
+					p.Log = ""
+					p.Revision = e.Revision
+					t.updateProcess(p)
+				}
+			}
 		case session.EventTypeTurnFinished:
 			t.applyTurnFinished(b)
 		}
@@ -259,7 +284,7 @@ func (t *Transcript) Facts(events []session.Event) {
 // transcript projection.
 func transcriptRelevantEvent(typ session.EventType) bool {
 	switch typ {
-	case session.EventTypeInputQueued, session.EventTypeInputDelivered, session.EventTypeInputCancelled, session.EventTypeAssistantCommitted,
+	case session.EventTypeProcessRegistered, session.EventTypeProcessStarted, session.EventTypeProcessFinished, session.EventTypeProcessReleased, session.EventTypeInputQueued, session.EventTypeInputDelivered, session.EventTypeInputCancelled, session.EventTypeAssistantCommitted,
 		session.EventTypeToolStarted, session.EventTypeToolFinished, session.EventTypeTurnFinished,
 		session.EventTypeConversationReset:
 		return true
@@ -332,6 +357,10 @@ func (t *Transcript) applyInputCancelled(b []byte) {
 func (t *Transcript) applyAssistantCommitted(b []byte) {
 	var e session.AssistantCommitted
 	if json.Unmarshal(b, &e) != nil {
+		return
+	}
+	// Model-only context stays in the journal, outside the display projection.
+	if strings.HasPrefix(e.Message.InternalSource, "runtime_") {
 		return
 	}
 	var text strings.Builder
@@ -416,7 +445,7 @@ func (t *Transcript) applyToolStarted(b []byte) {
 	if json.Unmarshal(b, &e) != nil {
 		return
 	}
-	t.put(protocol.TranscriptItem{ID: ToolID(e.TurnID, e.StepID, e.Call.CallID), Kind: "tool", TurnID: protocol.TurnID(e.TurnID), StepID: protocol.StepID(e.StepID), CallID: protocol.CallID(e.Call.CallID), Tool: e.Call.ToolID, Args: e.Call.Arguments, Status: "running", ParentCallID: protocol.CallID(e.ParentCallID), ChildIndex: e.ChildIndex})
+	t.put(protocol.TranscriptItem{ID: ToolID(e.TurnID, e.StepID, e.Call.CallID), Kind: "tool", TurnID: protocol.TurnID(e.TurnID), StepID: protocol.StepID(e.StepID), CallID: protocol.CallID(e.Call.CallID), Tool: e.Call.ToolID, Args: e.Call.Arguments, Status: "running", ParentCallID: protocol.CallID(e.ParentCallID), ChildIndex: e.ChildIndex, Process: t.processState(e.ProcessID)})
 }
 
 func (t *Transcript) applyToolFinished(b []byte) {
@@ -444,7 +473,36 @@ func (t *Transcript) applyToolFinished(b []byte) {
 	if item.Text == "" {
 		item.Text = e.Error
 	}
+	if e.Process != nil {
+		item.Process = t.processState(e.Process.ID)
+	}
 	t.put(item)
+}
+
+func (t *Transcript) processState(id string) *protocol.ProcessState {
+	p, ok := t.processes[id]
+	if !ok {
+		return nil
+	}
+	return protocol.CloneProcessState(&p)
+}
+
+func (t *Transcript) updateProcess(p protocol.ProcessState) {
+	if t.processes == nil {
+		t.processes = make(map[string]protocol.ProcessState)
+	}
+	if old, ok := t.processes[p.ID]; ok && old.Revision >= p.Revision {
+		return
+	}
+	t.processes[p.ID] = *protocol.CloneProcessState(&p)
+	if p.Terminal() {
+		delete(t.buffers, p.Origin)
+	}
+	for i := range t.items {
+		if t.items[i].ID == p.Origin || t.items[i].Process != nil && t.items[i].Process.ID == p.ID {
+			t.items[i].Process = protocol.CloneProcessState(&p)
+		}
+	}
 }
 
 func (t *Transcript) applyTurnFinished(b []byte) {
@@ -550,6 +608,32 @@ func (t *Transcript) Event(ev protocol.EventView) {
 		if ev.Tool == nil {
 			return
 		}
+		if progress := ev.Tool.Progress; progress != nil {
+			p, ok := t.processes[progress.ID]
+			if !ok || p.Terminal() {
+				return
+			}
+			// Background wait output belongs to the original command row.
+			// Preserve its durable tool text separately from this transient tail.
+			if t.buffers == nil {
+				t.buffers = make(map[string]*transcriptBuffer)
+			}
+			b := t.buffers[p.Origin]
+			if b != nil && progress.Next <= b.processNext {
+				return
+			}
+			if b == nil || progress.Offset != b.processNext {
+				b = &transcriptBuffer{}
+			}
+			b.data = append(b.data, ev.Tool.Output...)
+			if len(b.data) > 2*TextLimit {
+				tail, dropped := Tail(string(b.data), TextLimit)
+				b.data, b.offset = []byte(tail), b.offset+dropped
+			}
+			b.processNext = progress.Next
+			t.buffers[p.Origin] = b
+			return
+		}
 		id := toolEventTranscriptID(ev)
 		for _, old := range t.items {
 			if old.ID == id && old.Status == "running" {
@@ -587,6 +671,11 @@ func (t *Transcript) EventItem(ev protocol.EventView) *protocol.TranscriptItem {
 	}
 	if ev.Tool != nil {
 		id = toolEventTranscriptID(ev)
+		if ev.Tool.Progress != nil {
+			if process, ok := t.processes[ev.Tool.Progress.ID]; ok {
+				id = process.Origin
+			}
+		}
 	}
 	if id == "" {
 		return nil

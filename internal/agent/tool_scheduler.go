@@ -2,13 +2,12 @@ package agent
 
 import (
 	"ccdp/internal/messages"
-	"ccdp/internal/protocol"
 	"ccdp/internal/tooling"
 )
 
 // dispatchToolsForContext settles a batch and projects its model output in
 // call order, independently of the order in which concurrent reads finish.
-func (a *Agent) dispatchToolsForContext(calls []messages.ToolCall, jc toolJournalContext) ([]toolRunResult, error) {
+func (a *Agent) dispatchToolsForContext(calls []messages.ToolCall, jc toolJournalContext) ([]tooling.Result, error) {
 	n := jc.maxParallel
 	if n == 0 {
 		a.mu.Lock()
@@ -23,11 +22,7 @@ func (a *Agent) dispatchToolsForContext(calls []messages.ToolCall, jc toolJourna
 	for i, call := range calls {
 		invocations[i] = toolInvocation{agent: a, call: call, journal: withToolCallIndex(jc, i)}
 	}
-	executed := (tooling.Executor{MaxParallel: n}).Execute(invocations)
-	results := make([]toolRunResult, len(executed))
-	for i, result := range executed {
-		results[i] = toolRunResult{output: result.Output, code: result.Code, isErr: result.IsError, status: result.Status, displayTruncated: result.DisplayTruncated, dataError: result.DataError, outputID: result.OutputID}
-	}
+	results := (tooling.Executor{MaxParallel: n}).Execute(invocations)
 
 	_, err := a.projectToolResults(jc, calls, results)
 	return results, err
@@ -36,16 +31,6 @@ func (a *Agent) dispatchToolsForContext(calls []messages.ToolCall, jc toolJourna
 func withToolCallIndex(jc toolJournalContext, index int) toolJournalContext {
 	jc.callIndex = index
 	return jc
-}
-
-type toolRunResult struct {
-	output           string
-	code             *protocol.CodeResult
-	isErr            bool
-	status           string // explicit success/error/denied/cancelled outcome
-	displayTruncated bool
-	dataError        string
-	outputID         string
 }
 
 // toolInvocation bridges runtime admission and journal settlement into the

@@ -24,7 +24,7 @@ func newMemoryProviderAgent(t *testing.T, p llm.Provider, history bool) *Agent {
 	t.Helper()
 	cfg := config.Default()
 	cfg.Workspace, cfg.SessionDir, cfg.ProjectMemoryDir = t.TempDir(), t.TempDir(), t.TempDir()
-	cfg.MemoryHistory, cfg.Model, cfg.PermissionMode = history, "memory-test", string(permissions.ModeBypass)
+	cfg.MemoryHistory, cfg.Model, cfg.PermissionMode = history, "memory-test", string(permissions.ModeAuto)
 	cfg.MaxTurns = 4
 	registry := plugin.NewModelRegistry()
 	registry.Register(p)
@@ -179,7 +179,7 @@ func TestMemoryCorruptionDoesNotBlockPreparation(t *testing.T) {
 		t.Fatalf("memory failure blocked chat: %v", err)
 	}
 	defer a.releaseStepContext(step)
-	if !strings.Contains(joinSystemBlocks(step.systemBlocks), "memory unavailable") {
+	if !strings.Contains(fmt.Sprint(a.buildRequestForStep(step).Messages), "memory unavailable") {
 		t.Fatal("memory failure hidden")
 	}
 }

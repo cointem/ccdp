@@ -15,6 +15,8 @@ func (p *State) Apply(event session.Event) error {
 		return fmt.Errorf("replay: nil event")
 	}
 	switch e := event.(type) {
+	case *session.ProcessRegistered, *session.ProcessStarted, *session.ProcessFinished, *session.ProcessReleased, *session.ProcessResultsProjected:
+		return p.applyProcess(e)
 	case *session.SessionCreated:
 		p.ID, p.CreatedAt = e.SessionID, e.CreatedAt
 		if e.ParentID != "" {
@@ -115,10 +117,21 @@ func (p *State) Apply(event session.Event) error {
 			toolMessage.DisplayTruncated, toolMessage.DataError = result.DisplayTruncated, result.DataError
 			if finished, ok := p.finishedTools[key]; ok {
 				toolMessage.OutputRef = outputReference(finished)
+				toolMessage.SourceOutputs = p.processOutputReferences(finished.CompletionIDs)
 			}
 			toolMessage.ID = toolResultMessageID(key, result.Text, result.Status)
 			p.History = append(p.History, toolMessage)
 			p.historyStep = append(p.historyStep, e.StepID)
+		}
+		// Images follow the complete batch of tool results. Keeping them in a
+		// separate multimodal user message works across the existing providers
+		// without interrupting assistant/tool-result pairing.
+		for _, result := range e.Results {
+			key := p.resolveToolFactKey(e.TurnID, e.StepID, result.CallID)
+			if finished, ok := p.finishedTools[key]; ok && finished.Image != nil {
+				p.History = append(p.History, toolImageMessage(key, finished.Image))
+				p.historyStep = append(p.historyStep, e.StepID)
+			}
 		}
 	case *session.TasksChanged:
 		p.Tasks = append([]session.Task(nil), e.Tasks...)
@@ -133,8 +146,6 @@ func (p *State) Apply(event session.Event) error {
 			}
 			p.GoalAccountingIDs[e.AccountingID] = true
 		}
-	case *session.WorkflowChanged:
-		p.Workflow = e.Workflow
 	case *session.ContextCompacted:
 		message, err := session.DecodeMessage(e.Summary)
 		if err != nil {

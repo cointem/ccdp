@@ -118,15 +118,15 @@ func TestQuestionRoundTripAndReasoningWire(t *testing.T) {
 	}
 }
 
-func TestQuestionPlanCapabilityAndCancellation(t *testing.T) {
+func TestQuestionCapabilityAndCancellation(t *testing.T) {
 	ag := newAgentForTest(t)
 	defer ag.Close()
 	tool := &askUserQuestionTool{ag: ag}
-	if !planAllowedImplementation(tool) || readOnlyImplementation(tool) {
-		t.Fatal("question must be a plan-allowed serial barrier")
+	if toolKind(tool) != permissions.KindState || readOnlyImplementation(tool) {
+		t.Fatal("question must be a serial control operation")
 	}
 	if decision, _ := ag.services.perms.Check(tool.Name(), nil, toolKind(tool)); decision != permissions.DecisionAllow {
-		t.Fatal("plan mode denied clarification")
+		t.Fatal("permission policy denied clarification")
 	}
 	raw, _ := json.Marshal(map[string]any{"questions": clarificationQuestions()})
 	var args map[string]any
@@ -178,7 +178,7 @@ func TestGenerationSettingsPersistResetAndFreeze(t *testing.T) {
 		t.Fatal("settings not published")
 	}
 	frozen := cloneConfig(ag.services.cfg)
-	req := ag.buildRequestFromConfig(frozen, ag.currentSandbox().Snapshot(), "openai-test", "test", nil, false, nil)
+	req := ag.buildRequestFromConfig(frozen, ag.currentSandbox().Snapshot(), "openai-test", "test", nil, nil)
 	if req.ReasoningEffort != "max" || req.Verbosity != "low" {
 		t.Fatal("request lost settings")
 	}
@@ -197,7 +197,7 @@ func TestGenerationSettingsPersistResetAndFreeze(t *testing.T) {
 	if req.ReasoningEffort != "max" {
 		t.Fatal("prepared request mutated")
 	}
-	req = ag.buildRequestFromConfig(restored, ag.currentSandbox().Snapshot(), "openai-test", "test", nil, false, nil)
+	req = ag.buildRequestFromConfig(restored, ag.currentSandbox().Snapshot(), "openai-test", "test", nil, nil)
 	body, _ := json.Marshal(req)
 	if req.ReasoningEffort != config.DefaultReasoningEffort {
 		t.Fatalf("reset effort = %q, want built-in default %q", req.ReasoningEffort, config.DefaultReasoningEffort)
@@ -206,7 +206,7 @@ func TestGenerationSettingsPersistResetAndFreeze(t *testing.T) {
 		t.Fatalf("verbosity must stay omitted when unset: %s", body)
 	}
 	restored.ReasoningEffort = "none"
-	req = ag.buildRequestFromConfig(restored, ag.currentSandbox().Snapshot(), "deepseek-test", "test", []messages.Message{{Role: messages.RoleAssistant, Content: "ok", ReasoningContent: "reason"}}, false, nil)
+	req = ag.buildRequestFromConfig(restored, ag.currentSandbox().Snapshot(), "deepseek-test", "test", []messages.Message{{Role: messages.RoleAssistant, Content: "ok", ReasoningContent: "reason"}}, nil)
 	if req.Thinking == nil || req.Thinking.Type != "disabled" || req.ReasoningEffort != "" {
 		t.Fatal("DeepSeek none must disable thinking")
 	}

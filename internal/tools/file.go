@@ -26,6 +26,11 @@ func (*ReadTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "offset": map[string]any{"default": 1, "type": "integer", "minimum": 1}, "limit": map[string]any{"default": 2000, "type": "integer", "minimum": 1, "maximum": 2000}}, "required": []string{"file_path"}}
 }
 func (*ReadTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeFileWorker(ctx, "Read", args)
+}
+
+// executeRead runs only inside the fixed file worker.
+func executeRead(ctx *Context, args map[string]any) (Result, error) {
 	return executeText(ctx, args, func(ctx *Context) (string, error) {
 		if e := ctx.checkResources(); e != nil {
 			return "", e
@@ -210,6 +215,11 @@ func (*WriteTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}, "mode": map[string]any{"default": "create", "type": "string", "enum": []string{"create", "replace"}}}, "required": []string{"file_path", "content"}}
 }
 func (*WriteTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeFileWorker(ctx, "Write", args)
+}
+
+// executeWrite runs only inside the fixed file worker.
+func executeWrite(ctx *Context, args map[string]any) (Result, error) {
 	return executeText(ctx, args, func(ctx *Context) (output string, runErr error) {
 		if e := ctx.checkResources(); e != nil {
 			return "", e
@@ -234,11 +244,6 @@ func (*WriteTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 		if e != nil {
 			return "", e
 		}
-		lock, e := fsops.LockPath(path)
-		if e != nil {
-			return "", e
-		}
-		defer lock.Close()
 		root, relative, e := ctx.openWriteRoot(path)
 		if e != nil {
 			return "", e
@@ -289,6 +294,11 @@ func (*EditTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "edits": map[string]any{"type": "array", "minItems": 1, "items": map[string]any{"type": "object", "properties": map[string]any{"old_text": map[string]any{"type": "string", "minLength": 1}, "new_text": map[string]any{"type": "string"}}, "required": []string{"old_text", "new_text"}}}}, "required": []string{"file_path", "edits"}}
 }
 func (*EditTool) Execute(ctx *Context, args map[string]any) (Result, error) {
+	return executeFileWorker(ctx, "Edit", args)
+}
+
+// executeEdit runs only inside the fixed file worker.
+func executeEdit(ctx *Context, args map[string]any) (Result, error) {
 	return executeText(ctx, args, func(ctx *Context) (output string, runErr error) {
 		if e := ctx.checkResources(); e != nil {
 			return "", e
@@ -309,11 +319,6 @@ func (*EditTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 		if e != nil {
 			return "", e
 		}
-		lock, e := fsops.LockPath(path)
-		if e != nil {
-			return "", e
-		}
-		defer lock.Close()
 		root, relative, e := ctx.openWriteRoot(path)
 		if e != nil {
 			return "", e
@@ -391,17 +396,6 @@ func (*EditTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 	})
 }
 
-func appendBounded(sb *strings.Builder, value string, limit int) {
-	if remaining := limit - sb.Len(); remaining > 0 {
-		if len(value) > remaining {
-			value = value[:remaining]
-			for !utf8.ValidString(value) && len(value) > 0 {
-				value = value[:len(value)-1]
-			}
-		}
-		sb.WriteString(value)
-	}
-}
 func diffSummary(old, next string) string {
 	return "Applied edit.\n- " + strings.ReplaceAll(strings.TrimSuffix(old, "\n"), "\n", "\n- ") + "\n+ " + strings.ReplaceAll(strings.TrimSuffix(next, "\n"), "\n", "\n+ ")
 }

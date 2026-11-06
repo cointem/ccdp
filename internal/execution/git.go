@@ -6,10 +6,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
-	"time"
 )
+
+const nativeGitPath = "/Library/Developer/CommandLineTools/usr/bin/git"
 
 // ReadOnlyGitArgv returns an argv for a git query which is insulated from
 // repository configuration that can otherwise run a helper or a pager.  The
@@ -125,13 +125,5 @@ func verifyProcessProfile(ctx context.Context, profile string, argv []string, re
 	if !readOnlyQuery {
 		return verifyProfileContext(ctx, profile)
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	// The narrow profile intentionally forbids the usual /bin/sh probe and
-	// rlimit shell wrapper, because Git helpers use that same shell executable.
-	probe := exec.CommandContext(probeCtx, sandbox.BackendPath, "-p", profile, "--", argv[0], "--version")
-	if output, err := probe.CombinedOutput(); err != nil {
-		return fmt.Errorf("execution: Seatbelt rejected read-only query profile: %w (%s)", err, strings.TrimSpace(string(output)))
-	}
-	return nil
+	return sandbox.VerifyProfile(ctx, profile, argv[0], "--version")
 }

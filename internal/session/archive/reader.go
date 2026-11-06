@@ -22,16 +22,23 @@ func Load(dir, id string) (*Snapshot, error) {
 		return nil, err
 	}
 	defer store.Close()
-	records, err := store.Read(session.Beginning)
-	if err != nil {
-		return nil, err
-	}
-	snapshot, err := FromRecords(records, id)
+	snapshot, err := FromStore(store, id)
 	if err == nil {
-		snapshot.Records = records
 		snapshot.Artifacts = session.OpenArtifactStoreReadOnly(filepath.Join(dir, id))
 	}
 	return snapshot, err
+}
+
+// FromStore reads a complete snapshot without changing the store.
+func FromStore(store session.ReadOnlyStore, id string) (*Snapshot, error) {
+	if store == nil {
+		return nil, fmt.Errorf("archive: nil session store")
+	}
+	records, err := session.ReadAll(store)
+	if err != nil {
+		return nil, err
+	}
+	return FromRecords(records, id)
 }
 
 // List returns authoritative JSONL sessions, newest first, plus an

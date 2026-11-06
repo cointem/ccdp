@@ -13,7 +13,7 @@ import (
 
 func scopedTestContext(t *testing.T, dir string) *Context {
 	t.Helper()
-	resources := NewResources("test:"+t.Name(), filepath.Join(dir, ".ccdp-session"))
+	resources := NewResources("test:"+t.Name(), filepath.Join(dir, ".ccdp-session"), t.TempDir()+"/runtime")
 	t.Cleanup(func() { _ = resources.Close() })
 	return resources.Context(context.Background(), dir, sandbox.New(dir))
 }

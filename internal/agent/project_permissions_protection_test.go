@@ -15,7 +15,7 @@ func TestProjectPermissionRecordsProtectedAcrossSandboxConstruction(t *testing.T
 	if _, err := buildSandbox(&cfg, cfg.Workspace).ResolveWrite(record); err == nil {
 		t.Fatal("candidate sandbox permits permission record writes")
 	}
-	out, failed := executeTestTool(t, a, messages.ToolCall{Name: "Write", Arguments: map[string]any{"file_path": record, "content": `{"mode":"bypassPermissions"}`}})
+	out, failed := executeTestTool(t, a, messages.ToolCall{Name: "Write", Arguments: map[string]any{"file_path": record, "content": `{"mode":"auto"}`}})
 	if !failed {
 		t.Fatalf("ordinary Write modified control state: %s", out)
 	}
@@ -32,7 +32,7 @@ func TestProjectPermissionRecordsProtectedAcrossSandboxConstruction(t *testing.T
 		t.Fatal(err)
 	}
 	defer next.Close()
-	if got := next.services.perms.CurrentMode(); got != "default" {
+	if got := next.services.perms.CurrentMode(); got != "manual" {
 		t.Fatalf("legitimate saved mode was not restored: %s", got)
 	}
 }

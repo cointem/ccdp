@@ -1,7 +1,7 @@
 package changes
 
 import (
-	"ccdp/internal/sandbox"
+	"ccdp/internal/testenv"
 	"context"
 	"fmt"
 	"os"
@@ -64,7 +64,7 @@ func TestStructureApplyRecoversAtEveryStep(t *testing.T) {
 				if err = s.save("transactions", plan.ID, Journal{Plan: plan, Status: "applying", NextStep: stop}); err != nil {
 					t.Fatal(err)
 				}
-				if _, err = s.Apply(context.Background(), plan, sandbox.New(root)); err != nil {
+				if _, err = s.Apply(context.Background(), plan, testenv.Sandbox(t, root)); err != nil {
 					t.Fatal(err)
 				}
 				for path := range target.Files {
@@ -95,7 +95,7 @@ func TestStructureApplyRejectsUnselectedFilesBeforeMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.Apply(context.Background(), plan, sandbox.New(root)); err == nil {
+	if _, err = s.Apply(context.Background(), plan, testenv.Sandbox(t, root)); err == nil {
 		t.Fatal("unselected file removed")
 	}
 	for _, path := range []string{"a/b", "a/extra"} {
@@ -127,7 +127,7 @@ func TestRegressionFileDirectoryTransition(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err = s.Apply(context.Background(), plan, sandbox.New(root)); err != nil {
+			if _, err = s.Apply(context.Background(), plan, testenv.Sandbox(t, root)); err != nil {
 				t.Fatalf("valid replacement failed: %v", err)
 			}
 			for p := range target.Files {
@@ -150,7 +150,7 @@ func TestApplyRemovesSymlinkWithoutChangingItsTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := New("")
-	policy := sandbox.New(root)
+	policy := testenv.Sandbox(t, root)
 	base, err := store.CapturePaths(context.Background(), root, []string{"reference"}, policy)
 	if err != nil {
 		t.Fatal(err)

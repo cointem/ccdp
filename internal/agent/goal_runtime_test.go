@@ -11,6 +11,7 @@ import (
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func submitGoalTestCommand(t *testing.T, a *Agent, id, action, objective string, budget *int64) protocol.Receipt {
@@ -62,7 +63,7 @@ func TestGoalRuntimeContinuesAcrossTurnsAndCompletes(t *testing.T) {
 		n := calls.Add(1)
 		foundGoal := false
 		for _, message := range req.Messages {
-			if message.Role == "system" {
+			if message.Role == "user" {
 				text, _ := message.Content.(string)
 				foundGoal = foundGoal || strings.Contains(text, "implement-and-verify-goal")
 			}
@@ -186,7 +187,7 @@ func TestGoalRuntimeQueuedUserInputPrecedesAutomaticContinuation(t *testing.T) {
 		}
 		lastUser := ""
 		for _, message := range req.Messages {
-			if message.Role == "user" {
+			if isTaskMessage(message) {
 				lastUser, _ = message.Content.(string)
 			}
 		}
@@ -298,7 +299,7 @@ func TestGoalRuntimeAccountsChildWorkWithoutGrantingGoalControl(t *testing.T) {
 		getResult, updateResult := "", ""
 		for _, message := range req.Messages {
 			text, _ := message.Content.(string)
-			if message.Role == "user" && text == "goal-child-assignment" {
+			if isTaskMessage(message) && text == "goal-child-assignment" {
 				child = true
 			}
 			if message.Role == "tool" {
@@ -341,7 +342,7 @@ func TestGoalRuntimeAccountsChildWorkWithoutGrantingGoalControl(t *testing.T) {
 	if err := a.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(cfg.SessionDir, a.SessionID())
+	snapshot, err := archive.Load(cfg.SessionDir, a.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +371,7 @@ func TestGoalRuntimeEditWaitsForOldStepAndRequiresNewCompletion(t *testing.T) {
 		}
 		foundNewGoal := false
 		for _, message := range req.Messages {
-			if message.Role == "system" {
+			if message.Role == "user" {
 				text, _ := message.Content.(string)
 				foundNewGoal = foundNewGoal || strings.Contains(text, "new-edited-objective")
 			}

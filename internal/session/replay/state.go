@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -13,9 +14,12 @@ import (
 )
 
 type State struct {
-	ID        string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Processes        map[string]Process
+	ProcessOrder     []string
+	pendingProcesses []string
+	ID               string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 	// TurnSeq/StepSeq are monotonic counters derived from durable fact IDs.
 	// They are not a projection of usage or history; they only prevent a
 	// resumed Agent from reusing a transaction identity already in the log.
@@ -28,7 +32,6 @@ type State struct {
 	CommandDigests    map[string]string // retained after completion for retry identity
 	ScheduledCommands map[string]session.CommandScheduled
 	CompletedCommands map[string]session.CommandCompleted
-	Workflow          session.WorkflowState
 	GoalAccountingIDs map[string]bool
 	Goal              *protocol.Goal
 	Tasks             []session.Task
@@ -157,6 +160,7 @@ func (p *State) PendingAttachments() map[string][]messages.ImageAttachment {
 
 func New() *State {
 	return &State{
+		Processes:   make(map[string]Process),
 		pendingByID: make(map[string]messages.Message), pendingInput: make(map[string]session.InputQueued),
 		startedTools: make(map[toolFactKey]session.ToolStarted), finishedTools: make(map[toolFactKey]session.ToolFinished), projected: make(map[toolFactKey]bool),
 		CommandDigests: make(map[string]string), ScheduledCommands: make(map[string]session.CommandScheduled), CompletedCommands: make(map[string]session.CommandCompleted),
@@ -254,6 +258,7 @@ func (p *State) FinalizeRecovery() {
 	// lost during a crash, recover a legal tool-result pair from the raw facts
 	// without executing the tool again. Sort by the frozen call ordinal when
 	// available; old logs retain their append order via rawFinishedOrder.
+	var recoveredImages []toolFactKey
 	for _, key := range p.orderedFinishedIDs() {
 		if p.projected[key] {
 			continue
@@ -267,10 +272,33 @@ func (p *State) FinalizeRecovery() {
 		}
 		result := finished.Result
 		content := result.Text
+		if len(finished.CompletionIDs) > 0 {
+			// Raw tool output may be durable without having reached the model.
+			// Recover a reference here; pending process facts deliver the payload.
+			var refs []protocol.ProcessOutput
+			for _, id := range finished.CompletionIDs {
+				if proc, ok := p.Processes[id]; ok {
+					refs = append(refs, proc.State.ProcessOutput.Reference())
+				}
+			}
+			if len(refs) > 0 {
+				data, _ := json.Marshal(struct {
+					Results  []protocol.ProcessOutput `json:"process_results"`
+					OutputID string                   `json:"output_id,omitempty"`
+				}{Results: refs, OutputID: func() string {
+					if finished.RawOutput != nil {
+						return finished.RawOutput.Hash
+					}
+					return ""
+				}()})
+				content = string(data)
+			}
+		}
 		if result.Status != "success" && result.Status != "ok" && !strings.HasPrefix(content, "Error: ") {
 			content = "Error: " + content
 		}
 		message := messages.Message{Role: messages.RoleTool, ToolCallID: key.CallID, ToolStatus: result.Status, Content: content, OutputRef: outputReference(finished)}
+		message.SourceOutputs = p.processOutputReferences(finished.CompletionIDs)
 		message.DisplayTruncated = result.DisplayTruncated || finished.DisplayTruncated
 		message.DataError = result.DataError
 		if message.DataError == "" {
@@ -279,6 +307,12 @@ func (p *State) FinalizeRecovery() {
 		message.ID = toolResultMessageID(key, result.Text, result.Status)
 		p.insertRecoveredToolResult(key, message)
 		p.projected[key] = true
+		if finished.Image != nil {
+			recoveredImages = append(recoveredImages, key)
+		}
+	}
+	for _, key := range recoveredImages {
+		p.recoverToolImage(key)
 	}
 }
 

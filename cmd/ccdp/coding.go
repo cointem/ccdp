@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"ccdp/internal/agent"
 	"ccdp/internal/commands"
 	"ccdp/internal/config"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session/archive"
 )
 
 func isCodingCommand(s string) bool {
@@ -33,7 +35,7 @@ func runCodingCLI(args []string, out, diagnostics io.Writer) int {
 	for i := 0; i < len(args); i++ {
 		key := args[i]
 		switch key {
-		case "-d", "--workspace", "-r", "--session", "--config-file", "--permission-mode":
+		case "-d", "--workspace", "-r", "--session", "--config-file", "--mode":
 			if i+1 == len(args) {
 				return fail(fmt.Errorf("%s requires a value", key))
 			}
@@ -45,7 +47,7 @@ func runCodingCLI(args []string, out, diagnostics io.Writer) int {
 				sessionID = args[i]
 			case "--config-file":
 				configPath = args[i]
-			case "--permission-mode":
+			case "--mode":
 				mode = args[i]
 			}
 		default:
@@ -85,12 +87,22 @@ func runCodingCLI(args []string, out, diagnostics io.Writer) int {
 	}
 	var a *agent.Agent
 	if sessionID != "" {
-		snap, err := agent.LoadSession(cfg.SessionDir, sessionID)
+		snap, err := archive.Load(cfg.SessionDir, sessionID)
 		if err != nil {
 			return fail(err)
 		}
+		cfg, e = agent.ResolveResumeConfig(&cfg, snap)
+		if e == nil {
+			e = prepareDevelopmentEnvironment(&cfg, strings.NewReader(""), diagnostics, false)
+		}
+		if e != nil {
+			return fail(e)
+		}
 		a, e = agent.Resume(&cfg, snap)
 	} else {
+		if e = prepareDevelopmentEnvironment(&cfg, strings.NewReader(""), diagnostics, false); e != nil {
+			return fail(e)
+		}
 		a, e = agent.New(&cfg)
 	}
 	if e != nil {

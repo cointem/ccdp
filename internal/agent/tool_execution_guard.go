@@ -15,9 +15,6 @@ func (a *Agent) toolExecutionError() error {
 	if a.services.persistenceErr != nil {
 		return fmt.Errorf("session persistence failed: %w", a.services.persistenceErr)
 	}
-	if a.capabilities.capabilityRevoking {
-		return fmt.Errorf("sandbox capability revocation is pending")
-	}
 	if a.lifecycle.closing || a.lifecycle.closed || a.turn.interruptFlag {
 		return context.Canceled
 	}
@@ -40,8 +37,16 @@ func (a *Agent) admitToolStartOwned(tc messages.ToolCall, tool tools.Tool, execu
 	if err := a.toolExecutionError(); err != nil {
 		return err
 	}
-	if a.inPlanMode() && !planAllowedImplementation(tool) {
-		return fmt.Errorf("blocked in plan mode: %s modifies state", tc.Name)
+	a.mu.Lock()
+	revoking := a.capabilities.capabilityRevoking
+	desktopEnabled := a.services.cfg.ComputerUseEnabled && a.children.childState == nil
+	a.mu.Unlock()
+	_, desktop := tool.(*tools.ComputerTool)
+	if desktop && !desktopEnabled {
+		return fmt.Errorf("permission denied: Computer requires an explicitly enabled root session")
+	}
+	if revoking && !controlTool(tool, tc.Arguments) && !desktop {
+		return fmt.Errorf("execution environment is quarantined; invocation was not started")
 	}
 	if denied, reason := a.services.perms.HardDeny(tc.Name, tc.Arguments); denied {
 		return fmt.Errorf("permission denied: %s", reason)

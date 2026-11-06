@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"ccdp/internal/execution"
 	"ccdp/internal/mcp"
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
@@ -23,12 +24,13 @@ const maxRequestedCapabilities = 8
 type capabilityPolicyVersion struct {
 	sandboxRevision    uint64
 	capabilityRevision uint64
+	revocationRevision uint64
 }
 
 func (a *Agent) toolCapabilityPolicy(tc messages.ToolCall, tool tools.Tool) (*sandbox.Sandbox, []protocol.CapabilityRequest, capabilityPolicyVersion, error) {
 	a.mu.Lock()
 	base := a.services.sandbox
-	version := capabilityPolicyVersion{capabilityRevision: a.capabilities.capabilityRevision}
+	version := capabilityPolicyVersion{capabilityRevision: a.capabilities.capabilityRevision, revocationRevision: a.capabilities.revocationRevision}
 	if base != nil {
 		version.sandboxRevision = base.Revision
 		base = base.Snapshot()
@@ -40,11 +42,22 @@ func (a *Agent) toolCapabilityPolicy(tc messages.ToolCall, tool tools.Tool) (*sa
 	revoking := a.capabilities.capabilityRevoking
 	workspace := a.services.cfg.Workspace
 	a.mu.Unlock()
-	if revoking {
+	// Desktop access has its own launch grant and OS checks. Project executor
+	// quarantine and filesystem/network grants do not confer or revoke it.
+	if _, desktop := tool.(*tools.ComputerTool); desktop {
+		return base, nil, version, nil
+	}
+	if revoking && !controlTool(tool, tc.Arguments) {
 		return nil, nil, version, fmt.Errorf("sandbox capability revocation is pending; inspect /sandbox before requesting further tool work")
 	}
 	if base == nil {
 		return nil, nil, version, fmt.Errorf("sandbox policy is unavailable")
+	}
+	if controlTool(tool, tc.Arguments) {
+		return base, nil, version, nil
+	}
+	if err := execution.CheckEnvironment(base); err != nil {
+		return nil, nil, version, err
 	}
 	for _, grant := range grants {
 		if err := applyCapability(base, grant); err != nil {
@@ -92,7 +105,7 @@ func (a *Agent) toolCapabilityPolicy(tc messages.ToolCall, tool tools.Tool) (*sa
 		if capabilityGranted(base, canonical) {
 			continue
 		}
-		if a.children.childState != nil && (!isTaskChild(a.children.childState.purpose) || a.children.childState.nonInteractive) {
+		if a.children.childState != nil && (!isTaskChild(a.children.childState.purpose) || a.children.childState.readOnlyWorkspace || a.children.childState.nonInteractive && a.children.childState.access == nil) {
 			return nil, nil, version, fmt.Errorf("child sandbox capability ceiling does not allow requesting %s", describeCapability(canonical))
 		}
 		unique = append(unique, canonical)
@@ -218,12 +231,17 @@ func validateGrantDirectory(policy *sandbox.Sandbox, dir string) error {
 		}
 	}
 	snapshot := policy.Snapshot()
+	for _, readOnly := range snapshot.ReadOnlyDirs {
+		if pathContains(readOnly, dir) {
+			return fmt.Errorf("capability directory %q is explicitly read-only", dir)
+		}
+	}
 	for _, protected := range snapshot.ProtectedDirs {
 		if pathContains(dir, protected) || pathContains(protected, dir) {
 			return fmt.Errorf("capability directory %q overlaps protected application state", dir)
 		}
 	}
-	for _, denied := range snapshot.DisallowedDirs {
+	for _, denied := range append(snapshot.DisallowedDirs, snapshot.CredentialDirs...) {
 		if pathContains(dir, denied) || pathContains(denied, dir) {
 			return fmt.Errorf("capability directory %q overlaps an explicitly disallowed path", dir)
 		}
@@ -283,8 +301,8 @@ func (a *Agent) addSessionCapabilitiesOwned(version capabilityPolicyVersion, req
 	if a.capabilities.capabilityRevoking {
 		return nil, version, fmt.Errorf("sandbox capabilities are being revoked")
 	}
-	if a.services.sandbox == nil || a.services.sandbox.Revision != version.sandboxRevision || a.capabilities.capabilityRevision != version.capabilityRevision {
-		return nil, version, fmt.Errorf("sandbox policy changed while capability approval was pending; retry the tool under the current policy")
+	if a.services.sandbox == nil || a.services.sandbox.Revision != version.sandboxRevision || a.capabilities.revocationRevision != version.revocationRevision {
+		return nil, version, fmt.Errorf("access decision expired after the environment policy changed; invocation was not started")
 	}
 	if a.turn.turnCtx != nil && a.turn.turnCtx.Err() != nil || a.turn.interruptFlag {
 		return nil, version, fmt.Errorf("capability approval expired because the operation was interrupted")
@@ -311,8 +329,8 @@ func (a *Agent) addSessionCapabilitiesOwned(version capabilityPolicyVersion, req
 	return candidate, version, nil
 }
 
-func (a *Agent) approveToolWithCapabilities(tc messages.ToolCall, reason string, base *sandbox.Sandbox, version capabilityPolicyVersion, requests []protocol.CapabilityRequest, contexts ...context.Context) (*sandbox.Sandbox, capabilityPolicyVersion, bool, bool) {
-	answer := a.requestApprovalDetailed(tc, reason, requests, contexts...)
+func (a *Agent) approveToolWithCapabilities(tc messages.ToolCall, reason string, resourcesOnly bool, base *sandbox.Sandbox, version capabilityPolicyVersion, requests []protocol.CapabilityRequest, contexts ...context.Context) (*sandbox.Sandbox, capabilityPolicyVersion, bool, bool) {
+	answer := a.requestApprovalDetailed(tc, reason, requests, resourcesOnly, contexts...)
 	if !answer.approve {
 		if !a.capabilityApprovalCurrent(version) {
 			return base, version, false, false
@@ -320,7 +338,24 @@ func (a *Agent) approveToolWithCapabilities(tc messages.ToolCall, reason string,
 		return base, version, false, answer.remember
 	}
 	if !a.capabilityApprovalCurrent(version) {
-		return base, version, false, false
+		// Concurrent additive grants do not invalidate this user decision.
+		// Rebuild under the current policy; revocations and base changes do.
+		a.mu.Lock()
+		valid := !a.capabilities.capabilityRevoking && a.services.sandbox != nil && a.services.sandbox.Revision == version.sandboxRevision && a.capabilities.revocationRevision == version.revocationRevision
+		if valid {
+			base = a.services.sandbox.Snapshot()
+			for _, grant := range a.capabilities.capabilityGrants {
+				if applyCapability(base, grant) != nil {
+					valid = false
+					break
+				}
+			}
+			version.capabilityRevision = a.capabilities.capabilityRevision
+		}
+		a.mu.Unlock()
+		if !valid || !a.capabilityApprovalCurrent(version) {
+			return base, version, false, false
+		}
 	}
 	if len(requests) == 0 {
 		return base, version, true, answer.remember
@@ -334,6 +369,7 @@ func (a *Agent) approveToolWithCapabilities(tc messages.ToolCall, reason string,
 		return policy, updatedVersion, true, false
 	case protocol.CapabilityScopeOnce:
 		policy := base.Snapshot()
+		policy.SingleUse = true
 		for _, request := range requests {
 			if err := applyCapability(policy, request); err != nil {
 				return base, version, false, false
@@ -377,6 +413,7 @@ func (a *Agent) applyRevokeCapabilities(cmd protocol.Command, owned ...bool) pro
 		// Invalidate all outstanding approval prompts at the same moment that
 		// dispatch is frozen. The revoking bit stays set if any cleanup fails.
 		a.capabilities.capabilityRevision++
+		a.capabilities.revocationRevision++
 	}
 	turnCancel := a.turn.turnCancel
 	resources, oldMCP, supervisor := a.services.resources, a.services.mcp, a.services.supervisor
@@ -425,6 +462,11 @@ func (a *Agent) applyRevokeCapabilities(cmd protocol.Command, owned ...bool) pro
 	// Close every admission gate before interrupting work. ProcessManager keeps
 	// starts blocked until every old process has exited; the MCP manager is
 	// closed and replaced only after the active turn has released its leases.
+	for _, grant := range grants {
+		if err := applyCapability(base, grant); err != nil {
+			return a.rejectedReceipt(cmd, protocol.ErrorInternal, "cannot reconstruct retiring environment: "+err.Error())
+		}
+	}
 	scope := &sandboxQuiescence{turnCancel: turnCancel, resources: resources, mcp: oldMCP, supervisor: supervisor, policy: base, turn: &a.lifecycle.turnWG, operations: &a.lifecycle.operationWG}
 	var revokeErr error
 	if len(owned) > 0 && owned[0] {
@@ -465,12 +507,11 @@ func (a *Agent) applyRevokeCapabilities(cmd protocol.Command, owned ...bool) pro
 		delete(a.capabilities.capabilityGrants, key)
 	}
 	a.capabilities.capabilityRevision++
-	a.capabilities.capabilityRevoking = false
 	a.sequences.catalogVersion++
 	a.mu.Unlock()
 	a.settingsCommitMu.Unlock()
-	if resources != nil && resources.Processes != nil {
-		resources.Processes.ResumeAfterRevocation()
+	if err := a.resumeSandboxAdmission(); err != nil {
+		return a.rejectedReceipt(cmd, protocol.ErrorInternal, "revoked access; executor reopening was not confirmed: "+err.Error())
 	}
 	a.emitStatus("session sandbox capabilities revoked; MCP connections were closed; run /reload to reconnect configured servers")
 	a.publishState()

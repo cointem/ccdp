@@ -94,32 +94,6 @@ func (p *Writer) persistSettingsSnapshotLocked(settings session.Settings, revisi
 	return err
 }
 
-// persistWorkflow appends a recoverable workflow state transition. Workflow
-// is UI/session state, not model history, so replay keeps it in the typed
-// projection without manufacturing a chat message.
-func (p *Writer) PersistWorkflow(workflow session.WorkflowState) error {
-	if p == nil {
-		return errors.New("agent: nil session persistence")
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.store == nil {
-		return session.ErrClosed
-	}
-	projection, err := p.projectionLocked()
-	if err != nil {
-		return err
-	}
-	if reflect.DeepEqual(projection.Workflow, workflow) {
-		return nil
-	}
-	_, err = p.commitLocked(session.Batch{TransactionID: messages.StableID("workflow", struct {
-		Workflow session.WorkflowState
-		Cursor   session.Cursor
-	}{workflow, p.store.CurrentCursor()}), Events: []session.Event{session.WorkflowChanged{Workflow: workflow}}})
-	return err
-}
-
 // PersistTasks commits the full task-list replacement. Only a successful
 // commit updates the bound session projection used by views and prompts.
 func (p *Writer) PersistTasks(tasks []session.Task) error {

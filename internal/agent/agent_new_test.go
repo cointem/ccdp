@@ -1,12 +1,14 @@
 package agent
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"ccdp/internal/config"
+	"ccdp/internal/protocol"
 )
 
 // newAgentForTest builds an agent with a temp session dir for unit tests that
@@ -75,7 +77,7 @@ func TestImageContentParts(t *testing.T) {
 
 func TestTraceWritten(t *testing.T) {
 	ag := newAgentForTest(t)
-	ag.emit(Event{Type: EventUserMsg, Text: "hello trace"})
+	ag.emit(protocol.EventView{Kind: protocol.EventUserMessage, Text: "hello trace"})
 	ag.Close()
 
 	data, err := os.ReadFile(ag.TracePath())
@@ -84,5 +86,14 @@ func TestTraceWritten(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "hello trace") {
 		t.Errorf("trace does not contain event: %s", data)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var event protocol.EventView
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Text == "hello trace" && (event.Kind != protocol.EventUserMessage || event.SessionID != protocol.SessionID(ag.SessionID())) {
+			t.Fatalf("diagnostics lost the Watch event identity: %+v", event)
+		}
 	}
 }

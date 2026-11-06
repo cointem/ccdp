@@ -35,7 +35,7 @@ func runRgProgramPage(t *testing.T, ctx *Context) (Result, rgProgramPage) {
 func TestRgProgramPaginationDoesNotCountContext(t *testing.T) {
 	root := t.TempDir()
 	reviewRgWrite(t, root, "text.txt", "before\nhit first\nbetween\nhit second\nafter\n")
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	offset := 0
 	for _, matchLine := range []int{2, 4} {
 		ctx.Args = map[string]any{"pattern": "hit", "context": 1, "limit": 1, "offset": offset}
@@ -65,7 +65,7 @@ func TestRgProgramPaginationDoesNotCountContext(t *testing.T) {
 func TestRgOnlyMatchingKeepsAllSubmatchesOnSourceLine(t *testing.T) {
 	root := t.TempDir()
 	reviewRgWrite(t, root, "text.txt", "hit hit\nhit hit hit\n")
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	for offset, count := range []int{2, 3} {
 		ctx.Args = map[string]any{"pattern": "hit", "only_matching": true, "limit": 1, "offset": offset}
 		result, page := runRgProgramPage(t, ctx)
@@ -86,7 +86,7 @@ func TestRgOnlyMatchingKeepsAllSubmatchesOnSourceLine(t *testing.T) {
 func TestRgOnlyMatchingMultilinePreservesSourceNumbers(t *testing.T) {
 	root := t.TempDir()
 	reviewRgWrite(t, root, "text.txt", "alpha B\nC alpha\nalpha alpha\n")
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	for offset, want := range [][]string{{"alpha", "B"}, {"C", "alpha"}, {"alpha", "alpha"}} {
 		ctx.Args = map[string]any{"pattern": "alpha|B\\nC", "multiline": true, "only_matching": true, "limit": 1, "offset": offset}
 		result, page := runRgProgramPage(t, ctx)
@@ -106,7 +106,7 @@ func TestRgProgramFilePagination(t *testing.T) {
 	reviewRgWrite(t, root, "a.txt", "hit\n")
 	reviewRgWrite(t, root, "b.txt", "hit\nhit\n")
 	reviewRgWrite(t, root, "c.txt", "hit\n")
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	for _, mode := range []string{rgModeFiles, rgModeCount} {
 		ctx.Args = map[string]any{"pattern": "hit", "mode": mode, "limit": 1, "offset": 1}
 		result, page := runRgProgramPage(t, ctx)
@@ -129,7 +129,7 @@ func TestRgProgramFilePagination(t *testing.T) {
 func TestRgProgramReportsTextClipping(t *testing.T) {
 	root := t.TempDir()
 	reviewRgWrite(t, root, "text.txt", "hit "+strings.Repeat("x", 100)+"\n")
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	ctx.OutputLimit = 64
 	ctx.Args = map[string]any{"pattern": "hit"}
 	result, page := runRgProgramPage(t, ctx)

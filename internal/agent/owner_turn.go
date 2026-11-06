@@ -11,10 +11,6 @@ func (a *Agent) isBusy() bool {
 }
 
 func (a *Agent) setPhase(phase protocol.RuntimePhase) {
-	if a.owner == nil {
-		a.setPhaseOwned(phase)
-		return
-	}
 	a.ensureRun()
 	request := turnPhaseChanged{phase: phase, done: make(chan struct{})}
 	select {

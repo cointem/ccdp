@@ -22,10 +22,7 @@ func (a *Agent) enqueueChildRecord(record supervision.RunRecord) <-chan error {
 		result <- err
 		return result
 	}
-	if a.owner == nil {
-		result <- a.commitChildRecord(frozen)
-		return result
-	}
+
 	a.ensureRun()
 	a.mu.Lock()
 	select {
@@ -56,9 +53,6 @@ func (a *Agent) drainChildRecords() {
 }
 
 func (a *Agent) waitChildRecord(reply <-chan error) error {
-	if a.owner == nil {
-		return <-reply
-	}
 	select {
 	case err := <-reply:
 		return err
@@ -77,10 +71,7 @@ func (a *Agent) commitChildRecord(record supervision.RunRecord) error {
 	if p == nil {
 		return errors.New("child: parent persistence unavailable")
 	}
-	var accounted map[string]bool
-	if a.owner != nil {
-		accounted = a.owner.childAccounted
-	}
+	accounted := a.owner.childAccounted
 	if accounted == nil {
 		records, err := p.Read(session.Beginning)
 		if err != nil {
@@ -92,9 +83,7 @@ func (a *Agent) commitChildRecord(record supervision.RunRecord) error {
 				accounted[string(fact.Child.Run.ID)] = true
 			}
 		}
-		if a.owner != nil {
-			a.owner.childAccounted = accounted
-		}
+		a.owner.childAccounted = accounted
 	}
 	key := string(record.Fact.Child.Run.ID)
 	if record.Terminal && accounted[key] {

@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"ccdp/internal/testenv"
 )
 
 func reviewRgWrite(t *testing.T, root, path, body string) {
@@ -28,7 +30,7 @@ func TestNativeRgNestedIgnore(t *testing.T) {
 	reviewRgWrite(t, root, "a/.gitignore", "skip.txt\n")
 	reviewRgWrite(t, root, "a/deep/skip.txt", "needle\n")
 	reviewRgWrite(t, root, "b/a/skip.txt", "needle\n")
-	lines, _, err := ripgrepSearch(rgCtx(root), &rgRequest{pattern: "needle", base: root})
+	lines, _, err := ripgrepSearch(rgCtx(t, root), &rgRequest{pattern: "needle", base: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +42,7 @@ func TestNativeRgNestedIgnore(t *testing.T) {
 func TestNativeRgMultilineCRLF(t *testing.T) {
 	root := t.TempDir()
 	reviewRgWrite(t, root, "crlf.txt", "aaa\r\nbbb\r\nccc\r\nddd\r\n")
-	lines, _, err := ripgrepSearch(rgCtx(root), &rgRequest{pattern: "ccc\\r\\n", base: root, multiline: true})
+	lines, _, err := ripgrepSearch(rgCtx(t, root), &rgRequest{pattern: "ccc\\r\\n", base: root, multiline: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +54,7 @@ func TestNativeRgMultilineCRLF(t *testing.T) {
 func TestNativeRgHonorsCancelledContext(t *testing.T) {
 	root := t.TempDir()
 	reviewRgWrite(t, root, "file.txt", "needle\n")
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	ctx.Context = cancelled
@@ -67,9 +69,11 @@ func TestNativeIgnoreFIFOIsSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 	reviewRgWrite(t, root, "file.txt", "needle")
+	ctx := rgCtx(t, root)
+	testenv.Prepare(t, ctx.Sandbox)
 	done := make(chan error, 1)
 	go func() {
-		lines, _, err := ripgrepSearch(rgCtx(root), &rgRequest{pattern: "needle", base: root})
+		lines, _, err := ripgrepSearch(ctx, &rgRequest{pattern: "needle", base: root})
 		if err == nil && len(lines) != 1 {
 			err = fmt.Errorf("got %d matches", len(lines))
 		}
@@ -110,7 +114,7 @@ func TestNativeIgnoreRulesAgreeWithRipgrep(t *testing.T) {
 		}
 		want = append(want, filepath.ToSlash(rel))
 	}
-	lines, _, err := ripgrepSearch(rgCtx(root), &rgRequest{pattern: "needle", base: root, outputMode: rgModeFiles})
+	lines, _, err := ripgrepSearch(rgCtx(t, root), &rgRequest{pattern: "needle", base: root, outputMode: rgModeFiles})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +139,7 @@ func TestRgSubdirectoryInheritsOnlyScopedAncestors(t *testing.T) {
 	} {
 		reviewRgWrite(t, parent, path, body)
 	}
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	req := &rgRequest{pattern: "needle", base: filepath.Join(root, "sub"), outputMode: rgModeFiles}
 	for _, search := range []func(*Context, *rgRequest) ([]rgLine, bool, error){ripgrepSearch} {
 		lines, _, err := search(ctx, req)
@@ -172,7 +176,7 @@ func TestRgSymlinkScopeUsesCanonicalDepth(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, "a", "b"), filepath.Join(root, "link")); err != nil {
 		t.Fatal(err)
 	}
-	lines, _, err := ripgrepSearch(rgCtx(root), &rgRequest{pattern: "needle", base: filepath.Join(root, "link"), outputMode: rgModeFiles})
+	lines, _, err := ripgrepSearch(rgCtx(t, root), &rgRequest{pattern: "needle", base: filepath.Join(root, "link"), outputMode: rgModeFiles})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +193,7 @@ func TestSnapshotRgRejectsImplicitIgnoreOutsideReadRoot(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, "outside-ignore"), filepath.Join(snapshot, ".gitignore")); err != nil {
 		t.Fatal(err)
 	}
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	ctx.ReadRoot = snapshot
 	req := &rgRequest{pattern: "needle", base: snapshot, outputMode: rgModeFiles}
 	for _, search := range []func(*Context, *rgRequest) ([]rgLine, bool, error){ripgrepSearch} {

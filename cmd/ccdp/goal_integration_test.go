@@ -31,7 +31,7 @@ func TestHeadlessGoalRuntimeIntegration(t *testing.T) {
 	cfg.Workspace = t.TempDir()
 	cfg.SessionDir = filepath.Join(cfg.Workspace, "sessions")
 	cfg.Model = "goal-model"
-	cfg.PermissionMode = "bypassPermissions"
+	cfg.PermissionMode = "auto"
 	cfg.EnableProjectMemory = false
 	registry := plugin.NewModelRegistry()
 	registry.Register(p)

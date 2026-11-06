@@ -14,6 +14,7 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func codingFixture(t *testing.T) (*Agent, string) {
@@ -33,7 +34,7 @@ func codingFixture(t *testing.T) (*Agent, string) {
 	cfg := config.Default()
 	cfg.Workspace = root
 	cfg.SessionDir = t.TempDir()
-	cfg.PermissionMode = "bypass"
+	cfg.PermissionMode = "auto"
 	cfg.EnableGuardian = config.BoolPtr(false)
 	cfg.EnableProjectMemory = false
 	cfg.MCPServers = nil
@@ -439,7 +440,7 @@ func TestDeliveryCreatesInitialCommitWithoutIndex(t *testing.T) {
 	cfg := config.Default()
 	cfg.Workspace = root
 	cfg.SessionDir = t.TempDir()
-	cfg.PermissionMode = "bypass"
+	cfg.PermissionMode = "auto"
 	cfg.EnableGuardian = config.BoolPtr(false)
 	a, e := testNew(t, &cfg)
 	if e != nil {
@@ -484,7 +485,7 @@ func TestPreparedRestoreSurvivesSessionRestart(t *testing.T) {
 	cfg := a.services.cfg.Clone()
 	sid := a.SessionID()
 	a.Close()
-	snap, e := LoadSession(cfg.SessionDir, sid)
+	snap, e := archive.Load(cfg.SessionDir, sid)
 	if e != nil {
 		t.Fatal(e)
 	}

@@ -62,3 +62,44 @@ func TestCancelledPendingUserInputNeverEntersTranscript(t *testing.T) {
 		t.Fatalf("unsent input entered transcript: %+v", items)
 	}
 }
+
+func TestRuntimeContextStaysOutOfVisibleTranscript(t *testing.T) {
+	var messages []session.Message
+	var facts []session.Event
+	for _, input := range []struct{ id, source string }{
+		{"user", ""}, {"access", "runtime_access"}, {"repository", "runtime_repository"}, {"answer", ""},
+	} {
+		message := session.Message{MessageID: input.id, Role: "user", InternalSource: input.source,
+			Content: []session.ContentBlock{{Kind: session.ContentText, Text: `<runtime_context section="access">example</runtime_context>`}}}
+		if input.id == "answer" {
+			message.Role = "assistant"
+		}
+		messages = append(messages, message)
+		facts = append(facts, session.AssistantCommitted{TurnID: "turn-1", Message: message})
+	}
+	for name, events := range map[string][]session.Event{
+		"append": facts,
+		"reset":  {session.ConversationReset{TurnID: "turn-1", Messages: messages}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			live := &Transcript{window: 2}
+			live.Facts(events)
+			visible, more := live.Snapshot()
+			if more || len(visible) != 2 || visible[0].ID != "user" || visible[1].ID != "answer" {
+				t.Fatalf("internal context leaked or displaced user content: %+v, more=%v", visible, more)
+			}
+			var records []session.Record
+			for i, event := range events {
+				records = append(records, session.Record{Seq: uint64(i + 1), Event: event})
+			}
+			page := NewTranscript(0, 2)
+			if err := page.ReplayRecords(context.Background(), records, session.Beginning); err != nil {
+				t.Fatal(err)
+			}
+			replayed, more := page.Snapshot()
+			if more || !reflect.DeepEqual(replayed, visible) || page.Position("answer") != 2 {
+				t.Fatalf("replay or pagination exposed internal context: %+v", replayed)
+			}
+		})
+	}
+}

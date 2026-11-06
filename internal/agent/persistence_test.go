@@ -14,6 +14,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func testPersistenceConfig(t *testing.T) config.Config {
@@ -43,7 +44,7 @@ func TestAgentPersistenceProjectionRoundTrip(t *testing.T) {
 	if err := p.PersistSettingsSnapshot(session.Settings{Workspace: cfg.Workspace, Model: cfg.Model}, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.persistUsage(Usage{InputTokens: 12, OutputTokens: 7, CachedTokens: 2, TurnCount: 3}); err != nil {
+	if err := p.persistUsage(protocol.UsageSnapshot{InputTokens: 12, OutputTokens: 7, CachedTokens: 2, TurnCount: 3}); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.PersistInputQueued("queued-1", "later", "followup", "", created); err != nil {
@@ -52,7 +53,7 @@ func TestAgentPersistenceProjectionRoundTrip(t *testing.T) {
 	if err := p.PersistHistoryMessages(history, "turn-1"); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := SessionSnapshot{ID: "round-trip", CreatedAt: time.Unix(100, 0).UTC(), UpdatedAt: time.Unix(105, 0).UTC(), Workspace: cfg.Workspace, Model: cfg.Model, History: history, Usage: Usage{InputTokens: 12, OutputTokens: 7, CachedTokens: 2, TurnCount: 3}}
+	snapshot := archive.Snapshot{ID: "round-trip", CreatedAt: time.Unix(100, 0).UTC(), UpdatedAt: time.Unix(105, 0).UTC(), Workspace: cfg.Workspace, Model: cfg.Model, History: history, Usage: session.Usage{InputTokens: 12, OutputTokens: 7, TotalTokens: 19, CachedTokens: 2, TurnCount: 3}}
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func TestAgentPersistenceProjectionRoundTrip(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.SessionDir, "round-trip.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy JSON path should not be written, stat err=%v", err)
 	}
-	got, err := LoadSession(cfg.SessionDir, "round-trip")
+	got, err := archive.Load(cfg.SessionDir, "round-trip")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,14 +122,14 @@ func TestFlatJSONSessionIsNotImportedOrModified(t *testing.T) {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	listed, issues, err := ListSessions(cfg.SessionDir)
+	listed, issues, err := archive.List(cfg.SessionDir)
 	if err != nil || len(listed) != 0 || len(issues) != 0 {
 		t.Fatalf("list: %+v, %+v, %v", listed, issues, err)
 	}
-	if _, err := LoadSession(cfg.SessionDir, "retired"); err == nil {
+	if _, err := archive.Load(cfg.SessionDir, "retired"); err == nil {
 		t.Fatal("flat JSON loaded as a current session")
 	}
-	if a, err := Resume(&cfg, &SessionSnapshot{ID: "retired"}); err == nil {
+	if a, err := Resume(&cfg, &archive.Snapshot{ID: "retired"}); err == nil {
 		a.Close()
 		t.Fatal("resume created a session instead of rejecting missing JSONL")
 	}
@@ -153,7 +154,7 @@ func TestReplayStartedToolIsUnknownWithoutRerun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := SessionSnapshotProjection(store, "recover")
+	got, err := archive.FromStore(store, "recover")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +180,7 @@ func TestNewRefusesExistingSessionAndResumeUsesProjection(t *testing.T) {
 		ag.Close()
 		t.Fatal("New attached to an existing session")
 	}
-	snap, err := LoadSession(cfg.SessionDir, "existing")
+	snap, err := archive.Load(cfg.SessionDir, "existing")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +287,7 @@ func TestSessionCloseResumeCloseUsesDistinctLifecycleTransactions(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	snapshot, err := LoadSession(cfg.SessionDir, sessionID)
+	snapshot, err := archive.Load(cfg.SessionDir, sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +341,7 @@ func TestHistoryClearDoesNotResurrectOldProjection(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := LoadSession(cfg.SessionDir, "history-clear")
+	got, err := archive.Load(cfg.SessionDir, "history-clear")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +370,7 @@ func TestHistoryAThenBThenAIsNotSwallowedByTransactionDedup(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := LoadSession(cfg.SessionDir, "history-cycle")
+	got, err := archive.Load(cfg.SessionDir, "history-cycle")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +408,7 @@ func TestAgentPendingAndDeliveredInputsSurviveRestartWithoutRerun(t *testing.T) 
 	}
 	ag.Close()
 
-	snap, err := LoadSession(cfg.SessionDir, ag.SessionID())
+	snap, err := archive.Load(cfg.SessionDir, ag.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,7 +462,7 @@ func TestAgentCommitsUseMemoryStoreWhenPersistenceDisabled(t *testing.T) {
 	if p == nil {
 		t.Fatal("memory persistence missing")
 	}
-	got, err := SessionSnapshotProjection(p, ag.SessionID())
+	got, err := archive.FromStore(p, ag.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,21 +481,21 @@ func TestPopulateMemoryResumePreservesSnapshotIdentityAndInbox(t *testing.T) {
 	defer p.Close()
 	created := time.Unix(1001, 0).UTC()
 	pendingAt := time.Unix(1002, 0).UTC()
-	snapshot := &SessionSnapshot{
+	snapshot := &archive.Snapshot{
 		ID: "memory-seed", CreatedAt: created, UpdatedAt: pendingAt,
 		Workspace: cfg.Workspace, Model: cfg.Model,
 		History: []messages.Message{
 			{ID: "user-stable", Role: messages.RoleUser, Content: "hello", CreatedAt: created.Add(time.Second)},
 			{ID: "assistant-stable", Role: messages.RoleAssistant, Content: "world", CreatedAt: created.Add(2 * time.Second)},
 		},
-		Usage:         Usage{InputTokens: 9, OutputTokens: 4, CachedTokens: 2, TurnCount: 1},
+		Usage:         session.Usage{InputTokens: 9, OutputTokens: 4, TotalTokens: 13, CachedTokens: 2, TurnCount: 1},
 		PendingInputs: []protocol.InputView{{ID: "pending-stable", Text: "queued", Strategy: protocol.InputSteer, State: "queued", CreatedAt: pendingAt}},
 		ParentID:      "parent-session", BranchPoint: 1, BranchSummary: "already tried",
 	}
 	if err := p.populateMemoryResume(snapshot); err != nil {
 		t.Fatal(err)
 	}
-	got, err := SessionSnapshotProjection(p, snapshot.ID)
+	got, err := archive.FromStore(p, snapshot.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +514,7 @@ func TestPopulateMemoryResumePreservesSnapshotIdentityAndInbox(t *testing.T) {
 	if err := p.populateMemoryResume(snapshot); err != nil {
 		t.Fatal(err)
 	}
-	again, err := SessionSnapshotProjection(p, snapshot.ID)
+	again, err := archive.FromStore(p, snapshot.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,11 +527,11 @@ func TestResumeNoPersistenceRetainsProvidedHistoryAndPending(t *testing.T) {
 	cfg := testPersistenceConfig(t)
 	cfg.NoSessionPersistence = true
 	created := time.Unix(1100, 0).UTC()
-	snapshot := &SessionSnapshot{
+	snapshot := &archive.Snapshot{
 		ID: "memory-resume-agent", CreatedAt: created, UpdatedAt: created.Add(time.Second),
 		Workspace: cfg.Workspace, Model: cfg.Model,
 		History:       []messages.Message{{ID: "resume-user", Role: messages.RoleUser, Content: "keep me", CreatedAt: created.Add(2 * time.Second)}},
-		Usage:         Usage{InputTokens: 5, OutputTokens: 6, TurnCount: 1},
+		Usage:         session.Usage{InputTokens: 5, OutputTokens: 6, TotalTokens: 11, TurnCount: 1},
 		PendingInputs: []protocol.InputView{{ID: "resume-pending", Text: "wait me", Strategy: protocol.InputFollowup, State: "queued", CreatedAt: created.Add(3 * time.Second)}},
 	}
 	ag, err := Resume(&cfg, snapshot)
@@ -543,12 +544,12 @@ func TestResumeNoPersistenceRetainsProvidedHistoryAndPending(t *testing.T) {
 		t.Fatalf("resumed memory history = %+v", history)
 	}
 	ag.mu.Lock()
-	pending := cloneInputViews(ag.conversation.durable.PendingInputViews())
+	pending := append([]protocol.InputView(nil), ag.conversation.durable.PendingInputViews()...)
 	ag.mu.Unlock()
 	if len(pending) != 1 || pending[0].ID != "resume-pending" || pending[0].Strategy != protocol.InputFollowup {
 		t.Fatalf("resumed memory typed pending = %+v", pending)
 	}
-	if got := ag.Usage(); got != snapshot.Usage {
+	if got := sessionUsage(ag.Usage()); got != snapshot.Usage {
 		t.Fatalf("resumed memory usage = %+v, want %+v", got, snapshot.Usage)
 	}
 }
@@ -619,7 +620,7 @@ func TestListSessionsSkipsDamagedSessionAndReportsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sessions, issues, err := ListSessions(cfg.SessionDir)
+	sessions, issues, err := archive.List(cfg.SessionDir)
 	if err != nil {
 		t.Fatalf("one damaged session failed the whole listing: %v", err)
 	}

@@ -15,7 +15,7 @@ func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 	p.stream = func(_ context.Context, req llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
 		text := ""
 		for _, m := range req.Messages {
-			if m.Role == "user" {
+			if isTaskMessage(m) {
 				text, _ = m.Content.(string)
 			}
 		}
@@ -35,7 +35,7 @@ func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Settings.Model.Model != "child-test-model" || view.Settings.Permission.Mode != "bypassPermissions" || view.Closing || view.Busy || view.Phase != protocol.PhaseIdle || len(view.Transcript) == 0 {
+	if view.Settings.Model.Model != "child-test-model" || view.Settings.Permission.Mode != "auto" || view.Closing || view.Busy || view.Phase != protocol.PhaseIdle || len(view.Transcript) == 0 {
 		t.Fatalf("completed view lost settings or transcript: %+v", view)
 	}
 	// Simulate a recovered reader with no retained in-process final snapshot.

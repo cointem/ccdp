@@ -8,6 +8,7 @@ import (
 
 	"ccdp/internal/messages"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 // These tests exercise the production compaction/fork paths with a real
@@ -47,7 +48,7 @@ func TestForkJournalAdmissionFailureDoesNotCreateChild(t *testing.T) {
 	if err := a.appendHistory(messages.Message{Role: messages.RoleAssistant, Content: "abandoned"}); err != nil {
 		t.Fatal(err)
 	}
-	before, _, err := ListSessions(a.services.cfg.SessionDir)
+	before, _, err := archive.List(a.services.cfg.SessionDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +59,7 @@ func TestForkJournalAdmissionFailureDoesNotCreateChild(t *testing.T) {
 	if err == nil || !errors.As(err, &journalErr) {
 		t.Fatalf("fork error = %v, want request journal failure", err)
 	}
-	after, _, err := ListSessions(a.services.cfg.SessionDir)
+	after, _, err := archive.List(a.services.cfg.SessionDir)
 	if err != nil {
 		t.Fatal(err)
 	}

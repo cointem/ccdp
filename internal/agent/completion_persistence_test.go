@@ -24,6 +24,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/session/journal"
 	"ccdp/internal/tools"
 	"ccdp/internal/workspace"
@@ -391,7 +392,7 @@ func TestFormalCompactFailureKeepsHistory(t *testing.T) {
 }
 
 func TestFormalSettingsFailureDoesNotPublish(t *testing.T) {
-	for _, commandType := range []protocol.CommandType{protocol.CommandSetExecutionMode, protocol.CommandSetPermissionPolicy, protocol.CommandSetSandboxPolicy} {
+	for _, commandType := range []protocol.CommandType{protocol.CommandSetPermissionPolicy, protocol.CommandSetSandboxPolicy} {
 		t.Run(string(commandType), func(t *testing.T) {
 			a := newJournalRuntimeAgent(t, &formalCompletionProvider{})
 			before, err := a.Snapshot(context.Background())
@@ -405,10 +406,8 @@ func TestFormalSettingsFailureDoesNotPublish(t *testing.T) {
 			backend.mu.Unlock()
 			command := protocol.Command{ID: protocol.CommandID("formal-settings-failure"), SessionID: protocol.SessionID(a.SessionID()), Type: commandType}
 			switch commandType {
-			case protocol.CommandSetExecutionMode:
-				command.ExecutionMode = &protocol.SetExecutionMode{Mode: protocol.ExecutionModePlan}
 			case protocol.CommandSetPermissionPolicy:
-				command.PermissionPolicy = &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: "default", AlwaysDeny: []string{"FormalAuditEffect"}}}
+				command.PermissionPolicy = &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: "manual", AlwaysDeny: []string{"FormalAuditEffect"}}}
 			case protocol.CommandSetSandboxPolicy:
 				command.SandboxPolicy = &protocol.SetSandboxPolicy{Policy: protocol.SandboxPolicy{NetworkAccess: true}}
 			}
@@ -423,7 +422,7 @@ func TestFormalSettingsFailureDoesNotPublish(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(before.Settings, after.Settings) || before.Workflow != after.Workflow {
+			if !reflect.DeepEqual(before.Settings, after.Settings) {
 				t.Fatalf("uncommitted settings became live:\n before=%+v\n after=%+v", before.Settings, after.Settings)
 			}
 		})
@@ -526,7 +525,7 @@ func TestFormalCommandFactsPreventResumeRetry(t *testing.T) {
 			if err := os.WriteFile(path, []byte(marker), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			snapshot, err := LoadSession(cfg.SessionDir, sessionID)
+			snapshot, err := archive.Load(cfg.SessionDir, sessionID)
 			if err != nil {
 				t.Fatal(err)
 			}

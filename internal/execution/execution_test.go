@@ -38,8 +38,7 @@ func TestRunNotifyDrainsUnterminatedLargeLine(t *testing.T) {
 }
 
 func TestRunSlowNotifyDoesNotBlockProcessDrain(t *testing.T) {
-	start := time.Now()
-	res, err := Run(testRequest(t, Request{
+	req := testRequest(t, Request{
 		Context:     context.Background(),
 		Command:     "for i in $(seq 1 100); do echo line; done",
 		OutputLimit: 1024,
@@ -47,7 +46,12 @@ func TestRunSlowNotifyDoesNotBlockProcessDrain(t *testing.T) {
 			time.Sleep(500 * time.Millisecond)
 			return nil
 		},
-	}))
+	})
+	if _, err := Run(Request{Context: context.Background(), Command: "true", Dir: req.Dir, Sandbox: req.Sandbox}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	res, err := Run(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +162,7 @@ func TestSanitizedEnvironmentGitHubOptInIsNarrow(t *testing.T) {
 }
 
 func TestExplicitEnvironmentCannotReintroduceHostProxyOrAgentSocket(t *testing.T) {
-	policy := sandbox.New(t.TempDir())
+	policy := testSandbox(t, t.TempDir())
 	policy.SetScratchDir(t.TempDir())
 	env, cleanup, err := prepareProcessEnvironment([]string{
 		"PATH=/usr/bin:/bin",
@@ -183,12 +187,12 @@ func TestExplicitEnvironmentCannotReintroduceHostProxyOrAgentSocket(t *testing.T
 	}
 }
 
-func TestProcessEnvironmentReusesSessionScratchForCaches(t *testing.T) {
+func TestProcessEnvironmentKeepsScratchPrivateAndCachesStable(t *testing.T) {
 	scratch := t.TempDir()
 	if resolved, err := filepath.EvalSymlinks(scratch); err == nil {
 		scratch = resolved
 	}
-	policy := sandbox.New(t.TempDir())
+	policy := testSandbox(t, t.TempDir())
 	policy.SetScratchDir(scratch)
 
 	first, cleanupFirst, err := prepareProcessEnvironment([]string{"PATH=/usr/bin:/bin"}, policy.Snapshot())
@@ -201,69 +205,23 @@ func TestProcessEnvironmentReusesSessionScratchForCaches(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanupSecond()
-	for _, key := range []string{"HOME", "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "GOCACHE", "npm_config_cache", "PIP_CACHE_DIR"} {
+	home, _ := os.UserHomeDir()
+	if environmentValue(first, "HOME") != home {
+		t.Fatal("HOME discovery changed")
+	}
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "GOCACHE", "GOMODCACHE", "GOTMPDIR", "npm_config_cache", "PIP_CACHE_DIR", "UV_CACHE_DIR", "CARGO_HOME"} {
 		firstValue, secondValue := environmentValue(first, key), environmentValue(second, key)
 		if firstValue == "" || firstValue != secondValue {
 			t.Fatalf("%s was not stable across session calls: first=%q second=%q", key, firstValue, secondValue)
 		}
-		if !withinPath(scratch, firstValue) {
-			t.Fatalf("%s escaped the session scratch root: %q", key, firstValue)
+		root := environmentValue(first, "XDG_CACHE_HOME")
+		switch key {
+		case "TMPDIR", "TMP", "TEMP", "GOTMPDIR":
+			root = scratch
 		}
-	}
-}
-
-func TestPreferNativeGitAvoidsXcrunShim(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("macOS Command Line Tools adaptation")
-	}
-	if executableFile(nativeGitPath) == "" {
-		t.Skip("Command Line Tools git is not installed")
-	}
-	env := []string{"PATH=/usr/bin:/bin"}
-	argv, _ := preferNativeGit([]string{"git", "--version"}, "", env, t.TempDir())
-	if argv[0] != nativeGitPath {
-		t.Fatalf("argv git resolved to the xcrun shim: %v", argv)
-	}
-	_, shellEnv := preferNativeGit(nil, "git status", env, t.TempDir())
-	if got := environmentValue(shellEnv, "PATH"); !strings.HasPrefix(got, filepath.Dir(nativeGitPath)+string(os.PathListSeparator)) {
-		t.Fatalf("shell git PATH does not select the native tool: %q", got)
-	}
-}
-
-func TestPreferNativeCLTPythonAvoidsXcrunShim(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("macOS Command Line Tools adaptation")
-	}
-	nativePath := nativeCLTPythonPath()
-	if nativePath == "" {
-		t.Skip("Command Line Tools Python framework is not installed")
-	}
-	dir := t.TempDir()
-	env := []string{"PATH=/usr/bin:/bin"}
-	argv, _ := preferNativeCLTPython([]string{"/usr/bin/python3", "--version"}, "", env, dir, nativePath)
-	if argv[0] != nativePath {
-		t.Fatalf("argv python resolved to the xcrun shim: %v", argv)
-	}
-	_, shellEnv := preferNativeCLTPython(nil, "python3 --version", env, dir, nativePath)
-	if got := environmentValue(shellEnv, "PATH"); !strings.HasPrefix(got, filepath.Dir(nativePath)+string(os.PathListSeparator)) {
-		t.Fatalf("shell PATH does not select the native Python runtime: %q", got)
-	}
-
-	policy := sandbox.New(dir)
-	addExecutionReadRoots(policy, argv, "", dir, env)
-	wantRoot := pythonFrameworkVersionRoot(nativePath)
-	if wantRoot == "" || executableReadRoot(nativePath, policy.Workspace) != wantRoot {
-		t.Fatalf("Python executable read root = %q, want exact version root %q", executableReadRoot(nativePath, policy.Workspace), wantRoot)
-	}
-	found := false
-	for _, root := range policy.ExecutionReadRoots {
-		if root == wantRoot {
-			found = true
-			break
+		if !withinPath(root, firstValue) {
+			t.Fatalf("%s escaped its assigned root: %q", key, firstValue)
 		}
-	}
-	if !found {
-		t.Fatalf("execution policy did not discover Python runtime root %q: %v", wantRoot, policy.ExecutionReadRoots)
 	}
 }
 
@@ -279,7 +237,7 @@ func TestRunArgvAllowsGitReadTreeWithTemporaryIndex(t *testing.T) {
 		Context: context.Background(),
 		Dir:     dir,
 		Env:     env,
-		Sandbox: sandbox.New(dir),
+		Sandbox: testSandbox(t, dir),
 	})
 	if err != nil {
 		t.Fatalf("git read-tree was incorrectly treated as interactive: %v (result=%+v)", err, result)
@@ -341,7 +299,7 @@ func TestSandboxLimitsApplyToAllExecutionEntrances(t *testing.T) {
 		return nil
 	}
 
-	s := sandbox.New(t.TempDir())
+	s := testSandbox(t, t.TempDir())
 	s.Limits = &sandbox.Limits{MaxFiles: 64}
 	if err := runEntrances("Seatbelt", s); err != nil {
 		t.Fatal(err)
@@ -473,7 +431,7 @@ func testRequest(t *testing.T, req Request) Request {
 		req.Dir = t.TempDir()
 	}
 	if req.Sandbox == nil {
-		req.Sandbox = sandbox.New(req.Dir)
+		req.Sandbox = testSandbox(t, req.Dir)
 	}
 	return req
 }
@@ -484,7 +442,7 @@ func TestApprovedShellPreservesProjectPATH(t *testing.T) {
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf project-output\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Run(Request{Context: context.Background(), Command: "project-query", Dir: root, Env: []string{"PATH=" + root + ":/usr/bin:/bin"}, Sandbox: sandbox.New(root)})
+	res, err := Run(Request{Context: context.Background(), Command: "project-query", Dir: root, Env: []string{"PATH=" + root + ":/usr/bin:/bin"}, Sandbox: testSandbox(t, root)})
 	if err != nil {
 		t.Fatal(err)
 	}

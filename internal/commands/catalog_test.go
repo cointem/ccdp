@@ -5,10 +5,10 @@ import "testing"
 func TestDefaultCatalogHasStableCommandSurface(t *testing.T) {
 	catalog := Default()
 	names := catalog.Names()
-	if len(names) != 59 {
-		t.Fatalf("default command surface has %d spellings, want 59", len(names))
+	if len(names) != 58 {
+		t.Fatalf("default command surface has %d spellings, want 58", len(names))
 	}
-	for _, removed := range []string{"/cost", "/next"} {
+	for _, removed := range []string{"/cost", "/next", "/plan"} {
 		if _, ok := catalog.Lookup(removed); ok {
 			t.Fatalf("removed %s command is still registered", removed)
 		}

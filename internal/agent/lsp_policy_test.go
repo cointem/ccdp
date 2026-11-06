@@ -76,7 +76,7 @@ func TestCodeNavigateRecordsExternalExecutionBeforePolicyTightening(t *testing.T
 		t.Fatal(err)
 	}
 	cfg.AdditionalDirectories = []string{writable}
-	cfg.PermissionMode = "bypass"
+	cfg.PermissionMode = "auto"
 	cfg.EnableGuardian = config.BoolPtr(false)
 	cfg.LanguageServers = map[string]workspace.LanguageServer{
 		"test": {Argv: []string{executable, "-test.run=^TestLSPPolicyHelper$", "--", "lsp-policy-helper"}, LanguageID: "go", Extensions: []string{".go"}},

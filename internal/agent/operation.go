@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"ccdp/internal/protocol"
@@ -30,7 +31,7 @@ func (a *Agent) scheduleOperation(cmd protocol.Command, name string, operation c
 	a.mu.Lock()
 	revoking := a.capabilities.capabilityRevoking
 	if (requireIdle && (a.turn.busy || a.lifecycle.settling)) || a.lifecycle.closing || a.lifecycle.closed ||
-		revoking && name != "query:doctor" && name != "query:status" {
+		revoking && !strings.HasPrefix(name, "query:") && name != "save" && name != "compact" && cmd.Type != protocol.CommandSetWorkspace {
 		a.mu.Unlock()
 		if revoking {
 			return a.rejectedReceipt(cmd, protocol.ErrorBusy, "sandbox capability revocation is in progress")
@@ -153,11 +154,11 @@ func (a *Agent) settleOperation(result operationCompleted) {
 		if finalReceipt.Error != nil {
 			reason = finalReceipt.Error.Error()
 		}
-		a.emit(Event{Type: EventError, Text: name + ": " + reason})
+		a.emit(protocol.EventView{Kind: protocol.EventError, Text: name + ": " + reason})
 	} else {
-		a.emit(Event{Type: EventToolResult, Tool: &ToolEvent{ID: string(cmd.ID), Name: name, Status: status, Output: boundedOutput}})
+		a.emit(protocol.EventView{Kind: protocol.EventToolResult, Tool: &protocol.ToolView{ID: protocol.CallID(cmd.ID), Name: name, Status: status, Output: boundedOutput}})
 		if err != nil && name != "review" {
-			a.emit(Event{Type: EventError, Text: name + ": " + err.Error()})
+			a.emit(protocol.EventView{Kind: protocol.EventError, Text: name + ": " + err.Error()})
 		}
 	}
 	cancel()

@@ -3,6 +3,7 @@ package codemode
 import (
 	"bytes"
 	"ccdp/internal/execution"
+	"ccdp/internal/testenv"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -45,11 +46,11 @@ func runTest(t *testing.T, code string, bindings map[string]Binding) (Summary, e
 	if !Available {
 		t.Skip("requires Darwin Seatbelt")
 	}
-	return Run(context.Background(), Options{Code: code, Timeout: 10 * time.Second, MaxParallel: 2, Bindings: bindings})
+	return Run(testWorkerContext(t, context.Background()), Options{Code: code, Timeout: 10 * time.Second, MaxParallel: 2, Bindings: bindings})
 }
 func TestWorkerAsyncToolComposition(t *testing.T) {
 	s, err := runTest(t, `const a = await tools.Read({x:3}); const b = await tools.Read({x:a.data.value+4}); text(b.data);`, map[string]Binding{
-		"Read": {ReadOnly: true, Run: func(ctx context.Context, i int, a map[string]any) Result {
+		"Read": {Concurrent: func(map[string]any) bool { return true }, Run: func(ctx context.Context, i int, a map[string]any) Result {
 			data, _ := json.Marshal(map[string]any{"value": a["x"]})
 			return Result{Status: "success", Data: data}
 		}},
@@ -78,7 +79,7 @@ func TestWorkerDataErrorRetainsCompletedExecutionStatus(t *testing.T) {
 func TestWorkerRejectsUnsafeIntegerBeforeCallingTool(t *testing.T) {
 	calls := 0
 	summary, err := runTest(t, `try { await tools.Read({id:9007199254740993}); } catch(e) { text(e.message); }`, map[string]Binding{
-		"Read": {ReadOnly: true, Run: func(context.Context, int, map[string]any) Result {
+		"Read": {Concurrent: func(map[string]any) bool { return true }, Run: func(context.Context, int, map[string]any) Result {
 			calls++
 			return Result{Status: "success"}
 		}},
@@ -122,7 +123,7 @@ func TestWorkerSchedulerBarriers(t *testing.T) {
 	var order []string
 	b := map[string]Binding{}
 	for _, name := range []string{"Read", "Write"} {
-		b[name] = Binding{ReadOnly: name == "Read", Run: func(ctx context.Context, i int, args map[string]any) Result {
+		b[name] = Binding{Concurrent: func(map[string]any) bool { return name == "Read" }, Run: func(ctx context.Context, i int, args map[string]any) Result {
 			mu.Lock()
 			active++
 			peak = max(peak, active)
@@ -176,7 +177,7 @@ func TestWorkerCaptureSharesProgramResultBudget(t *testing.T) {
 }
 
 func TestWorkerStartupFailurePopulatesSummary(t *testing.T) {
-	s, err := Run(context.Background(), Options{Code: "text(1)", Executable: filepath.Join(t.TempDir(), "missing-worker")})
+	s, err := Run(context.Background(), Options{Code: "text(1)"})
 	if err == nil || s.Error != err.Error() {
 		t.Fatalf("summary=%+v error=%v", s, err)
 	}
@@ -193,10 +194,9 @@ func TestWorkerOSIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	executable, _ := os.Executable()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	p, err := execution.CodeWorker(ctx, executable, "--code-probe", secret, listener.Addr().String())
+	p, err := execution.CodeWorker(testWorkerContext(t, ctx), "--code-probe", secret, listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,8 +207,9 @@ func TestWorkerOSIsolation(t *testing.T) {
 	}
 }
 func TestWorkerCPULimit(t *testing.T) {
+	ctx := testWorkerContext(t, context.Background())
 	start := time.Now()
-	_, err := runTest(t, `while(true){}`, nil)
+	_, err := Run(ctx, Options{Code: `while(true){}`, Timeout: 10 * time.Second})
 	if err == nil || !strings.Contains(err.Error(), "execution limit") || time.Since(start) > 8*time.Second {
 		t.Fatalf("CPU timeout: %v %s", err, time.Since(start))
 	}
@@ -222,7 +223,7 @@ func TestApprovalPausesOnlyCellClock(t *testing.T) {
 		resume()
 		return Result{Status: "success"}
 	}}}
-	_, err := Run(ctx, Options{Code: `await tools.Approve({});`, Timeout: 150 * time.Millisecond, Bindings: b})
+	_, err := Run(testWorkerContext(t, ctx), Options{Code: `await tools.Approve({});`, Timeout: 150 * time.Millisecond, Bindings: b})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +233,7 @@ func TestApprovalPausesOnlyCellClock(t *testing.T) {
 		<-ctx.Done()
 		return Result{Status: "cancelled"}
 	}}
-	_, err = Run(ctx, Options{Code: `await tools.Approve({});`, Timeout: time.Second, Bindings: b})
+	_, err = Run(testWorkerContext(t, ctx), Options{Code: `await tools.Approve({});`, Timeout: time.Second, Bindings: b})
 	if err == nil {
 		t.Fatal("parent cancellation ignored while approval paused")
 	}
@@ -248,7 +249,7 @@ func TestFrameBounds(t *testing.T) {
 }
 
 func TestWorkerLargeDuplexAndCallLimit(t *testing.T) {
-	b := map[string]Binding{"Large": {ReadOnly: true, Run: func(ctx context.Context, i int, a map[string]any) Result {
+	b := map[string]Binding{"Large": {Concurrent: func(map[string]any) bool { return true }, Run: func(ctx context.Context, i int, a map[string]any) Result {
 		return Result{Status: "success", Text: strings.Repeat("x", 200000)}
 	}}}
 	s, err := runTest(t, `const pad='a'.repeat(100000);const r=await Promise.all(Array.from({length:6},()=>tools.Large({pad})));text(r.map(x=>x.text.length));`, b)
@@ -288,7 +289,7 @@ func TestWorkerCancellationJoins(t *testing.T) {
 	started := make(chan struct{})
 	settled := make(chan struct{})
 	go func() { <-started; cancel() }()
-	s, err := Run(ctx, Options{Code: `await tools.Wait({});`, Bindings: map[string]Binding{"Wait": {Run: func(ctx context.Context, i int, a map[string]any) Result {
+	s, err := Run(testWorkerContext(t, ctx), Options{Code: `await tools.Wait({});`, Bindings: map[string]Binding{"Wait": {Run: func(ctx context.Context, i int, a map[string]any) Result {
 		close(started)
 		<-ctx.Done()
 		close(settled)
@@ -302,4 +303,11 @@ func TestWorkerCancellationJoins(t *testing.T) {
 	default:
 		t.Fatal("child not settled")
 	}
+}
+
+func testWorkerContext(t *testing.T, parent context.Context) context.Context {
+	t.Helper()
+	policy := testenv.Sandbox(t, t.TempDir())
+	testenv.Prepare(t, policy)
+	return execution.WithController(parent, policy.ExecutorID)
 }

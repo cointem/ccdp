@@ -176,7 +176,7 @@ func TestSupervisorContinueKeepsOriginalOutcomeAndRejectsStaleControl(t *testing
 	p.stream = func(_ context.Context, req llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
 		text := "answer"
 		for _, m := range req.Messages {
-			if m.Role == "user" {
+			if isTaskMessage(m) {
 				text, _ = m.Content.(string)
 			}
 		}

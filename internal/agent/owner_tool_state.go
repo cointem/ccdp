@@ -21,9 +21,6 @@ type sessionCapabilitiesResult struct {
 }
 
 func (a *Agent) addSessionCapabilities(version capabilityPolicyVersion, requested []protocol.CapabilityRequest) (*sandbox.Sandbox, capabilityPolicyVersion, error) {
-	if a.owner == nil {
-		return a.addSessionCapabilitiesOwned(version, requested)
-	}
 	request := sessionCapabilitiesRequested{version: version, capabilities: append([]protocol.CapabilityRequest(nil), requested...), result: make(chan sessionCapabilitiesResult, 1)}
 	a.ensureRun()
 	select {
@@ -52,9 +49,6 @@ func (a *Agent) takeGuardianSlotOwned() bool {
 	return true
 }
 func (a *Agent) takeGuardianSlot() bool {
-	if a.owner == nil {
-		return a.takeGuardianSlotOwned()
-	}
 	a.ensureRun()
 	request := guardianSlotRequested{result: make(chan bool, 1)}
 	select {
@@ -94,9 +88,7 @@ func (a *Agent) installDiscoveredTools(request toolsDiscoveredPrepared) error {
 }
 func (a *Agent) discoverToolsFromWorker(version uint64, schemas []session.ToolSchema) error {
 	request := toolsDiscoveredPrepared{version: version, schemas: schemas, result: make(chan error, 1)}
-	if a.owner == nil {
-		return a.installDiscoveredTools(request)
-	}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- request:
@@ -126,9 +118,7 @@ func (a *Agent) commitTasks(request tasksPrepared) error {
 }
 func (a *Agent) saveTasksFromWorker(tasks []session.Task) error {
 	request := tasksPrepared{tasks: tasks, result: make(chan error, 1)}
-	if a.owner == nil {
-		return a.commitTasks(request)
-	}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- request:

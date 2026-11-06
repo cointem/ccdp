@@ -12,10 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"ccdp/internal/protocol"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
+
+	"ccdp/internal/protocol"
 )
 
 func astraModel(t *testing.T, width, height int) Model {
@@ -48,7 +49,7 @@ func TestAstraAcceptanceFrames(t *testing.T) {
 		lipgloss.SetColorProfile(profile.profile)
 		lipgloss.SetHasDarkBackground(profile.dark)
 		for _, size := range [][2]int{{24, 12}, {40, 16}, {80, 24}, {120, 40}} {
-			for _, scene := range []string{"conversation", "markdown", "tool", "approval", "plan", "question", "picker", "reader"} {
+			for _, scene := range []string{"conversation", "markdown", "tool", "approval", "question", "picker", "reader"} {
 				name := fmt.Sprintf("%s/%dx%d/%s", profile.name, size[0], size[1], scene)
 				t.Run(name, func(t *testing.T) {
 					m := astraModel(t, size[0], size[1])
@@ -58,11 +59,8 @@ func TestAstraAcceptanceFrames(t *testing.T) {
 					case "tool":
 						m.applyTranscript([]protocol.TranscriptItem{{ID: "tool-1", Kind: "tool", Tool: "Bash", CallID: "call-1", Args: json.RawMessage(`{"command":"go test ./..."}`), Status: "running", Text: "line one\nline two\nline three"}})
 						m.busy = true
-					case "approval", "plan":
+					case "approval":
 						tool := "Bash"
-						if scene == "plan" {
-							tool = "Plan"
-						}
 						m.approval = &approvalPrompt{ID: "approval-1", Tool: tool, Command: strings.Repeat("review this action\n", 20), Reason: "Needs approval"}
 					case "question":
 						m.setQuestion(uiQuestionRequest())
@@ -98,13 +96,10 @@ func TestAstraAcceptanceFrames(t *testing.T) {
 					if strings.Contains(plain, "ctx:") || strings.Contains(plain, "≈") || strings.Contains(plain, "6.2%") {
 						t.Errorf("context includes unwanted labels:\n%s", plain)
 					}
-					if (scene == "approval" || scene == "plan" || scene == "question") && size[0] >= 40 && !strings.Contains(sanitizeANSI(m.viewport.View()), "Recent context") {
+					if (scene == "approval" || scene == "question") && size[0] >= 40 && !strings.Contains(sanitizeANSI(m.viewport.View()), "Recent context") {
 						t.Errorf("decision hides recent conversation:\n%s", plain)
 					}
-					if scene == "plan" && (strings.Contains(plain, "always") || strings.Contains(plain, "never") || strings.Contains(plain, "[a]")) {
-						t.Errorf("plan exposes tool-rule approval options:\n%s", plain)
-					}
-					if (scene == "approval" || scene == "plan" || scene == "question" || scene == "picker") && strings.Contains(strings.ToLower(plain), "enter send") {
+					if (scene == "approval" || scene == "question" || scene == "picker") && strings.Contains(strings.ToLower(plain), "enter send") {
 						t.Errorf("active decision/selector advertises sending despite owning Enter:\n%s", plain)
 					}
 				})

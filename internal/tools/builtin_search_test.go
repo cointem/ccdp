@@ -1,15 +1,12 @@
-package plugin
+package tools
 
 import (
-	"ccdp/internal/tools"
 	"testing"
 )
 
 func TestBuiltinSearchExposesOnlyRg(t *testing.T) {
-	registry := tools.NewRegistry()
-	if err := NewToolsPlugin(false).Init(&Context{Tools: registry}); err != nil {
-		t.Fatal(err)
-	}
+	registry := NewRegistry()
+	RegisterBuiltins(registry, false)
 	if tool, ok := registry.Get("Rg"); !ok || tool.Name() != "Rg" {
 		t.Fatal("Rg was not registered")
 	}

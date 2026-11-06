@@ -91,7 +91,7 @@ func (m *Model) activityForSnapshot(snapshot protocol.SessionView) Activity {
 		a.Phase = ActivityStopping
 		a.Label = "正在停止"
 	}
-	if a.Phase != ActivityClosed && (snapshot.Approval != nil || snapshot.Plan != nil) {
+	if a.Phase != ActivityClosed && (snapshot.Approval != nil) {
 		a.Phase = ActivityWaitingApproval
 		a.Label = "等待你的决定"
 	}
@@ -103,6 +103,10 @@ func (m *Model) activityForSnapshot(snapshot protocol.SessionView) Activity {
 		switch snapshot.LastTurn.Status {
 		case protocol.TurnFailed:
 			a.Phase, a.Label, a.Detail = ActivityFailed, "本轮失败", snapshot.LastTurn.Error
+		case protocol.TurnLimited:
+			a.Phase, a.Label, a.Detail = ActivityFailed, "已达到步骤上限", snapshot.LastTurn.Error
+		case protocol.TurnBlocked:
+			a.Phase, a.Label, a.Detail = ActivityFailed, "本轮受阻", snapshot.LastTurn.Error
 		case protocol.TurnCancelled:
 			a.Phase, a.Label, a.Detail = ActivityCancelled, "本轮已停止", snapshot.LastTurn.Error
 		case protocol.TurnSucceeded:
@@ -222,7 +226,23 @@ func (m *Model) updateActivityFromEvent(ev protocol.EventView) {
 		if ev.Tool != nil {
 			a.ToolID, a.ToolName, a.Detail = ev.Tool.ID, ev.Tool.Name, ev.Tool.Status
 		}
-	case protocol.EventApprovalRequest, protocol.EventPlanReady:
+	case protocol.EventToolPhase:
+		if ev.Tool == nil || ev.Tool.Phase == protocol.ExecutionCompleted {
+			return
+		}
+		a.ToolID, a.ToolName = ev.Tool.ID, ev.Tool.Name
+		a.Phase, a.Label = ActivityPreparing, "准备执行环境"
+		switch ev.Tool.Phase {
+		case protocol.ExecutionQueued:
+			a.Label = "等待工具执行"
+		case protocol.ExecutionWaitingAccess:
+			a.Phase, a.Label = ActivityWaitingApproval, "等待访问决定"
+		case protocol.ExecutionAdmitted:
+			a.Label = "已获准执行"
+		case protocol.ExecutionDispatching:
+			a.Phase, a.Label = ActivityRunningTool, "正在运行工具"
+		}
+	case protocol.EventApprovalRequest:
 		a.Phase, a.Label = ActivityWaitingApproval, "等待你的决定"
 	case protocol.EventQuestionRequest:
 		a.Phase, a.Label = ActivityWaitingQuestion, "等待你的回答"

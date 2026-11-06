@@ -24,10 +24,10 @@ func decodeProcess(t *testing.T, out string, e error) processView {
 }
 func TestUnifiedProcessRepeatableOutputAndEOF(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "yield_ms": 0})
+	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, e)
 	id := v.ID
-	if id == 0 {
+	if id == "" {
 		t.Fatal(v)
 	}
 	if _, e = runTool(t, NewProcessTool(), ctx, map[string]any{"id": id, "action": "write", "input": "中文 marker\n", "eof": true}); e != nil {
@@ -53,23 +53,26 @@ func TestUnifiedProcessRepeatableOutputAndEOF(t *testing.T) {
 }
 
 func TestCompletedProcessRetentionIsBounded(t *testing.T) {
-	m := NewProcessManager("retention")
+	m := NewProcessManager("retention", "generation", "owner")
 	logs := t.TempDir()
 	for i := 1; i <= maxCompletedProcesses+10; i++ {
 		path := filepath.Join(logs, fmt.Sprintf("process-%d.log", i))
 		if err := os.WriteFile(path, []byte("output"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		m.procs[i] = &managedProcess{exited: true, buf: []byte("output"), logPath: path}
+		m.procs[fmt.Sprintf("%04d", i)] = &managedProcess{exited: true, done: closedProcessDone(), logPath: path}
 	}
-	m.procs[1000] = &managedProcess{}
+	m.procs["1000"] = &managedProcess{}
 	m.mu.Lock()
-	m.pruneExitedLocked()
+	evicted := m.pruneExitedLocked()
 	m.mu.Unlock()
+	for _, p := range evicted {
+		p.release()
+	}
 	if len(m.procs) != maxCompletedProcesses+1 || m.Count() != 1 {
 		t.Fatal("incorrect retention", len(m.procs), m.Count())
 	}
-	if _, ok := m.procs[1]; ok {
+	if _, ok := m.procs["0001"]; ok {
 		t.Fatal("oldest completed handle retained")
 	}
 	entries, err := os.ReadDir(logs)
@@ -77,18 +80,21 @@ func TestCompletedProcessRetentionIsBounded(t *testing.T) {
 		t.Fatal("evicted logs retained", len(entries), err)
 	}
 	// An older, long-running command that finishes now must remain readable.
-	m.procs[1] = &managedProcess{exited: true, finishedAt: time.Now()}
+	m.procs["0001"] = &managedProcess{exited: true, done: closedProcessDone(), finishedAt: time.Now()}
 	m.mu.Lock()
-	m.pruneExitedLocked()
+	evicted = m.pruneExitedLocked()
 	m.mu.Unlock()
-	if _, ok := m.procs[1]; !ok {
+	for _, p := range evicted {
+		p.release()
+	}
+	if _, ok := m.procs["0001"]; !ok {
 		t.Fatal("newly completed long-running command evicted")
 	}
 }
 
 func TestUnifiedProcessStopRemovesHandle(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "yield_ms": 0})
+	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, err)
 	out, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "stop"})
 	stopped := decodeProcess(t, out, err)
@@ -104,7 +110,7 @@ func TestUnifiedProcessStopRemovesHandle(t *testing.T) {
 }
 func TestCompletedLargeOutputCanContinue(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "awk 'BEGIN { for(i=0;i<9000;i++) print \"abcdefghijk\" }'", "yield_ms": 10000})
+	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "awk 'BEGIN { for(i=0;i<9000;i++) print \"abcdefghijk\" }'"})
 	v := decodeProcess(t, out, e)
 	mp, _ := ctx.Resources.Processes.Get(v.ID)
 	select {
@@ -129,14 +135,16 @@ func TestCompletedLargeOutputCanContinue(t *testing.T) {
 }
 func TestProcessWaitCancellationDoesNotKillProcess(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "yield_ms": 0})
+	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, e)
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	copy := *ctx
 	copy.Context = cancelCtx
-	if _, e = runTool(t, NewProcessTool(), &copy, map[string]any{"id": v.ID, "action": "read", "wait_ms": 1000}); e == nil {
-		t.Fatal("cancel ignored")
+	for _, action := range []string{"read", "wait"} {
+		if _, e = runTool(t, NewProcessTool(), &copy, map[string]any{"id": v.ID, "action": action}); e == nil {
+			t.Fatalf("%s ignored cancellation", action)
+		}
 	}
 	if _, e = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "input": "still alive\n", "eof": true}); e != nil {
 		t.Fatal(e)
@@ -144,7 +152,7 @@ func TestProcessWaitCancellationDoesNotKillProcess(t *testing.T) {
 }
 func TestBashTTY(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "test -t 1 && printf tty-ok", "tty": true, "yield_ms": 1000})
+	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "test -t 1 && printf tty-ok", "tty": true})
 	v := decodeProcess(t, out, e)
 	mp, _ := ctx.Resources.Processes.Get(v.ID)
 	<-mp.done
@@ -157,7 +165,7 @@ func TestBashTTY(t *testing.T) {
 
 func TestProcessUTF8OffsetsAndInvalidBytes(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "printf 'a中文b'", "yield_ms": 1000})
+	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "printf 'a中文b'"})
 	v := decodeProcess(t, out, e)
 	mp, _ := ctx.Resources.Processes.Get(v.ID)
 	<-mp.done
@@ -181,3 +189,5 @@ func TestProcessUTF8OffsetsAndInvalidBytes(t *testing.T) {
 		t.Fatal(v)
 	}
 }
+
+func closedProcessDone() chan struct{} { ch := make(chan struct{}); close(ch); return ch }

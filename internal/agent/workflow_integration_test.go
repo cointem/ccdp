@@ -188,9 +188,9 @@ func waitForWorkflowFile(t *testing.T, path string) {
 	t.Fatalf("workflow did not reach %s", path)
 }
 
-func TestCommandRunWorkflowDeniedAndPlanDoNotMutate(t *testing.T) {
+func TestCommandRunWorkflowDeniedDoesNotMutate(t *testing.T) {
 	t.Run("hard deny", func(t *testing.T) {
-		setup := newWorkflowTestSetup(t, permissions.ModeBypass, []string{"Bash"},
+		setup := newWorkflowTestSetup(t, permissions.ModeAuto, []string{"Bash"},
 			`printf 'git %s\n' "$*" >> "$CCDP_WORKFLOW_LOG"`,
 			`printf 'gh %s\n' "$*" >> "$CCDP_WORKFLOW_LOG"`)
 		cmd := workflowCommand(setup.ag, "workflow-denied", protocol.WorkflowCommitPushPR, "must not run")
@@ -204,23 +204,4 @@ func TestCommandRunWorkflowDeniedAndPlanDoNotMutate(t *testing.T) {
 		}
 	})
 
-	t.Run("plan", func(t *testing.T) {
-		setup := newWorkflowTestSetup(t, permissions.ModePlan, nil,
-			`printf 'git %s\n' "$*" >> "$CCDP_WORKFLOW_LOG"`,
-			`printf 'gh %s\n' "$*" >> "$CCDP_WORKFLOW_LOG"`)
-		cmd := workflowCommand(setup.ag, "workflow-plan", protocol.WorkflowCommitPushPR, "must not run")
-		receipt, err := setup.ag.Submit(context.Background(), cmd)
-		if err != nil || !receipt.Rejected() {
-			t.Fatalf("plan receipt=%+v err=%v, want rejection", receipt, err)
-		}
-		if receipt.Error == nil || receipt.Error.Code != protocol.ErrorInvalidState {
-			t.Fatalf("plan receipt error=%+v, want invalid state", receipt.Error)
-		}
-		if facts := readWorkflowFacts(t, setup.ag, cmd.ID); len(facts.scheduled) != 0 || len(facts.completed) != 0 {
-			t.Fatalf("plan workflow persisted operation facts: %+v", facts)
-		}
-		if got := readWorkflowLog(t, setup.log); len(got) != 0 {
-			t.Fatalf("plan workflow mutated: %q", got)
-		}
-	})
 }

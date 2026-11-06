@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
-	"ccdp/internal/events"
 	"ccdp/internal/llm"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
-	"ccdp/internal/session/replay"
+	"ccdp/internal/session/archive"
 )
 
 // Reopen the actual writer and projection, dropping all process-local request
@@ -20,24 +18,16 @@ func reopenAccountingAgent(t *testing.T, old *Agent) *Agent {
 	if err := old.persistenceHandle().Close(); err != nil {
 		t.Fatal(err)
 	}
-	p, err := openSessionPersistence(old.services.cfg, old.conversation.sessionID, time.Now().UTC())
+	old.Close()
+	snapshot, err := archive.Load(old.services.cfg.SessionDir, old.conversation.sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = p.Close() })
-	snapshot, err := p.snapshotFromOwnedStore(old.conversation.sessionID)
+	a, err := Resume(old.services.cfg, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &Agent{
-		services:     sessionServices{cfg: old.services.cfg, persistence: p, registry: old.services.registry, perms: old.services.perms, evbus: events.NewBus()},
-		conversation: conversationState{sessionID: old.conversation.sessionID, durable: replay.State{Goal: protocol.CloneGoal(snapshot.Goal), GoalAccountingIDs: snapshot.GoalAccountingIDs, Usage: sessionUsage(snapshot.Usage)}},
-		publications: watchState{},
-	}
-	if err := p.BindState(&a.conversation.durable, &a.mu); err != nil {
-		t.Fatal(err)
-	}
-	a.services.supervisor = &SessionSupervisor{root: a, sessionDir: old.services.cfg.SessionDir, memory: old.services.cfg.NoSessionPersistence}
+	t.Cleanup(a.Close)
 	return a
 }
 
@@ -132,11 +122,13 @@ func TestPreparedNestedChildRecoveryTransfersTokensAndGoalOnce(t *testing.T) {
 				if _, err := parent.persistenceHandle().CommitEvents("edge-"+id, recoveryChildEdge(root.conversation.sessionID, goal.ID, parent.conversation.sessionID, id)); err != nil {
 					t.Fatal(err)
 				}
-				p, err := openSessionPersistence(cfg, id, time.Now().UTC())
+				childCfg := cfg.Clone()
+				childCfg.SessionID = id
+				child, err := testNewWithOptions(t, &childCfg, Options{EffectiveConfigFrozen: true, Purpose: childPurposeTask, ParentSessionID: parent.SessionID(), Supervisor: root.services.supervisor, goalOwner: root, goalOwnerID: goal.ID})
 				if err != nil {
 					t.Fatal(err)
 				}
-				child := &Agent{services: sessionServices{cfg: cfg, persistence: p}, conversation: conversationState{sessionID: id, goalOwner: root, goalOwnerID: goal.ID}}
+				t.Cleanup(child.Close)
 				request, err := child.recordPreparedRequest(context.Background(), "task", "provider", "", journalRequest(), testRequestMetadata(child))
 				if err != nil {
 					t.Fatal(err)
@@ -187,12 +179,13 @@ func TestAccountingRecoverySkipsCurrentRootAndChildRequests(t *testing.T) {
 	if _, err := root.persistenceHandle().CommitEvents("edge", recoveryChildEdge(root.conversation.sessionID, goal.ID, root.conversation.sessionID, childID)); err != nil {
 		t.Fatal(err)
 	}
-	p, err := openSessionPersistence(cfg, childID, time.Now().UTC())
+	childCfg := cfg.Clone()
+	childCfg.SessionID = childID
+	child, err := testNewWithOptions(t, &childCfg, Options{EffectiveConfigFrozen: true, Purpose: childPurposeTask, ParentSessionID: root.SessionID(), Supervisor: root.services.supervisor, goalOwner: root, goalOwnerID: goal.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = p.Close() })
-	child := &Agent{services: sessionServices{cfg: cfg, persistence: p}, conversation: conversationState{sessionID: childID, goalOwner: root, goalOwnerID: goal.ID}}
+	t.Cleanup(child.Close)
 	if _, err := child.recordPreparedRequest(context.Background(), "task", "provider", "", journalRequest(), testRequestMetadata(child)); err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +255,7 @@ func TestChildUsageBeforeFirstOwnRequestDoesNotInventUnknownCacheHistory(t *test
 	if got := a.Usage().Cache; got.UnknownHistory || got.InputTokens != 100 || got.ReportedInputTokens != 100 || got.CachedTokens != 80 {
 		t.Fatalf("first own request inherited child cache history: %+v", got)
 	}
-	snapshot, err := p.snapshotFromOwnedStore(a.conversation.sessionID)
+	snapshot, err := archive.FromStore(p, a.conversation.sessionID)
 	if err != nil || snapshot.Usage.Cache.UnknownHistory {
 		t.Fatalf("incremental replay cache=%+v error=%v", snapshot.Usage.Cache, err)
 	}
@@ -282,7 +275,7 @@ func TestChildUsageBeforeFirstOwnRequestDoesNotInventUnknownCacheHistory(t *test
 			t.Fatal(err)
 		}
 	}
-	replayed, err := SessionSnapshotProjection(store, a.conversation.sessionID)
+	replayed, err := archive.FromStore(store, a.conversation.sessionID)
 	if err != nil || replayed.Usage.Cache.UnknownHistory {
 		t.Fatalf("full replay invented unknown cache history: %+v error=%v", replayed.Usage.Cache, err)
 	}

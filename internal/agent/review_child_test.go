@@ -19,6 +19,7 @@ import (
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func TestBackgroundReviewIndependentOfParent(t *testing.T) {
@@ -70,7 +71,7 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 			}
 			cfg := config.Default()
 			cfg.Workspace, cfg.SessionDir, cfg.BaseURL = root, t.TempDir(), server.URL
-			cfg.APIKey, cfg.Model, cfg.PermissionMode = "test", "fake", "bypass"
+			cfg.APIKey, cfg.Model, cfg.PermissionMode = "test", "fake", "auto"
 			cfg.EnableGuardian, cfg.AutomaticCheckpoints = config.BoolPtr(false), config.BoolPtr(false)
 			cfg.MCPServers = nil
 			a, err := testNew(t, &cfg)
@@ -150,8 +151,14 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 			mainModel.mu.Lock()
 			calls := mainModel.calls
 			mainModel.mu.Unlock()
-			// One user, the initial tool catalog, and the single parent reply.
-			if calls != 1 || len(a.History()) != 3 {
+			// Runtime context/catalog entries are not additional conversation turns.
+			visible := 0
+			for _, message := range a.History() {
+				if message.InternalSource == "" {
+					visible++
+				}
+			}
+			if calls != 1 || visible != 2 {
 				t.Fatalf("review caused a parent follow-up: requests=%d history=%d", calls, len(a.History()))
 			}
 			reader, err := a.Sessions().OpenReader(ctx, launched.SessionID)
@@ -185,7 +192,7 @@ func TestBackgroundReviewIndependentOfParent(t *testing.T) {
 				if err != nil || list[0].Run.Status != "succeeded" || list[0].Run.WaitPolicy != "observe" {
 					t.Fatal("review discussion failed", list, err)
 				}
-				saved, err := LoadSession(cfg.SessionDir, string(launched.SessionID))
+				saved, err := archive.Load(cfg.SessionDir, string(launched.SessionID))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -222,7 +229,7 @@ func TestReviewChildReportSurvivesRestart(t *testing.T) {
 	}
 	cfg, id := cloneConfig(a.services.cfg), a.SessionID()
 	a.Close()
-	snap, err := LoadSession(cfg.SessionDir, id)
+	snap, err := archive.Load(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,14 +261,14 @@ func TestReviewApprovalDoesNotReplaceParentDecision(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	sid := protocol.SessionID(newSessionID())
-	r := &managedRun{parent: a, done: done, cancel: func() {}, opts: Options{Permissions: permissions.NewManager(permissions.ModeDefault, permissions.Policy{})},
+	r := &managedRun{parent: a, done: done, cancel: func() {}, opts: Options{Permissions: permissions.NewManager(permissions.ModeManual, permissions.Policy{})},
 		fact: session.ChildRunRecorded{Child: protocol.ChildSession{SessionID: sid, ParentSessionID: protocol.SessionID(a.SessionID()), Purpose: childPurposeReview, Run: protocol.RunView{ID: "approval-review", Status: "starting", WaitPolicy: "observe"}}}}
 	a.services.supervisor.directory.Restore(r.fact.Child, r, true)
 	defer func() {
 		a.services.supervisor.directory.Forget(sid)
 	}()
 	a.mu.Lock()
-	a.decisions.pendingApproval = &ApprovalRequest{ID: "main-decision", Tool: "Bash"}
+	a.decisions.pendingApproval = &protocol.ApprovalView{ID: "main-decision", Tool: "Bash"}
 	a.mu.Unlock()
 	result := make(chan error, 1)
 	go func() {

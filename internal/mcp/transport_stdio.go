@@ -47,9 +47,6 @@ func (c *Client) startStdio(ctx context.Context) error {
 	stderr := &boundedBuffer{limit: maxMCPStderr}
 	cmd.SetStderr(stderr)
 
-	if sb != nil {
-		sb.MarkExternalExecution()
-	}
 	if err := cmd.Start(); err != nil {
 		procCancel()
 		return fmt.Errorf("mcp %s: start %s: %w", c.name, c.cfg.Command, err)

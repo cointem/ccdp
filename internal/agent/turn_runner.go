@@ -61,7 +61,7 @@ func (a *Agent) runTurn(input turnInput) {
 			return
 		}
 		turnErr = fmt.Errorf("checkpoint: %w", checkpointErr)
-		a.emit(Event{Type: EventError, Text: turnErr.Error()})
+		a.emit(protocol.EventView{Kind: protocol.EventError, Text: turnErr.Error()})
 		return
 	}
 	defer func() {
@@ -90,9 +90,9 @@ func (a *Agent) runTurn(input turnInput) {
 			if reason == "" {
 				reason = "blocked by UserPromptSubmit hook"
 			}
-			a.emit(Event{Type: EventUserMsg, Text: text, MessageID: userMessage.ID})
+			a.emit(protocol.EventView{Kind: protocol.EventUserMessage, Text: text, MessageID: userMessage.ID})
 			turnErr = errors.New(reason)
-			a.emit(Event{Type: EventError, Text: reason})
+			a.emit(protocol.EventView{Kind: protocol.EventError, Text: reason})
 			return
 		} else if ho.Continue != nil && !*ho.Continue {
 			// {"continue": false} from a hook stops the agent loop entirely
@@ -101,9 +101,9 @@ func (a *Agent) runTurn(input turnInput) {
 			if reason == "" {
 				reason = "stopped by UserPromptSubmit hook"
 			}
-			a.emit(Event{Type: EventUserMsg, Text: text, MessageID: userMessage.ID})
+			a.emit(protocol.EventView{Kind: protocol.EventUserMessage, Text: text, MessageID: userMessage.ID})
 			turnErr = errors.New(reason)
-			a.emit(Event{Type: EventError, Text: reason})
+			a.emit(protocol.EventView{Kind: protocol.EventError, Text: reason})
 			return
 		} else if ho.AdditionalContext != "" {
 			// Hook-provided context rides along as a system message.
@@ -117,7 +117,7 @@ func (a *Agent) runTurn(input turnInput) {
 
 	}
 	if !input.goalContinuation {
-		a.emit(Event{Type: EventUserMsg, Text: text, MessageID: userMessage.ID})
+		a.emit(protocol.EventView{Kind: protocol.EventUserMessage, Text: text, MessageID: userMessage.ID})
 	}
 	if !input.historyAppended {
 		if err := a.appendHistory(userMessage); err != nil {
@@ -141,7 +141,8 @@ func (a *Agent) runTurn(input turnInput) {
 		}
 		cfg := a.configSnapshot()
 		if cfg.MaxTurns > 0 && steps >= cfg.MaxTurns {
-			a.emitStatus("max turns reached (%d) — stopping", cfg.MaxTurns)
+			turnErr = &turnStopError{status: protocol.TurnLimited, reason: fmt.Sprintf("model step limit reached (%d); task completion was not confirmed", cfg.MaxTurns)}
+			a.emitStatus("%s", turnErr)
 			return
 		}
 		a.setPhase(protocol.PhasePreparing)
@@ -157,7 +158,7 @@ func (a *Agent) runTurn(input turnInput) {
 			var inputErr *stepInputError
 			if errors.As(err, &inputErr) {
 				turnErr = err
-				a.emit(Event{Type: EventError, Text: err.Error()})
+				a.emit(protocol.EventView{Kind: protocol.EventError, Text: err.Error()})
 			} else {
 				a.failTurnPersistence(err)
 			}
@@ -189,7 +190,7 @@ func (a *Agent) runTurn(input turnInput) {
 		if outcome.err != nil {
 			turnErr = outcome.err
 			if outcome.action == stepRecoverContext {
-				a.emit(Event{Type: EventError, Text: outcome.err.Error()})
+				a.emit(protocol.EventView{Kind: protocol.EventError, Text: outcome.err.Error()})
 			}
 			return
 		}

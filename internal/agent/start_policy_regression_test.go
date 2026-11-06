@@ -11,7 +11,7 @@ import (
 
 func TestApprovedToolRechecksCurrentHardDeny(t *testing.T) {
 	a := capabilityTestAgent(t)
-	a.services.perms.SetMode(permissions.ModeDefault)
+	a.services.perms.SetMode(permissions.ModeManual)
 	shadow := &shadowCapabilityTool{}
 	a.services.registry.RegisterIn("shadow", shadow)
 	events := watchTestEvents(t, a)

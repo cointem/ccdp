@@ -32,7 +32,7 @@ func TestComposerStaysAtBottomAcrossStatusAndPanels(t *testing.T) {
 			}
 		}
 		assertBottom()
-		m.pushStatus("permission mode → default")
+		m.pushStatus("permission mode → manual")
 		assertBottom()
 		m.busy = true
 		assertBottom()

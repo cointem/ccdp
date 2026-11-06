@@ -13,6 +13,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session/archive"
 )
 
 func TestIsolatedWorkerDefaultCanWriteWithoutGit(t *testing.T) {
@@ -32,7 +33,7 @@ func TestIsolatedWorkerDefaultCanWriteWithoutGit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(a.services.cfg.Workspace, "child.txt")); !os.IsNotExist(err) {
 		t.Fatal("default worker modified parent workspace")
 	}
-	saved, err := LoadSession(a.services.cfg.SessionDir, rows[0].SessionID)
+	saved, err := archive.Load(a.services.cfg.SessionDir, rows[0].SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +85,7 @@ func TestAgentMailboxDurableAndDoesNotStartTurn(t *testing.T) {
 	if busy || starting || !a.hasAgentMessage() {
 		t.Fatal("queue-only message changed turn admission")
 	}
-	saved, err := LoadSession(a.services.cfg.SessionDir, a.conversation.sessionID)
+	saved, err := archive.Load(a.services.cfg.SessionDir, a.conversation.sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,7 @@ func TestChildDormantMessagesSurviveContinuation(t *testing.T) {
 	if run.ID == protocol.RunID(rows[0].RunID) {
 		t.Fatal("run identity reused")
 	}
-	saved, err := LoadSession(a.services.cfg.SessionDir, string(id))
+	saved, err := archive.Load(a.services.cfg.SessionDir, string(id))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,20 +214,6 @@ func TestSharedWorkerRetainsParentDeny(t *testing.T) {
 	}
 }
 
-func TestSharedWorkerCannotEscapeParentPlan(t *testing.T) {
-	a, _ := newTestAgent(t, &fakeLLM{script: []string{"tool:Write|file_path=escape.txt;mode=create;content=bad", "text:blocked"}})
-	if err := a.setExecutionMode(true); err != nil {
-		t.Fatal(err)
-	}
-	rows, err := runTestChildren(a, []childTask{{Description: "try writing", WorkspaceMode: "shared"}}, "plan-child")
-	if err != nil || rows[0].Error != "" {
-		t.Fatalf("%+v %v", rows, err)
-	}
-	if _, err := os.Stat(filepath.Join(a.services.cfg.Workspace, "escape.txt")); !os.IsNotExist(err) {
-		t.Fatal("worker escaped parent plan restriction")
-	}
-}
-
 func TestExplorerRetainsParentDecisionHooks(t *testing.T) {
 	a, _ := newTestAgent(t, &fakeLLM{script: []string{"text:done"}})
 	a.services.cfg.Hooks = hooks.Config{hooks.EventPreToolUse: {{Matcher: "Read", Command: "exit 2"}}}
@@ -276,7 +263,7 @@ func TestChildForkCopiesBalancedPrefix(t *testing.T) {
 	if err != nil || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}
-	saved, err := LoadSession(a.services.cfg.SessionDir, rows[0].SessionID)
+	saved, err := archive.Load(a.services.cfg.SessionDir, rows[0].SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}

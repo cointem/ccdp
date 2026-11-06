@@ -12,8 +12,8 @@ import (
 	"ccdp/internal/hooks"
 	"ccdp/internal/mcp"
 	"ccdp/internal/permissions"
-	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 // applySessionSettingsToConfig restores credential-free settings under the
@@ -48,17 +48,11 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 	// setting. Applying it to cfg.BaseURL would authenticate the top-level
 	// credential against another provider's server, so the resumed binding is
 	// always re-derived from the model plus the current config.
-	if settings.PermissionPolicy != "" && !launchOverride("permission_mode") {
-		current, _ := permissions.ParseMode(cfg.PermissionMode)
-		saved, _ := permissions.ParseMode(settings.PermissionPolicy)
-		if current == permissions.ModeBypass || (current != permissions.ModePlan && saved == permissions.ModeDefault) || saved == permissions.ModePlan || (current == permissions.ModeAcceptEdits && saved == permissions.ModeAcceptEdits) {
-			cfg.PermissionMode = settings.PermissionPolicy
-		}
-	}
-	if settings.ExecutionMode == string(protocol.ExecutionModePlan) && !launchOverride("permission_mode") {
-		cfg.PermissionMode = string(permissions.ModePlan)
+	if settings.PermissionPolicy == string(permissions.ModeManual) && !launchOverride("permission_mode") {
+		cfg.PermissionMode = string(permissions.ModeManual)
 	}
 	cfg.NetworkAccess = cfg.NetworkAccess && settings.NetworkAccess
+	cfg.LocalDevelopmentNetwork = cfg.LocalDevelopmentNetwork && settings.LocalDevelopmentNetwork
 	if settings.AlwaysAllow != nil && !launchOverride("always_allow") {
 		var allowed []string
 		for _, rule := range cfg.AlwaysAllow {
@@ -164,7 +158,7 @@ func canonicalSandboxDirectory(path string) string {
 // resume, the durable session settings snapshot, then applies the isolation
 // overrides for child/guardian sessions. It returns the validated config the
 // runtime is built from.
-func buildEffectiveConfig(base config.Config, initial *SessionSnapshot, isolated bool, opts Options) (config.Config, error) {
+func buildEffectiveConfig(base config.Config, initial *archive.Snapshot, isolated bool, opts Options) (config.Config, error) {
 	trustStore := base.TrustStore
 	if trustStore == nil {
 		trustStore = config.DefaultTrustStore()
@@ -216,14 +210,17 @@ func buildEffectiveConfig(base config.Config, initial *SessionSnapshot, isolated
 
 // validateResumeSession checks the restored session identity and, for a fresh
 // session, guards against clobbering an existing durable log.
-func validateResumeSession(cfg *config.Config, initial *SessionSnapshot) error {
+func validateResumeSession(cfg *config.Config, initial *archive.Snapshot) error {
 	if cfg.SessionID != "" {
-		if err := validateSessionID(cfg.SessionID); err != nil {
+		if err := archive.ValidateID(cfg.SessionID); err != nil {
 			return err
 		}
 	}
 	if initial != nil {
-		if err := validateSessionID(initial.ID); err != nil {
+		if _, err := usageFromSession(initial.Usage); err != nil {
+			return err
+		}
+		if err := archive.ValidateID(initial.ID); err != nil {
 			return err
 		}
 		if cfg.SessionID != initial.ID {

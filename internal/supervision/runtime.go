@@ -123,7 +123,6 @@ func SetOutcome(fact *session.ChildRunRecorded, output, failure, saveError strin
 type RuntimeStatus struct {
 	Approval *protocol.ApprovalView
 	Question *protocol.QuestionRequest
-	Plan     *protocol.PlanView
 	Usage    protocol.UsageSnapshot
 	ToolUses int
 }

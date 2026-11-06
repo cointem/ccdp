@@ -100,9 +100,6 @@ func (a *Agent) prepareChildWorkspace(ctx context.Context, task childTask, cfg *
 		applyChildRole(cfg, opts, task.Role, task.WorkspaceMode)
 		return parent, "", nil
 	}
-	if a.inPlanMode() {
-		return "", "", errors.New("isolated workspaces are unavailable in plan mode")
-	}
 	store := a.codingState().store
 	base, e := a.captureCoding(ctx)
 	if e != nil {
@@ -390,9 +387,6 @@ func (a *Agent) runMergeChild(ctx context.Context, cmd protocol.Command) (string
 			return "", err
 		}
 		defer release()
-	}
-	if a.inPlanMode() {
-		return "", errors.New("merging is unavailable in plan mode")
 	}
 	w := cmd.Workflow
 	store := a.codingState().store

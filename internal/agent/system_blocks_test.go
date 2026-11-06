@@ -9,24 +9,20 @@ import (
 	"testing"
 	"time"
 
-	"ccdp/internal/llm"
 	"ccdp/internal/messages"
+	"ccdp/internal/session"
 	"ccdp/internal/workspace"
 )
 
-// TestSystemBlockClassification verifies buildSystemBlocks emits ordered,
-// cache-offset sections: stable sections (core, tools, project instructions)
-// lead and are cacheable, while the environment section is dynamic.
+// Stable instructions and session environment are all cacheable.
 func TestSystemBlockClassification(t *testing.T) {
 	ag := newAgentForTest(t)
 	defer ag.Close()
 
 	cfg := cloneConfig(ag.services.cfg)
-	cfg.Workspace = t.TempDir() // CachedScan yields an (empty) repo map block.
+	cfg.Workspace = t.TempDir()
 
-	blocks := ag.buildSystemBlocks(cfg, time.Now(), "session-x", false, "", false,
-		"PROJECT_RULES_MARKER", "SKILLS_MARKER",
-		ag.History(), ag.currentSandbox().Snapshot())
+	blocks := buildSystemBlocks(cfg, time.Now(), "session-x", "PROJECT_RULES_MARKER", "SKILLS_MARKER")
 
 	if len(blocks) == 0 {
 		t.Fatal("no system blocks produced")
@@ -49,8 +45,8 @@ func TestSystemBlockClassification(t *testing.T) {
 			}
 		case strings.Contains(b.Text, "# Environment"):
 			envFound = true
-			if b.Cacheable {
-				t.Fatalf("environment section must be dynamic (uncached): %+v", b)
+			if !b.Cacheable {
+				t.Fatalf("session environment must be cacheable: %+v", b)
 			}
 		}
 	}
@@ -62,52 +58,109 @@ func TestSystemBlockClassification(t *testing.T) {
 	}
 }
 
-func TestSystemBlockStablePrefixSurvivesRepositoryQueryChange(t *testing.T) {
-	ag := newAgentForTest(t)
-	defer ag.Close()
-	cfg := cloneConfig(ag.services.cfg)
-	// Exceed the repository map's 120-entry budget so relevance changes which
-	// files are selected, rather than merely sorting the same complete list.
+func TestRuntimeContextPreservesRequestPrefixAndRepositoryQuery(t *testing.T) {
+	a := newAgentForTest(t)
+	defer a.Close()
+	cfg := cloneConfig(a.services.cfg)
 	for i := 0; i < 122; i++ {
 		if err := os.WriteFile(filepath.Join(cfg.Workspace, fmt.Sprintf("file%03d.go", i)), nil, 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	workspace.Invalidate(cfg.Workspace)
-	started := time.Now()
-	build := func(query string) ([]llm.SystemBlock, string) {
-		ag.mu.Lock()
-		ag.conversation.durable.History = []messages.Message{{Role: messages.RoleUser, Content: query}}
-		ag.mu.Unlock()
-		blocks := ag.buildSystemBlocks(cfg, started, "session", false, "", false,
-			"PROJECT_RULES_MARKER", "SKILLS_MARKER", ag.History(), ag.currentSandbox().Snapshot())
-		var stable []llm.SystemBlock
-		var layout string
-		dynamic := false
-		for _, b := range blocks {
-			if b.Cacheable {
-				if dynamic {
-					t.Fatal("cacheable instructions follow dynamic content")
-				}
-				stable = append(stable, b)
-			} else {
-				dynamic = true
-			}
-			if strings.Contains(b.Text, "# Repository layout") {
-				layout = b.Text
-			}
+	if err := a.appendHistory(messages.Message{Role: messages.RoleUser, Content: "file120"}); err != nil {
+		t.Fatal(err)
+	}
+	take := func() stepRuntime {
+		step, err := a.beginStepChecked()
+		if err != nil {
+			t.Fatal(err)
 		}
-		return stable, layout
+		a.releaseStepContext(step)
+		return step
 	}
-	first, firstLayout := build("file120")
-	second, secondLayout := build("file121")
-	if len(first) != 3 || !reflect.DeepEqual(first, second) {
-		t.Fatalf("stable prefix changed: first=%+v second=%+v", first, second)
+	first := take()
+	before := a.buildRequestForStep(first)
+	if wire := fmt.Sprint(before.Messages); !strings.Contains(wire, "Permission mode:") || !strings.Contains(wire, "# Repository layout") {
+		t.Fatal("model request lost runtime context")
 	}
-	if first[0].Text != cfg.SystemPrompt || first[1].Text != "SKILLS_MARKER" || !strings.Contains(first[2].Text, "PROJECT_RULES_MARKER") {
-		t.Fatal("stable instructions changed priority")
+	visible, _ := a.transcript.Snapshot()
+	if len(visible) != 1 || visible[0].Kind != "user" || visible[0].Text != "file120" {
+		t.Fatalf("runtime context leaked into the conversation: %+v", visible)
 	}
-	if firstLayout == "" || secondLayout == "" || firstLayout == secondLayout {
-		t.Fatal("fixture did not change the query-dependent repository map")
+	if len(first.contextMessages) != 0 {
+		t.Fatal("normal step left uncommitted context")
+	}
+	// Runtime results and invalidated file inventories do not change the task
+	// query or move context ahead of the cached conversation.
+	if err := a.appendHistory(messages.Message{Role: messages.RoleUser, InternalSource: "process_completion", Content: "file121"}); err != nil {
+		t.Fatal(err)
+	}
+	workspace.Invalidate(cfg.Workspace)
+	second := take()
+	after := a.buildRequestForStep(second)
+	if !reflect.DeepEqual(before.SystemBlocks, after.SystemBlocks) || !reflect.DeepEqual(before.Messages, after.Messages[:len(before.Messages)]) {
+		t.Fatal("runtime result rewrote the previous request prefix")
+	}
+	if len(second.history) != len(first.history)+1 {
+		t.Fatal("unchanged context was appended again")
+	}
+	if err := a.appendHistory(messages.Message{Role: messages.RoleUser, Content: "file121"}); err != nil {
+		t.Fatal(err)
+	}
+	third := take()
+	var maps []messages.Message
+	for _, m := range third.history {
+		if m.InternalSource == "runtime_repository" {
+			maps = append(maps, m)
+		}
+	}
+	if len(maps) != 2 || maps[0].ContextKey == maps[1].ContextKey || maps[0].Content == maps[1].Content {
+		t.Fatalf("new user query did not append a new relevant map: %+v", maps)
+	}
+	if !reflect.DeepEqual(first.systemBlocks, third.systemBlocks) {
+		t.Fatal("user query changed system prefix")
+	}
+	encoded, err := session.EncodeMessage(maps[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := session.DecodeMessage(encoded)
+	if err != nil || !reflect.DeepEqual(maps[1], decoded) {
+		t.Fatal("runtime context identity lost during replay", err)
+	}
+}
+
+func TestCompactionPreservesUserIntentBeforeRuntimeContext(t *testing.T) {
+	history := []messages.Message{{Role: messages.RoleUser, ID: "user", Content: "exact task"}}
+	for i := 0; i < 20; i++ {
+		history = append(history, messages.Message{Role: messages.RoleAssistant, Content: strings.Repeat("work ", 100)})
+	}
+	history = append(history, messages.Message{Role: messages.RoleUser, InternalSource: "runtime_goal", Content: "current budget"})
+	_, _, kept, _, ok := compactHistorySpans(history, 2, 100)
+	if !ok {
+		t.Fatal("fixture was not compacted")
+	}
+	for _, m := range kept {
+		if m.ID == "user" {
+			return
+		}
+	}
+	t.Fatal("runtime state displaced the latest real user input")
+}
+
+func TestContextSnapshotDoesNotAppendRuntimeHistory(t *testing.T) {
+	a := newAgentForTest(t)
+	defer a.Close()
+	before := a.History()
+	step, req, err := a.snapshotContextRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(step.contextMessages) == 0 || !strings.Contains(fmt.Sprint(req.Messages), "# Repository layout") {
+		t.Fatal("compaction preview lacks runtime context")
+	}
+	if !reflect.DeepEqual(before, a.History()) {
+		t.Fatal("preview mutated history")
 	}
 }

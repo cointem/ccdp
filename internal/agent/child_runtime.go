@@ -81,6 +81,7 @@ type childRuntimeState struct {
 	allowed           map[string]bool
 	parentSession     string
 	perms             *permissions.Manager
+	access            *childAccessCoordinator
 }
 
 // childStepSnapshot is populated by the provider/runtime owner at the
@@ -368,6 +369,9 @@ func (a *Agent) inheritBorrowedTools(lease *tools.Lease) {
 		if !ok || tool == nil {
 			continue
 		}
+		if _, desktop := tool.(*tools.ComputerTool); desktop {
+			continue
+		}
 		a.services.registry.RegisterIn("inherited", tool)
 		a.discovery.deferTools[name] = true
 	}
@@ -394,7 +398,11 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 		inheritedCapabilities = append(inheritedCapabilities, grant)
 	}
 	revokingCapabilities := a.capabilities.capabilityRevoking
-	readOnly := a.plan.planMode || (a.children.childState != nil && a.children.childState.readOnlyWorkspace)
+	readOnly := a.children.childState != nil && a.children.childState.readOnlyWorkspace
+	var access *childAccessCoordinator
+	if isTaskChild(purpose) && !readOnly && a.services.sandbox != nil {
+		access = &childAccessCoordinator{parent: a, sandboxRevision: a.services.sandbox.Revision, revocationRevision: a.capabilities.revocationRevision}
+	}
 	a.mu.Unlock()
 	if revokingCapabilities {
 		return config.Config{}, Options{}, errors.New("agent: parent sandbox capabilities are being revoked")
@@ -414,15 +422,14 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 	} else {
 		perms = perms.Clone()
 	}
-	if cfg.PermissionMode != string(permissions.ModePlan) {
-		cfg.PermissionMode = string(perms.CurrentMode())
-	}
+	cfg.PermissionMode = string(perms.CurrentMode())
 	allowed := childAllowedTools(purpose, registryNames)
 	if binding.model != "" {
 		cfg.Model = binding.model
 	}
 	cfg.SessionID = ""
 	cfg.EnableGuardian = config.BoolPtr(false)
+	cfg.ComputerUseEnabled = false
 	// The constructor filters cfg.Hooks to decision hooks. It must not replay
 	// project lifecycle commands, start MCP servers, or write project memory state as
 	// a startup side effect. Parent SubagentStart/Stop callbacks remain around
@@ -441,6 +448,7 @@ func childOptionsFromParent(a *Agent, purpose string) (config.Config, Options, e
 		ParentSessionID:       parentID,
 		InheritedCapabilities: inheritedCapabilities,
 		ExecutionGuard:        executionGuard,
+		access:                access,
 	}, nil
 }
 

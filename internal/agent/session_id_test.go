@@ -9,6 +9,7 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/llm"
 	"ccdp/internal/plugin"
+	"ccdp/internal/session/archive"
 )
 
 func TestNewSessionIDUniqueConcurrent(t *testing.T) {
@@ -32,7 +33,7 @@ func TestNewSessionIDUniqueConcurrent(t *testing.T) {
 
 	seen := make(map[string]struct{}, workers*perWorker)
 	for id := range ids {
-		if err := validateSessionID(id); err != nil {
+		if err := archive.ValidateID(id); err != nil {
 			t.Fatalf("generated invalid session id %q: %v", id, err)
 		}
 		if _, exists := seen[id]; exists {

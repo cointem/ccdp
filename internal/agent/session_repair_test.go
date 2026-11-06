@@ -17,6 +17,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func sessionRepairAgent(t *testing.T, memory bool) (*Agent, config.Config) {
@@ -89,7 +90,7 @@ func TestSessionRepairLongHistoryRestoreAndRemove(t *testing.T) {
 		if got := a.History(); !reflect.DeepEqual(got, want) {
 			t.Fatalf("live history differs: got %d messages, want %d", len(got), len(want))
 		}
-		loaded, err := LoadSession(a.services.cfg.SessionDir, a.SessionID())
+		loaded, err := archive.Load(a.services.cfg.SessionDir, a.SessionID())
 		if err != nil || !reflect.DeepEqual(loaded.History, want) {
 			t.Fatalf("replay history differs: %v", err)
 		}
@@ -230,7 +231,7 @@ func TestSessionRepairDiskToMemoryPreservesHistoryAndPendingImages(t *testing.T)
 	if err := a.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(cfg.SessionDir, id)
+	snapshot, err := archive.Load(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +263,7 @@ func TestSessionRepairSyntheticMemoryResumePreservesImages(t *testing.T) {
 	cfg := testPersistenceConfig(t)
 	cfg.NoSessionPersistence = true
 	historical, pending := inputPNG(t, 56), inputPNG(t, 78)
-	snapshot := &SessionSnapshot{ID: "repair-synthetic", Workspace: cfg.Workspace, Model: cfg.Model,
+	snapshot := &archive.Snapshot{ID: "repair-synthetic", Workspace: cfg.Workspace, Model: cfg.Model,
 		History: []messages.Message{{ID: "repair-synthetic-history", Role: messages.RoleUser, Content: "history ![image](history.png)", ImagesFrozen: true,
 			ImageAttachments: []messages.ImageAttachment{{MediaType: historical.MediaType, Data: historical.Data}}}},
 		PendingInputs:      []protocol.InputView{{ID: "repair-synthetic-pending", Text: "pending ![image](pending.png)", Strategy: protocol.InputFollowup}},
@@ -363,7 +364,7 @@ func TestSessionRepairReplacementDiscardsOldToolRecovery(t *testing.T) {
 	if err := a.clearHistoryCommand(protocol.Command{ID: "repair-discard-tools", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandClearConversation}); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(a.services.cfg.SessionDir, a.SessionID())
+	snapshot, err := archive.Load(a.services.cfg.SessionDir, a.SessionID())
 	if err != nil || len(snapshot.History) != 0 {
 		t.Fatalf("discarded tool round reappeared after reset: history=%+v, %v", snapshot.History, err)
 	}

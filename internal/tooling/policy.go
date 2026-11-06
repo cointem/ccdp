@@ -16,7 +16,7 @@ type Authority interface {
 	GoPreHook() (plugin.ToolDecision, string)
 	ShellPreHook() hooks.Output
 	CheckPermission() (permissions.Decision, string)
-	Approve(reason string) bool
+	Approve(reason string, resourcesOnly bool) bool
 	CheckReady() error
 	Invoke() Result
 	Rejected(status, reason string)
@@ -88,8 +88,8 @@ func (e Executor) Run(a Authority) Result {
 		if permission != permissions.DecisionAsk {
 			reason = "This tool needs additional sandbox access"
 		}
-		if !a.Approve(reason) {
-			return deny("permission denied by user: "+reason, reason)
+		if !a.Approve(reason, permission != permissions.DecisionAsk) {
+			return deny("access decision denied: "+reason, reason)
 		}
 	}
 	if err := a.CheckReady(); err != nil {

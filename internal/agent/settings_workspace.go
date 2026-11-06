@@ -74,6 +74,9 @@ func rebuildSandbox(cfg *config.Config, dir string, previous *sandbox.Sandbox) *
 	next := buildSandbox(cfg, dir)
 	next.ShareExecutionGuard(previous)
 	if previous != nil {
+		for _, root := range previous.Snapshot().ArtifactRoots {
+			next.AddArtifactRoot(root)
+		}
 		for _, root := range previous.Snapshot().ScratchDirs {
 			next.AddScratchDir(root)
 		}

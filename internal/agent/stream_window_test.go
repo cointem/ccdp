@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,35 @@ import (
 	"ccdp/internal/protocol"
 	"ccdp/internal/sessionview"
 )
+
+func TestDeferredToolEventOwnsPayload(t *testing.T) {
+	a, events := newTestAgent(t, &fakeLLM{})
+	a.mu.Lock()
+	a.publications.deferToolEvents = true
+	a.mu.Unlock()
+	event := protocol.EventView{Kind: protocol.EventToolResult, TurnID: "original-turn", StepID: "original-step", Tool: &protocol.ToolView{
+		ID: "call", Name: "Read", Status: "error", Args: json.RawMessage(`{"path":"original"}`),
+		Failure: &protocol.ToolFailure{Code: "original"},
+	}}
+	a.emit(event)
+	event.Tool.ID = "changed"
+	event.Tool.Args[0] = '!'
+	event.Tool.Failure.Code = "changed"
+	a.mu.Lock()
+	pending := a.publications.deferredToolEvents
+	a.publications.deferredToolEvents = nil
+	a.publications.deferToolEvents = false
+	a.mu.Unlock()
+	if len(pending) != 1 {
+		t.Fatalf("deferred events: %d", len(pending))
+	}
+	a.emit(pending[0])
+	seen := drainUntil(t, events, time.Second, func(ev protocol.EventView) bool { return ev.Kind == protocol.EventToolResult })
+	got := seen[len(seen)-1]
+	if got.CallID != "call" || got.TurnID != "original-turn" || got.StepID != "original-step" || string(got.Tool.Args) != `{"path":"original"}` || got.Tool.Failure.Code != "original" {
+		t.Fatalf("producer mutation reached deferred publication: %+v", got)
+	}
+}
 
 func TestStreamPublicationCoalescesAndFlushesFinalTail(t *testing.T) {
 	a, _ := newTestAgent(t, &fakeLLM{})
@@ -21,10 +51,10 @@ func TestStreamPublicationCoalescesAndFlushesFinalTail(t *testing.T) {
 	<-sub.Updates()
 	text := strings.Repeat("中文", 100)
 	for i := 0; i < 2000; i++ {
-		a.publishEvent(Event{Type: EventReasoning, Text: text})
+		a.emit(protocol.EventView{Kind: protocol.EventReasoning, Text: text})
 	}
-	a.publishEvent(Event{Type: EventReasoning, Text: "THE_FINAL_TAIL"})
-	a.publishEvent(Event{Type: EventStatus, Text: "finished reasoning"})
+	a.emit(protocol.EventView{Kind: protocol.EventReasoning, Text: "THE_FINAL_TAIL"})
+	a.emit(protocol.EventView{Kind: protocol.EventStatus, Text: "finished reasoning"})
 	count := 0
 	var latest *protocol.TranscriptItem
 	deadline := time.After(2 * time.Second)

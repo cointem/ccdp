@@ -1,12 +1,11 @@
 package changes
 
 import (
+	"ccdp/internal/testenv"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
-
-	"ccdp/internal/sandbox"
 )
 
 func TestReadFileRecognizesAbsentLeavesAcrossStructureChanges(t *testing.T) {
@@ -18,7 +17,7 @@ func TestReadFileRecognizesAbsentLeavesAcrossStructureChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := New("")
-	policy := sandbox.New(root)
+	policy := testenv.Sandbox(t, root)
 	for _, path := range []string{"missing", "directory", "file/old-child"} {
 		got, err := store.ReadFile(root, path, policy)
 		if err != nil || got.Kind != "absent" {
@@ -36,7 +35,7 @@ func TestReadFileRecognizesAbsentLeavesAcrossStructureChanges(t *testing.T) {
 func TestReadFileDoesNotTreatDeniedOrUnsupportedPathsAsAbsent(t *testing.T) {
 	root := t.TempDir()
 	store := New("")
-	policy := sandbox.New(root)
+	policy := testenv.Sandbox(t, root)
 	if err := os.Mkdir(filepath.Join(root, "denied"), 0700); err != nil {
 		t.Fatal(err)
 	}

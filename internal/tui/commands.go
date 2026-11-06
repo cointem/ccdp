@@ -138,8 +138,8 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		m.showContextDetail = true
 		return m, nil
 
-	case "plugins":
-		return m, m.runQuery(protocol.QueryPlugins, "plugin report requested")
+	case "providers":
+		return m, m.runQuery(protocol.QueryProviders, "provider report requested")
 
 	case "mcp":
 		return m, m.runQuery(protocol.QueryMCP, "MCP report requested")
@@ -153,24 +153,17 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 
 	case "mode":
 		if len(args) == 0 {
-			modes := append([]permissions.Mode(nil), permissions.ValidModes...)
 			descriptions := map[permissions.Mode]string{
-				permissions.ModeDefault:     "ask before risky operations",
-				permissions.ModeAcceptEdits: "allow file edits; ask for other risky operations",
-				permissions.ModePlan:        "plan without changing files",
-				permissions.ModeBypass:      "allow operations without approval",
+				permissions.ModeAuto:   "run development tasks within the authorized environment",
+				permissions.ModeManual: "ask before edits and non-read-only commands",
 			}
-			lines := make([]string, len(modes))
+			options := make([]SelectorOption, len(permissions.ValidModes))
 			selected := 0
-			for i, mode := range modes {
-				lines[i] = fmt.Sprintf("%s — %s", mode.Label(), descriptions[mode])
+			for i, mode := range permissions.ValidModes {
 				if mode == m.mode {
 					selected = i
 				}
-			}
-			options := make([]SelectorOption, len(modes))
-			for i, mode := range modes {
-				options[i] = SelectorOption{ID: string(mode), Label: mode.Label(), Description: descriptions[mode],
+				options[i] = SelectorOption{ID: string(mode), Label: string(mode), Description: descriptions[mode],
 					Current: mode == m.mode}
 			}
 			return m, m.startSelectorAt("Select permission mode", options, selected, true, selectorAction{Kind: selectorMode})
@@ -183,7 +176,7 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		policy := m.permissionPolicy()
 		policy.Mode = string(mode)
 		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetPermissionPolicy,
-			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+mode.Label())
+			PermissionPolicy: &protocol.SetPermissionPolicy{Policy: policy}}, "permission mode → "+string(mode))
 
 	case "effort", "verbosity":
 		if len(args) == 0 {
@@ -230,29 +223,6 @@ func (m *Model) runCommand(text string) (tea.Model, tea.Cmd) {
 		}
 		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetModel,
 			Model: &protocol.SetModel{Model: args[0]}}, "model → "+args[0])
-
-	case "plan":
-		on := !m.planMode
-		if m.hasSnapshot {
-			on = m.snapshot.Settings.ExecutionMode != protocol.ExecutionModePlan
-		}
-		if len(args) > 0 {
-			switch args[0] {
-			case "on":
-				on = true
-			case "off":
-				on = false
-			default:
-				m.pushLog("error", "usage: /plan [on|off]")
-				return m, nil
-			}
-		}
-		mode := protocol.ExecutionModeExecute
-		if on {
-			mode = protocol.ExecutionModePlan
-		}
-		return m, m.submitCommand(protocol.Command{Type: protocol.CommandSetExecutionMode,
-			ExecutionMode: &protocol.SetExecutionMode{Mode: mode}}, map[bool]string{true: "plan mode on", false: "plan mode off"}[on])
 
 	case "sandbox":
 		if len(args) == 2 && args[0] == "revoke" && args[1] == "all" {
@@ -868,11 +838,17 @@ func formatSandboxPolicy(workspace string, policy protocol.SandboxPolicy, runtim
 	}
 	status := "stable"
 	if runtime.RevocationPending {
-		status = "revocation pending; tool dispatch remains blocked"
+		status = "project execution quarantined; chat, saved outputs and cleanup remain available"
 	} else if runtime.ExternalExecutionPossible {
 		status = "local process descendants may retain an older Seatbelt policy; revoke/tighten may fail closed"
 	}
-	return fmt.Sprintf("Confirmed sandbox policy (revision %d)\nWorkspace: %s\nAdditional writable roots:%s\nAdditional read-only roots:%s\nDenied roots:%s\nNetwork access: %s\nSession-only grants:%s\nRuntime status: %s",
-		policy.Revision, workspace, list(policy.AdditionalDirectories),
-		list(policy.AdditionalReadOnlyDirectories), list(policy.DisallowedDirectories), network, list(grants), status)
+	if runtime.State != "" {
+		status = runtime.State + "; " + status
+	}
+	if runtime.Detail != "" {
+		status += "; " + runtime.Detail
+	}
+	return fmt.Sprintf("Confirmed sandbox policy (revision %d)\nEnvironment: %s\nWorkspace: %s\nScratch/cache: %s\nAdditional writable roots:%s\nAdditional read-only roots:%s\nDenied roots:%s\nNetwork access: %s\nLocal development TCP: %t\nSession-only grants:%s\nRuntime status: %s",
+		policy.Revision, runtime.EnvironmentID, workspace, runtime.ScratchDir, list(policy.AdditionalDirectories),
+		list(policy.AdditionalReadOnlyDirectories), list(policy.DisallowedDirectories), network, policy.LocalDevelopmentNetwork, list(grants), status)
 }

@@ -66,7 +66,7 @@ func (e ChildRunRecorded) validate() error {
 		return errors.New("invalid child purpose")
 	}
 	switch e.Child.Run.Status {
-	case "queued", "starting", "running", "waiting_approval", "waiting_question", "waiting_plan", "stopping", "settling", "succeeded", "partial", "failed", "cancelled", "interrupted", "unknown":
+	case "queued", "starting", "running", "waiting_approval", "waiting_question", "stopping", "settling", "succeeded", "partial", "failed", "cancelled", "interrupted", "unknown":
 	default:
 		return errors.New("invalid child run status")
 	}

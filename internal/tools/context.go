@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"ccdp/internal/computer"
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 	"ccdp/internal/skills"
@@ -29,13 +30,19 @@ type Context struct {
 	dataResult *Result
 	RunCode    func(string, time.Duration) (protocol.CodeResult, error)
 	context.Context
-	ReadRoot   string         // optional strict snapshot-only read boundary
-	WorkingDir string         // directory the tool should operate in
-	SessionDir string         // session directory for retained tool artifacts
-	Args       map[string]any // parsed JSON arguments from the model
-	Timeout    time.Duration  // per-tool timeout (0 = default)
+	ReadRoot      string         // optional strict snapshot-only read boundary
+	WorkingDir    string         // directory the tool should operate in
+	SessionDir    string         // session directory for retained tool artifacts
+	Args          map[string]any // parsed JSON arguments from the model
+	Timeout       time.Duration  // per-tool timeout (0 = default)
+	ProcessOrigin string
+	// Progress is display-only; lifecycle facts are acknowledged by the session owner.
+	ProcessProgress func(protocol.ProcessProgress, string)
+	ProcessEvent    func(protocol.ProcessEvent) (string, error)
 	// Resources owns the session's file state and process handles.
 	Resources *Resources
+	// Computer is an explicit root-session desktop grant, independent of Sandbox.
+	Computer *computer.Controller
 	// ReplaceTodos commits a validated task replacement through the session owner.
 	// It must publish the new list only after its durable commit succeeds.
 	ReplaceTodos func([]TodoState) error

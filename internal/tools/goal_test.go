@@ -110,7 +110,7 @@ func TestGoalToolsRespectInvocationScopeAndErrors(t *testing.T) {
 	if _, err := executeToolText(NewUpdateGoalTool(), &Context{Context: canceled, Goals: stub, Args: args}); !errors.Is(err, context.Canceled) || stub.calls != 0 {
 		t.Fatalf("canceled invocation: %v calls=%d", err, stub.calls)
 	}
-	resources := NewResources("owner", t.TempDir())
+	resources := NewResources("owner", t.TempDir(), t.TempDir()+"/runtime")
 	t.Cleanup(func() { _ = resources.Close() })
 	if _, err := executeToolText(NewUpdateGoalTool(), &Context{Resources: resources, Owner: "other", Goals: stub, Args: args}); err == nil || stub.calls != 0 {
 		t.Fatalf("cross-session invocation: %v calls=%d", err, stub.calls)

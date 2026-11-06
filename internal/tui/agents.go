@@ -311,7 +311,7 @@ func (m *Model) applyChildUpdate(child protocol.ChildSession) {
 	// badge in the parent after the child has completed.
 	if !child.Run.Active() {
 		child.Approval = nil
-		child.Question, child.Plan = nil, nil
+		child.Question = nil
 	}
 	replaced := false
 	for i := range m.routing.rows {
@@ -330,7 +330,7 @@ func (m *Model) applyChildUpdate(child protocol.ChildSession) {
 }
 
 func childNeedsAttention(child protocol.ChildSession) bool {
-	return child.Run.Active() && (child.Approval != nil || child.Question != nil || child.Plan != nil)
+	return child.Run.Active() && (child.Approval != nil || child.Question != nil)
 }
 
 func (m *Model) startAgentSwitch() tea.Cmd {
@@ -646,15 +646,12 @@ func projectTranscriptCell(item protocol.TranscriptItem) historyCell {
 	return historyCell{kind: item.Kind, text: text, textOffset: int(item.TextOffset), messageID: item.ID, turnID: item.TurnID,
 		toolID: string(item.CallID), status: item.Status, toolName: item.Tool, toolArgs: args,
 		parentCallID: string(item.ParentCallID), childIndex: item.ChildIndex,
-		toolArgsRaw: string(item.Args), toolTruncated: item.Truncated}
+		toolArgsRaw: string(item.Args), toolTruncated: item.Truncated, process: protocol.CloneProcessState(item.Process)}
 }
 
 func childInteractionLabel(child protocol.ChildSession) string {
 	if child.Question != nil {
 		return "answer required"
-	}
-	if child.Plan != nil {
-		return "plan decision required"
 	}
 	return "approval required"
 }

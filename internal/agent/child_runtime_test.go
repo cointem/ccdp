@@ -21,6 +21,7 @@ import (
 	"ccdp/internal/permissions"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/tools"
 )
 
@@ -45,7 +46,8 @@ func newChildRuntimeTestAgent(t *testing.T, p llm.Provider) (*Agent, config.Conf
 	cfg.SessionDir = filepath.Join(cfg.Workspace, "sessions")
 	cfg.Model = "child-test-model"
 	cfg.BaseURL = "http://127.0.0.1:1/unreachable"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
+	cfg.AlwaysAllow = []string{"JoinChildTest"}
 	cfg.EnableGuardian = config.BoolPtr(false)
 	cfg.EnableProjectMemory = false
 	cfg.MaxTurns = 4
@@ -106,7 +108,7 @@ func TestTaskChildUsesRealLoopAndAggregatesUsageOnce(t *testing.T) {
 		lastUser := ""
 		var toolResult string
 		for _, message := range req.Messages {
-			if message.Role == "user" {
+			if isTaskMessage(message) {
 				lastUser, _ = message.Content.(string)
 			}
 			if message.Role == "tool" {
@@ -144,14 +146,14 @@ func TestTaskChildUsesRealLoopAndAggregatesUsageOnce(t *testing.T) {
 	if err := a.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	saved, err := LoadSession(cfg.SessionDir, a.SessionID())
+	saved, err := archive.Load(cfg.SessionDir, a.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved.Usage != a.Usage() {
+	if saved.Usage != sessionUsage(a.Usage()) {
 		t.Fatalf("replay/live divergence: %+v vs %+v", saved.Usage, a.Usage())
 	}
-	sessions, issues, err := ListSessions(cfg.SessionDir)
+	sessions, issues, err := archive.List(cfg.SessionDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +176,7 @@ func TestTaskChildCancellationDoesNotPoisonNextParentTurn(t *testing.T) {
 	p := &childRuntimeTestProvider{name: "cancel-child-test-provider", stream: func(ctx context.Context, req llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
 		last := ""
 		for _, message := range req.Messages {
-			if message.Role == "user" {
+			if isTaskMessage(message) {
 				last, _ = message.Content.(string)
 			}
 		}
@@ -214,7 +216,7 @@ func TestTaskChildInterruptJoinsAndAggregatesPartialUsage(t *testing.T) {
 	p.stream = func(ctx context.Context, req llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
 		lastUser := ""
 		for _, message := range req.Messages {
-			if message.Role == "user" {
+			if isTaskMessage(message) {
 				lastUser, _ = message.Content.(string)
 			}
 		}
@@ -337,7 +339,7 @@ func TestConcurrentLaunchersShareParentChildSlots(t *testing.T) {
 		}
 		lastUser := ""
 		for _, message := range req.Messages {
-			if message.Role == "user" {
+			if isTaskMessage(message) {
 				lastUser, _ = message.Content.(string)
 			}
 		}
@@ -489,7 +491,7 @@ func TestTaskChildUsesStepProviderAndConfigSnapshot(t *testing.T) {
 		lastUser := ""
 		toolResult := ""
 		for _, message := range req.Messages {
-			if message.Role == "user" {
+			if isTaskMessage(message) {
 				lastUser, _ = message.Content.(string)
 			}
 			if message.Role == "tool" {
@@ -591,7 +593,7 @@ func TestChildToolGateHardPolicies(t *testing.T) {
 	guardian := &Agent{children: childRuntimeBindings{childState: &childRuntimeState{
 		purpose:        childPurposeGuardian,
 		nonInteractive: true,
-		perms:          permissions.NewManager(permissions.ModeBypass, permissions.Policy{}),
+		perms:          permissions.NewManager(permissions.ModeAuto, permissions.Policy{}),
 	}}}
 	for _, name := range []string{"Write", "Edit", "Bash", "WebSearch", "SpawnAgent", "EnterPlanMode", "ExitPlanMode", "unknown"} {
 		if denied, reason := ChildToolGate(guardian, messages.ToolCall{Name: name}, nil); !denied || reason == "" {
@@ -605,7 +607,7 @@ func TestChildToolGateHardPolicies(t *testing.T) {
 	task := &Agent{children: childRuntimeBindings{childState: &childRuntimeState{
 		purpose:        childPurposeTask,
 		nonInteractive: true,
-		perms:          permissions.NewManager(permissions.ModeDefault, permissions.Policy{}),
+		perms:          permissions.NewManager(permissions.ModeManual, permissions.Policy{}),
 	}}}
 	if denied, reason := ChildToolGate(task, messages.ToolCall{Name: "SpawnAgent"}, tools.NewAgentTool("SpawnAgent")); !denied || reason == "" {
 		t.Fatalf("nested delegation escaped hard gate: denied=%v reason=%q", denied, reason)

@@ -36,7 +36,7 @@ func TestReviewCancelledSecondWriteHasNoSideEffect(t *testing.T) {
 
 func TestReviewExplorerAdmitsItsAllowedWebTool(t *testing.T) {
 	cfg := isolatedTestConfig(t, "explorer")
-	cfg.PermissionMode = "bypass"
+	cfg.PermissionMode = "auto"
 	cfg.NetworkAccess = true
 	cfg.EnableGuardian = config.BoolPtr(false)
 	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, Purpose: childPurposeTask, ReadOnlyWorkspace: true, AllowedTools: childReadOnlyTools(childPurposeTask)})
@@ -65,6 +65,7 @@ func (p *reviewCancelGuardianProvider) Stream(_ context.Context, _ llm.Completio
 func TestReviewCancellationDuringGuardianHasNoWrite(t *testing.T) {
 	cfg := isolatedTestConfig(t, "cancel-guardian")
 	cfg.EnableGuardian = config.BoolPtr(true)
+	cfg.PermissionMode = "auto"
 	p := &reviewCancelGuardianProvider{}
 	registry := plugin.NewModelRegistry()
 	registry.Register(p)
@@ -78,7 +79,7 @@ func TestReviewCancellationDuringGuardianHasNoWrite(t *testing.T) {
 	a.turn.turnCtx, a.turn.turnCancel = context.WithCancel(a.lifecycle.rootCtx)
 	a.mu.Unlock()
 	p.cancel = a.interrupt
-	path := filepath.Join(cfg.Workspace, "after-cancel.txt")
+	path := filepath.Join(t.TempDir(), "after-cancel.txt")
 	out, failed := executeTestTool(t, a, messages.ToolCall{ID: "write", Name: "Write", Arguments: map[string]any{"file_path": path, "content": "after cancellation"}})
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("guardian cancellation still wrote file: failed=%v output=%s stat=%v", failed, out, err)

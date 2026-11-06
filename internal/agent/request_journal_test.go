@@ -22,6 +22,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func newJournalAgent(t testing.TB, memory bool) (*Agent, *sessionPersistence, *config.Config) {
@@ -33,36 +34,17 @@ func newJournalAgent(t testing.TB, memory bool) (*Agent, *sessionPersistence, *c
 	cfg.Model = "journal-model"
 
 	cfg.NoSessionPersistence = memory
-	backend := &journalTestBackend{}
-	p, err := openSessionPersistenceModeWithParent(&cfg, "journal-session", time.Unix(1, 0).UTC(), "agent", false, "", backend.options())
+	cfg.SessionID = "journal-session"
+	a, err := testNew(t, &cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &Agent{
-		services: sessionServices{
-			cfg:         &cfg,
-			persistence: p,
-			perms:       permissions.NewManager(permissions.ModeDefault, permissions.Policy{}),
-			evbus:       events.NewBus(),
-		},
-		conversation: conversationState{
-			sessionID: "journal-session",
-		},
-		sequences: seqState{
-			settingsRev: 7,
-			contextRev:  9,
-			turnSeq:     2,
-			stepSeq:     4,
-		},
-		publications: watchState{},
-	}
-	if err := p.BindState(&a.conversation.durable, &a.mu); err != nil {
-		t.Fatal(err)
-	}
-	a.services.supervisor = &SessionSupervisor{root: a, sessionDir: cfg.SessionDir, memory: memory}
-	registerJournalBackend(t, p, backend)
-	t.Cleanup(func() { _ = p.Close() })
-	return a, p, &cfg
+	a.mu.Lock()
+	a.sequences.settingsRev, a.sequences.contextRev = 7, 9
+	a.sequences.turnSeq, a.sequences.stepSeq = 2, 4
+	a.mu.Unlock()
+	t.Cleanup(a.Close)
+	return a, a.persistenceHandle(), a.services.cfg
 }
 
 func journalRequest() llm.CompletionRequest {
@@ -76,6 +58,28 @@ func journalRequest() llm.CompletionRequest {
 			Name: "Read", Description: "read a file", Parameters: map[string]any{"type": "object"},
 		}}},
 		Stream: true,
+	}
+}
+
+func TestGoalEstimateCountsModelInputOnce(t *testing.T) {
+	a, _, _ := newJournalAgent(t, true)
+	req := journalRequest()
+	text := strings.Repeat("stable project instructions ", 200)
+	req.Messages = append([]llm.ChatMessage{{Role: "system", Content: text}}, req.Messages...)
+	req.SystemBlocks = []llm.SystemBlock{{Text: text, Cacheable: true}}
+	req.Messages = append(req.Messages, llm.ChatMessage{Role: "system", ToolUpdate: &messages.ToolUpdate{Initial: true, Added: []messages.ToolDefinition{{Name: "Read", Description: "read a file", Parameters: map[string]any{"type": "object"}}}}})
+	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider", "", req, testRequestMetadata(a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// These alternate wire representations repeat text in the journal JSON,
+	// but providers receive one system prefix and one current tool catalog.
+	plain := req
+	plain.SystemBlocks = nil
+	plain.Messages = plain.Messages[:len(plain.Messages)-1]
+	want := llm.EstimateRequestBudget(plain, 0).InputTokens
+	if attempt.estimatedInput < want || attempt.estimatedInput > want+16 {
+		t.Fatalf("goal input estimate counted journal duplicates: got=%d model=%d", attempt.estimatedInput, want)
 	}
 }
 
@@ -315,7 +319,10 @@ func TestRequestJournalUsageSubscriberCanPersist(t *testing.T) {
 	var saveErr error
 	a.services.evbus.Subscribe(events.TopicUsageUpdated, func(events.Topic, events.Payload) {
 		called = true
-		saveErr = a.persistWorkflowFact(session.WorkflowState{})
+		a.mu.Lock()
+		settings, revision := a.sessionSettingsLocked(), a.sequences.settingsRev
+		a.mu.Unlock()
+		saveErr = a.persistSettingsFact(settings, revision)
 	})
 	attempt, err := a.recordPreparedRequest(context.Background(), "main", "provider-a", "https://example.test/v1", journalRequest(), testRequestMetadata(a))
 	if err != nil {
@@ -344,7 +351,7 @@ func TestLoadSessionReplaysCreatedParentID(t *testing.T) {
 	if err := child.Close(); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(cfg.SessionDir, "child-session")
+	snapshot, err := archive.Load(cfg.SessionDir, "child-session")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +408,8 @@ func newJournalRuntimeAgent(t *testing.T, provider llm.Provider) *Agent {
 	cfg.SessionDir = filepath.Join(cfg.Workspace, "sessions")
 	cfg.Model = "request-journal-gate-model"
 	cfg.BaseURL = "http://127.0.0.1:1/unreachable"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
+	cfg.AlwaysAllow = []string{"FormalAuditEffect"}
 	cfg.MaxTurns = 2
 	registry := plugin.NewModelRegistry()
 	registry.Register(provider)
@@ -517,7 +525,7 @@ func TestSessionCacheWeightedPersistedAndExcludesChildUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restored, err := snapshotFromRecords(records, "journal-session")
+	restored, err := archive.FromRecords(records, "journal-session")
 	if err != nil || restored.Usage.Cache != want {
 		t.Fatalf("cache lost in replay: %+v %v", restored, err)
 	}

@@ -4,6 +4,7 @@ package codemode
 
 import (
 	"bytes"
+	"ccdp/internal/protocol"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -20,13 +21,15 @@ const MaxQueue = 32
 const MaxResults = 8 << 20
 
 type Result struct {
-	CallID    string          `json:"call_id,omitempty"`
-	Status    string          `json:"status"`
-	Text      string          `json:"text"`
-	Data      json.RawMessage `json:"data,omitempty"`
-	Truncated bool            `json:"truncated"`
-	DataError string          `json:"data_error,omitempty"`
-	OutputID  string          `json:"output_id,omitempty"`
+	Process       *protocol.ProcessOutput `json:"-"`
+	CompletionIDs []string                `json:"-"`
+	CallID        string                  `json:"call_id,omitempty"`
+	Status        string                  `json:"status"`
+	Text          string                  `json:"text"`
+	Data          json.RawMessage         `json:"data,omitempty"`
+	Truncated     bool                    `json:"truncated"`
+	DataError     string                  `json:"data_error,omitempty"`
+	OutputID      string                  `json:"output_id,omitempty"`
 }
 
 // ValidateData prevents a precise host JSON number from being silently rounded

@@ -7,7 +7,7 @@ import (
 
 // sessionOwner serializes command admission and turn handoff. Its control lane
 // outlives execution cancellation so shutdown can drain reliable completions.
-// Agent.mu protects compatibility readers and producer mailboxes; business
+// Agent.mu protects read views and producer mailboxes; business
 // transitions and durable projection updates execute in this loop.
 type sessionOwner struct {
 	decisions           []*decisionRequest

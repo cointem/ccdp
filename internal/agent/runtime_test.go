@@ -16,6 +16,7 @@ import (
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 // truncateForLog shortens a message for test failure dumps.
@@ -85,26 +86,27 @@ func TestEstimateTokensUsesRealBaseline(t *testing.T) {
 
 func TestInterruptNoteInjectedOnce(t *testing.T) {
 	ag := newRuntimeAgent(t)
-
 	ag.mu.Lock()
 	ag.turnMemory.interruptNote = true
 	ag.mu.Unlock()
-
-	firstStep := ag.beginStep()
-	req := ag.buildRequestForStep(firstStep)
-	releaseStepLease(firstStep)
-	sys, _ := req.Messages[0].Content.(string)
-	if !strings.Contains(sys, "Interrupted turn") {
-		t.Error("interrupted-turn guidance missing from system prompt")
+	first := ag.beginStep()
+	ag.releaseStepContext(first)
+	count := func(history []messages.Message) int {
+		n := 0
+		for _, m := range history {
+			if m.InternalSource == "runtime_interrupt" {
+				n++
+			}
+		}
+		return n
 	}
-
-	// Second request must not repeat it.
-	secondStep := ag.beginStep()
-	req = ag.buildRequestForStep(secondStep)
-	releaseStepLease(secondStep)
-	sys, _ = req.Messages[0].Content.(string)
-	if strings.Contains(sys, "Interrupted turn") {
-		t.Error("interrupted-turn guidance should be injected only once")
+	if count(first.history) != 1 {
+		t.Fatal("interrupted-turn guidance missing")
+	}
+	second := ag.beginStep()
+	ag.releaseStepContext(second)
+	if count(second.history) != 1 {
+		t.Fatal("interrupted-turn guidance appended twice")
 	}
 }
 
@@ -133,10 +135,10 @@ func TestDispatchToolsInterruptedFillsEveryResult(t *testing.T) {
 	// message with tool_calls that have no matching tool result, which
 	// providers reject with 400 on the next request.
 	for i, r := range results {
-		if r.output == "" {
+		if r.Output == "" {
 			t.Errorf("call %d (%s): empty result would break the protocol", i, calls[i].ID)
 		}
-		if !r.isErr {
+		if !r.IsError {
 			t.Errorf("call %d: interrupted dispatch should be an error result", i)
 		}
 	}
@@ -343,24 +345,23 @@ func TestSteerQueuedMessageInjected(t *testing.T) {
 
 	ag.mu.Lock()
 	defer ag.mu.Unlock()
-	// Expected shape: [user1, catalog, asst(tool), tool, user2(steered), asst(done)]
-	// The base system prompt lives outside history; catalog deltas are durable.
-	var dump strings.Builder
-	for i, m := range ag.conversation.durable.History {
-		fmt.Fprintf(&dump, "%d:%s:%q ", i, m.Role, truncateForLog(m.Content))
+	// User steering must retain order across append-only runtime context.
+	var history []messages.Message
+	for _, m := range ag.conversation.durable.History {
+		if m.InternalSource == "" {
+			history = append(history, m)
+		}
 	}
-	t.Logf("history: %s", dump.String())
-	n := len(ag.conversation.durable.History)
-	if n != 6 {
-		t.Fatalf("steered history should be 6 messages including catalog, got %d", n)
+	n := len(history)
+	if n != 5 {
+		t.Fatalf("steered conversation should have 5 messages, got %d", n)
 	}
-	last := ag.conversation.durable.History[n-1]
-	prev := ag.conversation.durable.History[n-2]
+	last, prev := history[n-1], history[n-2]
 	if last.Role != messages.RoleAssistant || !strings.Contains(last.Content, "done") {
 		t.Fatalf("expected final assistant 'done', got %q (%s)", last.Content, last.Role)
 	}
 	if prev.Role != messages.RoleUser || prev.Content != "steered message" {
-		t.Fatalf("steered message must be the last user message before the reply, got %q (%s)", prev.Content, prev.Role)
+		t.Fatalf("steered message must precede the reply, got %q (%s)", prev.Content, prev.Role)
 	}
 }
 
@@ -384,10 +385,10 @@ func TestForkBranchesSession(t *testing.T) {
 	oldID := ag.SessionID()
 	// turnFinished (which persists the session) runs after the TurnDone event
 	// is emitted; poll briefly for the source snapshot to land on disk.
-	var oldSnap *SessionSnapshot
+	var oldSnap *archive.Snapshot
 	var err error
 	for i := 0; i < 40; i++ {
-		if oldSnap, err = LoadSession(ag.SessionDir(), oldID); err == nil {
+		if oldSnap, err = archive.Load(ag.SessionDir(), oldID); err == nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -420,7 +421,7 @@ func TestForkBranchesSession(t *testing.T) {
 		t.Fatalf("source history changed from %d to %d messages", len(oldHistory), len(got))
 	}
 
-	snap, err := LoadSession(ag.SessionDir(), newID)
+	snap, err := archive.Load(ag.SessionDir(), newID)
 	if err != nil {
 		t.Fatalf("branched session not saved: %v", err)
 	}
@@ -446,7 +447,7 @@ func TestForkBranchesSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The source session file keeps its full history.
-	after, err := LoadSession(ag.SessionDir(), oldID)
+	after, err := archive.Load(ag.SessionDir(), oldID)
 	if err != nil {
 		t.Fatalf("source session missing after fork: %v", err)
 	}
@@ -466,7 +467,7 @@ func TestPendingInboxPersisted(t *testing.T) {
 	ag.turn.busy = true
 	ag.mu.Unlock()
 	// Seed usage through the durable projection, as production accounting does.
-	if err := ag.persistenceHandle().persistUsage(Usage{InputTokens: 12, OutputTokens: 3, TurnCount: 2}); err != nil {
+	if err := ag.persistenceHandle().persistUsage(protocol.UsageSnapshot{InputTokens: 12, OutputTokens: 3, TurnCount: 2}); err != nil {
 		t.Fatalf("persist usage fixture: %v", err)
 	}
 	for i, text := range []string{"queued one", "queued two", "queued three"} {
@@ -476,7 +477,7 @@ func TestPendingInboxPersisted(t *testing.T) {
 		}
 	}
 
-	snap, err := LoadSession(ag.SessionDir(), ag.SessionID())
+	snap, err := archive.Load(ag.SessionDir(), ag.SessionID())
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -509,12 +510,12 @@ func TestResumeRestoresWorkspaceAndModel(t *testing.T) {
 	cfg.Workspace = current
 	cfg.NoSessionPersistence = true
 	cfg.SessionDir = filepath.Join(current, "sessions")
-	snap := &SessionSnapshot{
+	snap := &archive.Snapshot{
 		ID:        "restore-context",
 		CreatedAt: time.Now(),
 		Workspace: restored,
 		Model:     "restored-model",
-		Usage:     Usage{TurnCount: 4},
+		Usage:     session.Usage{TurnCount: 4},
 	}
 	ag, err := Resume(&cfg, snap)
 	if err != nil {
@@ -524,57 +525,25 @@ func TestResumeRestoresWorkspaceAndModel(t *testing.T) {
 	if ag.services.cfg.Workspace != restored || ag.services.cfg.Model != "restored-model" {
 		t.Fatalf("restored context = %q/%q", ag.services.cfg.Workspace, ag.services.cfg.Model)
 	}
+	if ag.services.cfg.PermissionMode != "auto" || !ag.services.cfg.LocalDevelopmentNetwork {
+		t.Fatal("snapshot without settings changed the current development boundary")
+	}
 	if ag.Usage().TurnCount != 4 {
 		t.Fatalf("restored usage = %+v", ag.Usage())
 	}
 }
 
-func TestApprovalResponsesMustMatchPendingID(t *testing.T) {
-	ag := newRuntimeAgent(t)
-	approvalCh := make(chan approvalAnswer, 1)
-	planCh := make(chan bool, 1)
-	ag.mu.Lock()
-	ag.decisions.pendingApproval = &ApprovalRequest{ID: "approval-new"}
-	ag.decisions.approvalResp = approvalCh
-	ag.plan.pendingPlan = &PlanRequest{ID: "plan-new"}
-	ag.plan.planResp = planCh
-	ag.mu.Unlock()
-
-	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("stale-approval")), SessionID: protocol.SessionID(ag.SessionID()),
-		Type: protocol.CommandApproveTool, Approval: &protocol.ApproveTool{ApprovalID: "approval-old", Approve: true}})
-	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("stale-plan")), SessionID: protocol.SessionID(ag.SessionID()),
-		Type: protocol.CommandApprovePlan, Plan: &protocol.ApprovePlan{PlanID: "plan-old", Approve: true}})
-	select {
-	case <-approvalCh:
-		t.Fatal("stale approval was accepted")
-	default:
-	}
-	select {
-	case <-planCh:
-		t.Fatal("stale plan response was accepted")
-	default:
-	}
-
-	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("approval")), SessionID: protocol.SessionID(ag.SessionID()),
-		Type: protocol.CommandApproveTool, Approval: &protocol.ApproveTool{ApprovalID: "approval-new", Approve: true}})
-	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("plan")), SessionID: protocol.SessionID(ag.SessionID()),
-		Type: protocol.CommandApprovePlan, Plan: &protocol.ApprovePlan{PlanID: "plan-new", Approve: true}})
-	if ans := <-approvalCh; !ans.approve {
-		t.Fatal("matching approval was not accepted")
-	}
-	if ok := <-planCh; !ok {
-		t.Fatal("matching plan response was not accepted")
-	}
-}
-
 func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	ag := newRuntimeAgent(t)
+	ag.services.perms.SetMode(permissions.ModeManual)
+	ag.services.cfg.PermissionMode = string(permissions.ModeManual)
+	ag.services.baseCfg.PermissionMode = string(permissions.ModeManual)
 	settingsDir := filepath.Join(ag.services.cfg.Workspace, ".ccdp")
 	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	settingsPath := filepath.Join(settingsDir, "settings.json")
-	first := `{"permission_mode":"bypassPermissions","always_allow":["Bash:make build"],"hooks":{"PreToolUse":["echo ok"]},"enable_web_tools":false}`
+	first := `{"permission_mode":"auto","always_allow":["Bash:make build"],"hooks":{"PreToolUse":["echo ok"]},"enable_web_tools":false}`
 	if err := os.WriteFile(settingsPath, []byte(first), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -597,11 +566,11 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	if decision, _ := ag.services.perms.Check("Bash", map[string]any{"command": "make build"}, permissions.KindShell); decision != permissions.DecisionAllow {
 		t.Fatalf("project allow rule was not loaded: %s", decision)
 	}
-	if len(ag.HooksList()[hooks.EventPreToolUse]) != 1 {
+	if len(ag.services.hooks.List()[hooks.EventPreToolUse]) != 1 {
 		t.Fatal("project hook was not loaded")
 	}
-	if ag.PermissionMode() != permissions.ModeAcceptEdits {
-		t.Fatalf("project attempted to loosen permission policy: %s", ag.PermissionMode())
+	if ag.services.perms.CurrentMode() != permissions.ModeManual {
+		t.Fatalf("project attempted to loosen permission policy: %s", ag.services.perms.CurrentMode())
 	}
 	if _, ok := ag.services.registry.Get("WebFetch"); ok {
 		t.Fatal("web tools remained registered after disabling them")
@@ -615,11 +584,11 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	if decision, _ := ag.services.perms.Check("Bash", map[string]any{"command": "make build"}, permissions.KindShell); decision != permissions.DecisionAsk {
 		t.Fatalf("removed project allow rule remained active: %s", decision)
 	}
-	if len(ag.HooksList()[hooks.EventPreToolUse]) != 0 {
+	if len(ag.services.hooks.List()[hooks.EventPreToolUse]) != 0 {
 		t.Fatal("removed project hook remained active")
 	}
-	if ag.PermissionMode() != permissions.ModeAcceptEdits {
-		t.Fatalf("removed project permission settings remained active: %s", ag.PermissionMode())
+	if ag.services.perms.CurrentMode() != permissions.ModeManual {
+		t.Fatalf("removed project permission settings remained active: %s", ag.services.perms.CurrentMode())
 	}
 	if _, ok := ag.services.registry.Get("WebFetch"); !ok {
 		t.Fatal("web tools were not restored after removing the override")
@@ -633,7 +602,7 @@ func TestProjectSettingsLoadedAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(settingsDir, "settings.json"),
-		[]byte(`{"permission_mode":"acceptEdits","always_deny":["Bash:git push*"],"enable_web_tools":false}`), 0o600); err != nil {
+		[]byte(`{"permission_mode":"manual","always_deny":["Bash:git push*"],"enable_web_tools":false}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	trust := config.NewTrustStore(filepath.Join(t.TempDir(), "project-trust.json"))
@@ -645,7 +614,7 @@ func TestProjectSettingsLoadedAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	cfg.PermissionMode = string(permissions.ModeDefault)
+	cfg.PermissionMode = string(permissions.ModeManual)
 	cfg.Workspace = dir
 	cfg.SessionDir = filepath.Join(dir, "sessions")
 	cfg.TrustStore = trust
@@ -654,13 +623,32 @@ func TestProjectSettingsLoadedAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ag.Close()
-	if ag.PermissionMode() != permissions.ModeDefault {
-		t.Fatalf("untrusted project loosened startup permission mode = %s", ag.PermissionMode())
+	if ag.services.perms.CurrentMode() != permissions.ModeManual {
+		t.Fatalf("untrusted project loosened startup permission mode = %s", ag.services.perms.CurrentMode())
 	}
 	if decision, _ := ag.services.perms.Check("Bash", map[string]any{"command": "git push origin main"}, permissions.KindShell); decision != permissions.DecisionDeny {
 		t.Fatalf("startup deny rule decision = %s", decision)
 	}
 	if _, ok := ag.services.registry.Get("WebFetch"); ok {
 		t.Fatal("startup web setting was ignored")
+	}
+}
+
+func TestApprovalResponsesMustMatchPendingID(t *testing.T) {
+	a := newRuntimeAgent(t)
+	answer := make(chan approvalAnswer, 1)
+	a.mu.Lock()
+	a.decisions.pendingApproval = &protocol.ApprovalView{ID: "approval-new"}
+	a.decisions.approvalResp = answer
+	a.mu.Unlock()
+	submitTestCommand(t, a, protocol.Command{ID: "stale-approval", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandApproveTool, Approval: &protocol.ApproveTool{ApprovalID: "approval-old", Approve: true}})
+	select {
+	case <-answer:
+		t.Fatal("stale approval was accepted")
+	default:
+	}
+	submitTestCommand(t, a, protocol.Command{ID: "matching-approval", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandApproveTool, Approval: &protocol.ApproveTool{ApprovalID: "approval-new", Approve: true}})
+	if result := <-answer; !result.approve {
+		t.Fatal("matching approval was not accepted")
 	}
 }

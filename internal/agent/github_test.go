@@ -9,6 +9,7 @@ import (
 
 	"ccdp/internal/config"
 	"ccdp/internal/execution"
+	"ccdp/internal/permissions"
 )
 
 // newGithubAgent builds an agent whose workspace is the given dir.
@@ -81,7 +82,7 @@ func TestPRQueriesUseBranchPositionArgument(t *testing.T) {
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	a := newGithubAgent(t, dir)
 	defer a.Close()
-	a.services.perms.SetAllowAll(true)
+	a.services.perms.SetMode(permissions.ModeAuto)
 	a.services.sandbox.SetAllowNetwork(true)
 	if got := a.PRComments(); got != "comments" {
 		t.Fatalf("comments: %s", got)
@@ -167,7 +168,7 @@ func TestGitHubStatusSurfacesGHFailure(t *testing.T) {
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	ag := newGithubAgent(t, dir)
 	defer ag.Close()
-	ag.services.perms.SetAllowAll(true)
+	ag.services.perms.SetMode(permissions.ModeAuto)
 	ag.services.sandbox.SetAllowNetwork(true)
 
 	out := ag.GitHubStatus()

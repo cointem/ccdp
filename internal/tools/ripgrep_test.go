@@ -18,7 +18,7 @@ func TestRgRespectsSearchPolicyAndNativeUnicode(t *testing.T) {
 	for path, body := range map[string]string{".gitignore": "ignored.txt\n", "ignored.txt": "needle\n", "allowed.txt": "before\nneedle needle\nafter\n中文\n", "secret.txt": "needle secret\n", "binary.dat": "needle\x00binary\n", "link_target.txt": "noise\n", ".hidden.txt": "needle\n", "node_modules/x": "needle\n", "nested/.gitignore": "skip.txt\n", "nested/skip.txt": "needle\n"} {
 		reviewRgWrite(t, root, path, body)
 	}
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	ctx.Sandbox.AddDisallowedDir(filepath.Join(root, "secret.txt"))
 	for _, req := range []*rgRequest{
 		{pattern: "needle", base: root, outputMode: rgModeContent, before: 1, after: 1},
@@ -62,7 +62,7 @@ func TestRipgrepLimitsCountsAndArgumentBoundaries(t *testing.T) {
 	reviewRgWrite(t, root, "b.txt", "-needle\n")
 	for _, mode := range []string{rgModeFiles, rgModeCount, rgModeContent} {
 		req := &rgRequest{pattern: "-needle", base: root, outputMode: mode, maxLines: 1}
-		got, truncated, err := ripgrepSearch(rgCtx(root), req)
+		got, truncated, err := ripgrepSearch(rgCtx(t, root), req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,7 +82,7 @@ func TestRgMissingDependencyFailsWithoutFallback(t *testing.T) {
 	if executable.FindTrusted("rg", os.Getenv("PATH")) != "" {
 		t.Skip("rg installed in system fallback PATH")
 	}
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	ctx.Args = map[string]any{"pattern": "needle"}
 	output, err := executeToolText(NewRgTool(), ctx)
 	if err == nil || !strings.Contains(err.Error(), "ripgrep (rg) is required") || output != "" {
@@ -92,7 +92,7 @@ func TestRgMissingDependencyFailsWithoutFallback(t *testing.T) {
 
 func TestRgNativeOptionsAndEmptyDirectoryValidation(t *testing.T) {
 	root := t.TempDir()
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	ctx.Args = map[string]any{"pattern": "["}
 	if _, err := executeToolText(NewRgTool(), ctx); err == nil {
 		t.Fatal("invalid regex accepted in empty directory")

@@ -19,17 +19,6 @@ func StringArg(args map[string]any, key, fallback string) string {
 	return fallback
 }
 
-// IntArg extracts an int argument with a fallback. New runtime/tool code
-// should prefer IntArgChecked so malformed, fractional, or overflowing JSON
-// numbers cannot silently turn into an unrelated offset, pid, or timeout.
-func IntArg(args map[string]any, key string, fallback int) int {
-	n, err := IntArgChecked(args, key, fallback)
-	if err != nil {
-		return fallback
-	}
-	return n
-}
-
 // IntArgChecked parses the integer forms produced by both the legacy JSON
 // decoder (float64) and the strict UseNumber decoder (json.Number). It rejects
 // fractional, non-finite, and out-of-range values instead of truncating them.
@@ -101,17 +90,6 @@ func BoolArg(args map[string]any, key string, fallback bool) bool {
 		}
 	}
 	return fallback
-}
-
-// DumpArgs is a debug helper for tool authors.
-func DumpArgs(args map[string]any) string {
-	b, _ := json.Marshal(args)
-	return string(b)
-}
-
-// WrapError formats a tool error in a stable, parseable way.
-func WrapError(format string, a ...any) error {
-	return fmt.Errorf(format, a...)
 }
 
 // boundedToolString enforces the output admission limit at the final tool

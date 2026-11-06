@@ -1,14 +1,17 @@
 package tui
 
 import (
-	"ccdp/internal/agent"
-	"ccdp/internal/protocol"
 	"context"
 	"errors"
 	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
 	"strings"
 	"sync"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"ccdp/internal/agent"
+	"ccdp/internal/protocol"
+	"ccdp/internal/session/archive"
 )
 
 // sessionHost is the desktop runtime lifecycle adapter. SessionClient remains
@@ -28,11 +31,11 @@ type sessionHost struct {
 	retiredAgents []*agent.Agent
 }
 
-func (h *sessionHost) savedSessions() ([]agent.SessionSnapshot, []agent.SessionListIssue, error) {
+func (h *sessionHost) savedSessions() ([]archive.Snapshot, []archive.Issue, error) {
 	if h.ag == nil {
 		return nil, nil, fmt.Errorf("saved sessions unavailable through this session protocol")
 	}
-	return agent.ListSessions(h.ag.SessionDir())
+	return archive.List(h.ag.SessionDir())
 }
 
 // resumeOpenedMsg is produced after an independent Agent handle has been
@@ -358,7 +361,7 @@ func closeResumeCandidateCmd(candidate *agent.Agent) tea.Cmd {
 // sessionListIssuesNote renders the sessions a listing had to leave out. It
 // returns "" when the listing was complete, so callers can tell an empty
 // session directory apart from one they could not read.
-func sessionListIssuesNote(issues []agent.SessionListIssue) string {
+func sessionListIssuesNote(issues []archive.Issue) string {
 	if len(issues) == 0 {
 		return ""
 	}

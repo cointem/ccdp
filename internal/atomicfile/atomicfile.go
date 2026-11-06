@@ -100,12 +100,6 @@ func WriteFileWithSync(path string, data []byte, perm fs.FileMode, syncFn SyncFi
 	return nil
 }
 
-// WriteReader publishes a bounded stream atomically and returns the number of
-// bytes copied.  maxBytes <= 0 means no caller-imposed limit.
-func WriteReader(path string, r io.Reader, perm fs.FileMode, maxBytes int64) (int64, error) {
-	return WriteReaderWithSync(path, r, perm, maxBytes, nil, nil)
-}
-
 // WriteReaderWithSync is WriteReader with optional sync hooks.
 func WriteReaderWithSync(path string, r io.Reader, perm fs.FileMode, maxBytes int64, syncFn SyncFile, syncDirFn func(string) error) (int64, error) {
 	if r == nil {

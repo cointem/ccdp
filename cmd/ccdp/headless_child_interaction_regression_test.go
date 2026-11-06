@@ -30,34 +30,23 @@ type headlessDirectoryClient struct {
 func (c *headlessDirectoryClient) Sessions() protocol.SessionDirectory { return c.directory }
 
 func TestHeadlessChildInteractionsRouteToOwnerAndRecoverFromDirectory(t *testing.T) {
-	for _, kind := range []string{"question", "plan"} {
-		t.Run(kind, func(t *testing.T) {
-			child := protocol.ChildSession{SessionID: "child", Run: protocol.RunView{Status: "waiting_" + kind}}
-			if kind == "question" {
-				child.Question = &protocol.QuestionRequest{ID: "pending"}
-			} else {
-				child.Plan = &protocol.PlanView{ID: "pending", Version: 3}
-			}
-			owner := &headlessTestClient{}
-			root := &headlessDirectoryClient{directory: &headlessChildDirectory{rows: []protocol.ChildSession{child}, owners: map[protocol.SessionID]*headlessTestClient{"child": owner}}}
-			w := &headlessWatch{}
-			if err := w.childSnapshotDecisions(context.Background(), root, outJSON); err != nil {
-				t.Fatal(err)
-			}
-			if err := w.childDecision(context.Background(), root, child, outJSON); err != nil {
-				t.Fatal(err)
-			}
-			if len(root.commands) != 0 || len(owner.commands) != 1 || owner.commands[0].SessionID != "child" {
-				t.Fatalf("decision ownership/dedup: root=%+v child=%+v", root.commands, owner.commands)
-			}
-			cmd := owner.commands[0]
-			if kind == "question" && (cmd.Answer == nil || !cmd.Answer.Cancelled) {
-				t.Fatalf("question: %+v", cmd)
-			}
-			if kind == "plan" && (cmd.Plan == nil || cmd.Plan.Approve || cmd.Plan.PlanVersion != 3) {
-				t.Fatalf("plan: %+v", cmd)
-			}
-		})
+	child := protocol.ChildSession{SessionID: "child", Run: protocol.RunView{Status: "waiting_question"}}
+	child.Question = &protocol.QuestionRequest{ID: "pending"}
+	owner := &headlessTestClient{}
+	root := &headlessDirectoryClient{directory: &headlessChildDirectory{rows: []protocol.ChildSession{child}, owners: map[protocol.SessionID]*headlessTestClient{"child": owner}}}
+	w := &headlessWatch{}
+	if err := w.childSnapshotDecisions(context.Background(), root, outJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.childDecision(context.Background(), root, child, outJSON); err != nil {
+		t.Fatal(err)
+	}
+	if len(root.commands) != 0 || len(owner.commands) != 1 || owner.commands[0].SessionID != "child" {
+		t.Fatalf("decision ownership/dedup: root=%+v child=%+v", root.commands, owner.commands)
+	}
+	cmd := owner.commands[0]
+	if cmd.Answer == nil || !cmd.Answer.Cancelled {
+		t.Fatalf("question: %+v", cmd)
 	}
 }
 

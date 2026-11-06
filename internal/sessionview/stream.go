@@ -36,9 +36,39 @@ func (q *StreamQueue) Add(view protocol.EventView, now time.Time) time.Duration 
 		q.order = append(q.order, key)
 	} else {
 		view.Text = prior.Text + view.Text
+		if prior.Tool != nil && view.Tool != nil {
+			tool := *view.Tool
+			tool.Output = prior.Tool.Output + tool.Output
+			if tool.Progress != nil {
+				tool.Progress = protocol.CloneProcessProgress(tool.Progress)
+				if p := prior.Tool.Progress; p != nil && p.ID == tool.Progress.ID {
+					tool.Progress.Truncated = tool.Progress.Truncated || p.Truncated || p.Next != tool.Progress.Offset
+					tool.Progress.Offset = p.Offset
+				}
+			}
+			if len(tool.Output) > TextLimit {
+				tool.Output, _ = Tail(tool.Output, TextLimit)
+				if tool.Progress != nil {
+					tool.Progress = protocol.CloneProcessProgress(tool.Progress)
+					tool.Progress.Truncated = true
+				}
+				q.lost = true
+			}
+			view.Tool = &tool
+		}
 	}
 	if len(view.Text) > TextLimit {
 		view.Text, _ = Tail(view.Text, TextLimit)
+		q.lost = true
+	}
+	if view.Tool != nil && len(view.Tool.Output) > TextLimit {
+		tool := *view.Tool
+		tool.Output, _ = Tail(tool.Output, TextLimit)
+		if tool.Progress != nil {
+			tool.Progress = protocol.CloneProcessProgress(tool.Progress)
+			tool.Progress.Truncated = true
+		}
+		view.Tool = &tool
 		q.lost = true
 	}
 	q.pending[key] = view

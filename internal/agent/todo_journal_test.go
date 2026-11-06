@@ -10,6 +10,7 @@ import (
 
 	"ccdp/internal/messages"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func todoJournalCall(priority string) messages.ToolCall {
@@ -42,7 +43,7 @@ func TestTodoJournalRestoresWithoutSidecar(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			snapshot, err := LoadSession(cfg.SessionDir, id)
+			snapshot, err := archive.Load(cfg.SessionDir, id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -88,7 +89,7 @@ func TestTodoJournalFailureDoesNotPublish(t *testing.T) {
 	a.mu.Unlock()
 	cfg, id := a.configSnapshot(), a.SessionID()
 	a.Close()
-	saved, err := LoadSession(cfg.SessionDir, id)
+	saved, err := archive.Load(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +125,7 @@ func TestTodoJournalOrderAndSessionIsolation(t *testing.T) {
 func TestTodoMemoryResumeOldPriority(t *testing.T) {
 	cfg := testPersistenceConfig(t)
 	cfg.NoSessionPersistence = true
-	snapshot := &SessionSnapshot{ID: "todo-memory-resume", Workspace: cfg.Workspace, Model: cfg.Model, Tasks: []session.Task{{TaskID: "1", Title: "old record", Status: "pending"}}}
+	snapshot := &archive.Snapshot{ID: "todo-memory-resume", Workspace: cfg.Workspace, Model: cfg.Model, Tasks: []session.Task{{TaskID: "1", Title: "old record", Status: "pending"}}}
 	a, err := Resume(&cfg, snapshot)
 	if err != nil {
 		t.Fatal(err)

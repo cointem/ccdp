@@ -18,7 +18,7 @@ func (a *Agent) snapshotContextRequest() (stepRuntime, llm.CompletionRequest, er
 	step := stepRuntime{cfg: cloneConfig(a.services.cfg), binding: a.modelsState.activeBinding,
 		history: messages.Clone(a.historyLocked()), policy: a.services.sandbox.Snapshot(),
 		sessionID: a.conversation.sessionID, sessionStartAt: a.conversation.sessionStartAt,
-		skillStore: a.services.skills, isolated: a.children.childState != nil, plan: a.plan.planMode,
+		skillStore: a.services.skills, isolated: a.children.childState != nil,
 		modelSwitchMsg: a.conversation.modelSwitchMsg, interruptNote: a.turnMemory.interruptNote}
 	if step.binding.model == "" {
 		step.binding.model = a.activeModelLocked()
@@ -34,6 +34,7 @@ func (a *Agent) snapshotContextRequest() (stepRuntime, llm.CompletionRequest, er
 	}
 	a.settingsCommitMu.RUnlock()
 	step.goalPrompt = a.goalPrompt()
+	step.todoPrompt = a.todoSection()
 	if err := a.loadStepExternalContext(&step); err != nil {
 		return stepRuntime{}, llm.CompletionRequest{}, err
 	}

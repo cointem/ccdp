@@ -96,7 +96,6 @@ func (a *Agent) finishClose() {
 	if a.catalogNotificationsDone != nil {
 		<-a.catalogNotificationsDone
 	}
-	a.services.sessionReg.RunDispose(a.conversation.sessionID)
 	a.services.evbus.Emit(events.TopicSessionDisposed, events.SessionEvent{ID: a.conversation.sessionID})
 	if hookOut := a.runHookWithJournal(cleanupCtx, hooks.EventSessionEnd, func(hookCtx context.Context) hooks.Output {
 		return a.services.hooks.SessionEnd(hookCtx)
@@ -117,6 +116,12 @@ func (a *Agent) finishClose() {
 			closeErr = errors.Join(closeErr, fmt.Errorf("MCP close: %w", err))
 		}
 	}
+	if a.services.resources != nil && a.services.resources.Processes != nil {
+		if err := a.services.resources.Processes.Close(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("processes close: %w", err))
+		}
+	}
+	a.captureChildResult()
 	if a.services.resources != nil {
 		if err := a.services.resources.Close(); err != nil {
 			closeErr = errors.Join(closeErr, fmt.Errorf("resources close: %w", err))
@@ -138,11 +143,6 @@ func (a *Agent) finishClose() {
 		closeErr = errors.Join(closeErr, fmt.Errorf("persistence close: %w", err))
 	}
 	a.closeTrace()
-	if a.services.host != nil {
-		if err := a.services.host.Close(); err != nil {
-			closeErr = errors.Join(closeErr, fmt.Errorf("extension host close: %w", err))
-		}
-	}
 	if err := cleanupCtx.Err(); err != nil {
 		closeErr = errors.Join(closeErr, fmt.Errorf("cleanup deadline: %w", err))
 	}

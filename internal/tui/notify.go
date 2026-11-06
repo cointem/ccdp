@@ -6,7 +6,7 @@ import (
 )
 
 // notificationBody is the free text shown by a desktop notification. It is built
-// from runtime data (tool names, plan text) that must be treated as untrusted, so
+// from runtime data (tool names and output) that must be treated as untrusted, so
 // it is always sanitized before being wrapped in an escape sequence.
 
 // notifyUser sends a best-effort desktop/terminal notification so a user who
@@ -45,7 +45,7 @@ func notificationSequence(title, body string) (string, bool) {
 }
 
 // sanitizeNotification strips control bytes (ESC, BEL, NUL, CR/LF and other C0)
-// so untrusted tool/plan text cannot terminate the sequence early or inject a
+// so untrusted tool text cannot terminate the sequence early or inject a
 // second escape sequence into the terminal.
 func sanitizeNotification(s string) string {
 	if s == "" {

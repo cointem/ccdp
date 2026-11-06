@@ -33,33 +33,46 @@ func cloneToolDefs(src []llm.ToolDef) []llm.ToolDef {
 	return dst
 }
 
-// filterReadOnlyTools narrows a tool list to the plan-mode safe subset.
-func filterReadOnlyTools(tools []llm.ToolDef) []llm.ToolDef {
-	out := make([]llm.ToolDef, 0, len(tools))
-	for _, t := range tools {
-		if t.PlanAllowed {
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
-func (a *Agent) buildRequestFromConfig(cfg config.Config, policy *sandbox.Sandbox, model, sys string, history []messages.Message, plan bool, frozenTools []llm.ToolDef) llm.CompletionRequest {
+func (a *Agent) buildRequestFromConfig(cfg config.Config, policy *sandbox.Sandbox, model, sys string, history []messages.Message, frozenTools []llm.ToolDef) llm.CompletionRequest {
 	// Hard guarantee: never put an unpaired tool_call / tool message on the
 	// wire, whatever a history rewrite left behind (providers 400).
 	history = sanitizeToolPairs(history)
 	msgs := make([]llm.ChatMessage, 0, len(history)+1)
 	msgs = append(msgs, llm.ChatMessage{Role: "system", Content: sys})
 	var imageBytes int64
+	// Retain full evidence in the journal, but send only the two newest desktop
+	// observations. Reserve their bytes before expanding older user images.
+	var desktopBytes int64
+	firstDesktop, desktopCount := len(history), 0
+	for i := len(history) - 1; i >= 0 && desktopCount < 2; i-- {
+		if history[i].InternalSource == "runtime_computer" {
+			firstDesktop = i
+			desktopCount++
+			for _, image := range history[i].ImageAttachments {
+				desktopBytes += image.BlobSize
+			}
+		}
+	}
 
-	for _, m := range history {
+	for i, m := range history {
+		desktop := m.InternalSource == "runtime_computer"
+		if desktop && i < firstDesktop {
+			continue
+		}
 		switch m.Role {
 		case messages.RoleSystem:
 			msgs = append(msgs, llm.ChatMessage{Role: "system", Content: m.Content, ToolUpdate: messages.CloneToolUpdate(m.ToolUpdate)})
 		case messages.RoleUser:
 			// Multi-modal: canonical inputs use their frozen attachment blobs;
 			// legacy messages retain path-based compatibility expansion.
-			parts, used, hasImage, _ := a.imageContentPartsForMessage(cfg.Workspace, m, maxAttachmentBytes-imageBytes, policy.ResolveRead)
+			budget := maxAttachmentBytes - imageBytes - desktopBytes
+			if desktop {
+				budget = desktopBytes
+				for _, image := range m.ImageAttachments {
+					desktopBytes -= image.BlobSize
+				}
+			}
+			parts, used, hasImage, _ := a.imageContentPartsForMessage(cfg.Workspace, m, budget, policy.ResolveRead)
 			if hasImage && len(parts) > 0 {
 				imageBytes += used
 				msgs = append(msgs, llm.ChatMessage{Role: "user", Content: parts})
@@ -101,9 +114,6 @@ func (a *Agent) buildRequestFromConfig(cfg config.Config, policy *sandbox.Sandbo
 	applyGenerationRequest(cfg, &req)
 	if limit := cfg.MaxOutputTokensFor(model); limit > 0 {
 		req.MaxTokens = intPtr(limit)
-	}
-	if plan {
-		req.Tools = filterReadOnlyTools(req.Tools)
 	}
 	return req
 }

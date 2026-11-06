@@ -1,18 +1,19 @@
 package tui
 
 import (
-	"ccdp/internal/permissions"
-	"ccdp/internal/protocol"
 	"fmt"
-	"github.com/charmbracelet/lipgloss"
 	"strconv"
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"ccdp/internal/permissions"
+	"ccdp/internal/protocol"
 )
 
 func (m *Model) renderHeader() string {
 	modelName := m.modelName
 	mode := m.mode
-	planMode := m.planMode
 	sessionID := m.sessionID
 	usage := m.usage
 	contextWindow := 0
@@ -22,7 +23,6 @@ func (m *Model) renderHeader() string {
 		if m.snapshot.Settings.Permission.Mode != "" {
 			mode = permissions.Mode(m.snapshot.Settings.Permission.Mode)
 		}
-		planMode = m.snapshot.Settings.ExecutionMode == protocol.ExecutionModePlan
 		sessionID = m.snapshot.SessionID.String()
 		usage = m.snapshot.Usage
 		contextWindow = m.snapshot.Settings.ContextWindow
@@ -30,18 +30,10 @@ func (m *Model) renderHeader() string {
 	}
 	var modeColor lipgloss.TerminalColor = colorMuted
 	switch mode {
-	case "acceptEdits":
+	case "auto":
 		modeColor = colorGo
-	case "bypassPermissions":
-		modeColor = colorError
 	}
-	modeBadge := lipgloss.NewStyle().Foreground(modeColor).Bold(true).Render(mode.Label())
-
-	// Plan mode gets its own amber badge.
-	if planMode {
-		planBadge := styleRunning.Render("plan")
-		modeBadge = modeBadge + " " + planBadge
-	}
+	modeBadge := lipgloss.NewStyle().Foreground(modeColor).Bold(true).Render(string(mode))
 
 	ws := truncateDisplay(sanitizeANSI(m.workspace), 24)
 
@@ -279,7 +271,7 @@ func (m *Model) persistentStatusContent() (string, footerLabels) {
 	}
 	mode := string(m.mode)
 	if mode == "" {
-		mode = "acceptEdits"
+		mode = "auto"
 	}
 	if m.hasSnapshot && m.snapshot.Settings.Permission.Mode != "" {
 		mode = string(m.snapshot.Settings.Permission.Mode)
@@ -291,14 +283,8 @@ func (m *Model) persistentStatusContent() (string, footerLabels) {
 	if effort != "" && effort != "default" {
 		parts = append(parts, effortLabel(effort))
 	}
-	modeDisplay := permissions.Mode(mode).Label()
-	if m.planMode {
-		modeDisplay += " · plan"
-	}
+	modeDisplay := mode
 	modeStyle := styleStatus
-	if modeDisplay == "bypass" {
-		modeStyle = styleToolErr
-	}
 	parts = append(parts, modeStyle.Render(modeDisplay))
 	if warn, over := compactWarning(used, window, threshold); warn != "" && m.width >= 60 {
 		style := styleContextWarn
@@ -314,7 +300,7 @@ func (m *Model) persistentStatusContent() (string, footerLabels) {
 	parts = append(parts, ratioStyle.Render(ratio))
 	parts = append(parts, styleStatus.Render(cacheLabel(m.sessionCache())))
 	line := strings.Join(parts[:len(parts)-1], styleDivider.Render(" · ")) + styleDivider.Render(" · ") + parts[len(parts)-1]
-	return line, footerLabels{model: modelName, permission: permissions.Mode(mode).Label(), context: ratio, cache: cacheLabel(m.sessionCache())}
+	return line, footerLabels{model: modelName, permission: mode, context: ratio, cache: cacheLabel(m.sessionCache())}
 }
 
 // compactWarning is a proactive "auto-compaction approaching" hint built only

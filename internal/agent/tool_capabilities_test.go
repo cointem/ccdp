@@ -14,6 +14,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/tools"
 )
 
@@ -90,7 +91,8 @@ func TestStaleCapabilityApprovalCannotCommitAfterEpochChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.mu.Lock()
-	a.capabilities.capabilityRevision++ // models a concurrent grant or revoke after prompt creation
+	a.capabilities.capabilityRevision++
+	a.capabilities.revocationRevision++ // a revoke invalidates the pending grant
 	a.mu.Unlock()
 	if a.capabilityApprovalCurrent(version) {
 		t.Fatal("stale approval remained current after capability epoch changed")
@@ -434,7 +436,7 @@ func TestExecuteToolCapabilityApprovalScopeAndRestore(t *testing.T) {
 	if err := a.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(cfg.SessionDir, sessionID)
+	snapshot, err := archive.Load(cfg.SessionDir, sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,41 +486,6 @@ func TestReadOutsideWorkspaceNeedsNoDirectoryCapability(t *testing.T) {
 	}
 }
 
-func TestPlanAndGuardianRequireConcreteReadCapability(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		purpose string
-		plan    bool
-	}{
-		{name: "plan", plan: true},
-		{name: "guardian", purpose: childPurposeGuardian},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := capabilityTestAgent(t)
-			shadow := &shadowCapabilityTool{}
-			a.services.registry.RegisterIn("shadow", shadow)
-			if tc.plan {
-				a.mu.Lock()
-				a.plan.planMode = true
-				a.mu.Unlock()
-			} else {
-				a.children.childState = &childRuntimeState{purpose: tc.purpose, nonInteractive: true, allowed: map[string]bool{"Read": true}, perms: a.services.perms}
-			}
-			if _, failed := executeTestTool(t, a, messages.ToolCall{ID: "shadow-read", Name: "Read"}); !failed {
-				t.Fatal("shadow implementation was admitted")
-			}
-			if got := shadow.runs.Load(); got != 0 {
-				t.Fatalf("shadow implementation ran %d times", got)
-			}
-			for _, def := range a.toolDefsSnapshot() {
-				if def.Function.Name == "Read" && def.PlanAllowed {
-					t.Fatal("shadow Read was exposed as plan-capable")
-				}
-			}
-		})
-	}
-}
-
 func capabilityTestTool(t *testing.T, a *Agent, name string) tools.Tool {
 	t.Helper()
 	tool, ok := a.services.registry.Get(name)
@@ -526,4 +493,17 @@ func capabilityTestTool(t *testing.T, a *Agent, name string) tools.Tool {
 		t.Fatalf("missing test tool %s", name)
 	}
 	return tool
+}
+
+func TestGuardianRequiresConcreteReadCapability(t *testing.T) {
+	a := capabilityTestAgent(t)
+	shadow := &shadowCapabilityTool{}
+	a.services.registry.RegisterIn("shadow", shadow)
+	a.children.childState = &childRuntimeState{purpose: childPurposeGuardian, nonInteractive: true, allowed: map[string]bool{"Read": true}, perms: a.services.perms}
+	if _, failed := executeTestTool(t, a, messages.ToolCall{ID: "shadow-read", Name: "Read"}); !failed {
+		t.Fatal("shadow implementation was admitted")
+	}
+	if got := shadow.runs.Load(); got != 0 {
+		t.Fatalf("shadow implementation ran %d times", got)
+	}
 }

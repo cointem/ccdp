@@ -4,19 +4,19 @@ import (
 	"strings"
 	"testing"
 
-	"ccdp/internal/permissions"
-	"ccdp/internal/protocol"
 	tea "github.com/charmbracelet/bubbletea"
+
+	"ccdp/internal/protocol"
 )
 
 func TestFooterDoesNotPresentDefaultEffortAsPermissionMode(t *testing.T) {
 	m := sugModel()
 	m.width = 100
 	m.hasSnapshot = true
-	m.snapshot.Settings.Permission.Mode = "acceptEdits"
+	m.snapshot.Settings.Permission.Mode = "manual"
 	m.snapshot.Settings.ReasoningEffort = ""
 	text := sanitizeANSI(m.renderPersistentStatus())
-	if strings.Contains(text, "default") || strings.Count(text, "edits") != 1 {
+	if strings.Contains(text, "default") || strings.Count(text, "manual") != 1 {
 		t.Fatalf("ambiguous footer: %s", text)
 	}
 	m.snapshot.Settings.ReasoningEffort = "high"
@@ -30,13 +30,13 @@ func TestFooterKeepsDefaultPermissionAfterSwitchingBack(t *testing.T) {
 	m.width = 100
 	m.hasSnapshot = true
 	m.snapshot.Settings.ReasoningEffort = "default"
-	for _, mode := range []string{"default", "acceptEdits", "default"} {
+	for _, mode := range []string{"manual", "auto", "manual"} {
 		m.snapshot.Settings.Permission.Mode = mode
 		text := sanitizeANSI(m.renderPersistentStatus())
-		if strings.Count(text, permissions.Mode(mode).Label()) != 1 {
+		if strings.Count(text, mode) != 1 {
 			t.Fatalf("permission mode %q should appear exactly once: %s", mode, text)
 		}
-		if mode == "acceptEdits" && strings.Contains(text, "default") {
+		if mode == "manual" && strings.Contains(text, "default") {
 			t.Fatalf("default effort should stay hidden: %s", text)
 		}
 	}
@@ -47,7 +47,6 @@ func TestSnapshotClearsApprovalNoticeBeforeReceipt(t *testing.T) {
 	m.handleProtocolEvent(protocol.EventView{Kind: protocol.EventApprovalRequest, Approval: &protocol.ApprovalView{ID: "a", Tool: "Bash"}})
 	snapshot := m.snapshot
 	snapshot.Approval = nil
-	snapshot.Plan = nil
 	snapshot.Phase = protocol.PhaseIdle
 	m.applySnapshot(snapshot)
 	if strings.Contains(m.renderStatus(), "approval") || len(m.visibleNotices()) != 0 {

@@ -1,11 +1,12 @@
 package main
 
 import (
-	"ccdp/internal/protocol"
 	"context"
 	"errors"
 	"testing"
 	"time"
+
+	"ccdp/internal/protocol"
 )
 
 type recoveryDecisionClient struct{ headlessTestClient }
@@ -19,8 +20,6 @@ func (c *recoveryDecisionClient) Submit(ctx context.Context, cmd protocol.Comman
 	switch cmd.Type {
 	case protocol.CommandApproveTool:
 		event = protocol.EventView{Kind: protocol.EventApprovalRequest, Approval: c.snapshot.Approval}
-	case protocol.CommandApprovePlan:
-		event = protocol.EventView{Kind: protocol.EventPlanReady, Plan: c.snapshot.Plan}
 	case protocol.CommandAnswerQuestion:
 		event = protocol.EventView{Kind: protocol.EventQuestionRequest, Question: c.snapshot.Question}
 	default:
@@ -39,7 +38,6 @@ func TestHeadlessDecisionsRecoverFromSnapshot(t *testing.T) {
 		want protocol.CommandType
 	}{
 		{"approval", protocol.SessionView{Approval: &protocol.ApprovalView{ID: "approval"}}, protocol.CommandApproveTool},
-		{"plan", protocol.SessionView{Plan: &protocol.PlanView{ID: "plan", Version: 3}}, protocol.CommandApprovePlan},
 		{"question", protocol.SessionView{Question: &protocol.QuestionRequest{ID: "question"}}, protocol.CommandAnswerQuestion},
 	}
 	for _, tc := range cases {
@@ -74,9 +72,6 @@ func TestHeadlessDecisionsRecoverFromSnapshot(t *testing.T) {
 				if cmd.Approval != nil && cmd.Approval.Approve {
 					t.Fatal("headless approved tool")
 				}
-				if cmd.Plan != nil && (cmd.Plan.Approve || cmd.Plan.PlanVersion != 3) {
-					t.Fatalf("plan: %+v", cmd.Plan)
-				}
 				if cmd.Answer != nil && !cmd.Answer.Cancelled {
 					t.Fatal("headless answered question")
 				}
@@ -85,17 +80,9 @@ func TestHeadlessDecisionsRecoverFromSnapshot(t *testing.T) {
 	}
 }
 
-func TestHeadlessDecisionsPlanVersionAndFailure(t *testing.T) {
+func TestHeadlessDecisionFailureIsRetryable(t *testing.T) {
 	c := &headlessTestClient{}
 	d := headlessDecisions{client: c, sessionID: "s", handled: map[headlessDecisionKey]bool{}}
-	for _, version := range []uint64{1, 1, 2} {
-		if err := d.snapshot(context.Background(), protocol.SessionView{Plan: &protocol.PlanView{ID: "p", Version: version}}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if len(c.commands) != 2 {
-		t.Fatalf("plan commands=%d", len(c.commands))
-	}
 	c.transportErr = errors.New("transport down")
 	err := d.snapshot(context.Background(), protocol.SessionView{Approval: &protocol.ApprovalView{ID: "a"}})
 	if !errors.Is(err, c.transportErr) {
@@ -115,21 +102,19 @@ func (c *initialDecisionClient) Submit(ctx context.Context, cmd protocol.Command
 	if cmd.Type == protocol.CommandSubmitInput && !c.settled {
 		return protocol.Receipt{Status: protocol.ReceiptRejected, Error: &protocol.CommandError{Code: protocol.ErrorBusy, Message: "initial decision not settled"}}, nil
 	}
-	if cmd.Type == protocol.CommandApproveTool || cmd.Type == protocol.CommandApprovePlan || cmd.Type == protocol.CommandAnswerQuestion {
+	if cmd.Type == protocol.CommandApproveTool || cmd.Type == protocol.CommandAnswerQuestion {
 		c.settled = true
 	}
 	return c.headlessTestClient.Submit(ctx, cmd)
 }
 func TestRunHeadlessSettlesInitialDecisionBeforeInput(t *testing.T) {
-	for _, kind := range []string{"approval", "plan", "question"} {
+	for _, kind := range []string{"approval", "question"} {
 		t.Run(kind, func(t *testing.T) {
 			c := &initialDecisionClient{}
 			c.snapshot = headlessTestSnapshot()
 			switch kind {
 			case "approval":
 				c.snapshot.Approval = &protocol.ApprovalView{ID: "a"}
-			case "plan":
-				c.snapshot.Plan = &protocol.PlanView{ID: "p", Version: 1}
 			case "question":
 				c.snapshot.Question = &protocol.QuestionRequest{ID: "q"}
 			}

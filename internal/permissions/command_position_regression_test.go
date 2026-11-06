@@ -1,12 +1,13 @@
 package permissions
 
 import (
-	"ccdp/internal/sandbox"
 	"testing"
+
+	"ccdp/internal/sandbox"
 )
 
 func TestDangerousWordsAreDataOutsideExecutablePositions(t *testing.T) {
-	manager := NewManager(ModeBypass, Policy{})
+	manager := NewManager(ModeAuto, Policy{})
 	for _, command := range []string{"grep -n shutdown main.go", "git log --grep=shutdown", "git log --grep='git reset --hard'", "cat reboot.go", "echo mkfs", "rm shutdown.txt", "echo 'git reset --hard'", "sh -c 'echo reboot'"} {
 		if denied, reason := manager.HardDeny("Bash", map[string]any{"command": command}); denied {
 			t.Errorf("%s: %s", command, reason)
@@ -17,7 +18,7 @@ func TestDangerousWordsAreDataOutsideExecutablePositions(t *testing.T) {
 			t.Errorf("dangerous executable allowed: %s", command)
 		}
 	}
-	explicit := NewManager(ModeBypass, Policy{AlwaysDeny: []string{"Bash:*shutdown*"}})
+	explicit := NewManager(ModeAuto, Policy{AlwaysDeny: []string{"Bash:*shutdown*"}})
 	if denied, _ := explicit.HardDeny("Bash", map[string]any{"command": "grep shutdown file"}); !denied {
 		t.Fatal("explicit user deny rule changed")
 	}

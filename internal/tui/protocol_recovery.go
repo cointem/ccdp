@@ -78,7 +78,7 @@ func (m *Model) applyRecoveredOperations(msg operationsRecoveredMsg) {
 				m.consumeSubmission(op.CommandID)
 			}
 			switch input.Status {
-			case protocol.TurnSucceeded, protocol.TurnFailed, protocol.TurnCancelled:
+			case protocol.TurnSucceeded, protocol.TurnFailed, protocol.TurnCancelled, protocol.TurnLimited, protocol.TurnBlocked:
 				m.finishInputOperation(op, input.Status, input.Error)
 			}
 			continue

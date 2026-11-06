@@ -100,7 +100,7 @@ func TestWriteFileNoFollowRejectsHardlinkDescriptor(t *testing.T) {
 
 func TestStrictReadAllowsInternalSymlinkWithCanonicalOpen(t *testing.T) {
 	ctx := freshCtx(t)
-	ctx.Sandbox = sandbox.New(ctx.WorkingDir)
+	ctx.Sandbox = ctx.Resources.Context(ctx.Context, ctx.WorkingDir, sandbox.New(ctx.WorkingDir)).Sandbox
 	target := filepath.Join(ctx.WorkingDir, "target.txt")
 	alias := filepath.Join(ctx.WorkingDir, "alias.txt")
 	if err := os.WriteFile(target, []byte("inside\n"), 0o644); err != nil {

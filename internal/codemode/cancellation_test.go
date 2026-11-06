@@ -14,6 +14,7 @@ func TestCancellationBoundsIgnoringCallbackAndStopsQueue(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ctx = testWorkerContext(t, ctx)
 	started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	defer close(release)
 	var later atomic.Int32

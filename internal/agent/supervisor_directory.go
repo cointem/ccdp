@@ -2,9 +2,7 @@ package agent
 
 import (
 	"context"
-
 	"sort"
-
 	"time"
 
 	"ccdp/internal/messages"
@@ -70,12 +68,9 @@ func (s *SessionSupervisor) childRowLocked(r *managedRun) protocol.ChildSession 
 	if r.agent != nil && row.Run.Status == "running" {
 		row.Capabilities.Send = isTaskChild(row.Purpose)
 		row.Capabilities.Interrupt = true
-		row.Approval, row.Question, row.Plan = live.Approval, live.Question, live.Plan
+		row.Approval, row.Question = live.Approval, live.Question
 		if row.Question != nil {
 			row.Run.Status = "waiting_question"
-		}
-		if row.Plan != nil {
-			row.Run.Status = "waiting_plan"
 		}
 		if row.Approval != nil {
 			row.Run.Status = "waiting_approval"

@@ -48,9 +48,7 @@ func (a *Agent) viewHubOwned() *sessionview.Hub {
 }
 
 func (a *Agent) enqueueViewsLocked(updates ...protocol.Update) {
-	if a.owner == nil {
-		return
-	} // constructor-only test fixtures have no observers
+	// constructor-only test fixtures have no observers
 	for _, update := range updates {
 		if len(a.publications.pendingViews) >= 256 || a.publications.publicationsLost {
 			a.publications.pendingViews = []protocol.Update{{Type: protocol.UpdateResyncRequired, Cursor: update.Cursor, Revision: update.Revision}}

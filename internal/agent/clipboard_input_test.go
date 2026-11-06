@@ -17,6 +17,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func inputPNG(t *testing.T, red uint8) protocol.InputImage {
@@ -50,7 +51,7 @@ func TestClipboardInputReachesProviderAsImage(t *testing.T) {
 	}
 	found := false
 	for _, msg := range provider.requests[0].Messages {
-		if msg.Role != "user" {
+		if !isTaskMessage(msg) {
 			continue
 		}
 		// Prepared providers receive an owned JSON-normalized request.
@@ -96,7 +97,7 @@ func TestClipboardInputDurableQueueReplayAndIdentity(t *testing.T) {
 	if err := a.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(cfg.SessionDir, a.SessionID())
+	snapshot, err := archive.Load(cfg.SessionDir, a.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}

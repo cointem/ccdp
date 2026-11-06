@@ -53,14 +53,11 @@ func (a *Agent) RunOutput(previous map[string]bool) string {
 func (a *Agent) RunStatus() supervision.RuntimeStatus {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	out := supervision.RuntimeStatus{ToolUses: a.toolUses, Usage: protocol.UsageSnapshot{InputTokens: a.runtimeUsageLocked().InputTokens, OutputTokens: a.runtimeUsageLocked().OutputTokens, CachedTokens: a.runtimeUsageLocked().CachedTokens, Cache: a.runtimeUsageLocked().Cache, TurnCount: a.runtimeUsageLocked().TurnCount}}
+	out := supervision.RuntimeStatus{ToolUses: a.toolUses, Usage: a.runtimeUsageLocked()}
 	if p := a.decisions.pendingApproval; p != nil {
-		out.Approval = &protocol.ApprovalView{ID: p.ID, Tool: p.Tool, Reason: p.Reason, Args: approvalArgsView(p), Capabilities: append([]protocol.CapabilityRequest(nil), p.Capabilities...)}
+		out.Approval = protocol.CloneSessionView(protocol.SessionView{Approval: p}).Approval
 	}
 	out.Question = protocol.CloneQuestionRequest(a.decisions.pendingQuestion)
-	if p := a.plan.pendingPlan; p != nil {
-		out.Plan = &protocol.PlanView{ID: p.ID, Text: p.Plan, Version: planViewVersion}
-	}
 	return out
 }
 
@@ -102,9 +99,6 @@ type runInputsCancelled struct {
 
 func (runInputsCancelled) ownerControlMessage() {}
 func (a *Agent) cancelRunInputsFromWorker(runID string) error {
-	if a.owner == nil {
-		return a.cancelRunInputs(runID)
-	}
 	request := runInputsCancelled{runID: runID, result: make(chan error, 1)}
 	a.ensureRun()
 	select {

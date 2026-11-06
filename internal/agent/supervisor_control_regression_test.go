@@ -7,6 +7,7 @@ import (
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session/archive"
 )
 
 func TestSupervisorTypedContinuationRetry(t *testing.T) {
@@ -71,7 +72,7 @@ func TestChildForkRetainsCompletedToolRound(t *testing.T) {
 	if err != nil || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}
-	saved, err := LoadSession(a.services.cfg.SessionDir, rows[0].SessionID)
+	saved, err := archive.Load(a.services.cfg.SessionDir, rows[0].SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}

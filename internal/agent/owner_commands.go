@@ -1,8 +1,9 @@
 package agent
 
 import (
-	"ccdp/internal/protocol"
 	"context"
+
+	"ccdp/internal/protocol"
 )
 
 type controlCommand struct{ request runtimeCommand }
@@ -10,7 +11,7 @@ type controlCommand struct{ request runtimeCommand }
 func (controlCommand) ownerControlMessage() {}
 func isControlCommand(kind protocol.CommandType) bool {
 	switch kind {
-	case protocol.CommandInterrupt, protocol.CommandStop, protocol.CommandApproveTool, protocol.CommandApprovePlan, protocol.CommandAnswerQuestion:
+	case protocol.CommandInterrupt, protocol.CommandStop, protocol.CommandApproveTool, protocol.CommandAnswerQuestion:
 		return true
 	}
 	return false
@@ -24,9 +25,6 @@ type rejectedCommand struct {
 // Pre-admission failures have no durable effect. The caller captures a receipt
 // into a producer mailbox; only the owner merges it into command identity state.
 func (a *Agent) rejectBeforeAdmission(cmd protocol.Command, code protocol.ErrorCode, text string) protocol.Receipt {
-	if a.owner == nil {
-		return a.rejectedReceipt(cmd, code, text)
-	}
 	digest, err := commandInputDigest(cmd)
 	receipt := protocol.Receipt{CommandID: cmd.ID, SessionID: cmd.SessionID, Status: protocol.ReceiptRejected, Revision: a.revision(), Error: &protocol.CommandError{Code: code, Message: text}}
 	if cmd.ID == "" || err != nil {

@@ -10,9 +10,6 @@ import (
 // durable delta and the advertised definitions therefore describe that lease.
 func (a *Agent) recordStepTools(step *stepRuntime) error {
 	definitions := step.tools
-	if step.plan {
-		definitions = filterReadOnlyTools(definitions)
-	}
 	current := make([]messages.ToolDefinition, 0, len(definitions))
 	for _, tool := range definitions {
 		current = append(current, messages.ToolDefinition{Name: tool.Function.Name, Description: tool.Function.Description, Parameters: tool.Function.Parameters})

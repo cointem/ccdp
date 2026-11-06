@@ -92,6 +92,10 @@ func readInputResult(ctx context.Context, rows []session.Record, id protocol.Inp
 					out.Status = protocol.TurnSucceeded
 				case "cancelled":
 					out.Status = protocol.TurnCancelled
+				case "limit_reached":
+					out.Status = protocol.TurnLimited
+				case "blocked":
+					out.Status = protocol.TurnBlocked
 				default:
 					out.Status = protocol.TurnFailed
 				}

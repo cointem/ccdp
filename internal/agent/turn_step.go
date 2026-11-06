@@ -131,6 +131,9 @@ func (a *Agent) prepareStep(ctx context.Context, state *stepPreparation) (prepar
 }
 
 func (a *Agent) consumeStepInputs(state *stepPreparation) error {
+	if err := a.projectPendingProcesses(); err != nil {
+		return err
+	}
 	if err := a.consumeAgentMessages(); err != nil {
 		return err
 	}
@@ -143,7 +146,7 @@ func (a *Agent) consumeStepInputs(state *stepPreparation) error {
 	}
 	if ok {
 		state.steerClaimed = true
-		a.emit(Event{Type: EventUserMsg, Text: next.Text, MessageID: next.message().ID})
+		a.emit(protocol.EventView{Kind: protocol.EventUserMessage, Text: next.Text, MessageID: next.message().ID})
 		a.emitStatus("steered your message into the running turn")
 	}
 	return nil
@@ -182,10 +185,10 @@ func (a *Agent) runStep(ctx context.Context, prepared preparedStep, continueCoun
 	res, streamErr := a.streamPrepared(ctx, purpose, prepared.call, metadata, func(delta string) {
 		addSegment("assistant", delta)
 		streamed.WriteString(delta)
-		a.emit(Event{Type: EventStream, Text: delta})
+		a.emit(protocol.EventView{Kind: protocol.EventStream, Text: delta})
 	}, func(delta string) {
 		addSegment("thinking", delta)
-		a.emit(Event{Type: EventReasoning, Text: delta})
+		a.emit(protocol.EventView{Kind: protocol.EventReasoning, Text: delta})
 	})
 	a.setPhase(protocol.PhasePreparing)
 	if streamErr != nil {
@@ -215,7 +218,7 @@ func (a *Agent) runStep(ctx context.Context, prepared preparedStep, continueCoun
 			return stepOutcome{err: err}
 		}
 		err := fmt.Errorf("invalid tool call: %w", toolCallErr)
-		a.emit(Event{Type: EventError, Text: err.Error()})
+		a.emit(protocol.EventView{Kind: protocol.EventError, Text: err.Error()})
 		return stepOutcome{err: err}
 	}
 	a.recordGoalResponse(callText, len(calls))
@@ -232,28 +235,10 @@ func (a *Agent) runStep(ctx context.Context, prepared preparedStep, continueCoun
 		return stepOutcome{err: err}
 	}
 	if len(calls) == 0 {
-		if a.inPlanMode() {
-			if !a.requestPlanApproval(callText) {
-				a.pauseGoalFromWorker("plan was not approved")
-				a.emit(Event{Type: EventStatus, Text: "plan not approved — no changes made"})
-				return stepOutcome{}
-			}
-			if err := a.setPlanMode(false); err != nil {
-				a.failTurnPersistence(err)
-				return stepOutcome{err: err}
-			}
-			if err := a.appendHistory(messages.Message{
-				Role: messages.RoleUser, Content: "The plan above is approved. Execute it now, following the plan step by step. Verify each step.", CreatedAt: time.Now(),
-			}); err != nil {
-				a.failTurnPersistence(err)
-				return stepOutcome{err: err}
-			}
-			return stepOutcome{action: stepContinue}
-		}
 		if res.FinishReason == "length" && *continueCount < 3 {
 			*continueCount++
 			a.emitStatus("reply hit the token limit — continuing…")
-			if err := a.appendHistory(messages.Message{Role: messages.RoleUser, Content: "Continue your reply from where you left off.", CreatedAt: time.Now()}); err != nil {
+			if err := a.appendHistory(messages.Message{Role: messages.RoleUser, InternalSource: "reply_continuation", Content: "Continue your reply from where you left off.", CreatedAt: time.Now()}); err != nil {
 				a.failTurnPersistence(err)
 				return stepOutcome{err: err}
 			}
@@ -268,7 +253,7 @@ func (a *Agent) runStep(ctx context.Context, prepared preparedStep, continueCoun
 	}
 	if toolErr == nil {
 		for i, result := range results {
-			message := messages.NewToolResult(calls[i], result.output, result.isErr)
+			message := messages.NewToolResult(calls[i], result.Output, result.IsError)
 			a.services.evbus.Emit(events.TopicMessageAdded, events.MessageEvent{Role: string(message.Role), Content: message.Content})
 		}
 	}
@@ -276,8 +261,50 @@ func (a *Agent) runStep(ctx context.Context, prepared preparedStep, continueCoun
 		a.emit(event)
 	}
 	if toolErr != nil {
-		a.emit(Event{Type: EventError, Text: toolErr.Error()})
+		a.emit(protocol.EventView{Kind: protocol.EventError, Text: toolErr.Error()})
 		return stepOutcome{err: toolErr}
 	}
+	if a.repeatedAccessDenial(step.turn, results) {
+		note := "Stopped repeated requests for the same denied access. No further operation was started. Change the authorization in /permissions or /sandbox, or continue with a task that uses the available access."
+		a.emitStatus("%s", note)
+		if err := a.appendHistory(messages.Message{Role: messages.RoleAssistant, Content: note, CreatedAt: time.Now()}); err != nil {
+			return stepOutcome{err: err}
+		}
+		return stepOutcome{err: &turnStopError{status: protocol.TurnBlocked, reason: note}}
+	}
 	return stepOutcome{action: stepContinue}
+}
+
+// Count model rounds, not concurrent calls in one batch. Success, a different
+// resource, a new user turn, or a policy epoch change breaks the sequence.
+func (a *Agent) repeatedAccessDenial(turn uint64, results []tooling.Result) bool {
+	key := ""
+	for _, result := range results {
+		candidate := ""
+		if result.IsError && result.Failure != nil {
+			candidate = result.Failure.DecisionKey
+		}
+		if result.Code != nil && result.Code.Calls > 0 && result.Code.Calls == result.Code.Denied {
+			candidate = result.Code.DenialKey
+		}
+		if candidate == "" {
+			key = ""
+			break
+		}
+		if key != "" && key != candidate {
+			key = ""
+			break
+		}
+		key = candidate
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if turn != a.decisions.denialTurn || key != a.decisions.denialKey || key == "" {
+		a.decisions.denialRounds = 0
+	}
+	a.decisions.denialTurn, a.decisions.denialKey = turn, key
+	if key != "" {
+		a.decisions.denialRounds++
+	}
+	return a.decisions.denialRounds >= 3
 }

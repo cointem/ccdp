@@ -14,11 +14,11 @@ func ctxWithArgs(ctx *Context, args map[string]any) *Context {
 	c.Args = args
 	return &c
 }
-func extractPID(t *testing.T, out string) int { return decodeProcess(t, out, nil).ID }
+func extractPID(t *testing.T, out string) string { return decodeProcess(t, out, nil).ID }
 
 func TestProcessDefaultStdinEOF(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "yield_ms": 1000})
+	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat"})
 	v := decodeProcess(t, out, err)
 	if v.Status != "exited" || v.ExitCode == nil || *v.ExitCode != 0 {
 		t.Fatal(v)
@@ -30,7 +30,7 @@ func TestProcessDefaultStdinEOF(t *testing.T) {
 
 func TestProcessStopConcurrentAndDeletesLog(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": `sh -c 'trap "" INT; sleep 30 & wait'`, "yield_ms": 0})
+	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": `sh -c 'trap "" INT; sleep 30 & wait'`, "background": true})
 	v := decodeProcess(t, out, err)
 	mp, err := ctx.Resources.Processes.Get(v.ID)
 	if err != nil {
@@ -55,7 +55,7 @@ func TestProcessStopConcurrentAndDeletesLog(t *testing.T) {
 
 func TestProcessEOFIsIdempotent(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "yield_ms": 0})
+	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, err)
 	for i := 0; i < 2; i++ {
 		if _, err := runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "eof": true}); err != nil {
@@ -69,7 +69,7 @@ func TestProcessOwnerVersusObservationCancellation(t *testing.T) {
 	call, cancel := context.WithCancel(context.Background())
 	start := *ctx
 	start.Context = call
-	out, err := runTool(t, NewBashTool(), &start, map[string]any{"command": "cat", "stdin": "pipe", "yield_ms": 0})
+	out, err := runTool(t, NewBashTool(), &start, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, err)
 	cancel()
 	if _, err := runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "input": "alive\n"}); err != nil {
@@ -85,7 +85,7 @@ func TestProcessOwnerVersusObservationCancellation(t *testing.T) {
 
 func TestProcessTimeoutReason(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "sleep 30", "timeout_ms": 30, "yield_ms": 0})
+	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "sleep 30", "timeout_ms": 30, "background": true})
 	v := decodeProcess(t, out, err)
 	mp, _ := ctx.Resources.Processes.Get(v.ID)
 	select {
@@ -103,7 +103,7 @@ func TestProcessBoundedBuffer(t *testing.T) {
 	mp := &managedProcess{}
 	payload := strings.Repeat("x", 2*maxProcOutput) + "end"
 	mp.appendOutput([]byte(payload))
-	if len(mp.buf) != maxProcOutput || !strings.HasSuffix(string(mp.buf), "end") || mp.total != int64(len(payload)) {
+	if mp.tail.Len() != maxProcOutput || !strings.HasSuffix(string(mp.tail.Tail(maxProcOutput)), "end") || mp.total != int64(len(payload)) {
 		t.Fatal("tail or total incorrect")
 	}
 }
@@ -121,7 +121,7 @@ func TestBashConfiguredTimeoutAndExplicitOverride(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := freshCtx(t)
 			ctx.Timeout = 20 * time.Millisecond
-			args := map[string]any{"command": "sleep 0.2", "yield_ms": 1000}
+			args := map[string]any{"command": "sleep 0.2"}
 			if test.override != nil {
 				args["timeout_ms"] = test.override
 			}

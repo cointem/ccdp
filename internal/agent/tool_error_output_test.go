@@ -29,7 +29,7 @@ func (diagnosticFailureTool) Execute(ctx *tools.Context, args map[string]any) (t
 func TestToolFailurePreservesDiagnosticOutput(t *testing.T) {
 	a := capabilityTestAgent(t)
 	a.services.registry.Register(diagnosticFailureTool{})
-	a.services.perms.SetMode(permissions.ModeBypass)
+	a.services.perms.SetPolicy(permissions.Policy{AlwaysAllow: []string{"DiagnosticFailure"}})
 	output, failed := executeTestTool(t, a, messages.ToolCall{ID: "failure", Name: "DiagnosticFailure"})
 	if !failed || !strings.Contains(output, "exit 128") || !strings.Contains(output, "fatal: not a git repository") {
 		t.Fatalf("lost diagnostics: %q", output)

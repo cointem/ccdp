@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"ccdp/internal/config"
+	"ccdp/internal/execution"
 	"ccdp/internal/mcp"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
@@ -76,7 +77,7 @@ func (a *Agent) awaitSettings(done <-chan settingsPrepared) settingsPrepared {
 			a.handleOwnerControl(message, true)
 		case req := <-commands:
 			switch req.command.Type {
-			case protocol.CommandInterrupt, protocol.CommandStop, protocol.CommandApproveTool, protocol.CommandApprovePlan, protocol.CommandAnswerQuestion:
+			case protocol.CommandInterrupt, protocol.CommandStop, protocol.CommandApproveTool, protocol.CommandAnswerQuestion:
 				a.dispatchOwned(req)
 			default:
 				a.owner.deferred = append(a.owner.deferred, req)
@@ -94,18 +95,28 @@ type sandboxQuiescence struct {
 	mcp              *mcp.Manager
 	supervisor       *SessionSupervisor
 	policy           *sandbox.Sandbox
+	managedStopped   bool
 	turn, operations interface{ Wait() }
 }
 
-func (a *Agent) beginSandboxQuiescence(ownerCtx context.Context, closeMCP bool) (*sandboxQuiescence, error) {
+func (a *Agent) beginSandboxQuiescence(ownerCtx context.Context, closeMCP bool, allowPending ...bool) (*sandboxQuiescence, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.capabilities.capabilityRevoking {
+	if a.capabilities.capabilityRevoking && (len(allowPending) == 0 || !allowPending[0]) {
 		return nil, errors.New("sandbox capability revocation is already pending")
 	}
 	a.capabilities.capabilityRevoking = true
 	a.capabilities.capabilityRevision++
+	a.capabilities.revocationRevision++
 	scope := &sandboxQuiescence{revision: a.capabilities.capabilityRevision, turnCancel: a.turn.turnCancel, resources: a.services.resources, supervisor: a.services.supervisor, policy: a.services.sandbox, turn: &a.lifecycle.turnWG, operations: &a.lifecycle.sandboxOperationWG}
+	if scope.policy != nil {
+		scope.policy = scope.policy.Snapshot()
+		for _, grant := range a.capabilities.capabilityGrants {
+			if err := applyCapability(scope.policy, grant); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if ownerCtx != nil && a.turn.turnCtx == ownerCtx {
 		scope.turnCancel = nil
 	}
@@ -115,8 +126,32 @@ func (a *Agent) beginSandboxQuiescence(ownerCtx context.Context, closeMCP bool) 
 	return scope, nil
 }
 
+// Acknowledgement from the executor precedes reopening runtime admission.
+// Failed cleanup/IPC keeps project execution closed without disabling chat.
+func (a *Agent) resumeSandboxAdmission() error {
+	policy := a.currentSandbox()
+	if err := execution.ResumeAdmission(policy); err != nil {
+		a.mu.Lock()
+		a.capabilities.capabilityRevoking = true
+		a.mu.Unlock()
+		a.emitStatus("execution remains paused: %v", err)
+		return err
+	}
+	a.mu.Lock()
+	a.capabilities.capabilityRevoking = false
+	resources := a.services.resources
+	a.mu.Unlock()
+	if resources != nil && resources.Processes != nil {
+		resources.Processes.ResumeAfterRevocation()
+	}
+	return nil
+}
+
 func (scope *sandboxQuiescence) drain() error {
 	var stopErr error
+	gateCtx, gateCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	stopErr = execution.Quarantine(gateCtx, scope.policy)
+	gateCancel()
 	if scope.turnCancel != nil {
 		scope.turnCancel()
 	}
@@ -143,8 +178,16 @@ func (scope *sandboxQuiescence) drain() error {
 	if err := waitGroupContext(ctx, scope.operations); err != nil {
 		stopErr = errors.Join(stopErr, fmt.Errorf("wait for active runtime operations: %w", err))
 	}
+	if scope.resources != nil {
+		scope.resources.RetireFileWorkers()
+	}
 	if scope.policy != nil && scope.policy.ExternalExecutionPossible() {
-		stopErr = errors.Join(stopErr, errors.New("a local process may have descendants retaining the previous Seatbelt policy; restart the session and independently stop possible descendants before retrying the change"))
+		reason := "a local process may have descendants retaining the previous Seatbelt policy"
+		stopErr = errors.Join(stopErr, scope.policy.RecordQuarantine(reason))
+		scope.managedStopped = stopErr == nil
+		stopErr = errors.Join(stopErr, errors.New(reason))
+	} else {
+		scope.managedStopped = stopErr == nil
 	}
 	return stopErr
 }
@@ -152,7 +195,7 @@ func (scope *sandboxQuiescence) drain() error {
 func (a *Agent) finishSettingsPreparation() {
 	a.mu.Lock()
 	a.capabilities.settingsPreparing = false
-	resume := !a.turn.busy && !a.lifecycle.settling && !a.capabilities.capabilityRevoking && !a.lifecycle.closing && !a.lifecycle.closed && !a.turn.interruptFlag && a.services.persistenceErr == nil && (a.hasTurnStartingInputLocked() || a.goalRunnableLocked())
+	resume := !a.turn.busy && !a.lifecycle.settling && !a.lifecycle.closing && !a.lifecycle.closed && !a.turn.interruptFlag && a.services.persistenceErr == nil && (a.hasTurnStartingInputLocked() || a.goalRunnableLocked())
 	sequence := a.sequences.turnSeq
 	if resume {
 		a.turn.busy = true
@@ -170,7 +213,7 @@ func (a *Agent) settingsPreparationPending() bool {
 }
 func settingsMutationCommand(kind protocol.CommandType) bool {
 	switch kind {
-	case protocol.CommandSetModel, protocol.CommandSetGeneration, protocol.CommandSetExecutionMode, protocol.CommandSetPermissionPolicy, protocol.CommandSetSandboxPolicy, protocol.CommandRevokeCapabilities, protocol.CommandReloadSettings, protocol.CommandSetWorkspace, protocol.CommandTrustProject, protocol.CommandProjectMemory:
+	case protocol.CommandSetModel, protocol.CommandSetGeneration, protocol.CommandSetPermissionPolicy, protocol.CommandSetSandboxPolicy, protocol.CommandRevokeCapabilities, protocol.CommandReloadSettings, protocol.CommandSetWorkspace, protocol.CommandTrustProject, protocol.CommandProjectMemory:
 		return true
 	default:
 		return false

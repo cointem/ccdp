@@ -125,7 +125,7 @@ func (a *Agent) accountSharedAttempt(attempt session.Attempt) error {
 	}
 	a.mu.Lock()
 	a.mu.Unlock()
-	a.emit(Event{Type: EventUsage, Usage: &u})
+	a.emit(protocol.EventView{Kind: protocol.EventUsage, Usage: &u})
 	if attempt.UsageEstimated && attempt.Outcome == "unknown" {
 		a.emitStatus("recovered request %s in child %s; token usage estimated conservatively for %d input and %d output tokens", attempt.RequestID, attempt.SessionID, attempt.Usage.InputTokens, attempt.Usage.OutputTokens)
 	}

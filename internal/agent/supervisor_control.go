@@ -12,6 +12,7 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 // normalizeAgentControl establishes the command identity before any lookup or
@@ -227,12 +228,17 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 		applyChildRole(&cfg, &opts, row.Role, row.WorkspaceMode)
 	}
 	opts.memoryResume, opts.memoryBlobs = memory, blobs
-	var initial *SessionSnapshot
+	var initial *archive.Snapshot
 	if memory != nil {
-		initial, err = snapshotFromRecords(memory, string(row.SessionID))
+		initial, err = archive.FromRecords(memory, string(row.SessionID))
 	} else {
-		initial, err = LoadSession(cfg.SessionDir, string(row.SessionID))
+		initial, err = archive.Load(cfg.SessionDir, string(row.SessionID))
 	}
+	if err != nil {
+		lease.Close()
+		return row.Run, err
+	}
+	baseline, err := usageFromSession(initial.Usage)
 	if err != nil {
 		lease.Close()
 		return row.Run, err
@@ -256,8 +262,7 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 	}
 	next := &managedRun{workspaceLease: workspaceLease, initialInput: c.Input, initialCommandID: c.ID, fact: session.ChildRunRecorded{Version: 1, Child: row, SystemPrompt: system, CommandID: string(c.ID), CommandDigest: commandDigest}, parent: r.parent, cfg: cfg, opts: opts, lease: lease, toolLease: catalog, preHooks: hooks, cancel: cancel, done: make(chan struct{})}
 	bindChildGoal(&next.fact, opts)
-	u := initial.Usage
-	next.fact.UsageBaseline = protocol.UsageSnapshot{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CachedTokens: u.CachedTokens, TurnCount: u.TurnCount}
+	next.fact.UsageBaseline = baseline
 	if err := s.reserveRun(next, r); err != nil {
 		cancel()
 		lease.Close()

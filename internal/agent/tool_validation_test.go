@@ -42,7 +42,7 @@ func TestDirectAndProgramCallsShareExactValidationBeforeExecution(t *testing.T) 
 			a := capabilityTestAgent(t)
 			tool := &validatedEffectTool{data: json.RawMessage(`{"value":1}`)}
 			a.services.registry.Register(tool)
-			a.services.perms.SetMode(permissions.ModeBypass)
+			a.services.perms.SetPolicy(permissions.Policy{AlwaysAllow: []string{tool.Name()}})
 			step := testToolStep(t, a)
 			journal := toolJournalContextForStep(step)
 			journal.program = program
@@ -69,7 +69,7 @@ func TestInvalidOutputRecordsCompletedEffectAndNeverReexecutes(t *testing.T) {
 			a := capabilityTestAgent(t)
 			tool := &validatedEffectTool{data: json.RawMessage(`{"value":"wrong"}`)}
 			a.services.registry.Register(tool)
-			a.services.perms.SetMode(permissions.ModeBypass)
+			a.services.perms.SetPolicy(permissions.Policy{AlwaysAllow: []string{tool.Name()}})
 			journal := toolJournalContextForStep(testToolStep(t, a))
 			journal.program = program
 			if program {
@@ -109,7 +109,7 @@ func TestSchemaCompilationErrorPreventsExecution(t *testing.T) {
 			effect := &validatedEffectTool{data: json.RawMessage(`{"value":1}`)}
 			tool := &invalidOutputSchemaTool{effect}
 			a.services.registry.Register(tool)
-			a.services.perms.SetMode(permissions.ModeBypass)
+			a.services.perms.SetPolicy(permissions.Policy{AlwaysAllow: []string{tool.Name()}})
 			journal := toolJournalContextForStep(testToolStep(t, a))
 			journal.program = program
 			if program {

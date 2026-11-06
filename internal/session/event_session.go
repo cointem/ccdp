@@ -21,11 +21,11 @@ type Settings struct {
 	Endpoint                      string   `json:"endpoint,omitempty"`
 	Temperature                   *float64 `json:"temperature,omitempty"`
 	MaxOutputTokens               *int     `json:"max_output_tokens,omitempty"`
-	ExecutionMode                 string   `json:"execution_mode,omitempty"`
 	PermissionPolicy              string   `json:"permission_policy,omitempty"`
 	AlwaysAllow                   []string `json:"always_allow,omitempty"`
 	AlwaysDeny                    []string `json:"always_deny,omitempty"`
 	NetworkAccess                 bool     `json:"network_access,omitempty"`
+	LocalDevelopmentNetwork       bool     `json:"local_development_network"`
 	AdditionalDirectories         []string `json:"additional_directories,omitempty"`
 	AdditionalReadOnlyDirectories []string `json:"additional_read_only_directories,omitempty"`
 	DisallowedDirectories         []string `json:"disallowed_directories,omitempty"`
@@ -68,28 +68,10 @@ func (s Settings) validate() error {
 	if s.CompactThreshold < 0 || s.CompactThreshold > 1 {
 		return errors.New("compact_threshold must be between 0 and 1")
 	}
-	if s.ExecutionMode != "" && s.ExecutionMode != "execute" && s.ExecutionMode != "plan" {
-		return fmt.Errorf("unknown execution_mode %q", s.ExecutionMode)
-	}
-	if s.PermissionPolicy != "" && s.PermissionPolicy != "default" && s.PermissionPolicy != "acceptEdits" && s.PermissionPolicy != "bypassPermissions" {
+	if s.PermissionPolicy != "" && s.PermissionPolicy != "auto" && s.PermissionPolicy != "manual" {
 		return fmt.Errorf("unknown permission_policy %q", s.PermissionPolicy)
 	}
 	return nil
-}
-
-type WorkflowState struct {
-	Phase       string `json:"phase"`
-	PlanID      string `json:"plan_id,omitempty"`
-	PlanVersion uint64 `json:"plan_version,omitempty"`
-}
-
-func (w WorkflowState) validate() error {
-	switch w.Phase {
-	case "", "off", "drafting", "awaiting_decision":
-		return nil
-	default:
-		return fmt.Errorf("unknown workflow phase %q", w.Phase)
-	}
 }
 
 // Lifecycle and conversation events.
@@ -168,10 +150,6 @@ type SettingsChanged struct {
 	Settings Settings `json:"settings"`
 }
 
-type WorkflowChanged struct {
-	Workflow WorkflowState `json:"workflow"`
-}
-
 type TurnStarted struct {
 	TurnID      string   `json:"turn_id"`
 	StepID      string   `json:"step_id"`
@@ -222,10 +200,6 @@ func (e CommandCompleted) seal() {}
 func (e SettingsChanged) Type() EventType { return EventTypeSettingsChanged }
 
 func (e SettingsChanged) seal() {}
-
-func (e WorkflowChanged) Type() EventType { return EventTypeWorkflowChanged }
-
-func (e WorkflowChanged) seal() {}
 
 func (e TurnStarted) Type() EventType { return EventTypeTurnStarted }
 
@@ -338,8 +312,6 @@ func (e CommandCompleted) validate() error {
 
 func (e SettingsChanged) validate() error { return e.Settings.validate() }
 
-func (e WorkflowChanged) validate() error { return e.Workflow.validate() }
-
 func (e TurnStarted) validate() error {
 	if err := requireID("turn_id", e.TurnID); err != nil {
 		return err
@@ -353,6 +325,9 @@ func (e TurnFinished) validate() error {
 	}
 	if e.DurationMs < 0 {
 		return errors.New("duration_ms must not be negative")
+	}
+	if e.Outcome == "limit_reached" || e.Outcome == "blocked" {
+		return nil
 	}
 	return validateOutcome(e.Outcome)
 }

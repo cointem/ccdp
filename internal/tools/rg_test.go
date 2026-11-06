@@ -41,13 +41,8 @@ func rgFixture(t *testing.T) string {
 	return dir
 }
 
-func rgCtx(dir string) *Context {
-	return &Context{
-		Context:    context.Background(),
-		WorkingDir: dir,
-		Sandbox:    sandbox.New(dir),
-		Args:       map[string]any{},
-	}
+func rgCtx(t *testing.T, dir string) *Context {
+	return scopedTestContext(t, dir)
 }
 
 // resultLocations renders backend output as "file:line" pairs without depending on text formatting.
@@ -78,7 +73,7 @@ func itoa(n int) string {
 
 func TestRgSearchSkipsIgnoredAndNoise(t *testing.T) {
 	dir := rgFixture(t)
-	ctx := rgCtx(dir)
+	ctx := rgCtx(t, dir)
 	lines, _, err := ripgrepSearch(ctx, &rgRequest{pattern: "needle", base: dir, ignoreCase: true})
 	if err != nil {
 		t.Fatalf("ripgrepSearch: %v", err)
@@ -98,7 +93,7 @@ func TestRgSearchSkipsIgnoredAndNoise(t *testing.T) {
 
 func TestRgContextRendering(t *testing.T) {
 	dir := rgFixture(t)
-	ctx := rgCtx(dir)
+	ctx := rgCtx(t, dir)
 	req := &rgRequest{pattern: "package main", base: dir, before: 1, after: 1}
 	lines, _, err := ripgrepSearch(ctx, req)
 	if err != nil {
@@ -115,7 +110,7 @@ func TestRgContextRendering(t *testing.T) {
 
 func TestRgOutputModes(t *testing.T) {
 	dir := rgFixture(t)
-	ctx := rgCtx(dir)
+	ctx := rgCtx(t, dir)
 
 	files := &rgRequest{pattern: "needle", base: dir, ignoreCase: true, outputMode: rgModeFiles}
 	lines, _, err := ripgrepSearch(ctx, files)
@@ -147,7 +142,7 @@ func TestRgPaginationAndTruncationNote(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "many.txt"), []byte(b.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx := rgCtx(dir)
+	ctx := rgCtx(t, dir)
 
 	req := &rgRequest{pattern: "match line", base: dir, maxLines: 3}
 	lines, truncated, err := ripgrepSearch(ctx, req)
@@ -182,7 +177,7 @@ func TestRgToolRun(t *testing.T) {
 
 	run := func(args map[string]any) string {
 		t.Helper()
-		ctx := rgCtx(dir)
+		ctx := rgCtx(t, dir)
 		ctx.Args = args
 		out, err := executeToolText(tool, ctx)
 		if err != nil {
@@ -297,7 +292,7 @@ func TestRgRecursiveGlobIncludesRootFiles(t *testing.T) {
 	for _, mode := range []string{rgModeContent, rgModeFiles, rgModeCount} {
 		for _, glob := range []string{"**/*.go", "!**/*.go"} {
 			t.Run(mode+"/"+glob, func(t *testing.T) {
-				ctx := rgCtx(root)
+				ctx := rgCtx(t, root)
 				ctx.Args = map[string]any{"pattern": "needle", "glob": glob, "mode": mode}
 				out, err := executeToolResult(NewRgTool(), ctx)
 				if err != nil {
@@ -337,7 +332,7 @@ func TestRgFilePaginationUsesCompleteCounts(t *testing.T) {
 			for _, mode := range []string{rgModeCount, rgModeFiles} {
 				for _, offset := range []int{0, 1, 2, 3} {
 					req := &rgRequest{pattern: "hit", base: dir, outputMode: mode, maxLines: 2, offset: offset, before: 1, after: 1}
-					lines, truncated, err := search(rgCtx(dir), req)
+					lines, truncated, err := search(rgCtx(t, dir), req)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -358,7 +353,7 @@ func TestRgFilePaginationUsesCompleteCounts(t *testing.T) {
 				}
 			}
 			// A bounded process capture must not turn a prefix into a file count.
-			ctx := rgCtx(dir)
+			ctx := rgCtx(t, dir)
 			ctx.OutputLimit = 256
 			req := &rgRequest{pattern: "hit", base: dir, outputMode: rgModeCount, maxLines: 2}
 			lines, truncated, err := search(ctx, req)
@@ -382,7 +377,7 @@ func TestRgStreamsLargeTextAndFollowsExplicitAlias(t *testing.T) {
 	if err := os.Symlink("large.txt", filepath.Join(root, "alias.txt")); err != nil {
 		t.Fatal(err)
 	}
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	ctx.ReadRoot = root
 	ctx.Args = map[string]any{"pattern": "needle", "path": "alias.txt", "mode": "count"}
 	output, err := executeToolText(NewRgTool(), ctx)
@@ -396,7 +391,7 @@ func TestRgUnicodeRegexAndIncompleteMultiline(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "unicode.txt"), []byte("中文\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ctx := rgCtx(root)
+	ctx := rgCtx(t, root)
 	for pattern, want := range map[string]bool{`\w+`: true, `\p{L}+`: true} {
 		ctx.Args = map[string]any{"pattern": pattern}
 		output, err := executeToolText(NewRgTool(), ctx)

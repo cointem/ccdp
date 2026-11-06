@@ -21,13 +21,13 @@ func sugModel() *Model {
 	ta.SetWidth(40)
 	snapshot := protocol.SessionView{SessionID: "test-session",
 		Settings: protocol.SettingsSnapshot{Model: protocol.ModelBinding{Model: "test-model"},
-			Permission:    protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)},
+			Permission:    protocol.PermissionPolicy{Mode: string(permissions.ModeManual)},
 			Sandbox:       protocol.SandboxPolicy{},
 			ContextWindow: 100000},
 		Catalog: protocol.CatalogSnapshot{Providers: []protocol.ProviderSnapshot{{ID: "test", Models: []string{"test-model", "test-model-2"}}}}}
 	client := &recordingClient{snapshot: snapshot}
 	return &Model{sessionHost: &sessionHost{}, composerState: composerState{textarea: ta}, client: client, snapshot: snapshot, hasSnapshot: true,
-		sessionID: "test-session", modelName: "test-model", mode: permissions.ModeDefault,
+		sessionID: "test-session", modelName: "test-model", mode: permissions.ModeManual,
 		workspace: "", followOutput: true}
 }
 
@@ -341,7 +341,7 @@ func TestModelPermissionAndSandboxCommands(t *testing.T) {
 	client.snapshot.Catalog.Providers[0].Models = []string{"test-model", "test-model-2"}
 	m.snapshot = client.snapshot
 	m.hasSnapshot = true
-	m.mode = permissions.ModeDefault
+	m.mode = permissions.ModeManual
 	m.width, m.height = 80, 24
 	m.baseVpH = 19
 
@@ -372,16 +372,16 @@ func TestModelPermissionAndSandboxCommands(t *testing.T) {
 	if len(m.items) != 0 {
 		t.Fatalf("/mode should not enter the transcript: %#v", m.items)
 	}
-	if m.picker == nil || !m.picker.inline || len(m.picker.Options) != len(permissions.ValidModes) {
+	if m.picker == nil || !m.picker.inline || len(m.picker.Options) != 2 {
 		t.Fatalf("/mode should replace model status with an inline picker: %#v", m.picker)
 	}
-	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyDown})
+	m.handlePickerKey(tea.KeyMsg{Type: tea.KeyUp})
 	_, cmd = m.handlePickerKey(tea.KeyMsg{Type: tea.KeyEnter})
 	applyTeaCmd(m, cmd)
-	if m.mode != permissions.ModeDefault || noticeText(m) != "permission mode → edits" {
+	if m.mode != permissions.ModeManual || noticeText(m) != "permission mode → auto" {
 		t.Fatalf("mode selection was not applied: mode=%s status=%q", m.mode, noticeText(m))
 	}
-	if got := client.submits[len(client.submits)-1]; got.Type != protocol.CommandSetPermissionPolicy || got.PermissionPolicy.Policy.Mode != string(permissions.ModeAcceptEdits) {
+	if got := client.submits[len(client.submits)-1]; got.Type != protocol.CommandSetPermissionPolicy || got.PermissionPolicy.Policy.Mode != string(permissions.ModeAuto) {
 		t.Fatalf("unexpected mode command: %#v", got)
 	}
 
@@ -439,7 +439,7 @@ func TestSlashCommandOutputLifetime(t *testing.T) {
 		durable bool
 	}{
 		{"/model", false},
-		{"/mode default", false},
+		{"/mode manual", false},
 		{"/sandbox", true},
 		{"/config", true},
 		{"/config set model test", false},

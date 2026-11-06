@@ -18,10 +18,10 @@ type panelState struct {
 	// awaiting a receipt. A receipt for an unrelated command must never close
 	// the modal while commands complete out of order on the watch.
 	pendingApprovalCommand protocol.CommandID
-	// approvalState owns scrolling for long commands/plans.
+	// approvalState owns scrolling for long commands.
 	approvalState ScrollState
 	// approvalCursor is the ↑↓-selected choice inside the approval modal
-	// (0=allow once, 1=always allow, 2=deny; Plan uses 0=approve, 1=deny).
+	// (0=allow once, 1=always allow, 2=deny).
 	approvalCursor     int
 	approvalSelection  string
 	pendingApprovalKey string

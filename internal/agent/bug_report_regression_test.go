@@ -18,6 +18,7 @@ import (
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/session/replay"
 )
 
@@ -33,7 +34,7 @@ func TestResumeRestoresRuntimeSequences(t *testing.T) {
 	if err := a.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(cfg.SessionDir, sessionID)
+	snapshot, err := archive.Load(cfg.SessionDir, sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +90,7 @@ func TestConsecutiveModelChangesLeaveNoStaleCandidate(t *testing.T) {
 	if activeModel != "bug-second-model" {
 		t.Fatalf("last model did not win cleanly: active=%q", activeModel)
 	}
-	replayed, err := SessionSnapshotProjection(a.persistenceHandle(), a.SessionID())
+	replayed, err := archive.FromStore(a.persistenceHandle(), a.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +233,7 @@ func TestMaximumEscapedInputRemainsRecoverable(t *testing.T) {
 	if err := a.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := LoadSession(cfg.SessionDir, sessionID)
+	snapshot, err := archive.Load(cfg.SessionDir, sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +341,7 @@ func newLargeContextJournalRuntimeAgent(t *testing.T, provider llm.Provider) *Ag
 	cfg.SessionDir = filepath.Join(root, "sessions")
 	cfg.Model = "request-journal-gate-model"
 	cfg.BaseURL = "http://127.0.0.1:1/unreachable"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	cfg.MaxTurns = 2
 	cfg.ContextWindow = 1_000_000
 	registry := plugin.NewModelRegistry()

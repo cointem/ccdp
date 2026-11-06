@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"ccdp/internal/protocol"
 	tea "github.com/charmbracelet/bubbletea"
+
+	"ccdp/internal/protocol"
 )
 
 type panelKind uint8
@@ -61,9 +62,6 @@ func (m *Model) approvalKey() string {
 		return ""
 	}
 	key := m.sessionID + "\x00" + m.approval.ID + "\x00" + m.approval.Tool + "\x00" + m.approval.Command + "\x00" + m.approval.Reason
-	if m.approval.Tool == "Plan" && m.snapshot.Plan != nil {
-		key += fmt.Sprintf("\x00%d", m.snapshot.Plan.Version)
-	}
 	return key
 }
 
@@ -95,7 +93,7 @@ func (m *Model) selectedApprovalChoice() int {
 }
 
 func (m *Model) selectApprovalChoice(delta int) {
-	count := approvalChoiceCount(m.approval)
+	count := approvalChoiceCount
 	m.approvalCursor = min(count-1, max(0, m.selectedApprovalChoice()+delta))
 	m.approvalSelection, m.approvalSelected = m.approvalKey(), true
 	m.modalErr = ""

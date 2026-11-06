@@ -1,7 +1,7 @@
 package workspace
 
 import (
-	"ccdp/internal/sandbox"
+	"ccdp/internal/testenv"
 	"context"
 	"os"
 	"path/filepath"
@@ -19,7 +19,7 @@ func TestLanguageQueryRejectsNonregularDocuments(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"fifo", "dir"} {
-		policy := sandbox.New(root)
+		policy := testenv.Sandbox(t, root)
 		_, err := LanguageQuery(context.Background(), root, name, "outline", 1, 0, LanguageServer{Argv: []string{"must-not-start"}, LanguageID: "go"}, policy)
 		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
 			t.Fatalf("%s: %v", name, err)

@@ -13,7 +13,7 @@ type askUserQuestionTool struct{ ag *Agent }
 func (*askUserQuestionTool) Name() string { return "AskUserQuestion" }
 
 func (*askUserQuestionTool) Description() string {
-	return "Ask the user 1–4 structured clarification questions, each with 2–4 choices. Supports single or multiple selections and free-text answers. Available in plan mode: use it to resolve requirements before submitting a plan. This is not permission to execute tools. Do not include an Other option; the UI always accepts free text. Cancellation supplies no answer; never infer consent."
+	return "Ask the user 1–4 structured clarification questions, each with 2–4 choices. Supports single or multiple selections and free-text answers. This is not permission to execute tools. Do not include an Other option; the UI always accepts free text. Cancellation supplies no answer; never infer consent."
 }
 
 func (*askUserQuestionTool) Parameters() map[string]any {

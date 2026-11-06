@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 
+	"ccdp/internal/changes"
 	"ccdp/internal/permissions"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
@@ -21,6 +22,7 @@ type Options struct {
 	journalBackend        journal.BackendOptions
 	goalOwner             goalAccountTarget
 	goalOwnerID           string
+	access                *childAccessCoordinator
 	Supervisor            *SessionSupervisor
 	RootContext           context.Context
 	EffectiveConfigFrozen bool
@@ -33,6 +35,7 @@ type Options struct {
 	ParentSessionID       string
 	InheritedCapabilities []protocol.CapabilityRequest
 	ExecutionGuard        *sandbox.ExecutionGuard
+	memoryCoding          *changes.Store
 	memoryResume          []session.Record
 	memoryBlobs           journal.ArtifactAccess
 	memoryChildren        map[protocol.RunID]memoryRunRecords

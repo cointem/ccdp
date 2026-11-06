@@ -18,9 +18,6 @@ type stepReleased struct {
 func (stepReleased) ownerControlMessage() {}
 
 func (a *Agent) requestStepRuntime() (stepRuntime, error) {
-	if a.owner == nil {
-		return a.captureStepOwned()
-	}
 	a.ensureRun()
 	request := stepRequested{result: make(chan stepResult, 1)}
 	select {

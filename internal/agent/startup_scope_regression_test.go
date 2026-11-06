@@ -7,13 +7,14 @@ import (
 
 	"ccdp/internal/config"
 	"ccdp/internal/permissions"
+	"ccdp/internal/session/archive"
 )
 
 func TestReviewRound3ResumeHonorsCLISettings(t *testing.T) {
 	cfg := testPersistenceConfig(t)
 	cfg.EnableProjectMemory = false
 	cfg.EnableGuardian = config.BoolPtr(false)
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	cfg.AlwaysDeny = []string{"Bash:rm"}
 
 	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true})
@@ -27,14 +28,14 @@ func TestReviewRound3ResumeHonorsCLISettings(t *testing.T) {
 	if err := a.CloseContext(nil); err != nil {
 		t.Fatal(err)
 	}
-	saved, err := LoadSession(cfg.SessionDir, id)
+	saved, err := archive.Load(cfg.SessionDir, id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if saved.Settings == nil {
 		t.Fatal("fixture did not persist settings")
 	}
-	for field, value := range map[string]any{"permission_mode": "default", "always_deny": []string{"Write"}, "reasoning_effort": "high"} {
+	for field, value := range map[string]any{"permission_mode": "manual", "always_deny": []string{"Write"}, "reasoning_effort": "high"} {
 		if err := cfg.ApplyCLIOverride(field, value); err != nil {
 			t.Fatal(err)
 		}
@@ -44,8 +45,8 @@ func TestReviewRound3ResumeHonorsCLISettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resumed.Close()
-	if mode := resumed.services.perms.CurrentMode(); mode != permissions.ModeDefault {
-		t.Errorf("explicit --mode default became %q", mode)
+	if mode := resumed.services.perms.CurrentMode(); mode != permissions.ModeManual {
+		t.Errorf("explicit --mode manual became %q", mode)
 	}
 	decision, _ := resumed.services.perms.Check("Write", map[string]any{"file_path": "blocked.txt"}, permissions.KindWrite)
 	if decision != permissions.DecisionDeny {

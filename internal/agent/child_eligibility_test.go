@@ -14,7 +14,7 @@ func TestChildToolEligibilityPreservesArgumentScopedTools(t *testing.T) {
 		purpose:        childPurposeTask,
 		nonInteractive: true,
 		allowed:        map[string]bool{"Write": true},
-		perms: permissions.NewManager(permissions.ModeDefault, permissions.Policy{
+		perms: permissions.NewManager(permissions.ModeManual, permissions.Policy{
 			AlwaysAllow: []string{"Write:result.txt"},
 		}),
 	}}}

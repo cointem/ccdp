@@ -26,7 +26,7 @@ func (t *ignoringProgramTool) Execute(*tools.Context, map[string]any) (tools.Res
 }
 
 func TestProgramCancellationSettlesUnknownOnce(t *testing.T) {
-	a, _, _ := codeAgent(t, "", nil)
+	a, _, _ := codeAgent(t, "", func(cfg *config.Config) { cfg.AlwaysAllow = []string{"Ignoring"} })
 	tool := &ignoringProgramTool{codeFixtureTool: codeFixtureTool{name: "Ignoring"}, started: make(chan struct{}), release: make(chan struct{}), returned: make(chan struct{})}
 	a.services.registry.Register(tool)
 	defer func() {

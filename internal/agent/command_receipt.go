@@ -12,12 +12,6 @@ import (
 
 var runtimeIDCounter uint64
 
-// planViewVersion is scoped to the immutable plan identity rather than the
-// mutable settings revision. A new plan request receives a new ID, so version
-// one remains a valid optimistic-concurrency token even when settings change
-// while that plan is awaiting a decision.
-const planViewVersion uint64 = 1
-
 // Submit admits one typed command through the sole runtime loop. The returned
 // receipt distinguishes immediate application from work queued at a safe
 // boundary. Transport/context errors are separate from a rejected receipt.
@@ -187,7 +181,7 @@ func (a *Agent) publishCommandReceipt(cmd protocol.Command, status protocol.Rece
 		if a.lifecycle.closing || a.lifecycle.closed {
 			a.lifecycle.phase = protocol.PhaseStopping
 		}
-		drain = owner.Err() == nil && !a.capabilities.settingsPreparing && !a.capabilities.capabilityRevoking && !a.lifecycle.closing && !a.lifecycle.closed && !a.turn.interruptFlag && a.services.persistenceErr == nil && (a.hasTurnStartingInputLocked() || a.goalRunnableLocked())
+		drain = owner.Err() == nil && !a.capabilities.settingsPreparing && !a.lifecycle.closing && !a.lifecycle.closed && !a.turn.interruptFlag && a.services.persistenceErr == nil && (a.hasTurnStartingInputLocked() || a.goalRunnableLocked())
 	}
 	a.sequences.logSeq++
 	r := protocol.Receipt{CommandID: cmd.ID, SessionID: cmd.SessionID, Status: status,

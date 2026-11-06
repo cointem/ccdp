@@ -11,15 +11,15 @@ import (
 	"ccdp/internal/config"
 	"ccdp/internal/mcp"
 	"ccdp/internal/messages"
-	"ccdp/internal/permissions"
+	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/tools"
 )
 
 // New creates an agent with the given config and channels. The extension host
-// is set up here: a domain event bus, a scoped tool registry, and the built-in
-// plugins (toolset + default provider) are loaded through the same path an
-// external plugin would use.
+// is set up here: a domain event bus, scoped tools, model routing and hooks.
+// Built-in tools and the default provider are registered directly.
 func New(cfg *config.Config) (*Agent, error) {
 	return newAgent(cfg, nil)
 }
@@ -44,7 +44,7 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Agent, error) {
 // explicit resume. A normal New call must never attach an empty in-memory
 // projection to an existing log; callers must use Resume (which supplies the
 // restored projection) so execution always starts from durable history.
-func newAgent(cfg *config.Config, initial *SessionSnapshot) (*Agent, error) {
+func newAgent(cfg *config.Config, initial *archive.Snapshot) (*Agent, error) {
 	return newAgentWithOptions(cfg, initial, Options{})
 }
 
@@ -70,7 +70,7 @@ func agentOptionsRequireIsolation(opts Options) bool {
 // compact/fork helpers, and child/guardian sessions. It is the only place
 // that creates an Agent, so provider, permissions, lifecycle hooks, and child
 // hard-policy state cannot diverge across those runtimes.
-func newAgentWithOptions(cfg *config.Config, initial *SessionSnapshot, opts Options) (*Agent, error) {
+func newAgentWithOptions(cfg *config.Config, initial *archive.Snapshot, opts Options) (*Agent, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("agent: config is required")
 	}
@@ -78,6 +78,9 @@ func newAgentWithOptions(cfg *config.Config, initial *SessionSnapshot, opts Opti
 		return nil, err
 	}
 	baseCfg := cloneConfig(cfg)
+	if opts.Purpose == "" {
+		baseCfg.ExecutorID = ""
+	}
 	isolated := agentOptionsRequireIsolation(opts)
 	effectiveCfg, err := buildEffectiveConfig(baseCfg, initial, isolated, opts)
 	if err != nil {
@@ -101,8 +104,8 @@ func newAgentWithOptions(cfg *config.Config, initial *SessionSnapshot, opts Opti
 	}
 	rootCtx, rootCancel := context.WithCancel(rootParent)
 
-	// Extension host: domain registries, plugins, and provider bindings.
-	host, err := buildExtensionHost(cfg, opts, rootCancel)
+	// Domain registries and provider bindings.
+	host, err := buildExtensionRegistries(cfg, opts, rootCancel)
 	if err != nil {
 		return nil, err
 	}
@@ -135,11 +138,9 @@ func newAgentWithOptions(cfg *config.Config, initial *SessionSnapshot, opts Opti
 			trustStore: cfg.TrustStore,
 			client:     host.primaryBinding.client,
 			registry:   host.registry,
-			gohooks:    host.ectx.Hooks,
-			sessionReg: host.ectx.Session,
+			gohooks:    plugin.NewGoHooks(),
 			mcp:        mcp.NewManager(),
 			perms:      cfg.PermManager(),
-			host:       host.host,
 			evbus:      host.bus,
 			models:     host.models,
 			cfg:        cfg,
@@ -181,11 +182,10 @@ func newAgentWithOptions(cfg *config.Config, initial *SessionSnapshot, opts Opti
 			rootCancel: rootCancel,
 			closeDone:  make(chan struct{}),
 			phase:      protocol.PhaseIdle,
-			workflow:   protocol.WorkflowOff,
 		},
 	}
-	if cfg.NoSessionPersistence && initial != nil && initial.resumeCoding != nil {
-		a.services.coding = &codingState{sessionID: sid, store: initial.resumeCoding.Clone()}
+	if cfg.NoSessionPersistence && opts.memoryCoding != nil {
+		a.services.coding = &codingState{sessionID: sid, store: opts.memoryCoding.Clone()}
 	}
 	if err := a.finalizeConstruction(initial, opts, isolated, rootCancel); err != nil {
 		return nil, err
@@ -210,15 +210,12 @@ func (a *Agent) abortConstruction(rootCancel context.CancelFunc, closeWriter boo
 	if a.services.mcp != nil {
 		a.services.mcp.Close()
 	}
-	if a.services.host != nil {
-		_ = a.services.host.Close()
-	}
 }
 
 // finalizeConstruction turns the freshly-built Agent literal into a fully
 // initialized runtime: session lineage, durable snapshot replay, persistence,
 // execution mode, session services, tool discovery, and the supervisor.
-func (a *Agent) finalizeConstruction(initial *SessionSnapshot, opts Options, isolated bool, rootCancel context.CancelFunc) error {
+func (a *Agent) finalizeConstruction(initial *archive.Snapshot, opts Options, isolated bool, rootCancel context.CancelFunc) error {
 	a.applySessionLineage(opts, isolated)
 	a.applyInitialSnapshot(initial)
 	if err := a.acquirePersistence(initial, opts, rootCancel); err != nil {
@@ -227,7 +224,6 @@ func (a *Agent) finalizeConstruction(initial *SessionSnapshot, opts Options, iso
 	if err := a.replayOwnedStore(initial, opts, rootCancel); err != nil {
 		return err
 	}
-	a.initExecutionMode(initial)
 	if err := a.startSessionServices(rootCancel, isolated, opts.InheritedCapabilities, opts.ExecutionGuard); err != nil {
 		return err
 	}
@@ -272,13 +268,14 @@ func (a *Agent) applySessionLineage(opts Options, isolated bool) {
 			allowed:           cloneChildAllowed(opts.AllowedTools),
 			parentSession:     opts.ParentSessionID,
 			perms:             a.services.perms,
+			access:            opts.access,
 		}
 	}
 }
 
 // applyInitialSnapshot restores history, pending inbox and usage from a resume
 // snapshot so the runner can continue where the prior session left off.
-func (a *Agent) applyInitialSnapshot(initial *SessionSnapshot) {
+func (a *Agent) applyInitialSnapshot(initial *archive.Snapshot) {
 	if initial == nil {
 		return
 	}
@@ -287,18 +284,18 @@ func (a *Agent) applyInitialSnapshot(initial *SessionSnapshot) {
 		a.inbox.inputAttachments[protocol.InputID(id)] = frozenInputAttachments{Attachments: messages.CloneImageAttachments(attachments), Frozen: true}
 	}
 	a.conversation.parentID, a.conversation.branchPoint, a.conversation.branchSummary = initial.ParentID, initial.BranchPoint, initial.BranchSummary
-	a.sequences.turnSeq, a.sequences.stepSeq = initial.turnSeq, initial.stepSeq
+	a.sequences.turnSeq, a.sequences.stepSeq = initial.TurnSeq, initial.StepSeq
 }
 
 // acquirePersistence sets up the resources container, the active model
 // binding, and the checkpoint/persistence stores, then opens the session
 // writer for the fresh or resume path.
-func (a *Agent) acquirePersistence(initial *SessionSnapshot, opts Options, rootCancel context.CancelFunc) error {
+func (a *Agent) acquirePersistence(initial *archive.Snapshot, opts Options, rootCancel context.CancelFunc) error {
 	resourceDir := filepath.Join(a.services.cfg.SessionDir, a.conversation.sessionID)
 	if a.services.cfg.NoSessionPersistence {
 		resourceDir = ""
 	}
-	a.services.resources = tools.NewResourcesWithContext(a.conversation.sessionID, resourceDir, a.lifecycle.rootCtx)
+	a.services.resources = tools.NewResourcesWithContext(a.conversation.sessionID, resourceDir, a.lifecycle.rootCtx, a.services.cfg.ExecutorID, a.services.cfg.RuntimeRoot)
 	a.modelsState.activeBinding = a.modelsState.primaryBinding
 	openErr := error(nil)
 	if initial == nil && a.services.cfg.SessionID != "" {
@@ -310,17 +307,13 @@ func (a *Agent) acquirePersistence(initial *SessionSnapshot, opts Options, rootC
 		a.abortConstruction(rootCancel, false)
 		return openErr
 	}
-	if err := a.services.resources.Processes.CleanPreviousLogs(); err != nil {
-		a.abortConstruction(rootCancel, true)
-		return fmt.Errorf("clean previous process logs: %w", err)
-	}
 	return nil
 }
 
 // replayOwnedStore replays the now-owned durable log once more so a concurrent
 // writer cannot leave a stale history/inbox projection at startup. It also
 // restores input deduplication before new commands are admitted.
-func (a *Agent) replayOwnedStore(initial *SessionSnapshot, opts Options, rootCancel context.CancelFunc) error {
+func (a *Agent) replayOwnedStore(initial *archive.Snapshot, opts Options, rootCancel context.CancelFunc) error {
 	if initial == nil {
 		return nil
 	}
@@ -336,12 +329,16 @@ func (a *Agent) replayOwnedStore(initial *SessionSnapshot, opts Options, rootCan
 			a.abortConstruction(rootCancel, true)
 			return replayErr
 		}
-		owned, replayErr := p.snapshotFromOwnedStore(a.conversation.sessionID)
+		owned, replayErr := archive.FromStore(p, a.conversation.sessionID)
 		if replayErr != nil {
 			a.abortConstruction(rootCancel, true)
 			return replayErr
 		}
 		if owned != nil {
+			if _, err := usageFromSession(owned.Usage); err != nil {
+				a.abortConstruction(rootCancel, true)
+				return err
+			}
 			if (owned.Model != "" && owned.Model != a.services.cfg.Model) || (owned.Workspace != "" && owned.Workspace != a.services.cfg.Workspace) {
 				a.abortConstruction(rootCancel, true)
 				return fmt.Errorf("agent: session settings changed while opening %q; retry resume", a.conversation.sessionID)
@@ -359,38 +356,22 @@ func (a *Agent) replayOwnedStore(initial *SessionSnapshot, opts Options, rootCan
 				a.inbox.inputAttachments[protocol.InputID(id)] = frozenInputAttachments{Attachments: messages.CloneImageAttachments(attachments), Frozen: true}
 			}
 			a.conversation.parentID, a.conversation.branchPoint, a.conversation.branchSummary = owned.ParentID, owned.BranchPoint, owned.BranchSummary
-			if owned.turnSeq > a.sequences.turnSeq {
-				a.sequences.turnSeq = owned.turnSeq
+			if owned.TurnSeq > a.sequences.turnSeq {
+				a.sequences.turnSeq = owned.TurnSeq
 			}
-			if owned.stepSeq > a.sequences.stepSeq {
-				a.sequences.stepSeq = owned.stepSeq
+			if owned.StepSeq > a.sequences.stepSeq {
+				a.sequences.stepSeq = owned.StepSeq
 			}
 			a.mu.Unlock()
 		}
+	}
+	if err := a.recoverProcesses(); err != nil {
+		a.abortConstruction(rootCancel, true)
+		return err
 	}
 	if err := a.restoreInputDedup(); err != nil {
 		a.abortConstruction(rootCancel, true)
 		return err
 	}
 	return nil
-}
-
-// initExecutionMode seeds plan mode and the workflow phase for the restored or
-// fresh session.
-func (a *Agent) initExecutionMode(initial *SessionSnapshot) {
-	initialMode := a.services.perms.CurrentMode()
-	a.plan.planBaseMode = initialMode
-	if initialMode == permissions.ModePlan {
-		a.plan.planBaseMode = permissions.ModeDefault
-		a.plan.planMode = true
-		a.lifecycle.workflow = protocol.WorkflowDrafting
-		a.services.perms.SetMode(a.plan.planBaseMode)
-		a.services.cfg.PermissionMode = string(a.plan.planBaseMode)
-	}
-	if initial != nil && initial.Workflow != nil {
-		switch protocol.WorkflowState(initial.Workflow.Phase) {
-		case protocol.WorkflowOff, protocol.WorkflowDrafting, protocol.WorkflowAwaitingDecision:
-			a.lifecycle.workflow = protocol.WorkflowState(initial.Workflow.Phase)
-		}
-	}
 }

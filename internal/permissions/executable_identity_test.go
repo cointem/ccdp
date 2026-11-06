@@ -15,14 +15,14 @@ func TestReadOnlyApprovalRequiresExecutableIdentity(t *testing.T) {
 	}
 	t.Setenv("PATH", root+":/usr/bin:/bin")
 	for _, cmd := range []string{"cat victim", "head victim", "ls", "env echo hello", "env true", "env pwd", "env"} {
-		m := NewManager(ModeDefault, Policy{})
+		m := NewManager(ModeManual, Policy{})
 		if d, why := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d != DecisionAsk {
 			t.Fatalf("%q: %s %s", cmd, d, why)
 		}
 	}
 	// The shell resolves these builtins independently of PATH.
 	for _, cmd := range []string{"echo hello", "true", "pwd"} {
-		m := NewManager(ModeDefault, Policy{})
+		m := NewManager(ModeManual, Policy{})
 		if d, why := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d != DecisionAllow {
 			t.Fatalf("builtin %q: %s %s", cmd, d, why)
 		}
@@ -32,12 +32,12 @@ func TestReadOnlyApprovalRequiresExecutableIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, cmd := range []string{"env echo hello", "env true", "env pwd"} {
-		m := NewManager(ModeDefault, Policy{})
+		m := NewManager(ModeManual, Policy{})
 		if d, why := m.Check("Bash", map[string]any{"command": cmd}, KindShell); d != DecisionAsk {
 			t.Fatalf("external builtin %q: %s %s", cmd, d, why)
 		}
 	}
-	m := NewManager(ModeDefault, Policy{AlwaysAllow: []string{"Bash:cat victim"}})
+	m := NewManager(ModeManual, Policy{AlwaysAllow: []string{"Bash:cat victim"}})
 	if d, why := m.Check("Bash", map[string]any{"command": "cat victim"}, KindShell); d != DecisionAllow {
 		t.Fatalf("explicit approval lost: %s %s", d, why)
 	}
@@ -46,7 +46,7 @@ func TestReadOnlyApprovalRequiresExecutableIdentity(t *testing.T) {
 func TestReadOnlyApprovalRejectsCwdDependentPATH(t *testing.T) {
 	for _, path := range []string{"relative-tools:/usr/bin:/bin", ":/usr/bin:/bin"} {
 		t.Setenv("PATH", path)
-		m := NewManager(ModeDefault, Policy{})
+		m := NewManager(ModeManual, Policy{})
 		if decision, reason := m.Check("Bash", map[string]any{"command": "cat victim"}, KindShell); decision != DecisionAsk {
 			t.Fatalf("PATH=%q: %s %s", path, decision, reason)
 		}

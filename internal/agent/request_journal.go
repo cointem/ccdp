@@ -206,7 +206,7 @@ func (a *Agent) recordPreparedRequest(ctx context.Context, purpose, providerName
 		return fail(err)
 	}
 	return requestAttempt{
-		goalOwner: goalOwner, goalID: goalID, estimatedInput: llm.EstimateTokens(string(wire)),
+		goalOwner: goalOwner, goalID: goalID, estimatedInput: llm.EstimateRequestBudget(req, 0).InputTokens,
 		AttemptID: newRequestJournalID("attempt"), RequestID: requestID, Manifest: manifest,
 		apiKey: apiKey, historyLen: metadata.HistoryLen,
 	}, nil

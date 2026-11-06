@@ -1,13 +1,12 @@
 package changes
 
 import (
+	"ccdp/internal/testenv"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
-
-	"ccdp/internal/sandbox"
 )
 
 func TestUnchangedBlobReusedAndCorruptionDetectedOnRead(t *testing.T) {
@@ -67,7 +66,7 @@ func TestMergeRetainsIndependentUserEdit(t *testing.T) {
 func TestRestorePlanIsStaleSafeAndIdempotent(t *testing.T) {
 	root := t.TempDir()
 	s := New(t.TempDir())
-	policy := sandbox.New(root)
+	policy := testenv.Sandbox(t, root)
 	ctx := context.Background()
 	path := filepath.Join(root, "a.txt")
 	write := func(v string) {
@@ -116,7 +115,7 @@ func TestSnapshotSurvivesRestartAndDetectsCorruption(t *testing.T) {
 	if e := os.WriteFile(filepath.Join(root, "a"), []byte("original"), 0644); e != nil {
 		t.Fatal(e)
 	}
-	snap, e := s.CapturePaths(context.Background(), root, []string{"a"}, sandbox.New(root))
+	snap, e := s.CapturePaths(context.Background(), root, []string{"a"}, testenv.Sandbox(t, root))
 	if e != nil {
 		t.Fatal(e)
 	}

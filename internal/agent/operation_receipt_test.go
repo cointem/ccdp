@@ -10,10 +10,11 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 )
 
 func TestReviewSessionTitleRuneBoundary(t *testing.T) {
-	got := sessionTitle([]messages.Message{{Role: messages.RoleUser, Content: strings.Repeat("a", 59) + "中"}})
+	got := archive.Title([]messages.Message{{Role: messages.RoleUser, Content: strings.Repeat("a", 59) + "中"}})
 	if !utf8.ValidString(got) {
 		t.Fatalf("session title has invalid UTF-8: %q", got)
 	}

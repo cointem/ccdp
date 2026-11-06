@@ -152,7 +152,7 @@ func newTestAgent(t *testing.T, f *fakeLLM) (*Agent, <-chan protocol.EventView) 
 	cfg.Model = "fake-model"
 	cfg.Workspace = t.TempDir()
 	cfg.APIKey = "test"
-	cfg.PermissionMode = string(permissions.ModeBypass)
+	cfg.PermissionMode = string(permissions.ModeAuto)
 	cfg.SessionDir = t.TempDir()
 	cfg.SystemPrompt = "test system prompt"
 
@@ -258,7 +258,7 @@ func TestPermissionDenied(t *testing.T) {
 	// Force default mode so the dangerous command is denied.
 	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("set-mode")), SessionID: protocol.SessionID(ag.SessionID()),
 		Type:             protocol.CommandSetPermissionPolicy,
-		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)}}})
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeManual)}}})
 	go ag.Run()
 
 	submitTestInput(t, ag, "delete root")
@@ -287,7 +287,7 @@ func TestApprovalGate(t *testing.T) {
 	ag, events := newTestAgent(t, f)
 	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("set-mode")), SessionID: protocol.SessionID(ag.SessionID()),
 		Type:             protocol.CommandSetPermissionPolicy,
-		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)}}})
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeManual)}}})
 	go ag.Run()
 
 	submitTestInput(t, ag, "install sessionServices")
@@ -323,7 +323,7 @@ func TestApprovalDeniedRemembered(t *testing.T) {
 	ag, events := newTestAgent(t, f)
 	submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("set-mode")), SessionID: protocol.SessionID(ag.SessionID()),
 		Type:             protocol.CommandSetPermissionPolicy,
-		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeDefault)}}})
+		PermissionPolicy: &protocol.SetPermissionPolicy{Policy: protocol.PermissionPolicy{Mode: string(permissions.ModeManual)}}})
 	go ag.Run()
 
 	submitTestInput(t, ag, "install sessionServices")

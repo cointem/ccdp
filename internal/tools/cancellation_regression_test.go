@@ -7,21 +7,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
-// Poll cancellation only after the invocation has begun, without timing races.
-type cancelAfterChecks struct {
+// Observe entry into a cancellable wait without changing context semantics.
+type waitObservedContext struct {
 	context.Context
-	remaining int
+	waiting chan struct{}
+	once    sync.Once
 }
 
-func (c *cancelAfterChecks) Err() error {
-	c.remaining--
-	if c.remaining <= 0 {
-		return context.Canceled
-	}
-	return nil
+func (c *waitObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
 }
 
 func TestFileSearchToolsHonorCancellation(t *testing.T) {
@@ -42,16 +42,40 @@ func TestFileSearchToolsHonorCancellation(t *testing.T) {
 		{NewGlobTool(), map[string]any{"pattern": "**/*"}},
 		{NewLSTool(), map[string]any{}},
 	} {
-		for _, after := range []int{1, 20} {
-			t.Run(fmt.Sprintf("%s/after%d", tc.tool.Name(), after), func(t *testing.T) {
-				ctx := scopedTestContext(t, root)
-				ctx.Context = &cancelAfterChecks{Context: context.Background(), remaining: after}
-				ctx.Args = tc.args
-				if out, err := executeToolText(tc.tool, ctx); !errors.Is(err, context.Canceled) {
-					t.Fatalf("returned %q, %v", out, err)
+		t.Run(tc.tool.Name(), func(t *testing.T) {
+			ctx := scopedTestContext(t, root)
+			call, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			observed := &waitObservedContext{Context: call, waiting: make(chan struct{})}
+			ctx.Context, ctx.Args = observed, tc.args
+			ctx.Resources.initFileWorkers()
+			for i := 0; i < cap(ctx.Resources.fileWorkers); i++ {
+				<-ctx.Resources.fileWorkers
+			}
+			defer func() {
+				for i := 0; i < cap(ctx.Resources.fileWorkers); i++ {
+					ctx.Resources.fileWorkers <- nil
 				}
-			})
-		}
+			}()
+			done := make(chan error, 1)
+			go func() { _, err := executeToolText(tc.tool, ctx); done <- err }()
+			select {
+			case <-observed.waiting:
+			case err := <-done:
+				t.Fatalf("invocation did not wait for a worker: %v", err)
+			case <-time.After(10 * time.Second):
+				t.Fatal("worker admission did not become cancellable")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("got %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("cancelled admission did not settle")
+			}
+		})
 	}
 }
 
@@ -68,6 +92,9 @@ func TestWriteAndEditCancelAfterBeforeWrite(t *testing.T) {
 			ctx.Args = map[string]any{"file_path": "file.txt", "content": "changed"}
 			if replace {
 				if err := os.WriteFile(path, []byte("original"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := NewReadTool().Execute(ctx, map[string]any{"file_path": "file.txt"}); err != nil {
 					t.Fatal(err)
 				}
 				tool = NewEditTool()

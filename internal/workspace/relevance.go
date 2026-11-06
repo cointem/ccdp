@@ -6,9 +6,9 @@ import (
 	"unicode"
 )
 
-// RelevantRepoMap keeps entry points and query-related paths within the prompt
-// budget, then spreads remaining entries across directories.
-func (i *Info) RelevantRepoMap(limit int, query string) string {
+// RelevantRepoMap checks access only as ranked candidates are
+// selected, rather than resolving every path in a large inventory each step.
+func (i *Info) RelevantRepoMap(limit int, query string, allowed func(string) bool) string {
 	if i == nil {
 		return ""
 	}
@@ -20,7 +20,7 @@ func (i *Info) RelevantRepoMap(limit int, query string) string {
 		entry Entry
 		score int
 	}
-	rows := []ranked{}
+	rows := make([]ranked, 0, len(i.Files))
 	for _, entry := range i.Files {
 		if entry.IsDir {
 			continue
@@ -60,6 +60,9 @@ func (i *Info) RelevantRepoMap(limit int, query string) string {
 			deferred = append(deferred, row.entry)
 			continue
 		}
+		if allowed != nil && !allowed(row.entry.RelPath) {
+			continue
+		}
 		dirs[dir]++
 		out.Files = append(out.Files, row.entry)
 		if len(out.Files) == limit {
@@ -70,11 +73,14 @@ func (i *Info) RelevantRepoMap(limit int, query string) string {
 		if len(out.Files) == limit {
 			break
 		}
+		if allowed != nil && !allowed(entry.RelPath) {
+			continue
+		}
 		out.Files = append(out.Files, entry)
 	}
 	sort.Slice(out.Files, func(a, b int) bool { return out.Files[a].RelPath < out.Files[b].RelPath })
 	text := out.RepoMap(limit)
-	if len(rows) > len(out.Files) {
+	if i.Truncated || len(rows) > len(out.Files) {
 		text += "\nRepository map is a relevant sample. Use Glob/LS to find paths and Rg to search file contents.\n"
 	}
 	return text

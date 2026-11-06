@@ -29,7 +29,7 @@ func (requestCompleted) ownerControlMessage() {}
 type requestSettlement struct {
 	attempt     session.Attempt
 	manifest    session.RequestManifest
-	usage       Usage
+	usage       protocol.UsageSnapshot
 	applied     bool
 	goalChanged bool
 }
@@ -54,23 +54,20 @@ func (a *Agent) finishRequestAttempt(attempt requestAttempt, result llm.StreamRe
 	}
 	var settled requestSettlement
 	var err error
-	if a.owner == nil {
-		// Unpublished construction fixtures have exclusive ownership.
-		settled, err = a.settleRequestCompleted(completed)
-	} else {
-		a.ensureRun()
-		select {
-		case a.owner.control <- completed:
-		case <-a.owner.done:
-			return session.ErrClosed
-		}
-		select {
-		case outcome := <-completed.result:
-			settled, err = outcome.settlement, outcome.err
-		case <-a.owner.done:
-			return session.ErrClosed
-		}
+
+	a.ensureRun()
+	select {
+	case a.owner.control <- completed:
+	case <-a.owner.done:
+		return session.ErrClosed
 	}
+	select {
+	case outcome := <-completed.result:
+		settled, err = outcome.settlement, outcome.err
+	case <-a.owner.done:
+		return session.ErrClosed
+	}
+
 	if err != nil {
 		return err
 	}
@@ -209,6 +206,6 @@ func (a *Agent) settleRequestCompleted(completed requestCompleted) (requestSettl
 	a.mu.Unlock()
 	// Publish the committed projection before returning to the worker, which
 	// performs cross-session transfers and invokes arbitrary plugin callbacks.
-	a.emit(Event{Type: EventUsage, Usage: &candidate})
+	a.emit(protocol.EventView{Kind: protocol.EventUsage, Usage: &candidate})
 	return requestSettlement{applied: true, attempt: attemptEvent.Attempt, manifest: manifest, usage: candidate, goalChanged: goalFact != nil}, nil
 }

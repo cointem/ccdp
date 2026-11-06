@@ -240,10 +240,7 @@ func (a *Agent) markPersistenceFailure(err error) {
 	if cancel != nil {
 		cancel()
 	}
-	if a.owner == nil {
-		a.installPersistenceFailureOwned()
-		return
-	}
+
 	a.ensureRun()
 	select {
 	case a.owner.control <- completionsReady{}:
@@ -262,5 +259,5 @@ func (a *Agent) failTurnPersistence(err error) {
 		return
 	}
 	a.markPersistenceFailure(err)
-	a.emit(Event{Type: EventError, TurnID: fmt.Sprintf("%d", a.currentTurnSeq()), Text: "session persistence failed: " + err.Error()})
+	a.emit(protocol.EventView{Kind: protocol.EventError, TurnID: protocol.TurnID(fmt.Sprintf("%d", a.currentTurnSeq())), Text: "session persistence failed: " + err.Error()})
 }

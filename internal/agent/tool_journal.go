@@ -82,6 +82,7 @@ func toolJournalContextForStep(step stepRuntime) toolJournalContext {
 }
 
 type toolJournalExecution struct {
+	failure          *protocol.ToolFailure
 	ctx              toolJournalContext
 	started          bool
 	finished         bool
@@ -125,13 +126,17 @@ func (j *toolJournalExecution) start(a *Agent, tc messages.ToolCall) error {
 	if err := a.persistenceFailure(); err != nil {
 		return fail(err)
 	}
+	processID := ""
+	if tc.Name == "Process" {
+		processID, _ = tc.Arguments["id"].(string)
+	}
 	if _, err := p.Commit(session.Batch{
 		TransactionID: messages.StableID("tool-started", struct {
 			TurnID string
 			StepID string
 			CallID string
 		}{j.ctx.turnID, j.ctx.stepID, tc.ID}),
-		Events: []session.Event{session.ToolStarted{
+		Events: []session.Event{session.ToolStarted{ProcessID: processID,
 			TurnID: j.ctx.turnID, StepID: j.ctx.stepID, CallIndex: j.ctx.callIndex,
 			ParentCallID: j.ctx.parentCallID, ChildIndex: j.ctx.childIndex, ResultTarget: j.ctx.resultTarget(),
 			Call:        session.ToolCall{CallID: tc.ID, ToolID: tc.Name, Arguments: append([]byte(nil), args...)},
@@ -186,6 +191,23 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 		}
 	}
 	j.setStatus(status)
+	if isErr && j.failure == nil {
+		code, source, started, retry := "tool_failed", "tool", "unknown", "inspect_result"
+		if !j.started {
+			started = "no"
+		}
+		switch status {
+		case "unknown":
+			code, source, started, retry = "outcome_unknown", "executor", "unknown", "never_replay"
+		case "denied":
+			code, source, retry = "policy_denied", "policy", "after_policy_change"
+		case "cancelled":
+			code, source, retry = "cancelled", "runtime", "inspect_result"
+		case "resource_limit":
+			code, source, retry = "resource_limit", "runtime", "after_resource_change"
+		}
+		j.failure = &protocol.ToolFailure{Code: code, DecisionSource: source, ExecutionStarted: started, RetryClass: retry}
+	}
 	sideEffect := "none"
 	if j.started {
 		sideEffect = "attempted"
@@ -200,12 +222,22 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 		CallID string
 	}{j.ctx.turnID, j.ctx.stepID, tc.ID})
 	event := session.ToolFinished{
-		TurnID: j.ctx.turnID, StepID: j.ctx.stepID, CallID: tc.ID,
+		Failure: j.failure,
+		TurnID:  j.ctx.turnID, StepID: j.ctx.stepID, CallID: tc.ID,
 		ParentCallID: j.ctx.parentCallID, ChildIndex: j.ctx.childIndex, ResultTarget: j.ctx.resultTarget(),
 		EffectID: effectID, Status: status, SideEffect: sideEffect,
 		RawOutput: &ref,
 		Result:    session.ToolResult{CallID: tc.ID, Status: status, Text: resultText},
 	}
+	event.Process = protocol.CloneProcessOutput(j.result.Process)
+	if image := j.result.Image; image != nil {
+		imageRef, e := p.PutBlob(context.Background(), image.Data, image.MediaType)
+		if e != nil {
+			return fail(fmt.Errorf("persist tool image: %w", e))
+		}
+		event.Image = imageRef
+	}
+	event.CompletionIDs = append([]string(nil), j.result.CompletionIDs...)
 	event.DataError = j.result.DataError
 	event.DisplayTruncated = j.displayTruncated || resultText != output
 	event.DataTruncated = j.result.DataTruncated
@@ -280,21 +312,21 @@ func (a *Agent) finishUnexecutedToolWithStatus(jc toolJournalContext, tc message
 
 // persistToolResultsProjected commits the deterministic, model-visible
 // projection after every raw completion in this step has been admitted.
-func (a *Agent) persistToolResultsProjected(jc toolJournalContext, calls []messages.ToolCall, results []toolRunResult, budget session.Budget) error {
+func (a *Agent) persistToolResultsProjected(jc toolJournalContext, calls []messages.ToolCall, results []tooling.Result, budget session.Budget) error {
 	if len(calls) == 0 || len(calls) != len(results) {
 		return a.toolJournalFailure(errors.New("agent: tool projection call/result count mismatch"))
 	}
 	projected := make([]session.ProjectedToolResult, 0, len(results))
 	for i, result := range results {
-		status := result.status
+		status := result.Status
 		if status == "" {
-			if result.isErr {
+			if result.IsError {
 				status = "error"
 			} else {
 				status = "success"
 			}
 		}
-		projected = append(projected, session.ProjectedToolResult{CallID: calls[i].ID, Status: status, Text: result.output, DisplayTruncated: result.displayTruncated, DataError: result.dataError})
+		projected = append(projected, session.ProjectedToolResult{CallID: calls[i].ID, Status: status, Text: result.Output, DisplayTruncated: result.DisplayTruncated, DataError: result.DataError})
 	}
 	p := a.persistenceHandle()
 	if p == nil {
@@ -303,9 +335,39 @@ func (a *Agent) persistToolResultsProjected(jc toolJournalContext, calls []messa
 	if err := a.persistenceFailure(); err != nil {
 		return err
 	}
+	ids := projectedProcessIDs(results)
+	undelivered := ids[:0]
+	a.mu.Lock()
+	for _, id := range ids {
+		if proc, ok := a.conversation.durable.Processes[id]; ok && proc.Result != nil && !proc.Projected {
+			undelivered = append(undelivered, id)
+		}
+	}
+	a.mu.Unlock()
+	events := []session.Event{session.ToolResultsProjected{TurnID: jc.turnID, StepID: jc.stepID, Results: projected, Budget: budget}}
+	if len(undelivered) > 0 {
+		links := make(map[string]string, len(undelivered))
+		for i, r := range results {
+			for _, id := range r.CompletionIDs {
+				if _, linked := links[id]; !linked {
+					links[id] = calls[i].ID
+				}
+			}
+		}
+		for id := range links {
+			found := false
+			for _, kept := range undelivered {
+				found = found || id == kept
+			}
+			if !found {
+				delete(links, id)
+			}
+		}
+		events = append(events, session.ProcessResultsProjected{TurnID: jc.turnID, StepID: jc.stepID, ToolCalls: links, IDs: undelivered, Budget: budget})
+	}
 	if _, err := p.Commit(session.Batch{
 		TransactionID: messages.StableID("tool-projected", struct{ TurnID, StepID string }{jc.turnID, jc.stepID}),
-		Events:        []session.Event{session.ToolResultsProjected{TurnID: jc.turnID, StepID: jc.stepID, Results: projected, Budget: budget}},
+		Events:        events,
 	}); err != nil {
 		return a.toolJournalFailure(fmt.Errorf("agent: persist ToolResultsProjected: %w", err))
 	}
@@ -349,16 +411,16 @@ func (a *Agent) persistToolDiscovery(version uint64, name, description string, p
 // workspace/resource-owning tools an ordered happens-before edge.
 func (a *Agent) toolCallIsReadOnly(jc toolJournalContext, call messages.ToolCall) bool {
 	tool, _ := jc.toolLease.Get(call.Name)
-	return toolKind(tool).Concurrent()
+	return invocationKind(tool, call.Arguments).Concurrent()
 }
 
 // projectToolResults applies the aggregate budget in original call order.
 // The returned values are exactly the strings appended to history, so the
 // event and live projection cannot disagree when workers finish out of order.
-func (a *Agent) projectToolResults(jc toolJournalContext, calls []messages.ToolCall, results []toolRunResult) (session.Budget, error) {
+func (a *Agent) projectToolResults(jc toolJournalContext, calls []messages.ToolCall, results []tooling.Result) (session.Budget, error) {
 	projected := a.projectToolsFromWorker(jc, calls, results)
 	for i, result := range projected.results {
-		if result.output != results[i].output && calls[i].Name == "Read" {
+		if result.Output != results[i].Output && calls[i].Name == "Read" {
 			a.mu.Lock()
 			resources, sb := a.services.resources, a.services.sandbox
 			a.mu.Unlock()

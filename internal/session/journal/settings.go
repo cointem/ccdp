@@ -10,52 +10,6 @@ import (
 	"ccdp/internal/session"
 )
 
-func (p *Writer) PersistSettingsWorkflow(settings session.Settings, revision uint64, workflow *session.WorkflowState) error {
-	p.mu.Lock()
-	if p.store == nil {
-		p.mu.Unlock()
-		return session.ErrClosed
-	}
-	if p.failed != nil {
-		err := p.failed
-		p.mu.Unlock()
-		return err
-	}
-	projection, err := p.projectionLocked()
-	if err != nil {
-		p.mu.Unlock()
-		return fmt.Errorf("agent: inspect settings projection: %w", err)
-	}
-	events := make([]session.Event, 0, 2)
-	if !reflect.DeepEqual(projection.Settings, settings) || revision > projection.SettingsRev {
-		if revision == 0 {
-			revision = projection.SettingsRev + 1
-			if revision == 0 {
-				revision = 1
-			}
-		}
-		events = append(events, session.SettingsChanged{Revision: revision, Settings: settings})
-	}
-	if workflow != nil && *workflow != projection.Workflow {
-		events = append(events, session.WorkflowChanged{Workflow: *workflow})
-	}
-	if len(events) == 0 {
-		p.mu.Unlock()
-		return nil
-	}
-	if _, err = p.commitLocked(session.Batch{TransactionID: messages.StableID("settings-workflow", struct {
-		Settings session.Settings
-		Revision uint64
-		Workflow *session.WorkflowState
-		Cursor   session.Cursor
-	}{settings, revision, workflow, p.store.CurrentCursor()}), Events: events}); err != nil {
-		p.mu.Unlock()
-		return fmt.Errorf("agent: persist settings/workflow: %w", err)
-	}
-	p.mu.Unlock()
-	return nil
-}
-
 func (p *Writer) PersistGoal(goal *protocol.Goal) error {
 	if p == nil {
 		return errors.New("agent: nil session persistence")

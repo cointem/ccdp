@@ -15,12 +15,14 @@ func toolKind(tool tools.Tool) permissions.ToolKind {
 		*tools.ReadSkillTool, *tools.CodeNavigateTool, *toolSearchTool, *tools.ReadOutputTool, *readProjectMemoryTool:
 		return permissions.KindRead
 	case *tools.TodoWriteTool, *tools.CreateGoalTool, *tools.GetGoalTool, *tools.UpdateGoalTool,
-		*enterPlanModeTool, *exitPlanModeTool, *askUserQuestionTool:
+		*askUserQuestionTool:
 		return permissions.KindState
 	case *tools.WriteTool, *tools.EditTool, *updateProjectMemoryTool:
 		return permissions.KindWrite
 	case *tools.BashTool:
 		return permissions.KindShell
+	case *tools.ComputerTool:
+		return permissions.KindComputer
 	case *tools.ProcessTool:
 		return permissions.KindProcess
 	case *tools.AgentTool:
@@ -32,9 +34,32 @@ func toolKind(tool tools.Tool) permissions.ToolKind {
 	}
 }
 
-func planAllowedImplementation(tool tools.Tool) bool { return toolKind(tool).PlanAllowed() }
-
 func readOnlyImplementation(tool tools.Tool) bool {
 	kind := toolKind(tool)
 	return kind == permissions.KindRead || kind == permissions.KindNetwork
+}
+
+// Process observations and cleanup do not grant authority to a new command.
+// The concrete implementation and its owner-scoped handle still gate access.
+func invocationKind(tool tools.Tool, args map[string]any) permissions.ToolKind {
+	if _, ok := tool.(*tools.ProcessTool); ok {
+		switch tools.StringArg(args, "action", "") {
+		case "read", "wait":
+			return permissions.KindProcessRead
+		case "stop":
+			return permissions.KindProcessStop
+		}
+	}
+	return toolKind(tool)
+}
+
+// These operate on runtime-owned state or already-owned process handles.
+// They remain available when project execution has been quarantined.
+func controlTool(tool tools.Tool, args map[string]any) bool {
+	switch tool.(type) {
+	case *tools.ReadOutputTool, *toolSearchTool:
+		return true
+	}
+	kind := invocationKind(tool, args)
+	return kind == permissions.KindState || kind == permissions.KindProcessRead || kind == permissions.KindProcessStop
 }

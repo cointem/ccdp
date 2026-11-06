@@ -15,7 +15,7 @@ JSON.stringify = () => "corrupt";
 globalThis.Promise = null;
 const result = await tools.Read({});
 text([Object.getPrototypeOf(result.data) === Object.prototype, result.data.value]);
-`, map[string]Binding{"Read": {ReadOnly: true, Run: func(context.Context, int, map[string]any) Result {
+`, map[string]Binding{"Read": {Concurrent: func(map[string]any) bool { return true }, Run: func(context.Context, int, map[string]any) Result {
 		return Result{Status: "success", Data: json.RawMessage(`{"value":"JS-owned"}`)}
 	}}})
 	if err != nil || len(s.Outputs) != 1 || string(s.Outputs[0]) != `[true,"JS-owned"]` {
@@ -24,16 +24,18 @@ text([Object.getPrototypeOf(result.data) === Object.prototype, result.data.value
 }
 
 func TestGojaMemoryBudget(t *testing.T) {
+	ctx := testWorkerContext(t, context.Background())
 	start := time.Now()
-	_, err := runTest(t, `const held=[]; while(true) held.push(new Uint8Array(4*1024*1024));`, nil)
+	_, err := Run(ctx, Options{Code: `const held=[]; while(true) held.push(new Uint8Array(4*1024*1024));`, Timeout: 10 * time.Second})
 	if err == nil || !strings.Contains(err.Error(), "memory budget") || time.Since(start) > 8*time.Second {
 		t.Fatalf("worker did not report memory exhaustion: %v (%s)", err, time.Since(start))
 	}
 }
 
 func TestGojaMicrotasksCannotResetExecutionBudget(t *testing.T) {
+	ctx := testWorkerContext(t, context.Background())
 	start := time.Now()
-	_, err := runTest(t, `while(true) await Promise.resolve();`, nil)
+	_, err := Run(ctx, Options{Code: `while(true) await Promise.resolve();`, Timeout: 10 * time.Second})
 	if err == nil || !strings.Contains(err.Error(), "execution limit") || time.Since(start) > 8*time.Second {
 		t.Fatalf("microtask loop escaped budget: %v (%s)", err, time.Since(start))
 	}

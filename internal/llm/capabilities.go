@@ -154,13 +154,6 @@ func AdmitRequest(provider Provider, req CompletionRequest) (RequestBudget, erro
 	return budget, nil
 }
 
-// ValidateRequest is the error-only form of AdmitRequest for callers that do
-// not need the accounting details.
-func ValidateRequest(provider Provider, req CompletionRequest) error {
-	_, err := AdmitRequest(provider, req)
-	return err
-}
-
 // EstimateRequestBudget counts every model-visible wire contribution. The
 // estimate is intentionally conservative and provider-neutral: text uses the
 // existing character/rune heuristic, structured values are encoded once so
