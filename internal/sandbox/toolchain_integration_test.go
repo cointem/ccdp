@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"ccdp/internal/execution"
-	"ccdp/internal/sandbox"
+	"ccdp/internal/testenv"
 )
 
 // TestSeatbeltInstalledToolchains smoke-tests only tools installed on this
@@ -27,7 +27,7 @@ func TestSeatbeltInstalledToolchains(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main\nfunc main() { println(\"seatbelt-go-ok\") }\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sb := sandbox.New(workspace)
+	sb := testenv.Sandbox(t, workspace)
 	// Reuse the already-authorized workspace as the child HOME, TMPDIR, and
 	// tool cache root. The integration policy does not grant the host temp root.
 	sb.SetScratchDir(workspace)
@@ -97,7 +97,7 @@ func TestSeatbeltRustcUsesPrivateScratch(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workspace, "main.rs"), []byte("fn main() { println!(\"seatbelt-rust-ok\"); }\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	sb := sandbox.New(workspace)
+	sb := testenv.Sandbox(t, workspace)
 	sb.SetScratchDir(scratch)
 	command := fmt.Sprintf("%q --edition 2021 main.rs -o \"$TMPDIR/rust-test\" && \"$TMPDIR/rust-test\"", compilers[0])
 	result, err := execution.Run(execution.Request{Context: context.Background(), Command: command, Dir: workspace, Sandbox: sb, Timeout: 30 * time.Second})

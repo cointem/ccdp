@@ -52,10 +52,6 @@ func (s *MemoryStore) CurrentCursor() Cursor {
 	return s.state.Cursor
 }
 
-// PersistenceEnabled is useful for status bars; memory mode intentionally
-// does not claim that a receipt survived a process exit.
-func (s *MemoryStore) PersistenceEnabled() bool { return false }
-
 func (s *MemoryStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

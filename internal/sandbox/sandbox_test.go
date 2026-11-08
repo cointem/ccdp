@@ -1,11 +1,9 @@
 package sandbox
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -259,37 +257,6 @@ func TestCheckInteractive(t *testing.T) {
 	for _, ok := range []string{"go build ./...", "git status", "git read-tree HEAD", "echo hi"} {
 		if err := CheckInteractive(ok); err != nil {
 			t.Errorf("expected allow for %q: %v", ok, err)
-		}
-	}
-}
-
-func TestProfileShellSelectorExceptionIsExact(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("Darwin Seatbelt profile only")
-	}
-	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
-		t.Skip("sandbox-exec not available")
-	}
-	s := New(t.TempDir())
-	s.AddDisallowedDir("/private/var")
-	profile, err := s.Profile()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := `(allow file-read* (require-all (literal "/private/var/select/sh")`
-	if !strings.Contains(profile, want) {
-		t.Fatalf("Seatbelt profile lacks exact shell selector read exception: %s", profile)
-	}
-	if !strings.Contains(profile, "(allow file-read*)\n") {
-		t.Fatal("Seatbelt profile did not grant default host reads")
-	}
-	if !strings.Contains(profile, `(deny file-read* file-write* (subpath "/private/var"))`) {
-		t.Fatal("explicitly denied directory was not excluded from broad reads")
-	}
-	for _, root := range [...]string{"/bin", "/usr/bin", "/sbin", "/usr/sbin"} {
-		want := fmt.Sprintf(`(allow file-read-metadata file-test-existence (require-all (subpath "%s")`, root)
-		if !strings.Contains(profile, want) {
-			t.Fatalf("Seatbelt profile lacks narrow PATH lookup rule for %s: %s", root, profile)
 		}
 	}
 }

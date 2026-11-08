@@ -17,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"ccdp/internal/executable"
 	"ccdp/internal/netguard"
 	"ccdp/internal/sandbox"
 )
@@ -126,7 +125,6 @@ func StartArgv(req StartRequest) (*Process, error) {
 		return nil, err
 	}
 	argv := append([]string(nil), req.Argv...)
-	addExecutionReadRoots(policy, argv, "", req.Dir, procEnv)
 	profile, err := processProfile(policy, argv, req.readOnlyQuery)
 	if err != nil {
 		cleanupScratch()
@@ -167,7 +165,6 @@ func StartShell(ctx context.Context, command, dir string, env []string, policy *
 	if err != nil {
 		return nil, err
 	}
-	addExecutionReadRoots(policy, nil, command, dir, procEnv)
 	prepared, err := sandbox.PrepareCommandContext(ctx, policy, command)
 	if err != nil {
 		cleanupScratch()
@@ -301,7 +298,6 @@ func Run(req Request) (Result, error) {
 	}
 	argv := append([]string(nil), req.Argv...)
 	defer cleanupScratch()
-	addExecutionReadRoots(policy, argv, req.Command, req.Dir, procEnv)
 	var cmd *Process
 	if len(req.Argv) > 0 {
 		if argv[0] == "" {
@@ -679,229 +675,9 @@ func applyArgvLimits(policy *sandbox.Sandbox, argv []string) []string {
 	return append(wrapped, argv...)
 }
 
-func addExecutionReadRoots(policy *sandbox.Sandbox, argv []string, command, dir string, env []string) {
-	if policy == nil {
-		return
-	}
-	searchPath := os.Getenv("PATH")
-	for _, entry := range env {
-		if strings.HasPrefix(entry, "PATH=") {
-			searchPath = strings.TrimPrefix(entry, "PATH=")
-			break
-		}
-	}
-	var names []string
-	if len(argv) > 0 {
-		names = append(names, argv[0])
-	} else {
-		names = shellCommandNames(command)
-	}
-	for _, name := range names {
-		path := resolveExecutable(name, searchPath, dir)
-		if path == "" {
-			continue
-		}
-		if root := executableReadRoot(path, policy.Workspace); root != "" {
-			policy.AddExecutionReadRoot(root)
-		}
-	}
-}
-
-func resolveExecutable(name, searchPath, dir string) string {
-	path, _ := executable.Resolve(name, searchPath, dir)
-	return path
-}
-
-func executableReadRoot(executable, workspace string) string {
-	executable = filepath.Clean(executable)
-	if workspace != "" && withinPath(workspace, executable) {
-		return ""
-	}
-	for _, root := range []string{"/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/lib", "/System"} {
-		if withinPath(root, executable) {
-			return ""
-		}
-	}
-	for _, root := range []string{"/usr/local/go", "/Library/Developer/CommandLineTools/usr"} {
-		if withinPath(root, executable) {
-			return root
-		}
-	}
-	if root := pythonFrameworkVersionRoot(executable); root != "" {
-		return root
-	}
-	parts := strings.Split(filepath.ToSlash(executable), "/")
-	for i := 0; i+2 < len(parts); i++ {
-		if parts[i] == "Cellar" && parts[i+1] != "" && parts[i+2] != "" {
-			return filepath.FromSlash(strings.Join(parts[:i+3], "/"))
-		}
-	}
-	for i := 0; i+3 < len(parts); i++ {
-		if parts[i] == ".nvm" && parts[i+1] == "versions" && parts[i+2] == "node" {
-			return filepath.FromSlash(strings.Join(parts[:i+4], "/"))
-		}
-		if parts[i] == ".pyenv" && parts[i+1] == "versions" {
-			return filepath.FromSlash(strings.Join(parts[:i+3], "/"))
-		}
-		if parts[i] == ".rustup" && parts[i+1] == "toolchains" {
-			return filepath.FromSlash(strings.Join(parts[:i+3], "/"))
-		}
-	}
-	for _, root := range []string{
-		"/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain",
-		"/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs",
-	} {
-		if withinPath(root, executable) {
-			return root
-		}
-	}
-	// For an unfamiliar user-installed executable, grant only that binary's
-	// read/execute path. Its containing directory may hold unrelated user data.
-	return executable
-}
-
-func pythonFrameworkVersionRoot(executable string) string {
-	parts := strings.Split(filepath.ToSlash(filepath.Clean(executable)), "/")
-	for i := 0; i+3 < len(parts); i++ {
-		if parts[i] == "Python3.framework" && parts[i+1] == "Versions" && parts[i+2] != "" {
-			return filepath.FromSlash(strings.Join(parts[:i+3], "/"))
-		}
-	}
-	return ""
-}
-
 func withinPath(root, child string) bool {
 	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(child))
 	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
-}
-
-func shellCommandNames(command string) []string {
-	var segments []string
-	var b strings.Builder
-	quote := rune(0)
-	escaped := false
-	flush := func() {
-		if segment := strings.TrimSpace(b.String()); segment != "" {
-			segments = append(segments, segment)
-		}
-		b.Reset()
-	}
-	for _, r := range command {
-		if escaped {
-			b.WriteRune(r)
-			escaped = false
-			continue
-		}
-		if r == '\\' && quote != '\'' {
-			b.WriteRune(r)
-			escaped = true
-			continue
-		}
-		if quote != 0 {
-			b.WriteRune(r)
-			if r == quote {
-				quote = 0
-			}
-			continue
-		}
-		if r == '\'' || r == '"' {
-			quote = r
-			b.WriteRune(r)
-			continue
-		}
-		if r == ';' || r == '&' || r == '|' || r == '\n' || r == '(' || r == ')' {
-			flush()
-			continue
-		}
-		b.WriteRune(r)
-	}
-	flush()
-
-	var names []string
-	for _, segment := range segments {
-		words := shellWords(segment)
-		for i := 0; i < len(words); i++ {
-			word := words[i]
-			if word == "" || strings.Contains(word, "=") && !strings.Contains(word, "/") && !strings.HasPrefix(word, "=") {
-				continue
-			}
-			if shellKeywordOrBuiltin(word) {
-				if word == "command" || word == "exec" || word == "builtin" {
-					continue
-				}
-				if word == "then" || word == "else" || word == "do" || word == "!" {
-					continue
-				}
-				break
-			}
-			names = append(names, word)
-			if word == "env" || word == "nice" || word == "nohup" || word == "time" || word == "timeout" {
-				continue
-			}
-			break
-		}
-	}
-	return names
-}
-
-func shellKeywordOrBuiltin(word string) bool {
-	switch word {
-	case "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "in", "function", "!",
-		"cd", "echo", "printf", "export", "readonly", "local", "set", "unset", "shift", "read", "test", "[", ":", "true", "false", "ulimit", "umask", "wait", "jobs", "break", "continue", "return", "exit", "source", ".":
-		return true
-	default:
-		return false
-	}
-}
-
-func shellWords(segment string) []string {
-	var words []string
-	var b strings.Builder
-	quote := rune(0)
-	escaped := false
-	active := false
-	flush := func() {
-		if active {
-			words = append(words, b.String())
-			b.Reset()
-			active = false
-		}
-	}
-	for _, r := range segment {
-		if escaped {
-			b.WriteRune(r)
-			active = true
-			escaped = false
-			continue
-		}
-		if r == '\\' && quote != '\'' {
-			escaped = true
-			active = true
-			continue
-		}
-		if quote != 0 {
-			if r == quote {
-				quote = 0
-			} else {
-				b.WriteRune(r)
-			}
-			active = true
-			continue
-		}
-		if r == '\'' || r == '"' {
-			quote = r
-			active = true
-			continue
-		}
-		if r == ' ' || r == '\t' || r == '\r' {
-			flush()
-			continue
-		}
-		b.WriteRune(r)
-		active = true
-	}
-	flush()
-	return words
 }
 
 // RunArgv executes argv without interpreting caller-provided values as shell

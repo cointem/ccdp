@@ -22,10 +22,43 @@ func TestPreparedDevelopmentToolchains(t *testing.T) {
 	scratch := t.TempDir()
 	policy.AddScratchDir(scratch)
 	fixtures := map[string]string{
-		"go.mod":        "module example.com/ccdp-sandbox-test\n\ngo 1.27.0\n",
-		"smoke_test.go": "package smoke\nimport(\"net\";\"testing\")\nfunc TestLocal(t *testing.T){l,e:=net.Listen(\"tcp\",\"127.0.0.1:0\");if e!=nil{t.Fatal(e)};l.Close()}\n",
-		"package.json":  `{"name":"sandbox-smoke","version":"1.0.0","scripts":{"test":"node smoke.cjs"}}`,
-		"smoke.cjs":     `require('http').createServer((q,r)=>r.end('ok')).listen(0,'127.0.0.1',function(){ console.log('node-ok'); this.close(); });`,
+		"go.mod": "module example.com/ccdp-sandbox-test\n\ngo 1.27.0\n",
+		"smoke_test.go": `package smoke
+import (
+	"fmt"
+	"net"
+	"os/exec"
+	"syscall"
+	"testing"
+)
+func TestLocal(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil { t.Fatal(err) }
+	l.Close()
+}
+func TestChildSignals(t *testing.T) {
+	for _, detached := range []bool{false, true} {
+		for _, signal := range []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL} {
+			t.Run(fmt.Sprintf("detached=%t/signal=%d", detached, signal), func(t *testing.T) {
+				child := exec.Command("/bin/sleep", "2")
+				child.SysProcAttr = &syscall.SysProcAttr{Setsid: detached}
+				if err := child.Start(); err != nil { t.Fatal(err) }
+				// A finite lifetime also reclaims detached children under a broken policy.
+				defer func() { child.Process.Kill(); child.Wait() }()
+				if err := child.Process.Signal(syscall.Signal(0)); err != nil { t.Fatal(err) }
+				if signal == syscall.SIGKILL {
+					if err := child.Process.Kill(); err != nil { t.Fatal(err) }
+				} else if err := child.Process.Signal(signal); err != nil { t.Fatal(err) }
+				if err := child.Wait(); err == nil { t.Fatal("child exited without a signal") }
+				status := child.ProcessState.Sys().(syscall.WaitStatus)
+				if !status.Signaled() || status.Signal() != signal { t.Fatalf("exit status: %v", status) }
+			})
+		}
+	}
+}
+`,
+		"package.json": `{"name":"sandbox-smoke","version":"1.0.0","scripts":{"test":"node smoke.cjs"}}`,
+		"smoke.cjs":    `require('http').createServer((q,r)=>r.end('ok')).listen(0,'127.0.0.1',function(){ console.log('node-ok'); this.close(); });`,
 	}
 	for path, data := range fixtures {
 		if err := os.WriteFile(filepath.Join(root, path), []byte(data), 0600); err != nil {

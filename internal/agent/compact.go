@@ -223,14 +223,10 @@ func compactHistorySpans(history []messages.Message, keep, budget int) (head, to
 	return head, toSummarize, keptTail, lastTs, len(toSummarize) > 0
 }
 
-// commitCompaction rebuilds history as the leading facts plus a summary user
+// commitCompactionWithOutputs rebuilds history as the leading facts plus a summary user
 // message plus the kept tail, persists it (so an older full projection cannot
 // overwrite it), resets the token baseline, and publishes the compacted events
 // and post-compact hook.
-func (a *Agent) commitCompaction(hctx context.Context, head []messages.Message, summary string, keptTail []messages.Message, lastTs time.Time, keep int, source string) error {
-	return a.commitCompactionWithOutputs(hctx, head, summary, keptTail, lastTs, keep, source, nil, nil)
-}
-
 func (a *Agent) commitCompactionWithOutputs(hctx context.Context, head []messages.Message, summary string, keptTail []messages.Message, lastTs time.Time, keep int, source string, outputs []messages.OutputReference, check func([]messages.Message) error) error {
 	a.mu.Lock()
 	originalTokens := estimateHistoryTokens(a.historyLocked())

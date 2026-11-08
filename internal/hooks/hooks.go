@@ -518,14 +518,6 @@ func (m *Manager) PostCompact(ctx context.Context) Output {
 	return m.Run(ctx, EventPostCompact, nil)
 }
 
-// Notify runs the Notification hooks.
-func (m *Manager) Notify(ctx context.Context, text string) Output {
-	return m.Run(ctx, EventNotification, func(in *Input) {
-		in.Message = text
-		in.Input = text
-	})
-}
-
 // Stop runs the Stop hooks.
 func (m *Manager) Stop(ctx context.Context) Output {
 	return m.Run(ctx, EventStop, nil)

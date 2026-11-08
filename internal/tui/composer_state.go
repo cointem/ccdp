@@ -3,10 +3,12 @@ package tui
 import (
 	"ccdp/internal/protocol"
 	"github.com/charmbracelet/bubbles/textarea"
+	"time"
 )
 
 // composerState owns the state of its component within a session.
 type composerState struct {
+	lastEscape           time.Time
 	textarea             textarea.Model
 	clipboard            Clipboard
 	clipboardReader      ClipboardReader

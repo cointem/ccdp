@@ -539,27 +539,6 @@ func (s *Store) SelectPlan(p Plan, selection []string) (Plan, error) {
 	return s.SavePlan(p)
 }
 
-func (s *Store) LoadPlan(id string) (Plan, error) {
-	var p Plan
-	if !validID(id) {
-		return p, errors.New("invalid plan id")
-	}
-	b, e := s.get("plans/" + id + ".json")
-	if e != nil {
-		return p, e
-	}
-	if e = json.Unmarshal(b, &p); e != nil {
-		return p, e
-	}
-	p.ID = ""
-	raw, _ := json.Marshal(p)
-	p.ID = id
-	if digest(raw) != id {
-		return Plan{}, errors.New("corrupt plan")
-	}
-	return p, nil
-}
-
 // Materialize creates an independent copy. It never hardlinks workspace files.
 func (s *Store) Materialize(ctx context.Context, snap Snapshot, dest string) error {
 	root, e := os.OpenRoot(dest)

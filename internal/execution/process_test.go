@@ -3,11 +3,14 @@ package execution
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestProcessCompletionIsSharedAndClosesSignalEntry(t *testing.T) {
@@ -49,5 +52,34 @@ func TestAbandonedProcessClosesPreparedPipes(t *testing.T) {
 		if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
 			t.Fatal("pipe leaked", err)
 		}
+	}
+}
+
+func TestRunSignalsCannotReachHostProcess(t *testing.T) {
+	// This fixture is outside the workload sandbox. Never target a live user process.
+	host := exec.Command("/bin/sleep", "30")
+	if err := host.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = host.Process.Kill(); _ = host.Wait() }()
+	req := testRequest(t, Request{Context: context.Background(), Timeout: 5 * time.Second})
+	for _, signal := range []string{"0", "TERM", "KILL"} {
+		req.Command = fmt.Sprintf("kill -%s %d", signal, host.Process.Pid)
+		res, err := Run(req)
+		if err != nil || res.TimedOut || res.ExitCode == 0 || !strings.Contains(res.Output, "Operation not permitted") {
+			t.Fatalf("host signal %s: %+v %v", signal, res, err)
+		}
+	}
+}
+
+func TestRunCommandTimeoutCanSignalChild(t *testing.T) {
+	path, err := exec.LookPath("timeout")
+	if err != nil {
+		t.Skip("timeout is not installed")
+	}
+	res, err := Run(testRequest(t, Request{Context: context.Background(),
+		Command: QuoteArg(path) + " 0.2 /bin/sleep 10", Timeout: 5 * time.Second}))
+	if err != nil || res.TimedOut || res.ExitCode != 124 {
+		t.Fatalf("timeout could not terminate its child: %+v %v", res, err)
 	}
 }

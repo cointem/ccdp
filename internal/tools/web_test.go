@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"net"
-	"net/http"
 	"testing"
 )
 
@@ -56,24 +55,9 @@ func TestHTTPGetBlocksPrivateTarget(t *testing.T) {
 		"http://169.254.169.254/latest/meta-data/",
 		"http://localhost:9000/admin",
 	} {
-		if _, err := httpGet(context.Background(), raw); err == nil {
+		if _, _, _, _, err := httpGetDetails(context.Background(), raw); err == nil {
 			t.Errorf("expected httpGet to block %q", raw)
 		}
-	}
-}
-
-func TestCheckExternalRedirectBlocksPrivateHop(t *testing.T) {
-	target, _ := http.NewRequest(http.MethodGet, "http://169.254.169.254/latest/meta-data/", nil)
-	if err := checkExternalRedirect(target, nil); err == nil {
-		t.Error("redirect hop to the metadata service must be blocked")
-	}
-	target, _ = http.NewRequest(http.MethodGet, "http://127.0.0.1:8080/x", nil)
-	if err := checkExternalRedirect(target, nil); err == nil {
-		t.Error("redirect hop to loopback must be blocked")
-	}
-	ok, _ := http.NewRequest(http.MethodGet, "https://8.8.8.8/x", nil)
-	if err := checkExternalRedirect(ok, nil); err != nil {
-		t.Errorf("public redirect hop should pass: %v", err)
 	}
 }
 

@@ -179,7 +179,7 @@ type Config struct {
 	// pointer means "not set" (defaults to false; see GuardianEnabled).
 	EnableGuardian *bool `json:"enable_guardian"`
 
-	// EnableProjectMemory enables automatic durable notes (on by default).
+	// EnableProjectMemory enables automatic durable notes (off by default).
 	EnableProjectMemory bool   `json:"enable_project_memory"`
 	ProjectMemoryDir    string `json:"project_memory_dir"`
 	MemoryReadOnly      bool   `json:"memory_read_only"`
@@ -413,7 +413,6 @@ func defaultConfig() Config {
 		MaxParallelTools:        4,
 		MaxConcurrentAgents:     4,
 		ProjectMemoryDir:        filepath.Join(home, ".ccdp", "projects"),
-		EnableProjectMemory:     true,
 		CodeModeEnabled:         true,
 		Hooks:                   hooks.Config{},
 		EnableWebTools:          BoolPtr(true),

@@ -66,12 +66,6 @@ type Agent struct {
 	traceMu sync.Mutex
 }
 
-// AddDirectory grants the sandbox access to an extra directory at runtime.
-func (a *Agent) AddDirectory(dir string) { a.setDirectoryAccess(dir, false) }
-
-// AddDisallowedDirectory blocks a directory at runtime.
-func (a *Agent) AddDisallowedDirectory(dir string) { a.setDirectoryAccess(dir, true) }
-
 // syncHookContext keeps hook payloads and execution policy aligned with the
 // published agent state after mode, workspace, sandbox or session changes.
 func (a *Agent) syncHookContext() {

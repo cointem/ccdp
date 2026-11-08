@@ -23,6 +23,7 @@ import (
 func newMemoryProviderAgent(t *testing.T, p llm.Provider, history bool) *Agent {
 	t.Helper()
 	cfg := config.Default()
+	cfg.EnableProjectMemory = true
 	cfg.Workspace, cfg.SessionDir, cfg.ProjectMemoryDir = t.TempDir(), t.TempDir(), t.TempDir()
 	cfg.MemoryHistory, cfg.Model, cfg.PermissionMode = history, "memory-test", string(permissions.ModeAuto)
 	cfg.MaxTurns = 4

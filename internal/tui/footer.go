@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -154,6 +155,8 @@ func (m *Model) footerHints() string {
 			return "⌃C again to exit"
 		}
 		return "⌃C again to exit · any other key to continue"
+	case !m.lastEscape.IsZero() && time.Since(m.lastEscape) <= doubleEscapeInterval:
+		return "esc again to clear"
 	case len(m.cmdSug) > 0:
 		if narrow {
 			return "↑↓ choose · tab · esc"
@@ -165,6 +168,9 @@ func (m *Model) footerHints() string {
 		}
 		return "↑↓ choose · tab/enter complete · esc close"
 	case m.busy:
+		if m.hasInputDraft() {
+			return "enter steer · tab queue · ⌃c interrupt"
+		}
 		return "enter steer · tab queue · esc interrupt"
 	}
 	if narrow {
@@ -176,7 +182,7 @@ func (m *Model) footerHints() string {
 		// discoverable without consulting /help.
 		hints += " · ⌃t tasks"
 	}
-	if m.routing != nil && m.sessionID != m.routing.rootID {
+	if m.routing != nil && m.sessionID != m.routing.rootID && !m.hasInputDraft() {
 		// A child view with siblings advertises quick-switch so the cycling keys
 		// are discoverable without opening /agents.
 		if _, total := m.agentOrdinal(); total > 1 {

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strings"
@@ -29,7 +30,7 @@ func TestGitHubStatusNoRepo(t *testing.T) {
 	ag := newGithubAgent(t, t.TempDir())
 	defer ag.Close()
 
-	out := ag.GitHubStatus()
+	out := ag.GitHubStatusContext(context.Background())
 	if !strings.Contains(out, "no origin remote") {
 		t.Errorf("status missing remote line: %s", out)
 	}
@@ -47,7 +48,7 @@ func TestGitHubStatusHasRemote(t *testing.T) {
 	ag := newGithubAgent(t, dir)
 	defer ag.Close()
 
-	out := ag.GitHubStatus()
+	out := ag.GitHubStatusContext(context.Background())
 	if !strings.Contains(out, "https://github.com/example/repo.git") {
 		t.Errorf("status missing remote: %s", out)
 	}
@@ -56,17 +57,7 @@ func TestGitHubStatusHasRemote(t *testing.T) {
 	}
 }
 
-func TestPRCommentsNoRepo(t *testing.T) {
-	ag := newGithubAgent(t, t.TempDir())
-	defer ag.Close()
-
-	out := ag.PRComments()
-	if !strings.Contains(out, "not on a branch") {
-		t.Errorf("expected 'not on a branch': %s", out)
-	}
-}
-
-func TestPRQueriesUseBranchPositionArgument(t *testing.T) {
+func TestGitHubStatusUsesBranchPositionArgument(t *testing.T) {
 	dir := t.TempDir()
 	git(t, dir, "init", "-q")
 	git(t, dir, "checkout", "-q", "-b", "feature-test")
@@ -75,7 +66,7 @@ func TestPRQueriesUseBranchPositionArgument(t *testing.T) {
 	if err := os.Mkdir(bin, 0755); err != nil {
 		t.Fatal(err)
 	}
-	script := "#!/bin/sh\ncase \"$*\" in\n'pr view --comments feature-test') echo comments;;\n'pr view --json url --jq .url feature-test') echo https://github.com/example/repo/pull/1;;\n'--version'|'auth status') echo ok;;\n*) echo wrong-argv >&2; exit 1;;\nesac\n"
+	script := "#!/bin/sh\ncase \"$*\" in\n\n'pr view --json url --jq .url feature-test') echo https://github.com/example/repo/pull/1;;\n'--version'|'auth status') echo ok;;\n*) echo wrong-argv >&2; exit 1;;\nesac\n"
 	if err := os.WriteFile(bin+"/gh", []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -84,10 +75,7 @@ func TestPRQueriesUseBranchPositionArgument(t *testing.T) {
 	defer a.Close()
 	a.services.perms.SetMode(permissions.ModeAuto)
 	a.services.sandbox.SetAllowNetwork(true)
-	if got := a.PRComments(); got != "comments" {
-		t.Fatalf("comments: %s", got)
-	}
-	if got := a.GitHubStatus(); !strings.Contains(got, "pr: https://github.com/example/repo/pull/1") {
+	if got := a.GitHubStatusContext(context.Background()); !strings.Contains(got, "pr: https://github.com/example/repo/pull/1") {
 		t.Fatalf("status: %s", got)
 	}
 }
@@ -171,7 +159,7 @@ func TestGitHubStatusSurfacesGHFailure(t *testing.T) {
 	ag.services.perms.SetMode(permissions.ModeAuto)
 	ag.services.sandbox.SetAllowNetwork(true)
 
-	out := ag.GitHubStatus()
+	out := ag.GitHubStatusContext(context.Background())
 	if !strings.Contains(out, "gh: unavailable") || !strings.Contains(out, "forbidden") {
 		t.Fatalf("GitHub status hid gh failure: %s", out)
 	}

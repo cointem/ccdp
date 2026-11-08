@@ -31,21 +31,17 @@ type Sandbox struct {
 	SingleUse       bool   `json:"-"`
 	QuarantineStore string `json:"-"`
 
-	AdditionalDirs   []string
-	ReadOnlyDirs     []string
-	DisallowedDirs   []string
-	CredentialDirs   []string
-	PrivateRoots     []string
-	ArtifactRoots    []string
-	RuntimeReadFiles []string
-	ProtectedDirs    []string
-	ProtectedEntries []string
-	ScratchDirs      []string
-	CacheDir         string
-	// ExecutionReadRoots are narrow, invocation-specific install roots needed
-	// to load the selected executable and its bundled runtime files. They are
-	// derived by execution and are not persistent user directory grants.
-	ExecutionReadRoots      []string
+	AdditionalDirs          []string
+	ReadOnlyDirs            []string
+	DisallowedDirs          []string
+	CredentialDirs          []string
+	PrivateRoots            []string
+	ArtifactRoots           []string
+	RuntimeReadFiles        []string
+	ProtectedDirs           []string
+	ProtectedEntries        []string
+	ScratchDirs             []string
+	CacheDir                string
 	Limits                  *Limits
 	NetworkProxy            string
 	AllowNetwork            bool
@@ -376,7 +372,7 @@ func (s *Sandbox) Snapshot() *Sandbox {
 		DisallowedDirs: append([]string(nil), s.DisallowedDirs...), ProtectedDirs: append([]string(nil), s.ProtectedDirs...),
 		CredentialDirs:   append([]string(nil), s.CredentialDirs...),
 		ProtectedEntries: append([]string(nil), s.ProtectedEntries...),
-		ScratchDirs:      append([]string(nil), s.ScratchDirs...), CacheDir: s.CacheDir, ExecutionReadRoots: append([]string(nil), s.ExecutionReadRoots...),
+		ScratchDirs:      append([]string(nil), s.ScratchDirs...), CacheDir: s.CacheDir,
 		AllowNetwork: s.AllowNetwork, NetworkProxy: s.NetworkProxy,
 		LocalServices: append([]LocalService(nil), s.LocalServices...),
 	}
@@ -532,26 +528,6 @@ func (s *Sandbox) AddLocalService(service LocalService) error {
 	s.LocalServices = append(s.LocalServices, service)
 	s.Revision++
 	return nil
-}
-
-// AddExecutionReadRoot adds a per-invocation runtime root on a detached policy
-// snapshot. It deliberately does not change the durable policy revision.
-func (s *Sandbox) AddExecutionReadRoot(dir string) {
-	if s == nil {
-		return
-	}
-	abs := s.absDir(dir)
-	if abs == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, existing := range s.ExecutionReadRoots {
-		if existing == abs {
-			return
-		}
-	}
-	s.ExecutionReadRoots = append(s.ExecutionReadRoots, abs)
 }
 
 func (s *Sandbox) addRoot(target *[]string, dir string) {
@@ -960,7 +936,6 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	protected := append([]string(nil), s.ProtectedDirs...)
 	protectedEntries := append([]string(nil), s.ProtectedEntries...)
 	scratch := s.privateWritableRootsLocked()
-	executionReadRoots := append([]string(nil), s.ExecutionReadRoots...)
 	allowNetwork := s.AllowNetwork
 	localDevelopment := s.LocalDevelopmentNetwork
 	localServices := append([]LocalService(nil), s.LocalServices...)
@@ -979,7 +954,7 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	protected = cleanRoots(protected)
 	protectedEntries = cleanRoots(protectedEntries)
 	scratch = canonicalRoots(scratch)
-	executionReadRoots = canonicalRoots(executionReadRoots)
+	artifactRoots = canonicalRoots(artifactRoots)
 
 	var b strings.Builder
 	b.WriteString("(version 1)\n(deny default)\n(import \"system.sb\")\n")
@@ -987,11 +962,9 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	// explicit deny applies. Write access remains limited to authorized roots.
 	b.WriteString("(allow file-read*)\n")
 	for _, root := range disallowed {
-		fmt.Fprintf(&b, "(deny file-read* file-write* (literal %s))\n", sbplQuote(root))
 		fmt.Fprintf(&b, "(deny file-read* file-write* (subpath %s))\n", sbplQuote(root))
 	}
 	for _, root := range protected {
-		fmt.Fprintf(&b, "(deny file-write* (literal %s))\n", sbplQuote(root))
 		fmt.Fprintf(&b, "(deny file-write* (subpath %s))\n", sbplQuote(root))
 		fmt.Fprintf(&b, "(deny file-write-unlink (regex #\"^%s$\"))\n", sbplRegexEscape(root))
 	}
@@ -999,43 +972,22 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 		fmt.Fprintf(&b, "(deny file-write-unlink (regex #\"^%s$\"))\n", sbplRegexEscape(entry))
 	}
 	for _, root := range readOnly {
-		fmt.Fprintf(&b, "(deny file-write* (literal %s))\n", sbplQuote(root))
 		fmt.Fprintf(&b, "(deny file-write* (subpath %s))\n", sbplQuote(root))
 	}
 	writeDenied := append(append(append([]string(nil), disallowed...), protected...), readOnly...)
 	writableRoots := append(append([]string{workspace}, additional...), scratch...)
-	fmt.Fprintf(&b, "(allow file-read* (require-all (literal %s)%s))\n", sbplQuote("/private/var/select/sh"), sbplDenyPredicates(disallowed))
-
-	for _, root := range append(toolchainRoots(), executionReadRoots...) {
-		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
-	}
-	for _, root := range []string{"/bin", "/usr/bin", "/sbin", "/usr/sbin"} {
-		fmt.Fprintf(&b, "(allow file-read-metadata file-test-existence (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
-	}
-	// Keep exact-ancestor metadata checks for paths used by the execution
-	// adapter. Broad reads already permit directory inspection; these rules
-	// make the intended traversal permissions explicit.
-	metadataRoots := append([]string{workspace}, additional...)
-	metadataRoots = append(metadataRoots, readOnly...)
-	metadataRoots = append(metadataRoots, scratch...)
-	metadataRoots = append(metadataRoots, executionReadRoots...)
-	for _, parent := range exactAncestors(metadataRoots) {
-		fmt.Fprintf(&b, "(allow file-read-metadata file-test-existence (require-all (literal %s)%s))\n", sbplQuote(parent), sbplDenyPredicates(disallowed))
-	}
-	for _, root := range append([]string{workspace}, additional...) {
-		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
-		if readOnlyExecutable == "" {
+	if readOnlyExecutable == "" {
+		for _, root := range append([]string{workspace}, additional...) {
 			fmt.Fprintf(&b, "(allow file-write* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(writeDenied))
 		}
 	}
-	for _, root := range readOnly {
-		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
-	}
 	for _, root := range scratch {
-		fmt.Fprintf(&b, "(allow file-read* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(disallowed))
 		fmt.Fprintf(&b, "(allow file-write* (require-all (subpath %s)%s))\n", sbplQuote(root), sbplDenyPredicates(writeDenied))
 	}
 	b.WriteString("(allow process-fork)\n")
+	// Child daemons and timeout wrappers must be able to probe and signal one
+	// another, including after setsid. Keep the host/runtime outside this scope.
+	b.WriteString("(allow signal (target same-sandbox))\n")
 	if readOnlyExecutable == "" {
 		b.WriteString("(allow process-exec)\n")
 	} else {
@@ -1076,10 +1028,9 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 		fmt.Fprintf(&b, "(deny file-write-unlink (require-all (literal %s) (vnode-type DIRECTORY)))\n", sbplQuote(root))
 	}
 	// Seatbelt rules are ordered. Private restrictions must also constrain
-	// broad workspace/toolchain grants above, including future sibling owners.
+	// default reads and workspace writes above, including future sibling owners.
 	for _, privateRoot := range privateRoots {
 		privateRoot = canonicalRoot(privateRoot)
-		artifactRoots = canonicalRoots(artifactRoots)
 		allowedRoots := append(append([]string(nil), artifactRoots...), scratch...)
 		var artifactParents []string
 		for _, parent := range exactAncestors(append(append([]string(nil), allowedRoots...), runtimeFiles...)) {
@@ -1157,23 +1108,6 @@ func protectedWritableAncestors(writableRoots, excludedRoots []string) []string 
 	}
 	sort.Strings(ancestors)
 	return ancestors
-}
-
-func toolchainRoots() []string {
-	var roots []string
-	for _, root := range []string{
-		"/usr/local/go",
-		"/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain",
-		"/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs",
-		"/Library/Developer/CommandLineTools",
-		"/Library/Developer/CommandLineTools/usr",
-		"/Library/Developer/CommandLineTools/SDKs",
-	} {
-		if info, err := os.Stat(root); err == nil && info.IsDir() {
-			roots = append(roots, canonicalRoot(root))
-		}
-	}
-	return roots
 }
 
 func canonicalRoot(path string) string {

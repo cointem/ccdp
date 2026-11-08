@@ -255,12 +255,6 @@ func rgIgnoreRoot(ctx *Context, base string) string {
 	return root
 }
 
-// readRgFile admits bounded auxiliary input, such as .gitignore contents.
-// Search files use streaming lines or explicitly report incomplete reads.
-func readRgFile(ctx *Context, path string) ([]byte, bool) {
-	return readRgFileLimit(ctx, path, ctx.readLimit())
-}
-
 var errRgReadLimit = errors.New("Rg file read limit exceeded")
 
 func readRgFileLimit(ctx *Context, path string, limit int) ([]byte, bool) {

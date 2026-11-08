@@ -104,9 +104,6 @@ func (a *Agent) handleOwnerControl(message ownerControl, preparing bool) {
 		close(message.done)
 	case auxiliaryFactPrepared:
 		replyOwned(a, message.result, a.commitAuxiliaryOwned(message))
-	case directoryAccessRequested:
-		a.setDirectoryAccessOwned(message)
-		close(message.done)
 	case turnStartRequested:
 		replyOwned(a, message.result, a.persistTurnStarted(message.turnID, message.stepID, message.inputID))
 	case closeStarted:

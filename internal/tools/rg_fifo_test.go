@@ -1,10 +1,10 @@
 package tools
 
 import (
-	"ccdp/internal/sandbox"
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -18,10 +18,15 @@ func TestRegressionRgFIFO(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := make(chan struct{})
-	go func() { readRgFile(&Context{Context: ctx, Sandbox: sandbox.New(root)}, path); close(done) }()
+	toolCtx := scopedTestContext(t, root)
+	toolCtx.Context = ctx
+	done := make(chan error, 1)
+	go func() { _, err := readRgFileDetailed(toolCtx, path, toolCtx.readLimit()); done <- err }()
 	select {
-	case <-done:
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("expected FIFO rejection, got: %v", err)
+		}
 		return
 	case <-time.After(200 * time.Millisecond):
 	}

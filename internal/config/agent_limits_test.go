@@ -37,7 +37,7 @@ func TestConcurrencyLimitsIndependentAndStrict(t *testing.T) {
 
 func TestProjectMemoryDefaultsAndProtectedStorage(t *testing.T) {
 	cfg := defaultConfig()
-	if !cfg.EnableProjectMemory || cfg.MemoryReadOnly || cfg.MemoryHistory || filepath.Base(cfg.ProjectMemoryDir) != "projects" {
+	if cfg.EnableProjectMemory || cfg.MemoryReadOnly || cfg.MemoryHistory || filepath.Base(cfg.ProjectMemoryDir) != "projects" {
 		t.Fatal("unexpected memory defaults")
 	}
 	cfg.Workspace = t.TempDir()

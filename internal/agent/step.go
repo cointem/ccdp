@@ -299,18 +299,9 @@ func (a *Agent) buildRequestForStepChecked(step stepRuntime) (llm.CompletionRequ
 	return a.buildRequestForStep(step), nil
 }
 
-// toolDefsSnapshot converts one registry view into provider-neutral wire
+// toolDefsSnapshotFromLease converts one registry view into provider-neutral wire
 // declarations. The discovered/deferred decision is copied before reading the
 // registry so the callback never re-enters Agent.mu.
-func (a *Agent) toolDefsSnapshot() []llm.ToolDef {
-	if a.services.registry == nil {
-		return nil
-	}
-	lease := a.services.registry.Acquire()
-	defer lease.Close()
-	return a.toolDefsSnapshotFromLease(lease)
-}
-
 func (a *Agent) toolDefsSnapshotFromLease(lease *tools.Lease) []llm.ToolDef {
 	if lease == nil {
 		return nil

@@ -399,7 +399,19 @@ func TestChildHooksApplyToEachIndependentLaunch(t *testing.T) {
 	// The hook log intentionally lives outside the child workspace. Grant that
 	// one temporary directory to the parent session sandbox used by lifecycle
 	// hooks instead of relying on a nil/unrestricted policy.
-	a.AddDirectory(filepath.Dir(hookFile))
+	cfg := a.configSnapshot()
+	policy := protocol.SandboxPolicy{
+		NetworkAccess: cfg.NetworkAccess, LocalDevelopmentNetwork: cfg.LocalDevelopmentNetwork,
+		AdditionalDirectories:         append(cfg.AdditionalDirectories, filepath.Dir(hookFile)),
+		AdditionalReadOnlyDirectories: cfg.AdditionalReadOnlyDirectories,
+		DisallowedDirectories:         cfg.DisallowedDirectories,
+	}
+	if receipt := a.applyCommand(protocol.Command{
+		ID: "hook-log-directory", SessionID: protocol.SessionID(a.SessionID()), Type: protocol.CommandSetSandboxPolicy,
+		SandboxPolicy: &protocol.SetSandboxPolicy{Policy: policy},
+	}); receipt.Rejected() {
+		t.Fatalf("grant hook log directory: %+v", receipt)
+	}
 	a.services.hooks = hooks.NewManager(hooks.Config{
 		hooks.EventSubagentStart: {{Command: `printf 'start\n' >> "$CCDP_TEST_HOOK_FILE"`}},
 		hooks.EventSubagentStop:  {{Command: `printf 'stop\n' >> "$CCDP_TEST_HOOK_FILE"`}},

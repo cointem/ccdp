@@ -55,47 +55,6 @@ func (a *Agent) commitAuxiliary(transactionID string, fact session.Event) (sessi
 	}
 }
 
-type directoryAccessRequested struct {
-	dir    string
-	denied bool
-	done   chan struct{}
-}
-
-func (directoryAccessRequested) ownerControlMessage() {}
-func (a *Agent) setDirectoryAccessOwned(r directoryAccessRequested) {
-	a.mu.Lock()
-	if a.services.sandbox != nil {
-		if r.denied {
-			a.services.sandbox.AddDisallowedDir(r.dir)
-		} else {
-			a.services.sandbox.AddDir(r.dir)
-		}
-	}
-	a.mu.Unlock()
-	if a.services.hooks != nil {
-		a.syncHookContext()
-	}
-	if r.denied {
-		a.emitStatus("disallowed directory: %s", r.dir)
-	} else {
-		a.emitStatus("additional directory: %s", r.dir)
-	}
-}
-func (a *Agent) setDirectoryAccess(dir string, denied bool) {
-	r := directoryAccessRequested{dir: dir, denied: denied, done: make(chan struct{})}
-
-	a.ensureRun()
-	select {
-	case a.owner.control <- r:
-	case <-a.owner.done:
-		return
-	}
-	select {
-	case <-r.done:
-	case <-a.owner.done:
-	}
-}
-
 type turnStartRequested struct {
 	turnID, stepID, inputID string
 	result                  chan error

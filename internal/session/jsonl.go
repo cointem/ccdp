@@ -298,8 +298,6 @@ func (s *JSONLStore) CurrentCursor() Cursor {
 	return s.state.Cursor
 }
 
-func (s *JSONLStore) PersistenceEnabled() bool { return true }
-
 func (s *JSONLStore) RecoveryReport() RecoveryReport {
 	s.mu.Lock()
 	defer s.mu.Unlock()

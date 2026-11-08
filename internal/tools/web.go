@@ -310,22 +310,6 @@ func isPrivateIP(ip net.IP) bool {
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
 
-// checkExternalRedirect is the http.Client CheckRedirect hook: every hop of a
-// redirect chain is re-validated, so a public URL can't bounce the fetch onto
-// an internal address.
-func checkExternalRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
-	}
-	return validateExternalURL(req.Context(), req.URL.String())
-}
-
-// httpGet performs a GET with a timeout, an SSRF address check (initial URL
-// and every redirect hop) and a browser-ish user agent.
-func httpGet(ctx context.Context, u string) ([]byte, error) {
-	b, _, _, _, e := httpGetDetails(ctx, u)
-	return b, e
-}
 func webProxy(ctx *Context) string {
 	if ctx.Sandbox == nil {
 		return ""

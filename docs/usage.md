@@ -37,7 +37,8 @@
 | `Enter` | 发送；运行中补充当前任务 |
 | `Tab` | 运行中将消息排到下一轮；补全菜单打开时优先补全 |
 | `Option+Enter` / `Ctrl+J` | 换行 |
-| `Ctrl+C` / `Esc` | 中断当前执行；空闲时连续两次 `Ctrl+C` 退出 |
+| `Esc` 连按两次 | 500 毫秒内清空当前草稿（文字和图片），不打断任务 |
+| `Ctrl+C` / 空输入时 `Esc` | 中断当前执行；空闲时连续两次 `Ctrl+C` 退出 |
 | `Shift+Tab` | 切换审批模式：auto ↔ manual |
 | `Ctrl+O` | 打开完整转录阅读器 |
 | `Ctrl+R` | 搜索输入历史 |
@@ -81,7 +82,7 @@ OpenAI 兼容服务和本地模型服务可通过 `base_url` 接入。实际支�
   "network_access": true,
   "max_parallel_tools": 4,
   "max_concurrent_agents": 4,
-  "enable_project_memory": true,
+  "enable_project_memory": false,
   "memory_read_only": false,
   "memory_history": false,
   "bash_timeout_seconds": 120,
@@ -117,6 +118,8 @@ OpenAI 兼容服务和本地模型服务可通过 `base_url` 接入。实际支�
 
 需要先规划时，直接在消息中要求先给方案即可。`always_deny` 优先于 `always_allow`；两种模式都遵守明确拒绝、只读子任务和沙箱边界。`Process.read`、`Process.wait`、`Process.stop` 只操作当前会话的已有句柄，无需新审批。`/git` 提供隔离执行的只读查询。
 
+同一命令及其后代进程可以相互发送信号，支持 `kill`、`kill(pid, 0)`、`timeout` 和测试框架回收自己启动的 daemon。跨命令管理后台服务时，用 `Bash(background=true)` 运行服务的前台模式，通过返回的句柄调用 `Process.stop`；任意宿主进程不在这个授权范围内。
+
 工作区默认可读写，外部主机文件默认只读；禁读目录、常见凭证目录、provider 配置和其他会话数据受保护。本地操作在独立执行环境中运行，不会自动退回无沙箱执行。
 
 外网访问默认开启，可用 `network_access: false` 关闭。新开发基线单独启用 `local_development_network`，允许本机 TCP 连接和动态端口监听；Unix socket 和本机 UDP 仍需单独边界。若使用本机 HTTP 代理，在用户配置中设置 `network_proxy`（例如 `http://127.0.0.1:7897`）或 `CCDP_NETWORK_PROXY`；项目配置只能收紧网络能力。用 `/add-dir <dir>` 增加读写目录，`/add-dir --read-only <dir>` 指定只读目录，`/sandbox` 查看环境状态。
@@ -129,7 +132,7 @@ OpenAI 兼容服务和本地模型服务可通过 `base_url` 接入。实际支�
 
 ## 记忆
 
-记忆默认开启，用于保存长期偏好、用户纠正和经过验证的经验。可以直接说“记住……”“把……改成……”“忘记……”。任务进度、猜测和密钥不应写入长期记忆。
+记忆默认关闭，可用 `/memory on` 开启。开启后用于保存长期偏好、用户纠正和经过验证的经验，可以直接说“记住……”“把……改成……”“忘记……”。任务进度、猜测和密钥不应写入长期记忆。
 
 默认写入项目范围，明确通用于所有项目的偏好才写用户范围。同一 Git 仓库的 worktree 共享项目记忆；子 Agent 通过父任务获得相关记忆，由父 Agent 检查后保存新经验。
 

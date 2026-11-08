@@ -9,9 +9,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"sort"
 	"strings"
+	"time"
 )
 
 const composerPlaceholder = "Ask CCDP to do anything"
+const doubleEscapeInterval = 500 * time.Millisecond
 
 // newTextarea builds the input textarea with ccdp's key bindings: Enter
 // submits (handled by handleKey), Alt+Enter / Ctrl+J insert a newline. Terminals
@@ -80,11 +82,38 @@ func (m *Model) syncInputHeight() {
 
 // handleKey routes key presses based on the current state.
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Bubble Tea decodes two ESC bytes in one read as Alt+Escape.
+	doubleEscape := msg.Type == tea.KeyEsc && msg.Alt
+	if doubleEscape {
+		msg.Alt = false
+	}
+	lastEscape := m.lastEscape
+	m.lastEscape = time.Time{}
 	if m.detail != nil {
 		return m.handleDetailKey(msg)
 	}
 	if model, cmd, handled := m.manager.Route(m, msg); handled {
 		return model, cmd
+	}
+	if msg.String() == "esc" {
+		m.quitArmed = false
+		m.pasteRequest = ""
+		if m.activePanel() == panelTasks {
+			m.tasksVisible = false
+			return m, nil
+		}
+		if m.showContextDetail {
+			m.showContextDetail = false
+			return m, nil
+		}
+		if m.hasInputDraft() {
+			now := time.Now()
+			if doubleEscape || !lastEscape.IsZero() && now.Sub(lastEscape) <= doubleEscapeInterval {
+				m.clearInputDraft()
+				return m, nil
+			}
+			m.lastEscape = now
+		}
 	}
 	// ctrl+o expands the transcript in the detail reader, matching the sibling
 	// CLIs' verbose-output shortcut. The agent catalog stays on /agents and the
@@ -357,12 +386,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "esc":
 		m.quitArmed = false
-		if m.activePanel() == panelTasks {
-			m.tasksVisible = false
-			return m, nil
-		}
-		if m.showContextDetail {
-			m.showContextDetail = false
+		if !m.lastEscape.IsZero() {
 			return m, nil
 		}
 		if m.routing != nil && m.sessionID != m.routing.rootID {
@@ -372,10 +396,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.requestInterrupt()
 		}
 		m.closeCmdSuggest()
-		// Esc dismisses temporary UI while preserving the root draft and its
-		// attachments. A pending clipboard request is cancelled by invalidating
-		// its token, so a late host result cannot resurrect an attachment.
-		m.pasteRequest = ""
 		return m, nil
 	}
 
@@ -394,6 +414,21 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.refreshCmdSuggest()
 	m.refreshFileMention()
 	return m, cmd
+}
+
+func (m *composerState) hasInputDraft() bool {
+	return m.textarea.Value() != "" || len(m.inputImages) > 0 || m.missingHistoryImages
+}
+
+func (m *Model) clearInputDraft() {
+	m.textarea.Reset()
+	m.inputImages, m.inputRetry, m.pasteFold = nil, nil, nil
+	m.selectedImage, m.missingHistoryImages = 0, false
+	m.historyIdx, m.historyDraft = len(m.history), nil
+	m.closeCmdSuggest()
+	m.closeFileMention()
+	m.syncInputHeight()
+	m.layout()
 }
 
 func (m *Model) cmdSuggestionPageSize() int {

@@ -12,30 +12,6 @@ import (
 	"ccdp/internal/permissions"
 )
 
-// GitHub integration commands (Claude Code's /github, /pr-comments and
-// /commit-push-pr). They shell out to the local git and gh CLIs in the
-// workspace; the user drives them explicitly from the TUI.
-
-// gitCmd runs git in the workspace and returns combined output + error.
-func (a *Agent) gitCmd(args ...string) (string, error) {
-	return a.localCommand(append([]string{"git"}, args...), false)
-}
-
-// ghCmd runs gh (GitHub CLI) in the workspace and returns combined output.
-func (a *Agent) ghCmd(args ...string) (string, error) {
-	return a.localCommand(append([]string{"gh"}, args...), true)
-}
-
-func (a *Agent) localCommand(argv []string, network bool) (string, error) {
-	a.mu.Lock()
-	ctx := a.lifecycle.rootCtx
-	a.mu.Unlock()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return a.localCommandContext(ctx, argv, network)
-}
-
 func (a *Agent) localCommandContext(ctx context.Context, argv []string, network bool) (string, error) {
 	if len(argv) == 0 {
 		return "", fmt.Errorf("empty command")
@@ -49,7 +25,7 @@ func (a *Agent) localCommandContext(ctx context.Context, argv []string, network 
 	perms := a.services.perms
 	a.mu.Unlock()
 	if !externalCommandReadOnly(argv) {
-		return "", fmt.Errorf("legacy GitHub helper only permits an explicitly read-only command")
+		return "", fmt.Errorf("GitHub status query only permits an explicitly read-only command")
 	}
 	command := strings.Join(argv, " ")
 	if perms != nil {
@@ -92,22 +68,6 @@ func (a *Agent) localCommandContext(ctx context.Context, argv []string, network 
 		return out, fmt.Errorf("%s exited %d", argv[0], res.ExitCode)
 	}
 	return out, nil
-}
-
-// currentBranch returns the checked-out branch name, or "" when detached or
-// when the directory is not a git repository.
-func (a *Agent) currentBranch() string {
-	branch, err := a.gitCmd("branch", "--show-current")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(branch)
-}
-
-// GitHubStatus reports the integration state: gh availability, origin remote,
-// current branch and whether the branch already has a PR (/github).
-func (a *Agent) GitHubStatus() string {
-	return a.GitHubStatusContext(context.Background())
 }
 
 // GitHubStatusContext is the bounded-query variant used by the protocol
@@ -170,20 +130,6 @@ func (a *Agent) GitHubStatusContext(ctx context.Context) string {
 		}
 	}
 	return strings.TrimRight(sb.String(), "\n")
-}
-
-// PRComments fetches the current PR's description and review comments
-// (Claude Code /pr-comments). Bounded to keep the TUI output readable.
-func (a *Agent) PRComments() string {
-	branch := a.currentBranch()
-	if branch == "" {
-		return "not on a branch — cannot find the current PR"
-	}
-	out, err := a.ghCmd("pr", "view", "--comments", branch)
-	if err != nil {
-		return fmt.Sprintf("GitHub CLI request failed for branch %s: %s", branch, commandDiagnostic(out, err))
-	}
-	return truncateUTF8(out, 8000)
 }
 
 func commandDiagnostic(output string, err error) string {

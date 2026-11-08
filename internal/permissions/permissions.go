@@ -317,12 +317,6 @@ func (m *Manager) HardDeny(toolName string, args map[string]any) (bool, string) 
 	return false, ""
 }
 
-// IsHardDenied is a compact bool-only helper for hooks and adapters.
-func (m *Manager) IsHardDenied(toolName string, args map[string]any) bool {
-	denied, _ := m.HardDeny(toolName, args)
-	return denied
-}
-
 // ValidatePermissionRule reports whether a rule is worth storing. It refuses
 // the over-broad "allow every Bash command" forms, which silently disable the
 // command gate. kind is "allow" or "deny".
