@@ -66,7 +66,8 @@ func TestCodingCLIUsesDurableOperation(t *testing.T) {
 		t.Fatal(e)
 	}
 	var out, err bytes.Buffer
-	code := runCodingCLI([]string{"index", "status", "-d", root, "--config-file", path, "--mode", "auto"}, &out, &err)
+	// A fresh workspace starts with its configured defaults, without a consent flag.
+	code := runCodingCLI([]string{"index", "status", "-d", root, "--config-file", path}, &out, &err)
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, err.String())
 	}

@@ -220,20 +220,10 @@ Flags:
 	}
 
 	var ag *agent.Agent
-	stdinInfo, _ := os.Stdin.Stat()
-	interactive := stdinInfo != nil && stdinInfo.Mode()&os.ModeCharDevice != 0 && *promptFlag == "" && *inputFormat != "stream-json" && goalCommand == nil
 	if *resumeFlag != "" {
 		snap, err := archive.Load(cfg.SessionDir, *resumeFlag)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: cannot resume session %q: %v\n", *resumeFlag, err)
-			os.Exit(1)
-		}
-		cfg, err = agent.ResolveResumeConfig(&cfg, snap)
-		if err == nil {
-			err = prepareDevelopmentEnvironment(&cfg, os.Stdin, os.Stderr, interactive)
-		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
 		ag, err = agent.Resume(&cfg, snap)
@@ -243,10 +233,6 @@ Flags:
 		}
 		fmt.Fprintf(os.Stderr, "resumed session %s\n", *resumeFlag)
 	} else {
-		if err := prepareDevelopmentEnvironment(&cfg, os.Stdin, os.Stderr, interactive); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
 		ag, err = agent.New(&cfg)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)

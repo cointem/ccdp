@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"ccdp/internal/agent"
@@ -91,18 +90,8 @@ func runCodingCLI(args []string, out, diagnostics io.Writer) int {
 		if err != nil {
 			return fail(err)
 		}
-		cfg, e = agent.ResolveResumeConfig(&cfg, snap)
-		if e == nil {
-			e = prepareDevelopmentEnvironment(&cfg, strings.NewReader(""), diagnostics, false)
-		}
-		if e != nil {
-			return fail(e)
-		}
 		a, e = agent.Resume(&cfg, snap)
 	} else {
-		if e = prepareDevelopmentEnvironment(&cfg, strings.NewReader(""), diagnostics, false); e != nil {
-			return fail(e)
-		}
 		a, e = agent.New(&cfg)
 	}
 	if e != nil {
