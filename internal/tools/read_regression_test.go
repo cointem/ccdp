@@ -43,7 +43,7 @@ func TestReadBeyondEOFPreservesCompleteSnapshot(t *testing.T) {
 	if _, err := runTool(t, NewReadTool(), ctx, map[string]any{"file_path": p, "offset": 2}); err == nil {
 		t.Fatal("accepted offset past EOF")
 	}
-	if _, err := runTool(t, NewWriteTool(), ctx, map[string]any{"file_path": p, "mode": "replace", "content": "replacement"}); err != nil {
+	if _, err := runTool(t, NewWriteTool(), ctx, map[string]any{"file_path": p, "content": "replacement"}); err != nil {
 		t.Fatal(err)
 	}
 }

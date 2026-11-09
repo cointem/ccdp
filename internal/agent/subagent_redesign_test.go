@@ -17,7 +17,7 @@ import (
 )
 
 func TestIsolatedWorkerDefaultCanWriteWithoutGit(t *testing.T) {
-	f := &fakeLLM{script: []string{"tool:Write|file_path=child.txt;mode=create;content=created", "tool:Bash|command=printf verified", "text:done"}}
+	f := &fakeLLM{script: []string{"tool:Write|file_path=child.txt;content=created", "tool:Bash|command=printf verified", "text:done"}}
 	a, _ := newTestAgent(t, f)
 	rows, err := runTestChildren(a, []childTask{{Description: "write and verify"}}, "worker")
 	if err != nil || len(rows) != 1 || rows[0].Error != "" {
@@ -49,7 +49,7 @@ func TestIsolatedWorkerDefaultCanWriteWithoutGit(t *testing.T) {
 }
 
 func TestExplorerCanReportButCannotWrite(t *testing.T) {
-	f := &fakeLLM{script: []string{"tool:Write|file_path=forbidden.txt;mode=create;content=bad", "tool:SendMessage|agent_id=parent;text=write is blocked", "tool:SendMessage|agent_id=parent;text=inspection complete", "text:reported"}}
+	f := &fakeLLM{script: []string{"tool:Write|file_path=forbidden.txt;content=bad", "tool:SendMessage|agent_id=parent;text=write is blocked", "tool:SendMessage|agent_id=parent;text=inspection complete", "text:reported"}}
 	a, _ := newTestAgent(t, f)
 	rows, err := runTestChildren(a, []childTask{{Description: "inspect", Role: "explorer"}}, "explorer")
 	if err != nil || rows[0].Error != "" {

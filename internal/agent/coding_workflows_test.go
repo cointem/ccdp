@@ -374,7 +374,7 @@ func TestReviewCancelledBeforeSnapshotHasVisibleResult(t *testing.T) {
 }
 
 func TestWriteChildIsIsolatedAndExplicitlyMerged(t *testing.T) {
-	f := &fakeLLM{script: []string{"tool:Read|file_path=a.txt", "tool:Write|file_path=a.txt;mode=replace;content=child change", "text:done"}}
+	f := &fakeLLM{script: []string{"tool:Read|file_path=a.txt", "tool:Write|file_path=a.txt;content=child change", "text:done"}}
 	a, _ := newTestAgent(t, f)
 	root := a.services.cfg.Workspace
 	git(t, root, "init", "-q")

@@ -81,7 +81,7 @@ func TestRegressionNoopWriteDoesNotBlockRewind(t *testing.T) {
 	if _, err = executeToolText(tools.NewReadTool(), toolCtx); err != nil {
 		t.Fatal(err)
 	}
-	toolCtx.Args = map[string]any{"file_path": "chosen.txt", "content": "base\n", "mode": "replace"}
+	toolCtx.Args = map[string]any{"file_path": "chosen.txt", "content": "base\n"}
 	if _, err = executeToolText(tools.NewWriteTool(), toolCtx); err != nil {
 		t.Fatal(err)
 	}

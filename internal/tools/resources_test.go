@@ -39,7 +39,7 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 	if _, err := executeToolText(NewReadTool(), aCtx); err != nil {
 		t.Fatalf("A Read: %v", err)
 	}
-	bCtx.Args = map[string]any{"file_path": aFile, "content": "B", "mode": "replace"}
+	bCtx.Args = map[string]any{"file_path": aFile, "content": "B"}
 	if _, err := executeToolText(NewWriteTool(), bCtx); err == nil || !strings.Contains(err.Error(), "has not been read") {
 		t.Fatalf("B used A's freshness state: %v", err)
 	}

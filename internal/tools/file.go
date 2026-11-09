@@ -209,10 +209,10 @@ type WriteTool struct{}
 func NewWriteTool() *WriteTool  { return &WriteTool{} }
 func (*WriteTool) Name() string { return "Write" }
 func (*WriteTool) Description() string {
-	return "Create a file (mode=create, default), or explicitly replace an existing file (mode=replace). Replacement requires a successful recent Read of the current file version; a partial Read is sufficient. For local changes use Edit."
+	return "Write a file, creating it if missing. Existing files must have been Read or written by this session and unchanged since then. A partial Read suffices; use Edit for local changes."
 }
 func (*WriteTool) Parameters() map[string]any {
-	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}, "mode": map[string]any{"default": "create", "type": "string", "enum": []string{"create", "replace"}}}, "required": []string{"file_path", "content"}}
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}}, "required": []string{"file_path", "content"}}
 }
 func (*WriteTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 	return executeFileWorker(ctx, "Write", args)
@@ -232,10 +232,6 @@ func executeWrite(ctx *Context, args map[string]any) (Result, error) {
 		if !ok {
 			return "", fmt.Errorf("Write: content must be explicitly supplied")
 		}
-		mode := StringArg(ctx.Args, "mode", "create")
-		if mode != "create" && mode != "replace" {
-			return "", fmt.Errorf("Write: mode must be create or replace")
-		}
 		path, e := ctx.ResolveWrite(raw)
 		if e != nil {
 			return "", e
@@ -250,18 +246,14 @@ func executeWrite(ctx *Context, args map[string]any) (Result, error) {
 		}
 		defer root.Close()
 		var expected *fsops.Version
-		if mode == "create" {
-			if _, e = root.Lstat(relative); e == nil {
-				return "", fmt.Errorf("Write: file exists; use mode=replace after Read, or Edit")
-			} else if !os.IsNotExist(e) {
-				return "", e
-			}
-		} else {
+		if _, e := root.Lstat(relative); e == nil {
 			v, e := state.ObservedVersion(path)
 			if e != nil {
 				return "", e
 			}
 			expected = &v
+		} else if !os.IsNotExist(e) {
+			return "", e
 		}
 		if ctx.BeforeWrite != nil {
 			finish, e := ctx.BeforeWrite(path, nil)
@@ -279,7 +271,7 @@ func executeWrite(ctx *Context, args map[string]any) (Result, error) {
 			return "", e
 		}
 		state.MarkVersion(path, version)
-		return fmt.Sprintf("%s: wrote %d bytes (%s)", path, len(content), mode), nil
+		return fmt.Sprintf("%s: wrote %d bytes", path, len(content)), nil
 	})
 }
 

@@ -68,7 +68,7 @@ func TestMergedWorkspaceRecoveryPreservesActiveAndChangedDirectories(t *testing.
 }
 
 func TestPartialChildMergeRetainsUnmergedWork(t *testing.T) {
-	f := &fakeLLM{script: []string{"tool:Read|file_path=a.txt", "tool:Write|file_path=a.txt;mode=replace;content=child a", "tool:Read|file_path=b.txt", "tool:Write|file_path=b.txt;mode=replace;content=child b", "text:done"}}
+	f := &fakeLLM{script: []string{"tool:Read|file_path=a.txt", "tool:Write|file_path=a.txt;content=child a", "tool:Read|file_path=b.txt", "tool:Write|file_path=b.txt;content=child b", "text:done"}}
 	a, _ := newTestAgent(t, f)
 	root := a.services.cfg.Workspace
 	git(t, root, "init", "-q")

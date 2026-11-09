@@ -45,7 +45,7 @@ func TestFileWorkerPreservesVersionAndMutationRecords(t *testing.T) {
 	if err := os.WriteFile(path, []byte("before\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := NewWriteTool().Execute(ctx, map[string]any{"file_path": path, "content": "bad", "mode": "replace"})
+	_, err := NewWriteTool().Execute(ctx, map[string]any{"file_path": path, "content": "bad"})
 	if err == nil || !strings.Contains(err.Error(), "not been read") {
 		t.Fatalf("unobserved replacement: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestFileWorkerPreservesVersionAndMutationRecords(t *testing.T) {
 		before++
 		return func() error { after++; return nil }, nil
 	}
-	if _, err := NewWriteTool().Execute(ctx, map[string]any{"file_path": path, "content": "after\n", "mode": "replace"}); err != nil {
+	if _, err := NewWriteTool().Execute(ctx, map[string]any{"file_path": path, "content": "after\n"}); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
@@ -70,7 +70,7 @@ func TestFileWorkerPreservesVersionAndMutationRecords(t *testing.T) {
 	if err := os.WriteFile(path, []byte("external\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewWriteTool().Execute(ctx, map[string]any{"file_path": path, "content": "stale", "mode": "replace"}); err == nil {
+	if _, err := NewWriteTool().Execute(ctx, map[string]any{"file_path": path, "content": "stale"}); err == nil {
 		t.Fatal("worker overwrote unseen version")
 	}
 	if _, err := (&LSTool{}).Execute(ctx, map[string]any{"path": root}); err != nil {

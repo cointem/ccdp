@@ -41,7 +41,7 @@ func TestDefaultReadOnlyTurnDoesNotCaptureWorkspace(t *testing.T) {
 }
 
 func TestDefaultWriteAndUndoOnlyCaptureChangedFiles(t *testing.T) {
-	a, events := newTestAgent(t, &fakeLLM{script: []string{"tool:Read|file_path=chosen.txt", "tool:Write|file_path=chosen.txt;mode=replace;content=agent\ntwo\nthree\n", "text:done"}})
+	a, events := newTestAgent(t, &fakeLLM{script: []string{"tool:Read|file_path=chosen.txt", "tool:Write|file_path=chosen.txt;content=agent\ntwo\nthree\n", "text:done"}})
 	root := a.services.cfg.Workspace
 	path := filepath.Join(root, "chosen.txt")
 	if err := os.WriteFile(path, []byte("one\ntwo\nthree\n"), 0644); err != nil {

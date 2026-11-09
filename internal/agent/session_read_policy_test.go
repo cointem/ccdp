@@ -49,7 +49,7 @@ func TestOtherSessionDataIsPrivate(t *testing.T) {
 				if out, err := executeToolText(tools.NewReadTool(), ctx); err == nil {
 					t.Fatalf("other session data was exposed: %q", out)
 				}
-				ctx.Args = map[string]any{"file_path": path, "mode": "replace", "content": "changed"}
+				ctx.Args = map[string]any{"file_path": path, "content": "changed"}
 				if _, err := executeToolText(tools.NewWriteTool(), ctx); err == nil {
 					t.Fatal("session state became writable")
 				}

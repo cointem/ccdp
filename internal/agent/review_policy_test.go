@@ -57,7 +57,7 @@ func TestReviewUsesTaskPolicyAndAdmission(t *testing.T) {
 		}
 		// Interactive reviews may request additional authority through the same
 		// approval flow as tasks; this must not silently grant it.
-		call = messages.ToolCall{Name: "Write", Arguments: map[string]any{"file_path": path, "content": "changed", "mode": "replace"}}
+		call = messages.ToolCall{Name: "Write", Arguments: map[string]any{"file_path": path, "content": "changed"}}
 		tool, _ := child.services.registry.Get("Write")
 		_, requested, _, err := child.toolCapabilityPolicy(call, tool)
 		if err != nil || len(requested) != 1 || requested[0].Kind != "directory" {

@@ -47,24 +47,38 @@ func TestEditValidatesWholeBatch(t *testing.T) {
 		}
 	}
 }
-func TestReplaceChecksOriginalBytesAndCreateDoesNotOverwrite(t *testing.T) {
+func TestWriteRequiresCurrentVersion(t *testing.T) {
 	ctx := freshCtx(t)
 	p := filepath.Join(ctx.WorkingDir, "a")
-	os.WriteFile(p, []byte("old\n"), 0600)
-	if _, e := runTool(t, NewWriteTool(), ctx, map[string]any{"file_path": p, "content": "new"}); e == nil {
-		t.Fatal("create overwrote")
+	if err := os.WriteFile(p, []byte("old\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	args := map[string]any{"file_path": p, "content": "new"}
+	if _, e := runTool(t, NewWriteTool(), ctx, args); e == nil || !strings.Contains(e.Error(), "has not been read") {
+		t.Fatalf("unread replacement: %v", e)
+	}
+	if b, err := os.ReadFile(p); err != nil || string(b) != "old\n" {
+		t.Fatalf("unread file changed: %q %v", b, err)
 	}
 	runTool(t, NewReadTool(), ctx, map[string]any{"file_path": p})
 	info, _ := os.Stat(p)
 	os.WriteFile(p, []byte("bad\n"), 0600)
 	os.Chtimes(p, info.ModTime(), info.ModTime())
-	args := map[string]any{"file_path": p, "content": "new", "mode": "replace"}
-	if _, e := runTool(t, NewWriteTool(), ctx, args); e == nil {
-		t.Fatal("stale replacement accepted")
+	if _, e := runTool(t, NewWriteTool(), ctx, args); e == nil || !strings.Contains(e.Error(), "modified since observation") {
+		t.Fatalf("stale replacement: %v", e)
+	}
+	if b, err := os.ReadFile(p); err != nil || string(b) != "bad\n" {
+		t.Fatalf("external change overwritten: %q %v", b, err)
 	}
 	runTool(t, NewReadTool(), ctx, map[string]any{"file_path": p})
 	if _, e := runTool(t, NewWriteTool(), ctx, args); e != nil {
 		t.Fatal(e)
+	}
+	if b, err := os.ReadFile(p); err != nil || string(b) != "new" {
+		t.Fatalf("replacement lost: %q %v", b, err)
+	}
+	if info, err := os.Stat(p); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("replacement lost permissions: %v %v", info, err)
 	}
 }
 func TestReadRangeContinuationAndCompleteVisibility(t *testing.T) {
