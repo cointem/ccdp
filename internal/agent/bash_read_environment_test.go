@@ -29,9 +29,7 @@ func TestBashCreatedFileRemainsReadableAfterSettingsChanges(t *testing.T) {
 			}
 			switch change {
 			case "workspace":
-				if err := a.SetWorkspace(t.TempDir()); err != nil {
-					t.Fatal(err)
-				}
+				changeSettingsForTest(t, a, t.TempDir())
 			default:
 				cmd := protocol.Command{ID: "change-for-bash-read", Type: protocol.CommandReloadSettings, Reload: &protocol.ReloadCommand{}}
 				if change == "sandbox" {

@@ -56,10 +56,6 @@ type toolJournalContext struct {
 func releaseStepLease(step stepRuntime) {
 	if step.mcpLease != nil {
 		step.mcpLease.Close()
-		return
-	}
-	if step.toolLease != nil {
-		step.toolLease.Close()
 	}
 }
 
@@ -172,7 +168,17 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 	if err != nil {
 		return fail(err)
 	}
-	ref, err := artifacts.PutContext(context.Background(), []byte(output))
+	full := output
+	if j.result.FullText != "" {
+		full = j.result.FullText
+	}
+	var ref session.BlobRef
+	if process := j.result.Process; process != nil && process.Terminal() && process.OutputID != "" {
+		// The completion already saved the full log before wait returned.
+		ref, _, err = p.OutputArtifact(process.OutputID)
+	} else {
+		ref, err = artifacts.PutContext(context.Background(), []byte(full))
+	}
 	if err != nil {
 		return fail(fmt.Errorf("agent: persist raw tool output: %w", err))
 	}

@@ -335,8 +335,7 @@ func (r *Registry) Version() uint64 {
 // Lease is an immutable view of the visible registry at one step boundary.
 // It owns no registry lock: implementations remain reachable until the lease
 // is discarded, so unregister/replace cannot ABA a model tool call into a new
-// implementation during a stream. Close is present for symmetry and future
-// ref-counted implementations; current Tool values are Go-owned objects.
+// implementation during a stream. Tool values are Go-owned objects and need no release.
 type Lease struct {
 	definitions map[string]Definition
 	version     uint64
@@ -421,8 +420,6 @@ func (l *Lease) SchemasFiltered(keep func(name string) bool) []map[string]any {
 	return out
 }
 
-func (l *Lease) Close() {}
-
 // Names returns all visible tool names in sorted order.
 func (r *Registry) Names() []string {
 	r.mu.RLock()
@@ -439,19 +436,6 @@ func (r *Registry) Names() []string {
 	}
 	sort.Strings(names)
 	return names
-}
-
-// Schemas returns the merged tool declarations for the LLM API, sorted by name.
-func (r *Registry) Schemas() []map[string]any {
-	return r.SchemasFiltered(nil)
-}
-
-// SchemasFiltered returns tool declarations for names passing keep (nil keeps
-// all), sorted by name. Used for deferred tool injection. Names and tools are
-// collected under a single read lock so a concurrent Unregister can't produce
-// a nil tool between Names() and Get().
-func (r *Registry) SchemasFiltered(keep func(name string) bool) []map[string]any {
-	return r.Acquire().SchemasFiltered(keep)
 }
 
 // SchemaJSON returns a detached copy of the registration-time schema. Catalog

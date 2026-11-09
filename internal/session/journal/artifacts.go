@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
@@ -19,12 +20,14 @@ var ErrBlobMissing = errors.New("agent: prepared request blob is missing")
 // ArtifactReader gives archive and diagnostic readers no write capability.
 type ArtifactReader interface {
 	Read(session.BlobRef, int64) ([]byte, error)
+	ReadRange(session.BlobRef, int64, int) ([]byte, error)
 }
 
 // ArtifactAccess is scoped to the owning session's immutable blob store.
 type ArtifactAccess interface {
 	ArtifactReader
 	PutContext(context.Context, []byte) (session.BlobRef, error)
+	PutReader(context.Context, io.Reader) (session.BlobRef, error)
 }
 
 // MemoryArtifacts is the blob half of --no-session-persistence. It is
@@ -69,6 +72,17 @@ func (s *MemoryArtifacts) PutContext(ctx context.Context, data []byte) (session.
 	return session.BlobRef{Hash: hash, Size: int64(len(copyData)), MediaType: "application/json"}, nil
 }
 
+func (s *MemoryArtifacts) PutReader(ctx context.Context, reader io.Reader) (session.BlobRef, error) {
+	if err := ctx.Err(); err != nil {
+		return session.BlobRef{}, err
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, s.maxBytes+1))
+	if err != nil {
+		return session.BlobRef{}, err
+	}
+	return s.PutContext(ctx, data)
+}
+
 func (s *MemoryArtifacts) Read(ref session.BlobRef, maxBytes int64) ([]byte, error) {
 	if s == nil {
 		return nil, errors.New("agent: nil memory request artifacts")
@@ -97,6 +111,28 @@ func (s *MemoryArtifacts) Read(ref session.BlobRef, maxBytes int64) ([]byte, err
 		return nil, fmt.Errorf("%w: %s hash mismatch", ErrBlobCorrupt, ref.Hash)
 	}
 	return copyData, nil
+}
+
+// Bytes in this private map are hashed and copied on insertion, and never
+// exposed directly. Paging therefore only needs to copy the requested range.
+func (s *MemoryArtifacts) ReadRange(ref session.BlobRef, offset int64, limit int) ([]byte, error) {
+	if err := ValidateBlobRef(ref); err != nil {
+		return nil, err
+	}
+	if offset < 0 || offset > ref.Size || limit < 0 {
+		return nil, errors.New("range is outside output")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	data, ok := s.blobs[ref.Hash]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrBlobMissing, ref.Hash)
+	}
+	if int64(len(data)) != ref.Size {
+		return nil, fmt.Errorf("%w: %s size changed", ErrBlobCorrupt, ref.Hash)
+	}
+	end := offset + min(int64(limit), ref.Size-offset)
+	return append([]byte(nil), data[offset:end]...), nil
 }
 
 func ValidateBlobRef(ref session.BlobRef) error {

@@ -352,9 +352,9 @@ func (m *Model) approvalDetailLines() []string {
 func formatApprovalCapability(cap protocol.CapabilityRequest) string {
 	switch cap.Kind {
 	case "directory":
-		return fmt.Sprintf("%s directory %s", cap.Access, cap.Path)
+		return fmt.Sprintf("%s directory %s (including Unix sockets)", cap.Access, cap.Path)
 	case "network":
-		return "outbound TCP/UDP to non-local network destinations (Unix sockets remain blocked)"
+		return "outbound TCP/UDP to non-local network destinations (Unix socket scope unchanged)"
 	case "local_service":
 		return fmt.Sprintf("%s %s localhost service on port %d (Seatbelt may match other host-local addresses on that port)", cap.Direction, cap.Protocol, cap.Port)
 	default:

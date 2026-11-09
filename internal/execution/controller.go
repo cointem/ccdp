@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -119,6 +118,7 @@ type Controller struct {
 	isReady          bool
 	seq              uint64
 	root, binary     string
+	environments     []string
 	cmd              *exec.Cmd
 	input            io.WriteCloser
 	output, stream   io.ReadCloser
@@ -130,34 +130,6 @@ type Controller struct {
 	failure          error
 	closeDone        chan struct{}
 	closeErr         error
-	preparation      map[string]preparationFailure
-}
-
-type preparationFailure struct {
-	revision uint64
-	err      error
-}
-
-func reportPreparationFailure(policy *sandbox.Sandbox, revision uint64, err error) {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || policy == nil {
-		return
-	}
-	c := controllerFor(policy.ExecutorID)
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.preparation == nil {
-		c.preparation = map[string]preparationFailure{}
-	}
-	if len(c.preparation) >= 128 {
-		for key := range c.preparation {
-			delete(c.preparation, key)
-			break
-		}
-	}
-	c.preparation[policy.Workspace] = preparationFailure{revision: revision, err: err}
 }
 
 func NewController(roots ...string) *Controller {
@@ -181,7 +153,7 @@ func NewController(roots ...string) *Controller {
 	return c
 }
 
-func NewEnvironment(executorID, ownerToken string) (string, error) {
+func NewEnvironment(executorID string) (string, error) {
 	c := controllerFor(executorID)
 	if c == nil {
 		return "", ErrEnvironmentUnavailable
@@ -198,18 +170,21 @@ func NewEnvironment(executorID, ownerToken string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if ownerToken == "" || strings.ContainsAny(ownerToken, "/\\.") {
-		return "", fmt.Errorf("invalid environment owner")
+	parent, err := runtimepath.EnsurePrivate(runtimepath.TemporaryRoot())
+	if err != nil {
+		return "", err
 	}
-	root, err := runtimepath.EnsurePrivate(filepath.Join(c.root, "owners", ownerToken, "environments", id))
+	root, err := runtimepath.EnsurePrivate(filepath.Join(parent, id))
 	if err != nil {
 		return "", err
 	}
 	for _, part := range []string{"scratch", "logs"} {
 		if _, err := runtimepath.EnsurePrivate(filepath.Join(root, part)); err != nil {
+			_ = os.RemoveAll(root)
 			return "", err
 		}
 	}
+	c.environments = append(c.environments, root)
 	return root, nil
 }
 
@@ -218,6 +193,7 @@ func BindPrivateRoots(policy *sandbox.Sandbox) {
 		return
 	}
 	policy.AddPrivateRoot(runtimepath.DefaultRoot())
+	policy.AddPrivateRoot(runtimepath.TemporaryRoot())
 	if c := controllerFor(policy.ExecutorID); c != nil {
 		c.mu.Lock()
 		root := c.privateRoot
@@ -555,6 +531,7 @@ func (c *Controller) Close() error {
 	c.closed = true
 	c.closeDone = make(chan struct{})
 	in, out, stream, root, cmd := c.input, c.output, c.stream, c.root, c.cmd
+	environments := append([]string(nil), c.environments...)
 	priorFailure := c.failure
 	c.mu.Unlock()
 	controllers.Delete(c.ID)
@@ -581,6 +558,9 @@ func (c *Controller) Close() error {
 	// does not claim that detached descendants have been reclaimed.
 	if root != "" && closeErr == nil {
 		closeErr = errors.Join(closeErr, os.RemoveAll(root))
+		for _, environment := range environments {
+			closeErr = errors.Join(closeErr, os.RemoveAll(environment))
+		}
 	}
 	c.mu.Lock()
 	c.closeErr = closeErr
@@ -1096,9 +1076,6 @@ func EnvironmentStatus(policy *sandbox.Sandbox) (string, string) {
 	}
 	if c.failure != nil {
 		return "degraded", c.failure.Error()
-	}
-	if failure, exists := c.preparation[policy.Workspace]; exists && failure.revision == policy.Revision {
-		return "degraded", failure.err.Error()
 	}
 	if rootsOverlap(append([]string{policy.Workspace}, policy.AdditionalDirs...), c.blockedRoots) {
 		return "quarantined", "project execution is paused pending cleanup"

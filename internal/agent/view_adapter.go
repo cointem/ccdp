@@ -224,7 +224,6 @@ func (a *Agent) catalogSnapshotLocked() protocol.CatalogSnapshot {
 		out.Providers = append(out.Providers, *entry)
 	}
 	lease := a.services.registry.Acquire()
-	defer lease.Close()
 	for _, name := range lease.Names() {
 		schema, ok := lease.SchemaJSON(name)
 		if !ok {

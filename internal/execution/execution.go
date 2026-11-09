@@ -500,15 +500,15 @@ func Run(req Request) (Result, error) {
 	return res, fmt.Errorf("execution: %w", runErr)
 }
 
-func prepareProcessEnvironment(env []string, policy *sandbox.Sandbox) (prepared []string, release func(), prepareErr error) {
+// Preparation never dispatches the requested command. A failure affects this
+// attempt only; a later invocation can retry after its filesystem/config is fixed.
+func prepareProcessEnvironment(env []string, policy *sandbox.Sandbox) ([]string, func(), error) {
 	if policy == nil {
 		return nil, nil, fmt.Errorf("execution: sandbox policy is unavailable")
 	}
 	if err := CheckEnvironment(policy); err != nil {
 		return nil, nil, err
 	}
-	revision := policy.Revision
-	defer func() { reportPreparationFailure(policy, revision, prepareErr) }()
 	controller := controllerFor(policy.ExecutorID)
 	if controller == nil {
 		return nil, nil, ErrEnvironmentUnavailable
@@ -548,6 +548,7 @@ func prepareProcessEnvironment(env []string, policy *sandbox.Sandbox) (prepared 
 	entries = setEnvironment(entries, "TMPDIR", scratch)
 	entries = setEnvironment(entries, "TMP", scratch)
 	entries = setEnvironment(entries, "TEMP", scratch)
+	entries = setEnvironment(entries, "XDG_RUNTIME_DIR", scratch)
 	entries = setEnvironment(entries, "XDG_CACHE_HOME", cache)
 	entries = setEnvironment(entries, "GOCACHE", filepath.Join(cache, "go-build"))
 	entries = setEnvironment(entries, "GOMODCACHE", filepath.Join(cache, "go-mod"))

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"ccdp/internal/execution"
+	"ccdp/internal/fsops"
 	"ccdp/internal/protocol"
 	"ccdp/internal/runtimepath"
 	"ccdp/internal/sandbox"
@@ -121,7 +123,19 @@ func (mp *managedProcess) fact(kind string) error {
 	if kind == "finished" {
 		state.ProcessOutput = mp.completion()
 	}
-	outputID, err := mp.events(protocol.ProcessEvent{Kind: kind, State: state})
+	fact := protocol.ProcessEvent{Kind: kind, State: state}
+	if kind == "finished" {
+		log, err := fsops.OpenRegular("", state.Log)
+		if err != nil {
+			mp.mu.Lock()
+			mp.persistErr = err
+			mp.mu.Unlock()
+			return err
+		}
+		defer log.Close()
+		fact.Output = log
+	}
+	outputID, err := mp.events(fact)
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 	if outputID != "" {
@@ -501,6 +515,20 @@ func (m *ProcessManager) belongs(pid string) bool {
 func (m *ProcessManager) Get(pid string) (*managedProcess, error) {
 	if m == nil {
 		return nil, fmt.Errorf("process: nil manager")
+	}
+	parts := strings.Split(pid, ".")
+	valid := len(parts) == 4 && parts[0] == "p"
+	if valid {
+		for _, part := range parts[1:] {
+			decoded, err := base64.RawURLEncoding.Strict().DecodeString(part)
+			if err != nil || len(decoded) != 16 {
+				valid = false
+				break
+			}
+		}
+	}
+	if !valid {
+		return nil, fmt.Errorf("invalid_process_id: copy the complete id returned by Bash; the runtime has not been checked")
 	}
 	if !strings.HasPrefix(pid, "p."+m.generation+".") {
 		return nil, fmt.Errorf("stale_process: handle belongs to a different runtime; do not retry")

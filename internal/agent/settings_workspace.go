@@ -4,36 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"ccdp/internal/config"
 	"ccdp/internal/sandbox"
 )
-
-// SetWorkspace changes the agent's working directory at runtime (Codex /cd),
-// rebuilding the sandbox and invalidating the workspace model. The sandbox
-// pointer and workspace are swapped atomically under a.mu; tool goroutines
-// read them via currentSandbox(), so a /cd during a running turn never gives
-// half of one batch the old directory and half the new one.
-func (a *Agent) SetWorkspace(dir string) error {
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return err
-	}
-	st, err := os.Stat(abs)
-	if err != nil || !st.IsDir() {
-		return fmt.Errorf("not a directory: %s", dir)
-	}
-	if _, err := a.reserveSettingsMutation(); err != nil {
-		return err
-	}
-	defer a.releaseSettingsMutation()
-	if err := a.setWorkspaceContext(a.lifecycle.rootCtx, abs); err != nil {
-		return err
-	}
-	a.emitStatus("workspace → %s", abs)
-	return nil
-}
 
 func (a *Agent) setWorkspaceContext(ctx context.Context, abs string) error {
 	if ctx == nil {

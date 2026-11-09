@@ -240,6 +240,21 @@ func (p *Writer) ReadSnapshot() ([]session.Record, ArtifactAccess, error) {
 	return records, blobs, err
 }
 
+// OutputArtifact resolves a committed output without copying or scanning the log.
+func (p *Writer) OutputArtifact(id string) (session.BlobRef, ArtifactReader, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	state, err := p.projectionLocked()
+	if err != nil {
+		return session.BlobRef{}, nil, err
+	}
+	ref, ok := state.OutputReference(id)
+	if !ok {
+		return session.BlobRef{}, nil, fmt.Errorf("output %q is not referenced by the current session", id)
+	}
+	return ref, p.artifactAccess, nil
+}
+
 // ReadSnapshotWithRecovery freezes records and their recovery boundary under
 // the same writer lock. The boundary is internal metadata, not a durable fact.
 func (p *Writer) ReadSnapshotWithRecovery() ([]session.Record, ArtifactAccess, session.Cursor, error) {

@@ -28,6 +28,12 @@ func DefaultRoot() string {
 	return filepath.Join(home, ".ccdp", "runtime")
 }
 
+// TemporaryRoot keeps socket paths short even with a long HOME or TMPDIR.
+// EnsurePrivate must verify this user-owned boundary before creating children.
+func TemporaryRoot() string {
+	return filepath.Join("/tmp", fmt.Sprintf("ccdp-%d", os.Getuid()))
+}
+
 // EnsurePrivate creates components without following symlinks and verifies the
 // owned boundary before any worker can receive access to it.
 func EnsurePrivate(path string) (string, error) {

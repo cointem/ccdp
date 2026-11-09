@@ -1,17 +1,20 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
 	"ccdp/internal/config"
+	"ccdp/internal/messages"
+	"ccdp/internal/permissions"
 	"ccdp/internal/sandbox"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/tools"
 )
 
@@ -62,43 +65,54 @@ func TestOtherSessionDataIsPrivate(t *testing.T) {
 }
 
 func TestWebFetchContinuationReadableAfterSessionResume(t *testing.T) {
-	workspace := t.TempDir()
-	cfg := &config.Config{Workspace: workspace, SessionDir: filepath.Join(t.TempDir(), "sessions")}
-	sessionDir := filepath.Join(cfg.SessionDir, "current")
-	r := tools.NewResources("current", sessionDir, t.TempDir()+"/runtime")
-	defer r.Close()
-	ctx := r.Context(nil, workspace, cfg.Sandbox())
+	body := strings.Repeat("preview 中文 ", 1000) + "\nlast line\n"
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprint(w, strings.Repeat("preview ", 50)+"\ntruncated正文\nlast line\n")
+		fmt.Fprint(w, body)
 	}))
 	defer proxy.Close()
-	ctx.Sandbox.NetworkProxy = proxy.URL
-	ctx.HostNetworkAllowed = true
-	ctx.Args = map[string]any{"url": "http://public.invalid/article", "max_chars": 256}
-	out, err := executeToolText(tools.NewWebFetchTool(), ctx)
+	a, cfg := sessionRepairAgent(t, false)
+	a.services.cfg.NetworkProxy = proxy.URL
+	a.services.sandbox.NetworkProxy = proxy.URL
+	a.services.perms.SetMode(permissions.ModeAuto)
+	a.services.registry.Register(tools.NewWebFetchTool())
+	call := messages.ToolCall{ID: "web-full-output", Name: "WebFetch", Arguments: map[string]any{"url": "http://public.invalid/article", "max_chars": 256}}
+	if err := a.appendHistory(messages.AssistantWithTools("fetch", []messages.ToolCall{call})); err != nil {
+		t.Fatal(err)
+	}
+	result := a.executeToolResultWithJournal(call, toolJournalContextForStep(testToolStep(t, a)))
+	if result.IsError || !result.DisplayTruncated || result.OutputID == "" || !strings.Contains(result.Output, "ReadOutput output_id=") {
+		t.Fatalf("missing shared continuation: %+v", result)
+	}
+	if strings.Contains(result.Output, "last line") {
+		t.Fatal("max_chars did not limit the preview")
+	}
+	a.Close()
+	snapshot, err := archive.Load(cfg.SessionDir, a.SessionID())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, hint, ok := strings.Cut(out, "[incomplete; use Read on ")
-	if !ok {
-		t.Fatalf("missing continuation: %s", out)
-	}
-	path, err := strconv.Unquote(strings.TrimSuffix(hint, " to continue]"))
+	opened, err := Resume(&cfg, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, resume := range []bool{false, true} {
-		if resume {
-			_ = r.Close()
-			r = tools.NewResources("current", sessionDir, t.TempDir()+"/runtime")
-			defer r.Close()
-			ctx = r.Context(nil, workspace, buildSandbox(cfg, workspace))
-		}
-		ctx.Args = map[string]any{"file_path": path, "offset": 2, "limit": 1}
-		got, err := executeToolText(tools.NewReadTool(), ctx)
-		if err != nil || !strings.Contains(got, "2\ttruncated正文") || !strings.Contains(got, "next_offset=3") {
-			t.Fatalf("resume=%v: %q, %v", resume, got, err)
-		}
+	t.Cleanup(opened.Close)
+	page, err := opened.readOutput(context.Background(), result.OutputID, 0, 65536)
+	if err != nil || !strings.HasSuffix(page.Text, body) || page.More {
+		t.Fatalf("resume lost full output: bytes=%d, %v", len(page.Text), err)
+	}
+	forkID, err := opened.Fork(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fork, err := opened.OpenSession(forkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(fork.Close)
+	opened.Close()
+	copied, err := fork.readOutput(context.Background(), result.OutputID, 0, 65536)
+	if err != nil || copied.Text != page.Text {
+		t.Fatalf("fork lost full output: %v", err)
 	}
 }

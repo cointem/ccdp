@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"maps"
 	"reflect"
 	"testing"
 	"time"
@@ -162,7 +163,7 @@ func TestGoalResumePausesAndAppliesPendingEdit(t *testing.T) {
 			defer a.Close()
 			a.mu.Lock()
 			got := protocol.CloneGoal(a.conversation.durable.Goal)
-			ids := cloneGoalAccountingIDs(a.conversation.durable.GoalAccountingIDs)
+			ids := maps.Clone(a.conversation.durable.GoalAccountingIDs)
 			busy := a.turn.busy
 			a.mu.Unlock()
 			if got == nil || got.Status != protocol.GoalPaused || got.Objective != goal.PendingObjective || got.PendingObjective != "" || got.TokensUsed != goal.TokensUsed || got.ModelCalls != goal.ModelCalls || !ids["request-1"] || busy {

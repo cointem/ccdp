@@ -181,7 +181,7 @@ func TestLimitsAndIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	index, err := s.Index()
-	if err != nil || !strings.Contains(index, e.ID) || strings.Contains(index, "private long details") || len(index) > MaxIndexBytes {
+	if err != nil || !strings.Contains(index, "id: `"+e.ID+"`") || strings.Contains(index, e.ID+".md") || strings.Contains(index, "private long details") || len(index) > MaxIndexBytes {
 		t.Fatalf("%q %v", index, err)
 	}
 	if _, err = s.Read("../build"); err == nil {

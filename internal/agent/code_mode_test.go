@@ -86,9 +86,7 @@ func TestCodeModeManualAndReload(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(tc.contents), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if err := a.ReloadSettings(); err != nil {
-			t.Fatal(err)
-		}
+		changeSettingsForTest(t, a, "")
 		if _, ok := a.services.registry.Get("RunCode"); ok != (tc.enabled && codemode.Available) {
 			t.Fatalf("RunCode registered=%v after reload of %s", ok, tc.contents)
 		}
@@ -191,7 +189,6 @@ func TestCodeModeFrozenDirectory(t *testing.T) {
 	old := &codeFixtureTool{name: "Frozen", text: "old"}
 	a.services.registry.Register(old)
 	lease := a.services.registry.Acquire()
-	defer lease.Close()
 	a.services.registry.Register(&codeFixtureTool{name: "Frozen", text: "new"})
 	a.services.registry.Register(&codeFixtureTool{name: "Late", text: "late"})
 	jc := toolJournalContextForStep(testToolStep(t, a))
@@ -205,7 +202,6 @@ func TestCodeModeFrozenDirectory(t *testing.T) {
 func TestCodeModeBashHandleSurvivesCell(t *testing.T) {
 	a, _, _ := codeAgent(t, `text("unused")`, nil)
 	lease := a.services.registry.Acquire()
-	defer lease.Close()
 	jc := toolJournalContextForStep(testToolStep(t, a))
 	jc.toolLease, jc.allowedTools = lease, []string{"Bash", "Process"}
 	summary, err := a.runCode(context.Background(), messages.ToolCall{ID: "background"}, jc, `await tools.Bash({command:"sleep 0.2; printf ready",background:true});`, 5*time.Second)

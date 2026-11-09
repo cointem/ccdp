@@ -74,12 +74,12 @@ func BindDevelopmentCache(policy *sandbox.Sandbox) {
 	scope := struct {
 		Workspace, Platform, Proxy                                        string
 		Write, ReadOnly, Denied, Credentials, Private, Protected, Entries []string
-		Network, LocalTCP                                                 bool
+		Network, LocalDevelopment                                         bool
 		Services                                                          []sandbox.LocalService
 	}{Workspace: canonical(p.Workspace), Platform: runtime.GOOS + "/" + runtime.GOARCH, Proxy: p.NetworkProxy,
 		Write: roots(p.AdditionalDirs, false), ReadOnly: roots(p.ReadOnlyDirs, true), Denied: roots(p.DisallowedDirs, false),
 		Credentials: roots(p.CredentialDirs, false), Private: roots(p.PrivateRoots, false), Protected: roots(p.ProtectedDirs, true), Entries: roots(p.ProtectedEntries, true),
-		Network: p.AllowNetwork, LocalTCP: p.LocalDevelopmentNetwork, Services: services}
+		Network: p.AllowNetwork, LocalDevelopment: p.LocalDevelopmentNetwork, Services: services}
 	data, _ := json.Marshal(scope)
 	hash := sha256.Sum256(data)
 	policy.SetCacheDir(filepath.Join(root, "cache", "v1", fmt.Sprintf("%x", hash)))

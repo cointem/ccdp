@@ -366,7 +366,7 @@ func renderIndex(entries []Entry) string {
 	var out strings.Builder
 	out.WriteString("# Memory\n\n")
 	for i, e := range entries {
-		line := fmt.Sprintf("- [%s](%s.md) (%s): %s\n", brief(e.Title, 60), e.ID, e.Kind, e.Summary)
+		line := fmt.Sprintf("- %s (id: `%s`, %s): %s\n", brief(e.Title, 60), e.ID, e.Kind, e.Summary)
 		if out.Len()+len(line)+100 > MaxIndexBytes {
 			fmt.Fprintf(&out, "%d more notes; use ReadProjectMemory to search or list them.\n", len(entries)-i)
 			break

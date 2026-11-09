@@ -46,7 +46,6 @@ func TestReviewExplorerAdmitsItsAllowedWebTool(t *testing.T) {
 	t.Cleanup(a.Close)
 	tc := messages.ToolCall{ID: "web", Name: "WebFetch", Arguments: map[string]any{"url": "https://example.com"}}
 	lease := a.services.registry.Acquire()
-	defer lease.Close()
 	_, reason, _, denied := a.hardAdmitTool(tc, toolJournalContext{toolLease: lease})
 	if denied {
 		t.Fatalf("explorer WebFetch blocked despite explicit allowed set: %s", reason)

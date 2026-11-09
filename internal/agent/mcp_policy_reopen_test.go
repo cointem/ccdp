@@ -63,9 +63,7 @@ func TestExtraReviewMCPReloadAfterSandboxReset(t *testing.T) {
 			t.Fatal(r.Error)
 		}
 	}
-	if err = a.ReloadSettings(); err != nil {
-		t.Fatal(err)
-	}
+	changeSettingsForTest(t, a, "")
 	if len(a.services.mcp.Names()) != 1 {
 		t.Fatal("reload leaves configured MCP permanently disconnected after policy reset")
 	}

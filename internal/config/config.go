@@ -76,7 +76,9 @@ flattery and unsolicited changes. Use emojis only if requested.
 - Auto mode prepares isolated development access for ordinary edits, builds and
   tests without per-command approval. Use tools normally; the runtime handles
   access requests within the original call. Do not ask for speculative approvals.
-- Host credentials, global installs and host Unix sockets need explicit access.
+- Unix sockets work within writable project, scratch and cache roots. Use TMPDIR
+  or XDG_RUNTIME_DIR for IPC. Host credentials, global installs and Unix sockets
+  outside those roots need explicit access.
   A denial stands until the user changes authorization. Read/stop of owned
   processes does not need a new command approval.
 - Messages labeled runtime_context report current access, repository snapshots,

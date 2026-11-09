@@ -10,8 +10,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"ccdp/internal/atomicfile"
+	"ccdp/internal/fsops"
 )
 
 const blobsDirName = "blobs"
@@ -26,6 +28,8 @@ type ArtifactStore struct {
 	syncFile atomicfile.SyncFile
 	syncDir  func(string) error
 	readOnly bool
+	mu       sync.Mutex
+	verified map[string]fsops.Version
 }
 
 // NewArtifactStore creates a scoped artifact store.  It creates the blobs
@@ -188,7 +192,7 @@ func (s *ArtifactStore) PutReader(ctx context.Context, reader io.Reader) (BlobRe
 }
 
 // Open returns an immutable blob reader after validating its reference.
-func (s *ArtifactStore) Open(ref BlobRef) (io.ReadCloser, error) {
+func (s *ArtifactStore) Open(ref BlobRef) (*os.File, error) {
 	if s == nil {
 		return nil, errors.New("session: nil artifact store")
 	}
@@ -196,7 +200,7 @@ func (s *ArtifactStore) Open(ref BlobRef) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.Open(path)
+	f, err := fsops.OpenRegular(s.dir, path)
 	if err != nil {
 		return nil, err
 	}
@@ -213,22 +217,56 @@ func (s *ArtifactStore) Open(ref BlobRef) (io.ReadCloser, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("%w: blob exceeds %d bytes", ErrTooLarge, s.maxBytes)
 	}
-	// The filename is the content identity.  Verify before exposing bytes so
-	// an external same-size edit cannot silently enter a recovered manifest.
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != ref.Hash {
-		_ = f.Close()
-		return nil, fmt.Errorf("session: blob hash mismatch: got %s, want %s", got, ref.Hash)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		_ = f.Close()
-		return nil, err
+	// Reuse verification only while inode, size, mtime and ctime are unchanged.
+	// Same-size edits (even with a restored mtime) must be verified again.
+	version := fsops.FromInfo(stat)
+	s.mu.Lock()
+	verified, ok := s.verified[ref.Hash]
+	s.mu.Unlock()
+	if !ok || verified != version {
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if got := hex.EncodeToString(h.Sum(nil)); got != ref.Hash {
+			_ = f.Close()
+			return nil, fmt.Errorf("session: blob hash mismatch: got %s, want %s", got, ref.Hash)
+		}
+		after, err := f.Stat()
+		if err != nil || fsops.FromInfo(after) != version {
+			_ = f.Close()
+			return nil, fmt.Errorf("session: blob changed during verification")
+		}
+		s.mu.Lock()
+		if s.verified == nil || len(s.verified) >= 128 {
+			s.verified = make(map[string]fsops.Version)
+		}
+		s.verified[ref.Hash] = version
+		s.mu.Unlock()
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 	}
 	return f, nil
+}
+
+func (s *ArtifactStore) ReadRange(ref BlobRef, offset int64, limit int) ([]byte, error) {
+	if offset < 0 || offset > ref.Size || limit < 0 {
+		return nil, errors.New("range is outside output")
+	}
+	f, err := s.Open(ref)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data := make([]byte, min(int64(limit), ref.Size-offset))
+	n, err := f.ReadAt(data, offset)
+	if n == len(data) {
+		err = nil
+	}
+	return data[:n], err
 }
 
 // Read reads a bounded artifact into memory.  maxBytes <= 0 uses the
@@ -252,8 +290,7 @@ func (s *ArtifactStore) Dir() string {
 	return s.dir
 }
 
-// Verify recomputes a blob's content hash without mutating it.  It is useful
-// to detect an external edit to a supposedly immutable session directory.
+// Verify validates a blob's content identity, rehashing after external edits.
 func (s *ArtifactStore) Verify(ref BlobRef) error {
 	r, err := s.Open(ref)
 	if err != nil {

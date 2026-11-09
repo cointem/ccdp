@@ -543,9 +543,9 @@ func formatCapabilityRequests(requests []protocol.CapabilityRequest) string {
 	for _, req := range requests {
 		switch req.Kind {
 		case "directory":
-			lines = append(lines, fmt.Sprintf("- %s directory: %s", req.Access, req.Path))
+			lines = append(lines, fmt.Sprintf("- %s directory (including Unix sockets): %s", req.Access, req.Path))
 		case "network":
-			lines = append(lines, "- outbound TCP/UDP to non-local network destinations (Unix sockets remain blocked)")
+			lines = append(lines, "- outbound TCP/UDP to non-local network destinations (Unix socket scope unchanged)")
 		case "local_service":
 			lines = append(lines, fmt.Sprintf("- %s %s localhost service on port %d; Seatbelt may match other host-local addresses on that port", req.Direction, req.Protocol, req.Port))
 		}

@@ -110,9 +110,7 @@ func TestReloadResizesExistingChildLimiter(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(a.services.cfg.Workspace, ".ccdp", "settings.json"), []byte(`{"max_parallel_tools":2,"max_concurrent_agents":1}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.ReloadSettings(); err != nil {
-		t.Fatal(err)
-	}
+	changeSettingsForTest(t, a, "")
 	if task != slotsForParent(a, childPurposeTask) || guardian != slotsForParent(a, childPurposeGuardian) {
 		t.Fatal("reload replaced an active limiter")
 	}

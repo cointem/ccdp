@@ -990,23 +990,35 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	b.WriteString("(allow signal (target same-sandbox))\n")
 	if readOnlyExecutable == "" {
 		b.WriteString("(allow process-exec)\n")
+		b.WriteString("(allow process-info* (target same-sandbox))\n")
+		// Node's fs.watch uses the OS event service even for workspace paths.
+		b.WriteString("(allow mach-lookup (global-name \"com.apple.FSEvents\"))\n")
+		// Python's spawn-based pools use randomly named POSIX semaphores.
+		b.WriteString("(allow ipc-posix-sem (ipc-posix-name-regex #\"^/mp-[A-Za-z0-9_]+$\"))\n")
+		b.WriteString("(allow pseudo-tty)\n")
+		b.WriteString("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n")
+		b.WriteString("(allow file-read* file-write* file-ioctl (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n")
+		// Local IPC follows writable filesystem authority, independently of
+		// internet access. Private runtime exclusions are applied below too.
+		for _, root := range canonicalRoots(writableRoots) {
+			writeUnixSocketRules(&b, "allow", root, nil)
+		}
 	} else {
 		fmt.Fprintf(&b, "(allow process-exec (literal %s))\n", sbplQuote(readOnlyExecutable))
 		fmt.Fprintf(&b, "(deny process-exec (require-not (literal %s)))\n", sbplQuote(readOnlyExecutable))
 		b.WriteString("(deny network*)\n")
 	}
 	if allowNetwork {
-		// External networking excludes host-local services. Unix-domain sockets
-		// and named endpoints remain denied because these rules match IP-based
-		// TCP and UDP only. A local DNS stub, if needed, must be authorized
-		// separately as a local service; general egress cannot imply it.
+		// Internet access does not grant host-local TCP/UDP or Unix sockets.
 		b.WriteString("(allow network-outbound (require-all (remote tcp) (require-not (remote ip \"localhost:*\"))))\n")
 		b.WriteString("(allow network-outbound (require-all (remote udp) (require-not (remote ip \"localhost:*\"))))\n")
 	}
 	if localDevelopment {
-		b.WriteString("(allow network-outbound (remote tcp \"localhost:*\"))\n")
-		b.WriteString("(allow network-bind (require-all (local tcp) (local ip \"localhost:*\")))\n")
-		b.WriteString("(allow network-inbound (local tcp \"localhost:*\"))\n")
+		for _, protocol := range []string{"tcp", "udp"} {
+			fmt.Fprintf(&b, "(allow network-outbound (remote %s \"localhost:*\"))\n", protocol)
+			fmt.Fprintf(&b, "(allow network-bind (require-all (local %s) (local ip \"localhost:*\")))\n", protocol)
+			fmt.Fprintf(&b, "(allow network-inbound (local %s \"localhost:*\"))\n", protocol)
+		}
 	}
 	for _, service := range localServices {
 		selector := fmt.Sprintf("localhost:%d", service.Port)
@@ -1021,6 +1033,9 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 		fmt.Fprintf(&b, "(allow network-bind (require-all (local %s) (local ip %s)))\n", service.Protocol, sbplQuote(selector))
 		fmt.Fprintf(&b, "(allow network-inbound (local %s %s))\n", service.Protocol, sbplQuote(selector))
 	}
+	for _, root := range writeDenied {
+		writeUnixSocketRules(&b, "deny", root, nil)
+	}
 	// A writable root is an authority boundary for this invocation. Its
 	// contents remain writable, but the directory entry itself must not be
 	// renamed or removed, even when its parent is another writable root.
@@ -1031,6 +1046,7 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 	// default reads and workspace writes above, including future sibling owners.
 	for _, privateRoot := range privateRoots {
 		privateRoot = canonicalRoot(privateRoot)
+		writeUnixSocketRules(&b, "deny", privateRoot, scratch)
 		allowedRoots := append(append([]string(nil), artifactRoots...), scratch...)
 		var artifactParents []string
 		for _, parent := range exactAncestors(append(append([]string(nil), allowedRoots...), runtimeFiles...)) {
@@ -1065,6 +1081,22 @@ func (s *Sandbox) profile(readOnlyExecutable string) (string, error) {
 		fmt.Fprintf(&b, "(deny file-write-unlink (require-all (literal %s) (vnode-type DIRECTORY)))\n", sbplQuote(ancestor))
 	}
 	return b.String(), nil
+}
+
+func writeUnixSocketRules(b *strings.Builder, action, root string, excluded []string) {
+	for _, endpoint := range []struct{ operation, side string }{{"network-bind", "local"}, {"network-outbound", "remote"}} {
+		if len(excluded) == 0 {
+			fmt.Fprintf(b, "(%s %s (%s unix-socket (subpath %s)))\n", action, endpoint.operation, endpoint.side, sbplQuote(root))
+			continue
+		}
+		// Keep an explicit socket-family guard: negated path/endpoint filters
+		// alone can also match IP traffic in Seatbelt.
+		fmt.Fprintf(b, "(%s %s (require-all (%s unix-socket) (%s unix-socket (subpath %s))", action, endpoint.operation, endpoint.side, endpoint.side, sbplQuote(root))
+		for _, path := range excluded {
+			fmt.Fprintf(b, " (require-not (%s unix-socket (subpath %s)))", endpoint.side, sbplQuote(path))
+		}
+		b.WriteString("))\n")
+	}
 }
 
 func exactAncestors(roots []string) []string {

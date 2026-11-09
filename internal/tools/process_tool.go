@@ -18,7 +18,7 @@ type ProcessTool struct{}
 func NewProcessTool() *ProcessTool { return &ProcessTool{} }
 func (*ProcessTool) Name() string  { return "Process" }
 func (*ProcessTool) Description() string {
-	return "Inspect or control an owned background command using its opaque string id. read returns an immediate output snapshot; offset and next_offset are bytes. wait blocks once until completion with UI progress; do not poll for status. Completion is delivered automatically at the next model boundary. write sends stdin (eof closes pipe input); stop terminates and releases the handle. Cancellation of an observation leaves background work running. Prefer Read on log_path for earlier logs; retained logs expire after stop, eviction or session close."
+	return "Inspect or control an owned background command using its complete id. read returns current output with byte offsets. wait blocks until completion with UI progress; completion is also delivered automatically, so do not poll. write sends stdin (eof closes pipe input); stop terminates and releases the handle. Cancelling an observation leaves the command running. After completion, use ReadOutput with its output_id for retained logs."
 }
 func (*ProcessTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
@@ -321,7 +321,9 @@ func (mp *managedProcess) viewResult(ctx *Context, id string, offset, limit int,
 			v.Tail = strings.ToValidUTF8(tailBytes, "�")
 		}
 		v.Warning = baseWarning
-		if releasing {
+		if exited && v.OutputID != "" && int64(v.Next) < size {
+			v.Warning += fmt.Sprintf(" Read retained output with ReadOutput output_id=%q offset=%d.", v.OutputID, v.Next)
+		} else if releasing {
 			v.Warning += " Process handle and temporary log released; any output omitted from this response is no longer available through Process or log_path."
 		} else if int64(v.Next) < size {
 			v.Warning += fmt.Sprintf(" More retained output, if needed: Read file_path=%q (lines); or Process id=%s action=read offset=%d (bytes).", v.Log, id, v.Next)

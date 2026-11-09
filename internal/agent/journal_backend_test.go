@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"io"
 	"sync"
 	"testing"
 
@@ -90,6 +91,12 @@ func (s journalTestArtifacts) current() journal.ArtifactAccess {
 func (s journalTestArtifacts) Read(r session.BlobRef, n int64) ([]byte, error) {
 	return s.current().Read(r, n)
 }
+func (s journalTestArtifacts) ReadRange(r session.BlobRef, offset int64, n int) ([]byte, error) {
+	return s.current().ReadRange(r, offset, n)
+}
 func (s journalTestArtifacts) PutContext(ctx context.Context, b []byte) (session.BlobRef, error) {
 	return s.current().PutContext(ctx, b)
+}
+func (s journalTestArtifacts) PutReader(ctx context.Context, r io.Reader) (session.BlobRef, error) {
+	return s.current().PutReader(ctx, r)
 }

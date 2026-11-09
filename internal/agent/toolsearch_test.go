@@ -31,9 +31,9 @@ func TestDeferredToolNotInjected(t *testing.T) {
 	defer ag.Close()
 
 	// The custom tool is deferred: absent from inline schemas.
-	schemas := ag.toolSchemas()
+	schemas := ag.toolDefsSnapshotFromLease(ag.services.registry.Acquire())
 	for _, s := range schemas {
-		name := s["function"].(map[string]any)["name"].(string)
+		name := s.Function.Name
 		if name == "my-fmt" {
 			t.Fatal("deferred custom tool should not be injected before discovery")
 		}
@@ -42,7 +42,7 @@ func TestDeferredToolNotInjected(t *testing.T) {
 	// ToolSearch itself is always available.
 	foundSearch := false
 	for _, s := range schemas {
-		if s["function"].(map[string]any)["name"].(string) == "ToolSearch" {
+		if s.Function.Name == "ToolSearch" {
 			foundSearch = true
 		}
 	}
@@ -84,8 +84,8 @@ func TestDeferredToolNotInjected(t *testing.T) {
 	// Simulate a discovery: mark it and re-check.
 	ag.markDiscovered("my-fmt")
 	found := false
-	for _, s := range ag.toolSchemas() {
-		if s["function"].(map[string]any)["name"].(string) == "my-fmt" {
+	for _, s := range ag.toolDefsSnapshotFromLease(ag.services.registry.Acquire()) {
+		if s.Function.Name == "my-fmt" {
 			found = true
 		}
 	}

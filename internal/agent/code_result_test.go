@@ -156,7 +156,6 @@ func TestCodeModeArgumentPermissionKeepsBinding(t *testing.T) {
 		allowed: map[string]bool{"Write": true}, perms: a.services.perms,
 	}
 	lease := a.services.registry.Acquire()
-	defer lease.Close()
 	jc := toolJournalContextForStep(testToolStep(t, a))
 	jc.toolLease, jc.allowedTools = lease, []string{"Write"}
 	result, err := a.runCode(context.Background(), messages.ToolCall{ID: "limited"},

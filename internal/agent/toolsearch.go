@@ -59,7 +59,6 @@ func (t *toolSearchTool) Execute(ctx *tools.Context, args map[string]any) (tools
 			return "", fmt.Errorf("ToolSearch: provide exactly one of name or query")
 		}
 		lease := t.ag.services.registry.Acquire()
-		defer lease.Close()
 		var matches []string
 		for _, n := range lease.Names() {
 			if t.ag.children.childState != nil && t.ag.children.childState.allowed != nil && !t.ag.children.childState.allowed[n] {
@@ -151,15 +150,4 @@ func (a *Agent) isDiscovered(name string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.discovery.discovered[name]
-}
-
-// toolSchemas returns the tool declarations to inject this request: all
-// non-deferred tools plus any discovered deferred tools.
-func (a *Agent) toolSchemas() []map[string]any {
-	return a.services.registry.SchemasFiltered(func(name string) bool {
-		if a.children.childState != nil && a.children.childState.allowed != nil && !a.children.childState.allowed[name] {
-			return false
-		}
-		return !a.discovery.deferTools[name] || a.isDiscovered(name)
-	})
 }

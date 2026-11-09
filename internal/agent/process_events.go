@@ -2,8 +2,8 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"ccdp/internal/messages"
@@ -81,20 +81,23 @@ func (a *Agent) commitProcessFact(request processFactRequested) processFactResul
 	case "started":
 		event = session.ProcessStarted{State: f.State}
 	case "finished":
-		data, err := json.Marshal(f.State.ProcessOutput)
-		if err != nil {
-			return processFactResult{err: err}
-		}
 		artifacts, err := p.RequestArtifacts()
 		if err != nil {
 			return processFactResult{err: a.toolJournalFailure(err)}
 		}
-		ref, err := artifacts.PutContext(context.Background(), data)
+		if f.Output == nil {
+			// Synthetic recovery outcomes have no live log descriptor.
+			f.Output = strings.NewReader(f.State.Output)
+		}
+		ref, err := artifacts.PutReader(context.Background(), f.Output)
 		if err != nil {
 			return processFactResult{err: a.toolJournalFailure(err)}
 		}
-		ref.MediaType = "application/json"
+		ref.MediaType = "text/plain; charset=utf-8"
 		f.State.OutputID = ref.Hash
+		if f.State.Truncated {
+			f.State.Warning = fmt.Sprintf("Read retained output with ReadOutput output_id=%q offset=0. %s", ref.Hash, f.State.Warning)
+		}
 		event = session.ProcessFinished{State: f.State, Result: ref}
 	case "released":
 		event = session.ProcessReleased{ID: f.State.ID, Revision: f.State.Revision}

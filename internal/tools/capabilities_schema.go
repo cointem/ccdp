@@ -35,7 +35,7 @@ func capabilityRequestSchema() map[string]any {
 			"type": "object",
 			"properties": map[string]any{
 				"kind":      map[string]any{"type": "string", "enum": []string{"directory", "network", "local_service"}},
-				"path":      map[string]any{"type": "string", "description": "Existing absolute directory path for a directory request."},
+				"path":      map[string]any{"type": "string", "description": "Existing absolute directory whose writes and Unix socket access are requested."},
 				"access":    map[string]any{"type": "string", "enum": []string{"write", "outbound"}},
 				"direction": map[string]any{"type": "string", "enum": []string{"connect", "listen"}},
 				"protocol":  map[string]any{"type": "string", "enum": []string{"tcp", "udp"}},
@@ -44,6 +44,6 @@ func capabilityRequestSchema() map[string]any {
 			},
 			"required": []string{"kind"},
 		},
-		"description": "Extra sandbox capabilities for this invocation only: write access to a specific directory, outbound network, or a localhost service with direction, protocol and port. Host files are readable by default except explicitly denied paths. Approval scope is one call or this session. Seatbelt matches localhost plus port and may include other host-local addresses on that port.",
+		"description": "Extra sandbox capabilities for this invocation only: writes and Unix sockets in a specific directory, outbound network, or a localhost service with direction, protocol and port. Host files are readable by default except explicitly denied paths. Approval scope is one call or this session. Seatbelt matches localhost plus port and may include other host-local addresses on that port.",
 	}
 }

@@ -375,7 +375,11 @@ func TestRunCancellationWithNotifyContinuesDraining(t *testing.T) {
 	}()
 	select {
 	case <-started:
-	case <-time.After(2 * time.Second):
+	case <-runDone:
+		t.Fatalf("Run finished before streaming: %+v %v", result, runErr)
+	case <-time.After(5 * time.Second):
+		// Executor startup also pins the binary and compiles the profile;
+		// keep the cancellation deadline below independent of that setup.
 		t.Fatal("NotifyContext did not observe streaming output")
 	}
 	cancel()

@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"io"
 	"time"
 )
 
@@ -77,6 +78,9 @@ func CloneProcessState(p *ProcessState) *ProcessState {
 type ProcessEvent struct {
 	Kind  string
 	State ProcessState
+	// Output is the owned, completed log. Its descriptor remains open until
+	// durable completion is acknowledged; model-supplied paths are never read.
+	Output io.Reader
 }
 
 func (p ProcessOutput) Reference() ProcessOutput {

@@ -182,9 +182,13 @@ func testSeatbeltSocketCapabilities(t *testing.T, s *Sandbox) {
 	}
 	assertNoSocketAccepted(t, otherAccepted, "connect to unauthorized port")
 
-	// General egress must not enable Unix-domain sockets. This listener lives in
-	// the workspace so a failure cannot be attributed to file-path visibility.
-	socketPath := filepath.Join(s.Workspace, "u.sock")
+	// Internet access must not expose host sockets outside writable roots.
+	hostSockets, err := os.MkdirTemp("/tmp", "ccdp-host-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(hostSockets) })
+	socketPath := filepath.Join(hostSockets, "u.sock")
 	unixListener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatal(err)
@@ -208,6 +212,39 @@ func testSeatbeltSocketCapabilities(t *testing.T, s *Sandbox) {
 		t.Fatalf("internet egress unexpectedly enabled Unix-domain connect: %v stdout=%q stderr=%q", runErr, out, stderr)
 	}
 	assertNoSocketAccepted(t, unixAccepted, "Unix-domain connect with internet egress")
+	alias := filepath.Join(s.Workspace, "host.sock")
+	if err := os.Symlink(socketPath, alias); err != nil {
+		t.Fatal(err)
+	}
+	if out, stderr, err := runSocketHelper(s, helper, "unix", alias); err == nil || strings.Contains(string(out), "CONNECTED") {
+		t.Fatalf("socket symlink escaped workspace: %v stdout=%q stderr=%q", err, out, stderr)
+	}
+	for _, kind := range []string{"denied", "read-only", "protected", "private"} {
+		root := filepath.Join(s.Workspace, "socket-"+kind)
+		if err := os.Mkdir(root, 0700); err != nil {
+			t.Fatal(err)
+		}
+		switch kind {
+		case "denied":
+			s.AddDisallowedDir(root)
+		case "read-only":
+			s.AddReadOnlyDir(root)
+		case "protected":
+			s.AddProtectedDir(root)
+		case "private":
+			s.AddPrivateRoot(root)
+		}
+		path := filepath.Join(root, "u.sock")
+		listener, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, stderr, runErr := runSocketHelper(s, helper, "unix", path)
+		listener.Close()
+		if runErr == nil || strings.Contains(string(out), "CONNECTED") {
+			t.Fatalf("%s socket became accessible: %v stdout=%q stderr=%q", kind, runErr, out, stderr)
+		}
+	}
 
 	// External egress and a TCP connect grant do not imply the ability to bind
 	// or accept on localhost. The listen grant is scoped to one concrete port.

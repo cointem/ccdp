@@ -2,15 +2,80 @@ package tools
 
 import (
 	"ccdp/internal/execution"
+	"ccdp/internal/runtimepath"
 	"ccdp/internal/sandbox"
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestProcessIDErrorsDistinguishMalformedAndStaleHandles(t *testing.T) {
+	generation, _ := runtimepath.ID()
+	owner, _ := runtimepath.ID()
+	m := NewProcessManager("test", generation, owner)
+	id, err := m.newID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, malformed := range []string{"", "p.token", id[:len(id)-1], strings.Replace(id, "p.", "x.", 1)} {
+		if _, err := m.Get(malformed); err == nil || !strings.Contains(err.Error(), "invalid_process_id") {
+			t.Fatalf("malformed %q: %v", malformed, err)
+		}
+	}
+	if _, err := m.Get(id); err == nil || !strings.Contains(err.Error(), "process_released") {
+		t.Fatalf("well-formed missing handle: %v", err)
+	}
+	other, _ := runtimepath.ID()
+	if _, err := m.Get(strings.Replace(id, generation, other, 1)); err == nil || !strings.Contains(err.Error(), "stale_process") {
+		t.Fatalf("old generation: %v", err)
+	}
+	if _, err := m.Get(strings.Replace(id, owner, other, 1)); err == nil || !strings.Contains(err.Error(), "foreign_process") {
+		t.Fatalf("other owner: %v", err)
+	}
+}
+
+func TestUnixSocketCannotReachFutureSiblingEnvironment(t *testing.T) {
+	for _, shared := range []bool{true, false} {
+		t.Run(map[bool]string{true: "shared_executor", false: "separate_executor"}[shared], func(t *testing.T) {
+			first := NewResources("first", "", t.TempDir()+"/runtime")
+			defer first.Close()
+			// Put both future environments under the workspace grant. The private
+			// root must still exclude every owner except this command's own scratch.
+			workspace := filepath.Dir(filepath.Dir(first.ScratchDir()))
+			ctx := first.Context(context.Background(), workspace, sandbox.New(workspace))
+			out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.stdin.readline().strip()); print("CONNECTED")'`, "stdin": "pipe"})
+			process := decodeProcess(t, out, err)
+			executor := ""
+			if shared {
+				executor = first.ExecutorID()
+			}
+			second := NewResourcesWithContext("second", "", context.Background(), executor, t.TempDir()+"/runtime")
+			defer second.Close()
+			if err := second.CheckOpen(); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(second.ScratchDir(), "host.sock")
+			listener, err := net.Listen("unix", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			if _, err := runTool(t, NewProcessTool(), ctx, map[string]any{"id": process.ID, "action": "write", "input": path + "\n", "eof": true}); err != nil {
+				t.Fatal(err)
+			}
+			out, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": process.ID, "action": "wait"})
+			result := decodeProcess(t, out, err)
+			if result.ExitCode == nil || *result.ExitCode == 0 || !strings.Contains(result.Output, "Operation not permitted") {
+				t.Fatalf("old profile exposed future sibling socket: %+v", result)
+			}
+		})
+	}
+}
 
 func TestPrivateRuntimeRejectsFutureSiblingScratch(t *testing.T) {
 	for _, shared := range []bool{true, false} {

@@ -23,16 +23,3 @@ func (a *Agent) persistGoalLocked(goal *protocol.Goal) error {
 	}
 	return nil
 }
-
-func cloneGoalAccountingIDs(ids map[string]bool) map[string]bool {
-	if ids == nil {
-		return nil
-	}
-	copy := make(map[string]bool, len(ids))
-	for id, accounted := range ids {
-		if accounted {
-			copy[id] = true
-		}
-	}
-	return copy
-}

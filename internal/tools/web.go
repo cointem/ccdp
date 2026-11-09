@@ -9,8 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -33,7 +31,7 @@ func (t *WebFetchTool) Name() string { return "WebFetch" }
 func (t *WebFetchTool) Description() string {
 	return `Fetch a URL and return its content as readable plain text. Use this to
 read documentation, error pages or any public web resource. HTML is stripped
-to text. Content is capped (default 8000 chars). Network access requires
+to text. Preview defaults to 8000 chars; use ReadOutput for the saved full text. Network access requires
 approval in default permission mode.`
 }
 
@@ -104,13 +102,9 @@ func (t *WebFetchTool) Execute(ctx *Context, args map[string]any) (Result, error
 			return "", fmt.Errorf("WebFetch: output budget too small")
 		}
 		if len(runes) > maxChars || len(text) > budget {
-			path, e := saveToolText(ctx, "web-", text)
-			if e != nil {
-				return "", e
-			}
+			ctx.dataResult.FullText = header + text
 			text = string(runes[:min(len(runes), maxChars)])
 			text = truncateUTF8(text, budget)
-			text += fmt.Sprintf("\n[incomplete; use Read on %q to continue]", path)
 		}
 		return header + text, nil
 	})
@@ -426,28 +420,4 @@ func htmlUnescape(s string) string {
 		s = strings.ReplaceAll(s, r.from, r.to)
 	}
 	return s
-}
-
-func saveToolText(ctx *Context, prefix, text string) (string, error) {
-	dir := ctx.SessionDir
-	if ctx.Resources != nil {
-		dir = ctx.Resources.SessionDir()
-		if dir == "" {
-			dir = ctx.Resources.ScratchDir()
-		}
-	}
-	if dir == "" {
-		return "", fmt.Errorf("session output directory unavailable")
-	}
-	dir = filepath.Join(dir, "outputs")
-	if e := os.MkdirAll(dir, 0700); e != nil {
-		return "", e
-	}
-	f, e := os.CreateTemp(dir, prefix+"*.txt")
-	if e != nil {
-		return "", e
-	}
-	_, e = f.WriteString(text)
-	e = errors.Join(e, f.Close())
-	return f.Name(), e
 }

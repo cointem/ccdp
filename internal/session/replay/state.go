@@ -37,6 +37,7 @@ type State struct {
 	Tasks             []session.Task
 	CatalogVersion    uint64
 	History           []messages.Message
+	outputs           map[string]session.BlobRef
 	historyStep       []string // parallel step identity for typed assistant/tool facts
 	Usage             session.Usage
 	pendingOrder      []string

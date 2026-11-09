@@ -59,6 +59,13 @@ func TestChildSignals(t *testing.T) {
 `,
 		"package.json": `{"name":"sandbox-smoke","version":"1.0.0","scripts":{"test":"node smoke.cjs"}}`,
 		"smoke.cjs":    `require('http').createServer((q,r)=>r.end('ok')).listen(0,'127.0.0.1',function(){ console.log('node-ok'); this.close(); });`,
+		"watch.cjs": `const fs = require('fs');
+fs.mkdirSync('watched', {recursive: true});
+const deadline = setTimeout(() => process.exit(2), 3000);
+const watcher = fs.watch('watched', (_, name) => {
+  if (name === 'source') { watcher.close(); clearTimeout(deadline); console.log('watch-ok'); }
+});
+setTimeout(() => fs.writeFileSync('watched/source', 'changed'), 100);`,
 	}
 	for path, data := range fixtures {
 		if err := os.WriteFile(filepath.Join(root, path), []byte(data), 0600); err != nil {
@@ -67,7 +74,7 @@ func TestChildSignals(t *testing.T) {
 	}
 	for _, test := range []struct{ name, command string }{
 		{"go", "go test ./..."},
-		{"node", "node smoke.cjs"},
+		{"node", "node smoke.cjs && node watch.cjs"},
 		{"npm", "npm install --package-lock-only --ignore-scripts --offline --no-audit --no-fund && npm ci --offline --no-audit --no-fund && npm test"},
 		{"pnpm", "pnpm install --offline --ignore-scripts && pnpm test"},
 		{"python3", "python3 -m venv .venv && .venv/bin/python -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(\"python-ok\"); s.close()' && .venv/bin/pip --version"},
@@ -119,9 +126,16 @@ func TestScratchRepairAndCacheLinkCannotEscape(t *testing.T) {
 	if _, err := os.Stat(outside); !os.IsNotExist(err) {
 		t.Fatal("host wrote outside scratch")
 	}
-	state, _ := EnvironmentStatus(policy)
-	if state != "degraded" {
-		t.Fatalf("persistent preparation error left environment %s", state)
+	if err := CheckEnvironment(policy); err != nil {
+		t.Fatalf("pre-dispatch preparation error poisoned executor: %v", err)
+	}
+	if err := os.Remove(cache); err != nil {
+		t.Fatal(err)
+	}
+	if _, cleanup, err := prepareProcessEnvironment(nil, policy.Snapshot()); err != nil {
+		t.Fatalf("repaired cache cannot be retried: %v", err)
+	} else {
+		cleanup()
 	}
 }
 

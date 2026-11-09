@@ -48,7 +48,7 @@ func (step *stepRuntime) loadRuntimeContext(memory string, blocked bool) {
 		messages.EnsureID(&m)
 		step.contextMessages = append(step.contextMessages, m)
 	}
-	access := fmt.Sprintf("Permission mode: %s. Outbound network=%t; local development TCP=%t. HOME retains tool discovery. Temporary files are owner-private; build and package caches persist for this project and access scope. Global installs, host credentials and host Unix sockets require explicit access.",
+	access := fmt.Sprintf("Permission mode: %s. Outbound network=%t; local development TCP/UDP=%t. Unix sockets are allowed under writable project, scratch and cache roots. Use TMPDIR/XDG_RUNTIME_DIR for private temporary files and IPC. Build and package caches persist for this project and access scope. Global installs, host credentials and outside Unix sockets require explicit access.",
 		step.cfg.PermissionMode, step.policy.NetworkAllowed(), step.policy.LocalDevelopmentNetwork)
 	if step.cfg.ComputerUseEnabled {
 		access += "\nComputer is enabled for this root session: macOS main display only. Use screenshot then act with its frame.id; existing file/API tools are preferred when applicable. Desktop access is separate from project execution."

@@ -9,7 +9,7 @@ type ReadOutputTool struct{}
 func NewReadOutputTool() *ReadOutputTool { return &ReadOutputTool{} }
 func (*ReadOutputTool) Name() string     { return "ReadOutput" }
 func (*ReadOutputTool) Description() string {
-	return "Read a saved tool result from this session by output_id. offset and limit are bytes, not lines. Follow the returned ReadOutput offset to continue without rerunning the tool. A saved Bash/Process result is only that call's output page; use Process for the remaining process log, or Read its log_path."
+	return "Read saved tool output by output_id, including full WebFetch text and retained logs of completed commands. offset and limit are bytes. Follow the returned offset to continue without rerunning the tool. Use Process to observe commands that are still running."
 }
 func (*ReadOutputTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{

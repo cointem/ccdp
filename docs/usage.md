@@ -105,6 +105,8 @@ OpenAI 兼容服务和本地模型服务可通过 `base_url` 接入。实际支�
 
 `bash_timeout_seconds` 设置前台命令的默认超时，后台命令默认不设执行期限。工具输出预算使用字节：`max_result_size_bytes` 限制单个结果，`max_tool_output_bytes_per_turn` 限制整轮结果。
 
+长输出通过 `ReadOutput(output_id, offset, limit)` 按字节续读，包括 WebFetch 全文和已结束命令的保留日志。停止进程或释放临时日志后，已保存的输出仍可读取；运行中的命令通过 `Process` 查看进度或发送输入。
+
 </details>
 
 ## 权限与沙箱
@@ -122,7 +124,11 @@ OpenAI 兼容服务和本地模型服务可通过 `base_url` 接入。实际支�
 
 工作区默认可读写，外部主机文件默认只读；禁读目录、常见凭证目录、provider 配置和其他会话数据受保护。本地操作在独立执行环境中运行，不会自动退回无沙箱执行。
 
-外网访问默认开启，可用 `network_access: false` 关闭。新开发基线单独启用 `local_development_network`，允许本机 TCP 连接和动态端口监听；Unix socket 和本机 UDP 仍需单独边界。若使用本机 HTTP 代理，在用户配置中设置 `network_proxy`（例如 `http://127.0.0.1:7897`）或 `CCDP_NETWORK_PROXY`；项目配置只能收紧网络能力。用 `/add-dir <dir>` 增加读写目录，`/add-dir --read-only <dir>` 指定只读目录，`/sandbox` 查看环境状态。
+外网访问默认开启，可用 `network_access: false` 关闭。`local_development_network` 默认开启，允许本机 TCP/UDP 通信和动态端口监听；关闭后仍可按方向、协议和端口申请单个本机服务。若使用本机 HTTP 代理，在用户配置中设置 `network_proxy`（例如 `http://127.0.0.1:7897`）或 `CCDP_NETWORK_PROXY`；项目配置只能收紧网络能力。
+
+工作区、额外可写目录、当前会话临时目录和项目缓存内默认允许 Unix stream/datagram socket 的监听和连接，不依赖外网开关。只读、禁读、受保护目录和其他会话仍不可通过 socket 访问。临时 IPC 使用 `$TMPDIR` 或 `$XDG_RUNTIME_DIR`，二者指向短路径的私有目录，避免 macOS Unix socket 路径长度限制；直接写公共 `/tmp` 不在默认授权内。用 `/add-dir <dir>` 增加读写及目录内 Unix socket 权限，`/add-dir --read-only <dir>` 指定只读目录，`/sandbox` 查看环境状态。
+
+开发进程可以创建自己的伪终端，Python `multiprocessing` 的随机命名信号量可用；匿名 socket、文件锁和文件映射共享内存也可正常使用。macOS 的 setuid `/bin/ps` 在 Seatbelt 下仍无法执行，可用已有 `Process` 句柄管理命令，或用 `lsof` 检查文件和端口。
 
 额外访问按资源合并等待，批准后继续原调用；父会话与普通子任务共享资源决定，once 授权不扩散。相同拒绝不再重复审核或弹窗，连续三轮重复拒绝会结束无效工具循环。可选 guardian 只审例外，格式错误、额度耗尽或不可用都不会自动放行。
 

@@ -211,13 +211,6 @@ func (a *Agent) handleOwnerControl(message ownerControl, preparing bool) {
 		a.viewHubOwned().Close()
 		a.refreshSnapshotOwned()
 		close(message.done)
-	case settingsReservationRequested:
-		workspace, err := a.reserveSettingsMutationOwned()
-		replyOwned(a, message.result, settingsReservationResult{workspace: workspace, err: err})
-	case settingsReservationReleased:
-		a.releaseSettingsMutationOwned()
-		a.refreshSnapshotOwned()
-		close(message.done)
 	case settingsCandidateInstall:
 		replyOwned(a, message.result, a.installSettingsCandidate(message))
 	case sessionClosingPrepared:

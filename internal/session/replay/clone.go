@@ -26,6 +26,7 @@ func (p *State) Clone() *State {
 	}
 	q.Settings = p.Settings.Clone()
 	q.History = messages.Clone(p.History)
+	q.outputs = maps.Clone(p.outputs)
 	q.historyStep = slices.Clone(p.historyStep)
 	q.Goal = protocol.CloneGoal(p.Goal)
 	q.GoalAccountingIDs = maps.Clone(p.GoalAccountingIDs)

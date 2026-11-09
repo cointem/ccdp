@@ -32,13 +32,19 @@ func (a *Agent) readOutput(ctx context.Context, outputID string, offset int64, l
 	if offset < 0 {
 		return protocol.OutputPage{}, errors.New("negative output offset")
 	}
-	records, blobs, err := a.ReadRunRecords(ctx)
+	if err := ctx.Err(); err != nil {
+		return protocol.OutputPage{}, err
+	}
+	p := a.persistenceHandle()
+	if p == nil {
+		return protocol.OutputPage{}, session.ErrClosed
+	}
+	ref, blobs, err := p.OutputArtifact(outputID)
 	if err != nil {
 		return protocol.OutputPage{}, err
 	}
-	ref, ok := sessionOutputReference(records, outputID)
-	if !ok {
-		return protocol.OutputPage{}, fmt.Errorf("output %q is not referenced by the current session", outputID)
+	if offset > ref.Size {
+		return protocol.OutputPage{}, errors.New("offset is outside output")
 	}
 	if err := ctx.Err(); err != nil {
 		return protocol.OutputPage{}, err
@@ -46,65 +52,21 @@ func (a *Agent) readOutput(ctx context.Context, outputID string, offset int64, l
 	if blobs == nil {
 		return protocol.OutputPage{}, errors.New("output artifact unavailable")
 	}
-	data, err := blobs.Read(ref, session.DefaultMaxBlobBytes)
+	if limit <= 0 {
+		limit = 16 << 10
+	}
+	limit = min(limit, 64<<10)
+	// One lookahead byte identifies a split final rune; a tiny requested page
+	// must still hold at least one complete UTF-8 character.
+	data, err := blobs.ReadRange(ref, offset, max(limit+1, utf8.UTFMax))
 	if err != nil {
 		return protocol.OutputPage{}, err
 	}
-	return outputPage(string(data), offset, limit)
-}
-
-func sessionOutputReference(records []session.Record, id string) (session.BlobRef, bool) {
-	match := func(ref *session.BlobRef) (session.BlobRef, bool) {
-		if ref != nil && ref.Hash == id {
-			return *ref, true
-		}
-		return session.BlobRef{}, false
-	}
-	messageRef := func(message session.Message) (session.BlobRef, bool) {
-		for _, ref := range message.SourceOutputs {
-			if ref.Hash == id {
-				return ref, true
-			}
-		}
-		for _, block := range message.Content {
-			if block.ToolResult != nil {
-				if ref, ok := match(block.ToolResult.Blob); ok {
-					return ref, true
-				}
-			}
-		}
-		return session.BlobRef{}, false
-	}
-	for _, record := range records {
-		switch e := session.EventPointer(record.Event).(type) {
-		case *session.ProcessFinished:
-			if ref, ok := match(&e.Result); ok {
-				return ref, true
-			}
-		case *session.ToolFinished:
-			if ref, ok := match(e.RawOutput); ok {
-				return ref, true
-			}
-			if ref, ok := match(e.Result.Blob); ok {
-				return ref, true
-			}
-		case *session.AssistantCommitted:
-			if ref, ok := messageRef(e.Message); ok {
-				return ref, true
-			}
-		case *session.ConversationReset:
-			for _, message := range e.Messages {
-				if ref, ok := messageRef(message); ok {
-					return ref, true
-				}
-			}
-		case *session.ContextCompacted:
-			if ref, ok := messageRef(e.Summary); ok {
-				return ref, true
-			}
-		}
-	}
-	return session.BlobRef{}, false
+	page, err := outputPage(string(data), 0, limit)
+	page.Next += offset
+	page.Total = ref.Size
+	page.More = page.Next < ref.Size
+	return page, err
 }
 
 func outputPage(text string, offset int64, limit int) (protocol.OutputPage, error) {

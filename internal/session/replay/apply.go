@@ -9,11 +9,16 @@ import (
 	"ccdp/internal/session"
 )
 
-func (p *State) Apply(event session.Event) error {
+func (p *State) Apply(event session.Event) (err error) {
 	event = session.EventPointer(event)
 	if event == nil {
 		return fmt.Errorf("replay: nil event")
 	}
+	defer func() {
+		if err == nil {
+			p.indexOutputs(event)
+		}
+	}()
 	switch e := event.(type) {
 	case *session.ProcessRegistered, *session.ProcessStarted, *session.ProcessFinished, *session.ProcessReleased, *session.ProcessResultsProjected:
 		return p.applyProcess(e)

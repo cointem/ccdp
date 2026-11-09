@@ -515,9 +515,6 @@ func (l *StepLease) Close() {
 	if l.release != nil {
 		l.release()
 	}
-	if l.Tools != nil {
-		l.Tools.Close()
-	}
 }
 
 func (m *Manager) releaseGenerationRef(generation uint64) {

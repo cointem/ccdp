@@ -191,9 +191,7 @@ func TestQuarantinedWorkspaceAllowsChatAndIndependentWorkspace(t *testing.T) {
 	}
 	previousScratch := a.services.resources.ScratchDir()
 	independent := t.TempDir()
-	if err := a.SetWorkspace(independent); err != nil {
-		t.Fatalf("independent workspace: %v", err)
-	}
+	changeSettingsForTest(t, a, independent)
 	if a.services.resources.ScratchDir() == previousScratch {
 		t.Fatal("unconfirmed cache reused by independent workspace")
 	}

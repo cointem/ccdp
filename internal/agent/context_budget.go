@@ -30,7 +30,6 @@ func (a *Agent) snapshotContextRequest() (stepRuntime, llm.CompletionRequest, er
 	a.mu.Unlock()
 	if lease != nil {
 		step.tools = a.toolDefsSnapshotFromLease(lease)
-		lease.Close()
 	}
 	a.settingsCommitMu.RUnlock()
 	step.goalPrompt = a.goalPrompt()

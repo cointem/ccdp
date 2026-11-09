@@ -273,7 +273,7 @@ func (*readProjectMemoryTool) Description() string {
 }
 func (*readProjectMemoryTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
-		"id": map[string]any{"type": "string"}, "query": map[string]any{"type": "string"},
+		"id": map[string]any{"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$", "description": "The id shown in the memory index."}, "query": map[string]any{"type": "string"},
 		"scope": map[string]any{"type": "string", "enum": []string{"project", "user"}},
 	}}
 }

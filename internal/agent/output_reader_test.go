@@ -8,11 +8,92 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"ccdp/internal/llm"
 	"ccdp/internal/messages"
+	"ccdp/internal/permissions"
+	"ccdp/internal/session"
+	"ccdp/internal/session/journal"
 )
+
+type pagingStore struct {
+	session.Store
+	reads atomic.Int64
+}
+
+func (s *pagingStore) Read(cursor session.Cursor) ([]session.Record, error) {
+	s.reads.Add(1)
+	return s.Store.Read(cursor)
+}
+
+type pagingArtifacts struct {
+	journal.ArtifactAccess
+	fullReads atomic.Int64
+	pageBytes atomic.Int64
+}
+
+func (s *pagingArtifacts) Read(ref session.BlobRef, limit int64) ([]byte, error) {
+	s.fullReads.Add(1)
+	return s.ArtifactAccess.Read(ref, limit)
+}
+
+func (s *pagingArtifacts) ReadRange(ref session.BlobRef, offset int64, limit int) ([]byte, error) {
+	data, err := s.ArtifactAccess.ReadRange(ref, offset, limit)
+	s.pageBytes.Add(int64(len(data)))
+	return data, err
+}
+
+func TestReadOutputPagesWithoutCopyingHistoryOrFullBlob(t *testing.T) {
+	for _, memory := range []bool{false, true} {
+		t.Run(fmt.Sprint(memory), func(t *testing.T) {
+			a, _ := sessionRepairAgent(t, memory)
+			ref := saveTestOutput(t, a, strings.Repeat("x", 8<<20))
+			history := sessionRepairHistory(100)
+			history[0].SourceOutputs = []messages.OutputReference{ref}
+			sessionRepairSeed(t, a, history)
+			backend := journalBackend(t, a.persistenceHandle())
+			backend.mu.Lock()
+			store := &pagingStore{Store: backend.store}
+			blobs := &pagingArtifacts{ArtifactAccess: backend.blobs}
+			backend.store, backend.blobs = store, blobs
+			backend.mu.Unlock()
+			for i := range 3 {
+				page, err := a.readOutput(context.Background(), ref.Hash, int64(i*16384), 16384)
+				if err != nil || len(page.Text) != 16384 || page.Next != int64((i+1)*16384) {
+					t.Fatalf("page %d: %+v, %v", i, page, err)
+				}
+			}
+			if store.reads.Load() != 0 || blobs.fullReads.Load() != 0 || blobs.pageBytes.Load() > 3*(16384+4) {
+				t.Fatalf("paging did whole-state work: log reads=%d full reads=%d page bytes=%d", store.reads.Load(), blobs.fullReads.Load(), blobs.pageBytes.Load())
+			}
+		})
+	}
+}
+
+func TestCompletedCommandOutputSurvivesLogRelease(t *testing.T) {
+	a, _ := sessionRepairAgent(t, false)
+	a.services.perms.SetMode(permissions.ModeAuto)
+	command := "i=0; while [ \"$i\" -lt 1000 ]; do printf 'retained line\\n'; i=$((i+1)); done"
+	call := messages.ToolCall{ID: "saved-log", Name: "Bash", Arguments: map[string]any{"command": command}}
+	result := a.executeToolResultWithJournal(call, toolJournalContextForStep(testToolStep(t, a)))
+	if result.IsError || result.Process == nil || !result.Process.Terminal() || result.OutputID != result.Process.OutputID {
+		t.Fatalf("missing durable command log: %+v", result)
+	}
+	stop := messages.ToolCall{ID: "release-log", Name: "Process", Arguments: map[string]any{"id": result.Process.ID, "action": "stop"}}
+	stopped := a.executeToolResultWithJournal(stop, toolJournalContextForStep(testToolStep(t, a)))
+	if stopped.IsError {
+		t.Fatal(stopped.Output)
+	}
+	if _, err := os.Stat(result.Process.Log); !os.IsNotExist(err) {
+		t.Fatalf("temporary log was not released: %v", err)
+	}
+	page, err := a.readOutput(context.Background(), result.OutputID, 0, 65536)
+	if err != nil || page.More || page.Text != strings.Repeat("retained line\n", 1000) {
+		t.Fatalf("completed output was lost after release: bytes=%d, %v", len(page.Text), err)
+	}
+}
 
 func saveTestOutput(t *testing.T, a *Agent, text string) messages.OutputReference {
 	t.Helper()

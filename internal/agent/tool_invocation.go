@@ -66,10 +66,15 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 			preview = a.toolOutputPreview(raw, cfg.MaxResultSizeBytes)
 			execution.displayTruncated = preview != raw
 		}
+		execution.displayTruncated = execution.displayTruncated || execution.result.FullText != ""
 		if err := execution.finish(a, tc, raw, failed); err != nil {
 			return tooling.Result{Output: "session persistence failed: " + err.Error(), IsError: true}
 		}
 		if execution.displayTruncated {
+			if execution.result.FullText != "" {
+				// Preserve the tool's preview cap while using the shared output ID.
+				raw += fmt.Sprintf("\n[incomplete; continue with ReadOutput output_id=%q offset=%d]", execution.outputID, len(raw))
+			}
 			preview = a.toolOutputPreview(raw, cfg.MaxResultSizeBytes, execution.outputID)
 		}
 		result := tooling.Result{Process: execution.result.Process, CompletionIDs: execution.result.CompletionIDs, Output: preview, IsError: failed, Code: codeResult,

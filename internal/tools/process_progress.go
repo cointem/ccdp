@@ -97,7 +97,7 @@ func (mp *managedProcess) completion() processView {
 	v.Offset, v.Next = int(mp.total)-len(raw)+start, int(mp.total)
 	v.Truncated = v.Offset > 0
 	if v.Truncated {
-		v.Warning = "Showing the final output; use Read on log_path only if earlier output is needed."
+		v.Warning = "Showing the final output preview."
 	}
 	if v.Log == "" {
 		v.Warning = "The process handle and retained log have been released; this notification contains the final output preview."

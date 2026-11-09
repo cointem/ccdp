@@ -44,7 +44,6 @@ func TestReviewUsesTaskPolicyAndAdmission(t *testing.T) {
 		}
 		defer child.Close()
 		toolLease := child.services.registry.Acquire()
-		defer toolLease.Close()
 		for _, name := range []string{"Read", "Bash", "Write", "WebFetch", "SendMessage"} {
 			call := messages.ToolCall{Name: name}
 			if _, reason, _, denied := child.hardAdmitTool(call, toolJournalContext{toolLease: toolLease}); denied {

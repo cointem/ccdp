@@ -18,7 +18,6 @@ func TestProgramCapabilityIsExplicitAndFrozen(t *testing.T) {
 		r.Register(tool)
 		lease := r.Acquire()
 		d, _ := lease.Definition(tool.Name())
-		lease.Close()
 		if d.ProgramCallable {
 			t.Fatalf("implicit program grant: %s", tool.Name())
 		}
@@ -26,7 +25,6 @@ func TestProgramCapabilityIsExplicitAndFrozen(t *testing.T) {
 	tool := &mutableProgramTool{Tool: &ReadTool{}, enabled: true}
 	r.Register(tool)
 	lease := r.Acquire()
-	defer lease.Close()
 	tool.enabled = false
 	d, _ := lease.Definition("Read")
 	if !d.ProgramCallable {

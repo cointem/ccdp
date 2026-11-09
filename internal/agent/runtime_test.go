@@ -560,9 +560,7 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	ag.mu.Lock()
 	ag.services.trustStore = trust
 	ag.mu.Unlock()
-	if err := ag.ReloadSettings(); err != nil {
-		t.Fatal(err)
-	}
+	changeSettingsForTest(t, ag, "")
 	if decision, _ := ag.services.perms.Check("Bash", map[string]any{"command": "make build"}, permissions.KindShell); decision != permissions.DecisionAllow {
 		t.Fatalf("project allow rule was not loaded: %s", decision)
 	}
@@ -578,9 +576,7 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	if err := os.WriteFile(settingsPath, []byte(`{}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := ag.ReloadSettings(); err != nil {
-		t.Fatal(err)
-	}
+	changeSettingsForTest(t, ag, "")
 	if decision, _ := ag.services.perms.Check("Bash", map[string]any{"command": "make build"}, permissions.KindShell); decision != permissions.DecisionAsk {
 		t.Fatalf("removed project allow rule remained active: %s", decision)
 	}

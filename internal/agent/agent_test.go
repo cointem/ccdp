@@ -186,6 +186,23 @@ func submitTestCommand(t *testing.T, ag *Agent, cmd protocol.Command) protocol.R
 	return receipt
 }
 
+func changeSettingsForTest(t *testing.T, a *Agent, workspace string) {
+	t.Helper()
+	cmd := protocol.Command{ID: protocol.CommandID(newSessionID()), SessionID: protocol.SessionID(a.SessionID()),
+		Type: protocol.CommandReloadSettings, Reload: &protocol.ReloadCommand{}}
+	if workspace != "" {
+		cmd.Type, cmd.Reload = protocol.CommandSetWorkspace, nil
+		cmd.Workspace = &protocol.WorkspaceCommand{Path: workspace}
+	}
+	receipt := submitTestCommand(t, a, cmd)
+	if receipt.Status == protocol.ReceiptScheduled {
+		receipt = waitFormalCommandReceipt(t, a, cmd.ID)
+	}
+	if receipt.Rejected() {
+		t.Fatalf("settings command failed: %+v", receipt)
+	}
+}
+
 func submitTestInput(t *testing.T, ag *Agent, text string) protocol.Receipt {
 	t.Helper()
 	return submitTestCommand(t, ag, protocol.NewSubmitInput(

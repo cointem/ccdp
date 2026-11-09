@@ -72,7 +72,7 @@ func NewResourcesWithContext(owner, sessionDir string, ownerCtx context.Context,
 	r.executorID = executorID
 	r.ownerToken, r.initErr = runtimepath.ID()
 	if r.initErr == nil {
-		r.environmentDir, r.initErr = execution.NewEnvironment(executorID, r.ownerToken)
+		r.environmentDir, r.initErr = execution.NewEnvironment(executorID)
 	}
 	if r.initErr == nil {
 		r.scratchDir = filepath.Join(r.environmentDir, "scratch")
@@ -126,7 +126,7 @@ func (r *Resources) ReplaceScratch(path string) {
 }
 
 func (r *Resources) NewScratch() (string, error) {
-	root, err := execution.NewEnvironment(r.executorID, r.ownerToken)
+	root, err := execution.NewEnvironment(r.executorID)
 	if err != nil {
 		return "", err
 	}

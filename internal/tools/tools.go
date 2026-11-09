@@ -25,6 +25,9 @@ type Result struct {
 	Process       *protocol.ProcessOutput
 	CompletionIDs []string
 	Text          string
+	// FullText is the complete output when Text is a tool-selected preview.
+	// The runtime saves it and supplies the standard ReadOutput continuation.
+	FullText      string          `json:"-"`
 	Data          json.RawMessage `json:",omitempty"`
 	DataTruncated bool
 	DataError     string
