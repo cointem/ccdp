@@ -40,9 +40,8 @@ func TestWaitDoesNotSerializeIndependentRead(t *testing.T) {
 				if count == 2 {
 					for _, m := range a.History() {
 						if m.Role == messages.RoleTool {
-							var p protocol.ProcessOutput
-							if json.Unmarshal([]byte(m.Content), &p) == nil && p.ID != "" {
-								id = p.ID
+							if _, value, ok := strings.Cut(m.Content, "process_id="); ok {
+								id = strings.Fields(value)[0]
 							}
 						}
 					}
@@ -226,7 +225,7 @@ func TestDevelopmentCacheSurvivesOwnerRestart(t *testing.T) {
 		start := time.Now()
 		r, err := tools.NewBashTool().Execute(tc, map[string]any{"command": "printf 'CACHE=%s\\n' \"$GOCACHE\"; go test -count=1 ./...", "timeout_ms": 120000})
 		var p protocol.ProcessOutput
-		decode := json.Unmarshal([]byte(r.Text), &p)
+		decode := json.Unmarshal(r.Data, &p)
 		t.Logf("%s elapsed=%s result=%s err=%v decode=%v", label, time.Since(start), r.Text, err, decode)
 		if err != nil || decode != nil || p.ExitCode == nil || *p.ExitCode != 0 {
 			t.Fatal("build probe failed")

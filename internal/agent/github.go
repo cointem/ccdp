@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"unicode/utf8"
 
 	"ccdp/internal/execution"
 	"ccdp/internal/permissions"
@@ -169,33 +168,6 @@ func sanitizeRemoteURL(remote string) string {
 	// credentials or query material are still credentials. Keep the report
 	// useful without retaining any attacker-controlled bytes.
 	return "[redacted-url]"
-}
-
-func truncateUTF8(value string, limit int) string {
-	value = strings.ToValidUTF8(value, "�")
-	if limit <= 0 || len(value) <= limit {
-		return value
-	}
-	const suffix = "\n…[truncated]"
-	budget := limit - len(suffix)
-	if budget <= 0 {
-		return validUTF8Prefix(suffix, limit)
-	}
-	return validUTF8Prefix(value, budget) + suffix
-}
-
-func validUTF8Prefix(value string, limit int) string {
-	if limit <= 0 {
-		return ""
-	}
-	if len(value) <= limit {
-		return value
-	}
-	cut := limit
-	for cut > 0 && cut < len(value) && !utf8.RuneStart(value[cut]) {
-		cut--
-	}
-	return value[:cut]
 }
 
 // firstLine returns the first non-empty line of a string.

@@ -52,14 +52,15 @@ func TestProcessFactsRoundTripAndCompactionPreservesDelivery(t *testing.T) {
 	if len(recovered.History) != 1 || strings.Contains(recovered.History[0].Content, p.Output) || !strings.Contains(recovered.History[0].Content, p.OutputID) {
 		t.Fatal("crash recovery duplicated pending completion", recovered.History)
 	}
-	if err := state.Apply(session.ProcessResultsProjected{IDs: []string{p.ID}, Outputs: []protocol.ProcessOutput{p.ProcessOutput}}); err != nil {
+	projectedText := protocol.ProcessCompletionLabel + "stored presentation: " + p.Output
+	if err := state.Apply(session.ProcessResultsProjected{IDs: []string{p.ID}, Outputs: []protocol.ProcessOutput{p.ProcessOutput}, Texts: []string{projectedText}}); err != nil {
 		t.Fatal(err)
 	}
 	if len(state.PendingProcessResults()) != 0 || len(clone.PendingProcessResults()) != 1 {
 		t.Fatal("projected queue was not pruned independently of its clone")
 	}
-	if state.History[0].InternalSource != "process_completion" {
-		t.Fatal("process output was misclassified as user input")
+	if state.History[0].InternalSource != "process_completion" || state.History[0].Content != projectedText {
+		t.Fatal("process projection was re-rendered or misclassified")
 	}
 	summary, err := session.EncodeMessage(messages.Message{ID: "summary", Role: messages.RoleUser, Content: "compacted", SourceOutputs: []messages.OutputReference{*state.History[0].OutputRef}})
 	if err != nil {

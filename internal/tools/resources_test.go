@@ -46,17 +46,17 @@ func TestResourcesSessionIsolationAndClose(t *testing.T) {
 
 	// The two managers intentionally allocate distinct scope-tagged handles.
 	aCtx.Args = map[string]any{"command": "sleep 30", "background": true}
-	startedA, err := executeToolText(NewBashTool(), aCtx)
+	startedA, err := runToolData(t, NewBashTool(), aCtx, aCtx.Args)
 	if err != nil {
 		t.Fatalf("A ProcessStart: %v", err)
 	}
-	aPID := extractPID(t, startedA)
+	aPID := decodeProcess(t, startedA, nil).ID
 	bCtx.Args = map[string]any{"command": "cat", "stdin": "pipe"}
-	startedB, err := executeToolText(NewBashTool(), bCtx)
+	startedB, err := runToolData(t, NewBashTool(), bCtx, bCtx.Args)
 	if err != nil {
 		t.Fatalf("B ProcessStart: %v", err)
 	}
-	bPID := extractPID(t, startedB)
+	bPID := decodeProcess(t, startedB, nil).ID
 	if aPID == bPID {
 		t.Fatalf("scope-tagged handles unexpectedly collided: A=%s B=%s", aPID, bPID)
 	}

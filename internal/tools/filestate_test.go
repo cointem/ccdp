@@ -4,6 +4,7 @@ import (
 	"ccdp/internal/fsops"
 	"ccdp/internal/sandbox"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,49 +24,26 @@ func runTool(t *testing.T, tool Tool, ctx *Context, args map[string]any) (string
 	return executeToolText(tool, &c)
 }
 
-func TestRecentReadsRecencyOrder(t *testing.T) {
-	ctx := freshCtx(t)
-	a := filepath.Join(t.TempDir(), "a.txt")
-	b := filepath.Join(t.TempDir(), "b.txt")
-	c := filepath.Join(t.TempDir(), "c.txt")
-	for _, p := range []string{a, b, c} {
-		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		v, err := fsops.Observe(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ctx.Resources.Files.MarkVersion(p, v)
+func TestFileObservationsSurviveLargeReadSets(t *testing.T) {
+	state := NewFileState("session")
+	for i := 0; i < 1000; i++ {
+		state.MarkVersion(fmt.Sprint(i), fsops.Version{Size: int64(i)})
 	}
-
-	// Newest first, bounded by n.
-	recs := ctx.Resources.Files.RecentReads(2)
-	if len(recs) != 2 || recs[0].Path != c || recs[1].Path != b {
-		t.Fatalf("RecentReads(2) = %v", recs)
+	if v, err := state.ObservedVersion("0"); err != nil || v.Size != 0 {
+		t.Fatalf("old observation evicted: %v %v", v, err)
 	}
-
-	// Re-reading moves a path to the front of the recency order.
-	v, err := fsops.Observe(a)
-	if err != nil {
-		t.Fatal(err)
+	state.MarkVersion("0", fsops.Version{Size: 42})
+	if v, err := state.ObservedVersion("0"); err != nil || v.Size != 42 {
+		t.Fatal(v, err)
 	}
-	ctx.Resources.Files.MarkVersion(a, v)
-	recs = ctx.Resources.Files.RecentReads(3)
-	if recs[0].Path != a || recs[2].Path != b {
-		t.Fatalf("re-read did not refresh recency: %v", recs)
+	state.Clear()
+	if _, err := state.ObservedVersion("999"); err == nil {
+		t.Fatal("cleared observation retained")
 	}
-
-	// Forgetting drops the path entirely.
-	ctx.Resources.Files.ForgetFile(c)
-	recs = ctx.Resources.Files.RecentReads(10)
-	if len(recs) != 2 {
-		t.Fatalf("forgotten path still tracked: %v", recs)
-	}
-	for _, r := range recs {
-		if r.Path == c {
-			t.Fatal("forgotten path returned by RecentReads")
-		}
+	state.Close()
+	state.MarkVersion("new", fsops.Version{})
+	if _, err := state.ObservedVersion("new"); err == nil {
+		t.Fatal("closed state accepted observations")
 	}
 }
 

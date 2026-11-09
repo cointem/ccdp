@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"ccdp/internal/codemode"
 	"ccdp/internal/config"
 	"ccdp/internal/events"
 	processExecution "ccdp/internal/execution"
+	"ccdp/internal/fsops"
 	"ccdp/internal/hooks"
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
@@ -53,6 +55,7 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 		return tooling.Result{Output: err.Error(), IsError: true}
 	}
 	var codeResult *protocol.CodeResult
+	var observeRead func(string)
 	finishToolOutput := func(raw string, failed bool) tooling.Result {
 		if codeResult != nil {
 			encoded, err := json.Marshal(codeResult)
@@ -77,7 +80,7 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 			}
 			preview = a.toolOutputPreview(raw, cfg.MaxResultSizeBytes, execution.outputID)
 		}
-		result := tooling.Result{Process: execution.result.Process, CompletionIDs: execution.result.CompletionIDs, Output: preview, IsError: failed, Code: codeResult,
+		result := tooling.Result{ObserveOutput: observeRead, Process: execution.result.Process, CompletionIDs: execution.result.CompletionIDs, Output: preview, IsError: failed, Code: codeResult,
 			Data: execution.result.Data, DataTruncated: execution.result.DataTruncated,
 			DisplayTruncated: execution.displayTruncated, DataError: execution.result.DataError, OutputID: execution.outputID}
 		if journal.program {
@@ -86,7 +89,7 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 				// not exposed as a usable JavaScript value.
 				result.Data = nil
 			}
-			wire := codemode.Result{CallID: tc.ID, Status: execution.status, Text: raw,
+			wire := codemode.Result{Failure: execution.failure, CallID: tc.ID, Status: execution.status, Text: raw,
 				Data: result.Data, Truncated: result.DataTruncated, DataError: result.DataError, OutputID: result.OutputID}
 			encoded, encodeErr := json.Marshal(wire)
 			if encodeErr != nil || len(encoded) > codemode.MaxResult {
@@ -100,10 +103,9 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 		if result.DataError != "" && !journal.program {
 			result.Output = "Tool execution completed, but its structured data is invalid: " + result.DataError + "\n" + result.Output
 		}
-		if _, reader := tool.(*tools.ReadTool); reader && result.DisplayTruncated && resources != nil {
-			if path, e := sb.ResolveRead(tools.StringArg(tc.Arguments, "file_path", "")); e == nil {
-				resources.Files.ForgetFile(path)
-			}
+		if journal.program && !failed && result.ObserveOutput != nil {
+			result.ObserveOutput(result.Output)
+			result.ObserveOutput = nil
 		}
 		return result
 	}
@@ -115,6 +117,21 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 	a.emitStatus("%s running…", tc.Name)
 	start := time.Now()
 	tctx := a.buildToolContext(tc, turnCtx, cfg, sb, resources, skills)
+	tctx.ObserveRead = func(path string, version fsops.Version) {
+		observeRead = func(delivered string) {
+			// At least the first content rune (or the empty-file marker) must
+			// survive projection. A footer or a line number alone is not a read.
+			text := execution.result.Text
+			required := text
+			if tab := strings.IndexByte(text, '\t'); tab >= 0 {
+				_, size := utf8.DecodeRuneInString(text[tab+1:])
+				required = text[:tab+1+size]
+			}
+			if resources != nil && required != "" && strings.HasPrefix(delivered, required) {
+				resources.Files.MarkVersion(path, version)
+			}
+		}
+	}
 	a.bindProcessEvents(tctx, tc, journal)
 	a.bindProjectMemoryInvocation(tctx, cfg, journal.turnID)
 	if journal.program {
@@ -144,6 +161,7 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 			execution.result, err = tool.Execute(tctx, tctx.Args)
 		}
 		out = execution.result.Text
+		execution.failure = execution.result.Failure
 		codeResult = execution.result.Code
 		if codeResult != nil {
 			for _, p := range codeResult.Completed {
@@ -165,7 +183,7 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 	status := "ok"
 	if err != nil {
 		var unknown *processExecution.OutcomeUnknownError
-		if errors.As(err, &unknown) {
+		if errors.As(err, &unknown) || execution.failure != nil && execution.failure.SideEffect == "unknown" {
 			execution.setStatus("unknown")
 		} else if errors.Is(err, processExecution.ErrEnvironmentUnavailable) {
 			execution.failure = &protocol.ToolFailure{Code: "environment_unavailable", DecisionSource: "environment", ExecutionStarted: "no", RetryClass: "after_environment_change"}

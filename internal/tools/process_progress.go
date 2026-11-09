@@ -71,7 +71,7 @@ func (mp *managedProcess) waitForeground(ctx *Context) error {
 
 // Notifications carry a bounded tail even if retention already evicted the
 // log. They do not compete with reads for an output cursor.
-func (mp *managedProcess) completion() processView {
+func (mp *managedProcess) completion() protocol.ProcessOutput {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 	v := mp.identity.ProcessOutput
@@ -97,7 +97,10 @@ func (mp *managedProcess) completion() processView {
 	v.Offset, v.Next = int(mp.total)-len(raw)+start, int(mp.total)
 	v.Truncated = v.Offset > 0
 	if v.Truncated {
-		v.Warning = "Showing the final output preview."
+		v.Tail, v.Output = v.Output, ""
+		// The preview is not a consumed prefix. Continued reads start at byte
+		// zero; keeping the end cursor here would skip the missing output.
+		v.Offset, v.Next = 0, 0
 	}
 	if v.Log == "" {
 		v.Warning = "The process handle and retained log have been released; this notification contains the final output preview."

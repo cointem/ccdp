@@ -23,7 +23,7 @@ func TestLocalEditAfterPartialReadPreservesOtherChanges(t *testing.T) {
 	f.WriteString("external\n")
 	f.Close()
 	out, e := runTool(t, NewEditTool(), ctx, editArgs(p, "target", "changed"))
-	if e != nil || !strings.Contains(out, ":2") {
+	if e != nil || !strings.Contains(out, "@@ -2,1 +2,1 @@") {
 		t.Fatal(out, e)
 	}
 	b, _ := os.ReadFile(p)
@@ -96,7 +96,7 @@ func TestReadRangeContinuationAndCompleteVisibility(t *testing.T) {
 	if _, e = ctx.Resources.Files.ObservedVersion(p); e != nil {
 		t.Fatal("partial read lost version observation", e)
 	}
-	for _, args := range []map[string]any{{"file_path": p, "offset": 0}, {"file_path": p, "offset": 1700}, {"file_path": p, "unit": "bytes"}} {
+	for _, args := range []map[string]any{{"file_path": p, "offset": 0}, {"file_path": p, "offset": 1700}} {
 		if _, e := runTool(t, NewReadTool(), ctx, args); e == nil {
 			t.Fatal("invalid range accepted", args)
 		}

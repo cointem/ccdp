@@ -9,6 +9,7 @@ type ToolFailure struct {
 	DecisionSource   string              `json:"decision_source,omitempty"`
 	ExecutionStarted string              `json:"execution_started"` // yes, no, unknown
 	RetryClass       string              `json:"retry_class"`
+	SideEffect       string              `json:"side_effect,omitempty"` // none, completed, unknown; empty means unspecified
 	Resources        []CapabilityRequest `json:"resources,omitempty"`
 	DecisionKey      string              `json:"-"`
 }

@@ -9,28 +9,21 @@ import (
 	"time"
 )
 
-func ctxWithArgs(ctx *Context, args map[string]any) *Context {
-	c := *ctx
-	c.Args = args
-	return &c
-}
-func extractPID(t *testing.T, out string) string { return decodeProcess(t, out, nil).ID }
-
 func TestProcessDefaultStdinEOF(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat"})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat"})
 	v := decodeProcess(t, out, err)
 	if v.Status != "exited" || v.ExitCode == nil || *v.ExitCode != 0 {
 		t.Fatal(v)
 	}
-	if _, err := runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "input": "x"}); err == nil {
+	if _, err := runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "input": "x"}); err == nil {
 		t.Fatal("write accepted closed stdin")
 	}
 }
 
 func TestProcessStopConcurrentAndDeletesLog(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": `sh -c 'trap "" INT; sleep 30 & wait'`, "background": true})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": `sh -c 'trap "" INT; sleep 30 & wait'`, "background": true})
 	v := decodeProcess(t, out, err)
 	mp, err := ctx.Resources.Processes.Get(v.ID)
 	if err != nil {
@@ -55,10 +48,10 @@ func TestProcessStopConcurrentAndDeletesLog(t *testing.T) {
 
 func TestProcessEOFIsIdempotent(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, err)
 	for i := 0; i < 2; i++ {
-		if _, err := runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "eof": true}); err != nil {
+		if _, err := runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "eof": true}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -69,10 +62,10 @@ func TestProcessOwnerVersusObservationCancellation(t *testing.T) {
 	call, cancel := context.WithCancel(context.Background())
 	start := *ctx
 	start.Context = call
-	out, err := runTool(t, NewBashTool(), &start, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
+	out, err := runToolData(t, NewBashTool(), &start, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, err)
 	cancel()
-	if _, err := runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "input": "alive\n"}); err != nil {
+	if _, err := runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "input": "alive\n"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := ctx.Resources.Close(); err != nil {
@@ -85,7 +78,7 @@ func TestProcessOwnerVersusObservationCancellation(t *testing.T) {
 
 func TestProcessTimeoutReason(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "sleep 30", "timeout_ms": 30, "background": true})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "sleep 30", "timeout_ms": 30, "background": true})
 	v := decodeProcess(t, out, err)
 	mp, _ := ctx.Resources.Processes.Get(v.ID)
 	select {
@@ -93,7 +86,7 @@ func TestProcessTimeoutReason(t *testing.T) {
 	case <-time.After(8 * time.Second):
 		t.Fatal("timeout failed")
 	}
-	out, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read"})
+	out, err = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read"})
 	if got := decodeProcess(t, out, err); got.Status != "timed_out" {
 		t.Fatal(got)
 	}
@@ -125,7 +118,7 @@ func TestBashConfiguredTimeoutAndExplicitOverride(t *testing.T) {
 			if test.override != nil {
 				args["timeout_ms"] = test.override
 			}
-			out, err := runTool(t, NewBashTool(), ctx, args)
+			out, err := runToolData(t, NewBashTool(), ctx, args)
 			view := decodeProcess(t, out, err)
 			if view.Status != test.want {
 				t.Fatalf("status=%s, want %s: %s", view.Status, test.want, out)

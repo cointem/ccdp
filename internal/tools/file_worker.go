@@ -10,8 +10,10 @@ import (
 	"os"
 	"sync"
 
+	"ccdp/internal/atomicfile"
 	"ccdp/internal/execution"
 	"ccdp/internal/fsops"
+	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 )
 
@@ -137,6 +139,7 @@ func serveFileWorker(input io.Reader, output io.Writer) error {
 			return fmt.Errorf("unknown file operation")
 		}
 		result, runErr := execute(ctx, m.Args)
+		classifyFileFailure(m.Tool, &result, &runErr)
 		reply := fileMessage{Op: "result", Result: result, Versions: map[string]fsops.Version{}}
 		// Only observations produced by this call are merged back. Other concurrent
 		// reads must never be replaced by an older snapshot of the complete state.
@@ -218,6 +221,7 @@ func (r *Resources) RetireFileWorkers() {
 	}
 }
 func executeFileWorker(ctx *Context, name string, args map[string]any) (result Result, runErr error) {
+	defer func() { classifyFileFailure(name, &result, &runErr) }()
 	if err := ctx.checkResources(); err != nil {
 		return result, err
 	}
@@ -334,10 +338,16 @@ func executeFileWorker(ctx *Context, name string, args map[string]any) (result R
 	}
 	var finish func() error
 	beforeSeen, published := false, false
+	unknown := func(err error) error {
+		if published {
+			return &atomicfile.PublishedError{Err: err}
+		}
+		return &execution.OutcomeUnknownError{Cause: err}
+	}
 	for {
 		response, err := readFileFrame(w.output)
 		if err != nil {
-			return result, &execution.OutcomeUnknownError{Cause: fmt.Errorf("file worker: %w (%s)", err, w.diagnostic.String())}
+			return result, unknown(fmt.Errorf("file worker: %w (%s)", err, w.diagnostic.String()))
 		}
 		switch response.Op {
 		case "before", "after":
@@ -371,24 +381,50 @@ func executeFileWorker(ctx *Context, name string, args map[string]any) (result R
 				ack.Error = callbackErr.Error()
 			}
 			if err := writeFileFrame(w.input, ack); err != nil {
-				return result, &execution.OutcomeUnknownError{Cause: err}
+				return result, unknown(err)
 			}
 		case "result":
 			for path, v := range response.Versions {
-				state.MarkVersion(path, v)
+				if name == "Read" && ctx.ObserveRead != nil {
+					ctx.ObserveRead(path, v)
+				} else {
+					state.MarkVersion(path, v)
+				}
 			}
 			// Once grants and changed policies are never reused for a narrower call:
 			// the complete kernel profile is compared before every checkout.
 			reusable = parent.Err() == nil && !policy.SingleUse
 			if response.Error != "" {
-				if published {
-					return response.Result, &execution.OutcomeUnknownError{Cause: fmt.Errorf("file was published but completion was not confirmed: %s", response.Error)}
-				}
 				return response.Result, errors.New(response.Error)
 			}
 			return response.Result, nil
 		default:
-			return result, &execution.OutcomeUnknownError{Cause: fmt.Errorf("invalid file worker response")}
+			return result, unknown(fmt.Errorf("invalid file worker response"))
 		}
 	}
+}
+
+// Preserve publication facts across the worker boundary, including failures
+// after rename. Starting a worker is not evidence that it changed the file.
+func classifyFileFailure(name string, result *Result, err *error) {
+	if *err == nil || result.Failure != nil || name != "Edit" && name != "Write" {
+		return
+	}
+	f := &protocol.ToolFailure{Code: "file_not_changed", DecisionSource: "tool", ExecutionStarted: "yes", RetryClass: "after_correction", SideEffect: "none"}
+	note := "File not written."
+	if name == "Edit" {
+		note = "0 edits applied; file unchanged."
+	}
+	var published *atomicfile.PublishedError
+	var unknown *execution.OutcomeUnknownError
+	switch {
+	case errors.As(*err, &published):
+		f.Code, f.RetryClass, f.SideEffect = "file_published", "never_replay", "completed"
+		note = "File was written, but finalization failed. Inspect the result; do not repeat this mutation."
+	case errors.As(*err, &unknown):
+		f.Code, f.RetryClass, f.SideEffect = "outcome_unknown", "never_replay", "unknown"
+		note = "File outcome unknown. Inspect the current file; do not repeat this mutation."
+	}
+	result.Failure = f
+	*err = fmt.Errorf("%s %w", note, *err)
 }

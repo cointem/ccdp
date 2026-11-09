@@ -1,6 +1,7 @@
 package fsops
 
 import (
+	"ccdp/internal/atomicfile"
 	"context"
 	"fmt"
 	"io"
@@ -199,7 +200,11 @@ func PublishAt(ctx context.Context, root *os.Root, path string, data []byte, mod
 	if err := publishEntry(ctx, root, path, "regular", mode, data, expected == nil, check); err != nil {
 		return Version{}, err
 	}
-	return ObserveAt(root, path)
+	v, err := ObserveAt(root, path)
+	if err != nil {
+		return v, &atomicfile.PublishedError{Err: err}
+	}
+	return v, nil
 }
 
 func MultipleLinks(info os.FileInfo) bool {

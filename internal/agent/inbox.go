@@ -37,10 +37,6 @@ func turnInputFromView(view protocol.InputView) turnInput {
 	return newTurnInput(view.ID, view.Text, view.Strategy, view.CreatedAt)
 }
 
-func (input turnInput) view() protocol.InputView {
-	return protocol.InputView{ID: input.ID, Text: input.Text, Strategy: input.Strategy, State: "queued", CreatedAt: input.CreatedAt}
-}
-
 func (input turnInput) message() messages.Message {
 	message := messages.Message{ID: inputMessageID(string(input.ID)), Role: messages.RoleUser, Content: input.Text, CreatedAt: input.CreatedAt,
 		ImageAttachments: messages.CloneImageAttachments(input.ImageAttachments), ImagesFrozen: input.ImagesFrozen}

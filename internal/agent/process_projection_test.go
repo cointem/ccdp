@@ -35,7 +35,9 @@ func TestProcessCompletionAndWaitAppearOnceInProviderRequest(t *testing.T) {
 			var process protocol.ProcessOutput
 			for _, message := range a.History() {
 				if message.Role == messages.RoleTool {
-					_ = json.Unmarshal([]byte(message.Content), &process)
+					if _, value, ok := strings.Cut(message.Content, "process_id="); ok {
+						process.ID = strings.Fields(value)[0]
+					}
 				}
 			}
 			if process.ID == "" {

@@ -98,8 +98,8 @@ func TestReadLongLinePreviewAndSafeExtraction(t *testing.T) {
 			}
 		}
 	}
-	if _, err := ctx.Resources.Files.ObservedVersion(path); err == nil {
-		t.Fatal("preview granted edit observation")
+	if _, err := ctx.Resources.Files.ObservedVersion(path); err != nil {
+		t.Fatal("delivered partial content lost its version observation", err)
 	}
 }
 

@@ -152,7 +152,7 @@ func walkRgFiles(ctx *Context, r *rgRequest, visit func(string, string) error) e
 		return err
 	}
 	ignoreRoot := rgIgnoreRoot(ctx, r.base)
-	ign := workspace.NewMatcherSafe()
+	ign := workspace.NewMatcher()
 	loadIgnore := func(dir, rel string) {
 		if data, ok := readRgFileLimit(ctx, filepath.Join(dir, ".gitignore"), min(ctx.readLimit(), 256<<10)); ok {
 			ign.AddGitignore(data, rel)

@@ -16,6 +16,8 @@ type Invocation interface {
 }
 
 type Result struct {
+	// ObserveOutput acknowledges the actual delivered text after all budgets.
+	ObserveOutput    func(string) `json:"-"`
 	Process          *protocol.ProcessOutput
 	CompletionIDs    []string
 	Failure          *protocol.ToolFailure

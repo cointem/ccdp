@@ -165,8 +165,16 @@ func TestProcessWriteProjectionKeepsAcknowledgement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got protocol.ProcessOutput
-	if err := json.Unmarshal([]byte(rows[0].Output), &got); err != nil || got.BytesSent != 7 || !got.EOF {
-		t.Fatalf("write acknowledgement lost: %s %v", rows[0].Output, err)
+	if !strings.Contains(rows[0].Output, "Sent 7 bytes") || !strings.Contains(rows[0].Output, "stdin closed") || rows[0].Process.BytesSent != 7 || !rows[0].Process.EOF {
+		t.Fatalf("write acknowledgement lost: %+v", rows[0])
+	}
+}
+
+func TestProcessProjectionKeepsErrorAndHookContext(t *testing.T) {
+	p := protocol.ProcessOutput{ID: "p.test", Status: "stopped", OutputID: strings.Repeat("a", 64), Output: strings.Repeat("x", 3000), Next: 3000}
+	output := "command interrupted\n" + p.Text() + "\nhook context"
+	rows, budget, err := ApplyOutputBudget([]messages.ToolCall{{ID: "call"}}, []Result{{Process: &p, Output: output, Status: "error"}}, 256, 256, 0)
+	if err != nil || len(rows[0].Output)+len("Error: ") > 256 || budget.Used > 256 || !strings.Contains(rows[0].Output, "command interrupted") || !strings.Contains(rows[0].Output, "hook context") || !strings.Contains(rows[0].Output, "ReadOutput") {
+		t.Fatalf("%+v %+v %v", rows, budget, err)
 	}
 }

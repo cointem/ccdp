@@ -7,10 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"unicode/utf8"
 
+	"ccdp/internal/atomicfile"
 	"ccdp/internal/execution"
 	"ccdp/internal/fsops"
 )
@@ -34,9 +34,6 @@ func executeRead(ctx *Context, args map[string]any) (Result, error) {
 	return executeText(ctx, args, func(ctx *Context) (string, error) {
 		if e := ctx.checkResources(); e != nil {
 			return "", e
-		}
-		if _, ok := ctx.Args["unit"]; ok {
-			return "", fmt.Errorf("Read: unit is no longer supported; offset and limit always use lines")
 		}
 		raw := StringArg(ctx.Args, "file_path", "")
 		if raw == "" {
@@ -173,8 +170,8 @@ func executeRead(ctx *Context, args map[string]any) (Result, error) {
 			return "[empty file; EOF]", nil
 		}
 		if longLine {
-			// Preview is separate from complete lines and does not advance the
-			// line cursor or mark the file as successfully observed for editing.
+			// A preview is a partial observation, but not a complete line:
+			// keep its content separate and do not advance the line cursor.
 			note := fmt.Sprintf("[line %d exceeds output budget; preview only. Use Bash for bounded extraction: sed -n '%dp' %s | head -c 4096. Read offset=%d skips this line.]", line, line, execution.QuoteArg(path), line+1)
 			if len(note)+32 > budget {
 				note = fmt.Sprintf("[line %d exceeds output budget; preview only. Use Bash to extract this line in bounded chunks; Read offset=%d skips it.]", line, line+1)
@@ -191,6 +188,7 @@ func executeRead(ctx *Context, args map[string]any) (Result, error) {
 			preview = preview[:valid]
 			data["preview"] = preview
 			if preview != "" {
+				state.MarkVersion(path, fsops.FromInfo(after))
 				fmt.Fprintf(&out, "%d\t%s\n", line, preview)
 			}
 			out.WriteString(note)
@@ -262,7 +260,9 @@ func executeWrite(ctx *Context, args map[string]any) (Result, error) {
 			}
 			defer func() {
 				if runErr == nil {
-					runErr = finish()
+					if err := finish(); err != nil {
+						runErr = &atomicfile.PublishedError{Err: err}
+					}
 				}
 			}()
 		}
@@ -273,123 +273,6 @@ func executeWrite(ctx *Context, args map[string]any) (Result, error) {
 		state.MarkVersion(path, version)
 		return fmt.Sprintf("%s: wrote %d bytes", path, len(content)), nil
 	})
-}
-
-type EditTool struct{}
-
-func NewEditTool() *EditTool   { return &EditTool{} }
-func (*EditTool) Name() string { return "Edit" }
-func (*EditTool) Description() string {
-	return "Apply exact, unique, nonoverlapping text replacements in one file. All edits match the original current content. Reading only the relevant portion is sufficient. A missing new_text is invalid; an explicit empty new_text deletes text. No fuzzy matching."
-}
-func (*EditTool) Parameters() map[string]any {
-	return map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}, "edits": map[string]any{"type": "array", "minItems": 1, "items": map[string]any{"type": "object", "properties": map[string]any{"old_text": map[string]any{"type": "string", "minLength": 1}, "new_text": map[string]any{"type": "string"}}, "required": []string{"old_text", "new_text"}}}}, "required": []string{"file_path", "edits"}}
-}
-func (*EditTool) Execute(ctx *Context, args map[string]any) (Result, error) {
-	return executeFileWorker(ctx, "Edit", args)
-}
-
-// executeEdit runs only inside the fixed file worker.
-func executeEdit(ctx *Context, args map[string]any) (Result, error) {
-	return executeText(ctx, args, func(ctx *Context) (output string, runErr error) {
-		if e := ctx.checkResources(); e != nil {
-			return "", e
-		}
-		raw := StringArg(ctx.Args, "file_path", "")
-		if raw == "" {
-			return "", fmt.Errorf("Edit: missing file_path")
-		}
-		path, e := ctx.ResolveWrite(raw)
-		if e != nil {
-			return "", e
-		}
-		edits, ok := ctx.Args["edits"].([]any)
-		if !ok || len(edits) == 0 {
-			return "", fmt.Errorf("Edit: supply edits=[{old_text,new_text}]; legacy old_string/new_string parameters are unsupported")
-		}
-		state, e := ctx.fileStateForUse()
-		if e != nil {
-			return "", e
-		}
-		root, relative, e := ctx.openWriteRoot(path)
-		if e != nil {
-			return "", e
-		}
-		defer root.Close()
-		data, version, e := fsops.ReadAt(root, relative, 32<<20)
-		if e != nil {
-			return "", e
-		}
-		if !utf8.Valid(data) {
-			return "", fmt.Errorf("Edit: unsupported text encoding")
-		}
-		content := string(data)
-		type replacement struct {
-			start, end int
-			old, next  string
-		}
-		var replacements []replacement
-		for i, item := range edits {
-			m, ok := item.(map[string]any)
-			if !ok {
-				return "", fmt.Errorf("Edit: invalid entry %d", i+1)
-			}
-			old, ok := m["old_text"].(string)
-			next, nok := m["new_text"].(string)
-			if !ok || old == "" || !nok {
-				return "", fmt.Errorf("Edit: entry %d requires nonempty old_text and explicit new_text", i+1)
-			}
-			at := strings.Index(content, old)
-			if at < 0 {
-				return "", fmt.Errorf("Edit: old_text in entry %d not found; read the current region", i+1)
-			}
-			if strings.Contains(content[at+1:], old) {
-				return "", fmt.Errorf("Edit: old_text in entry %d is not unique; include more context", i+1)
-			}
-			replacements = append(replacements, replacement{at, at + len(old), old, next})
-		}
-		sort.Slice(replacements, func(i, j int) bool { return replacements[i].start < replacements[j].start })
-		for i := 1; i < len(replacements); i++ {
-			if replacements[i].start < replacements[i-1].end {
-				return "", fmt.Errorf("Edit: overlapping replacements; merge them into one")
-			}
-		}
-		var b strings.Builder
-		pos := 0
-		var summary strings.Builder
-		for _, r := range replacements {
-			b.WriteString(content[pos:r.start])
-			b.WriteString(r.next)
-			pos = r.end
-			fmt.Fprintf(&summary, "%s:%d\n%s\n", path, 1+strings.Count(content[:r.start], "\n"), diffSummary(r.old, r.next))
-		}
-		b.WriteString(content[pos:])
-		updated := b.String()
-		if updated == content {
-			return "No changes.", nil
-		}
-		if ctx.BeforeWrite != nil {
-			finish, e := ctx.BeforeWrite(path, data)
-			if e != nil {
-				return "", e
-			}
-			defer func() {
-				if runErr == nil {
-					runErr = finish()
-				}
-			}()
-		}
-		version, e = fsops.PublishAt(ctx.Context, root, relative, []byte(updated), 0644, &version)
-		if e != nil {
-			return "", e
-		}
-		state.MarkVersion(path, version)
-		return boundedToolString(ctx, summary.String()), nil
-	})
-}
-
-func diffSummary(old, next string) string {
-	return "Applied edit.\n- " + strings.ReplaceAll(strings.TrimSuffix(old, "\n"), "\n", "\n- ") + "\n+ " + strings.ReplaceAll(strings.TrimSuffix(next, "\n"), "\n", "\n+ ")
 }
 
 // Pin an admitted writable root before reading or recording a mutation. Every

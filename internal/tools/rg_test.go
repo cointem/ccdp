@@ -220,7 +220,7 @@ func TestIgnoreRules(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("# comment\ndist/\n*.log\n!keep.log\nsrc/secret.go\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ir := workspace.NewMatcherSafe()
+	ir := workspace.NewMatcher()
 	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
 	if err != nil {
 		t.Fatal(err)

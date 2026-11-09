@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"ccdp/internal/config"
 	"ccdp/internal/execution"
@@ -130,17 +129,6 @@ func TestGitHubReportRedactsRemoteCredentials(t *testing.T) {
 		if got := sanitizeRemoteURL(tt.input); got != tt.want {
 			t.Errorf("sanitizeRemoteURL(%q)=%q, want %q", tt.input, got, tt.want)
 		}
-	}
-}
-
-func TestPRCommentTruncationPreservesUTF8(t *testing.T) {
-	input := strings.Repeat("注", 5000)
-	got := truncateUTF8(input, 8000)
-	if !utf8.ValidString(got) {
-		t.Fatalf("truncated PR comments are invalid UTF-8")
-	}
-	if !strings.HasSuffix(got, "\n…[truncated]") {
-		t.Fatalf("truncated PR comments lack marker: %q", got[len(got)-min(len(got), 40):])
 	}
 }
 

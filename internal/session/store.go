@@ -152,24 +152,12 @@ type JSONLOptions struct {
 
 type JSONLOption func(*JSONLOptions)
 
-func WithMaxTransactionBytes(n int64) JSONLOption {
-	return func(o *JSONLOptions) { o.MaxTransactionBytes = n }
-}
-
-func WithMaxEventsPerTransaction(n int) JSONLOption {
-	return func(o *JSONLOptions) { o.MaxEventsPerTransaction = n }
-}
-
 func WithMaxBlobBytes(n int64) JSONLOption {
 	return func(o *JSONLOptions) { o.MaxBlobBytes = n }
 }
 
 func WithSyncFile(fn atomicfile.SyncFile) JSONLOption {
 	return func(o *JSONLOptions) { o.SyncFile = fn }
-}
-
-func WithSyncDir(fn func(string) error) JSONLOption {
-	return func(o *JSONLOptions) { o.SyncDir = fn }
 }
 
 func defaultJSONLOptions() JSONLOptions {
@@ -656,9 +644,6 @@ func sessionDir(root, sessionID string) (string, error) {
 	// a directory's basename would make arbitrary configured roots ambiguous.
 	return filepath.Join(root, sessionID), nil
 }
-
-// SessionDir resolves a single session under an already-resolved session root.
-func SessionDir(root, sessionID string) (string, error) { return sessionDir(root, sessionID) }
 
 // ListSessions reports event-log session directories without creating or
 // changing anything.  A missing root is an empty list.

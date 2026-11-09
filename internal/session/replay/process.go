@@ -57,8 +57,16 @@ func (p *State) applyProcess(event session.Event) error {
 			p.Processes[id] = v
 			if len(e.Outputs) > 0 {
 				output := e.Outputs[i]
-				data, _ := json.Marshal(output)
-				message := messages.Message{ID: output.ResultID, Role: messages.RoleUser, InternalSource: "process_completion", Content: protocol.ProcessCompletionLabel + string(data), OutputRef: &messages.OutputReference{Hash: v.Result.Hash, Size: v.Result.Size, MediaType: v.Result.MediaType}}
+				var text string
+				// Use the text committed at projection time, never re-render
+				// conversation history when presentation code changes.
+				if len(e.Texts) > 0 {
+					text = e.Texts[i]
+				} else {
+					data, _ := json.Marshal(output)
+					text = protocol.ProcessCompletionLabel + string(data)
+				}
+				message := messages.Message{ID: output.ResultID, Role: messages.RoleUser, InternalSource: "process_completion", Content: text, OutputRef: &messages.OutputReference{Hash: v.Result.Hash, Size: v.Result.Size, MediaType: v.Result.MediaType}}
 				p.History = append(p.History, message)
 				p.historyStep = append(p.historyStep, "")
 			}

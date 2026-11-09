@@ -25,10 +25,3 @@ func (a *Agent) cancelWork(reason string) {
 		a.services.supervisor.cancelDelegated(a)
 	}
 }
-
-// historyLen returns the number of messages in the conversation.
-func (a *Agent) historyLen() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return len(a.historyLocked())
-}

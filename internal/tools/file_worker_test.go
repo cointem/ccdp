@@ -87,10 +87,9 @@ func TestFileWorkerPreservesVersionAndMutationRecords(t *testing.T) {
 	ctx.BeforeWrite = func(string, []byte) (func() error, error) {
 		return func() error { return errors.New("completion journal unavailable") }, nil
 	}
-	_, err = NewWriteTool().Execute(ctx, map[string]any{"file_path": blocked, "content": "published once"})
-	var unknown *execution.OutcomeUnknownError
-	if !errors.As(err, &unknown) {
-		t.Fatalf("post-publication failure was retryable: %v", err)
+	result, err := NewWriteTool().Execute(ctx, map[string]any{"file_path": blocked, "content": "published once"})
+	if err == nil || result.Failure == nil || result.Failure.SideEffect != "completed" || result.Failure.RetryClass != "never_replay" || !strings.Contains(err.Error(), "File was written") {
+		t.Fatalf("post-publication fact was lost: %+v %v", result, err)
 	}
 	if data, err := os.ReadFile(blocked); err != nil || string(data) != "published once" {
 		t.Fatalf("publication fact lost: %q %v", data, err)

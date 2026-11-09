@@ -98,14 +98,14 @@ func TestRegressionCodeRestoreRetryPreservesNewConversation(t *testing.T) {
 	id := deliveryID(t, out)
 	tc := a.services.resources.Context(ctx, root, a.services.sandbox)
 	tc.Args = map[string]any{"command": "sleep 30", "background": true}
-	raw, err := executeToolText(tools.NewBashTool(), tc)
+	result, err := executeToolResult(tools.NewBashTool(), tc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var proc struct {
 		ID string `json:"process_id"`
 	}
-	if err = json.Unmarshal([]byte(raw), &proc); err != nil {
+	if err = json.Unmarshal(result.Data, &proc); err != nil {
 		t.Fatal(err)
 	}
 	_, err = runCoding(t, a, protocol.WorkflowCommand{Kind: protocol.WorkflowRestore, Action: "apply", ID: id})

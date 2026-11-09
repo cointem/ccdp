@@ -221,6 +221,9 @@ func (j *toolJournalExecution) finish(a *Agent, tc messages.ToolCall, output str
 			sideEffect = "completed"
 		}
 	}
+	if j.failure != nil && j.failure.SideEffect != "" {
+		sideEffect = j.failure.SideEffect
+	}
 	resultText := tooling.BoundedFactText(output, toolFactPreviewBytes)
 	effectID := messages.StableID("tool-effect", struct {
 		TurnID string
@@ -425,19 +428,7 @@ func (a *Agent) toolCallIsReadOnly(jc toolJournalContext, call messages.ToolCall
 // event and live projection cannot disagree when workers finish out of order.
 func (a *Agent) projectToolResults(jc toolJournalContext, calls []messages.ToolCall, results []tooling.Result) (session.Budget, error) {
 	projected := a.projectToolsFromWorker(jc, calls, results)
-	for i, result := range projected.results {
-		if result.Output != results[i].Output && calls[i].Name == "Read" {
-			a.mu.Lock()
-			resources, sb := a.services.resources, a.services.sandbox
-			a.mu.Unlock()
-			if resources != nil && sb != nil {
-				if path, e := sb.ResolveRead(tools.StringArg(calls[i].Arguments, "file_path", "")); e == nil {
-					resources.Files.ForgetFile(path)
-				}
-			}
-		}
-		results[i] = result
-	}
+	copy(results, projected.results)
 	return projected.budget, projected.err
 }
 

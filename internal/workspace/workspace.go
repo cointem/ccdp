@@ -113,10 +113,7 @@ func ScanContext(ctx context.Context, root string, maxFiles int) (*Info, error) 
 		Branch:    branch,
 	}
 
-	ignore, err := NewMatcher()
-	if err != nil {
-		return nil, err
-	}
+	ignore := NewMatcher()
 	// Load only ancestors and visited directories. A preliminary recursive
 	// gitignore scan would defeat maxFiles and descend into dependency trees.
 	if isRepo {

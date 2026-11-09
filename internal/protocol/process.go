@@ -1,8 +1,9 @@
 package protocol
 
 import (
-	"encoding/json"
+	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -89,15 +90,57 @@ func (p ProcessOutput) Reference() ProcessOutput {
 	return p
 }
 
-// FitProcessOutput preserves a legal envelope and its result reference. An
+// Text exposes only actionable metadata. Full state remains available to
+// programs and the UI without repeating opaque IDs for completed commands.
+func (p ProcessOutput) Text() string {
+	var out strings.Builder
+	switch {
+	case p.Status == "input_sent":
+		fmt.Fprintf(&out, "Sent %d bytes; process_id=%s", p.BytesSent, p.ID)
+		if p.EOF {
+			out.WriteString("; stdin closed")
+		}
+	case !p.Terminal():
+		fmt.Fprintf(&out, "Running; process_id=%s", p.ID)
+	case p.ExitCode != nil:
+		fmt.Fprintf(&out, "Exit code: %d", *p.ExitCode)
+		if p.Status != "exited" {
+			fmt.Fprintf(&out, " (%s)", p.Status)
+		}
+	default:
+		fmt.Fprintf(&out, "Status: %s", p.Status)
+	}
+	if p.Output != "" {
+		out.WriteString("\n" + p.Output)
+	}
+	if p.Tail != "" {
+		out.WriteString("\n[final output]\n" + p.Tail)
+	}
+	if p.Warning != "" {
+		out.WriteString("\n" + strings.TrimSpace(p.Warning))
+	}
+	if p.Truncated {
+		switch {
+		case p.OutputID != "":
+			fmt.Fprintf(&out, "\n[incomplete; ReadOutput output_id=%q offset=%d]", p.OutputID, p.Next)
+		case p.Log != "":
+			fmt.Fprintf(&out, "\n[incomplete; Process id=%q action=read offset=%d]", p.ID, p.Next)
+		default:
+			out.WriteString("\n[incomplete; no retained output available]")
+		}
+	}
+	return out.String()
+}
+
+// FitProcessOutput preserves the completion and its result reference. An
 // empty string means even metadata cannot fit, so delivery must stay pending.
 func FitProcessOutput(p ProcessOutput, limit int) (ProcessOutput, string) {
 	if limit <= 0 {
 		return p, ""
 	}
-	data, _ := json.Marshal(p)
-	if len(data) <= limit {
-		return p, string(data)
+	text := p.Text()
+	if len(text) <= limit {
+		return p, text
 	}
 	// This is a second budget boundary, after the tool computed its raw byte
 	// cursor. Never cut decoded text and pretend its UTF-8 length is a raw
@@ -105,11 +148,11 @@ func FitProcessOutput(p ProcessOutput, limit int) (ProcessOutput, string) {
 	p.Output, p.Tail, p.Warning = "", "", ""
 	p.Next = p.Offset
 	p.Truncated = true
-	data, _ = json.Marshal(p)
-	if len(data) > limit {
+	text = p.Text()
+	if len(text) > limit {
 		return p, ""
 	}
-	return p, string(data)
+	return p, text
 }
 
 // ProcessProgress describes raw log byte positions, independently of display

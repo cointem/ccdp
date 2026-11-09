@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -454,21 +453,6 @@ func (m *Model) startAgentSwitch() tea.Cmd {
 	default:
 		return tea.Sequence(tea.ClearScreen, ack)
 	}
-}
-
-// Bubble Tea suspends its renderer while this trusted terminal reset runs.
-// No subprocess is spawned and no worker is allowed to write to this stream.
-type resetAgentTerminal struct{ output io.Writer }
-
-func (c *resetAgentTerminal) SetStdin(io.Reader)    {}
-func (c *resetAgentTerminal) SetStderr(io.Writer)   {}
-func (c *resetAgentTerminal) SetStdout(w io.Writer) { c.output = w }
-func (c *resetAgentTerminal) Run() error {
-	// Clear only the managed alternate-screen frame. CSI 3J erases the
-	// terminal's native scrollback, which belongs to the root conversation and
-	// must survive child navigation.
-	_, err := io.WriteString(c.output, "\x1b[2J\x1b[H")
-	return err
 }
 
 func (m *Model) nextInlinePrint() tea.Cmd {

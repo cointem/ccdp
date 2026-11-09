@@ -53,16 +53,13 @@ func (*RgTool) OutputSchema() map[string]any {
 	return objectOutput(map[string]any{"mode": scalarOutput("string"), "entries": arrayOutput(objectOutput(map[string]any{"path": scalarOutput("string"), "line": scalarOutput("integer"), "text": scalarOutput("string"), "match": scalarOutput("boolean"), "count": scalarOutput("integer")})), "offset": scalarOutput("integer"), "next_offset": scalarOutput("integer"), "truncated": scalarOutput("boolean")})
 }
 
-// Process tools already own a documented JSON protocol. Parse only that
-// protocol, never arbitrary output returned by other tools.
+// The process view produces structured data once. Text is a separate compact
+// presentation; neither programs nor the UI need to parse it back into state.
 func processResult(result Result) Result {
-	if json.Valid([]byte(result.Text)) {
+	if result.Process != nil {
 		result.Data = json.RawMessage(result.Text)
-		var metadata struct {
-			Truncated bool `json:"truncated"`
-		}
-		_ = json.Unmarshal(result.Data, &metadata)
-		result.DataTruncated = metadata.Truncated
+		result.DataTruncated = result.Process.Truncated
+		result.Text = result.Process.Text()
 	}
 	return result
 }

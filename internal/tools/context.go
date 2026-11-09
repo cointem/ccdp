@@ -2,6 +2,7 @@ package tools
 
 import (
 	"ccdp/internal/computer"
+	"ccdp/internal/fsops"
 	"ccdp/internal/protocol"
 	"ccdp/internal/sandbox"
 	"ccdp/internal/skills"
@@ -57,6 +58,9 @@ type Context struct {
 	// bytes returned/retained by a tool. Zero uses package defaults.
 	ReadLimit   int
 	OutputLimit int
+	// ObserveRead defers read authority to the caller's delivery boundary.
+	// Without it, a returned Read result is immediately considered observed.
+	ObserveRead func(string, fsops.Version)
 	// ProcessInputLimit bounds one ProcessWrite call. Zero uses the default.
 	ProcessInputLimit int
 	// Sandbox applies the shared file policy: host reads are allowed except
@@ -150,18 +154,11 @@ func (c *Context) checkResources() error {
 	return nil
 }
 
-func (c *Context) fileState() *FileState {
-	if c != nil && c.Resources != nil {
-		return c.Resources.Files
-	}
-	return nil
-}
-
 func (c *Context) fileStateForUse() (*FileState, error) {
-	state := c.fileState()
-	if state == nil {
+	if c == nil || c.Resources == nil || c.Resources.Files == nil {
 		return nil, fmt.Errorf("tools: no session FileState injected")
 	}
+	state := c.Resources.Files
 	if err := state.CheckOpen(); err != nil {
 		return nil, err
 	}

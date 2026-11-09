@@ -67,7 +67,7 @@ func (a *Agent) runCode(ctx context.Context, parent messages.ToolCall, jc toolJo
 			if a.persistenceFailure() != nil || a.codeSteerPending() || result.Status == "resource_limit" || result.Status == "unknown" {
 				cancel()
 			}
-			return codemode.Result{Process: result.Process, CompletionIDs: result.CompletionIDs, CallID: id, Status: result.Status, Text: result.Output, Data: result.Data, Truncated: result.DataTruncated, DataError: result.DataError, OutputID: result.OutputID}
+			return codemode.Result{Failure: result.Failure, Process: result.Process, CompletionIDs: result.CompletionIDs, CallID: id, Status: result.Status, Text: result.Output, Data: result.Data, Truncated: result.DataTruncated, DataError: result.DataError, OutputID: result.OutputID}
 		}}
 	}
 	result, err := codemode.Run(cellCtx, codemode.Options{Code: code, Timeout: timeout, MaxParallel: jc.maxParallel, Bindings: bindings})

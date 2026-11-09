@@ -9,14 +9,16 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"ccdp/internal/protocol"
 )
 
-func decodeProcess(t *testing.T, out string, e error) processView {
+func decodeProcess(t *testing.T, out string, e error) protocol.ProcessOutput {
 	t.Helper()
 	if e != nil {
 		t.Fatal(e, out)
 	}
-	var v processView
+	var v protocol.ProcessOutput
 	if e = json.Unmarshal([]byte(out), &v); e != nil {
 		t.Fatal(e, out)
 	}
@@ -24,13 +26,13 @@ func decodeProcess(t *testing.T, out string, e error) processView {
 }
 func TestUnifiedProcessRepeatableOutputAndEOF(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
+	out, e := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, e)
 	id := v.ID
 	if id == "" {
 		t.Fatal(v)
 	}
-	if _, e = runTool(t, NewProcessTool(), ctx, map[string]any{"id": id, "action": "write", "input": "中文 marker\n", "eof": true}); e != nil {
+	if _, e = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": id, "action": "write", "input": "中文 marker\n", "eof": true}); e != nil {
 		t.Fatal(e)
 	}
 	mp, _ := ctx.Resources.Processes.Get(id)
@@ -43,9 +45,9 @@ func TestUnifiedProcessRepeatableOutputAndEOF(t *testing.T) {
 		t.Fatalf("exited processes counted: %d", n)
 	}
 	args := map[string]any{"id": id, "action": "read", "offset": 0}
-	out, e = runTool(t, NewProcessTool(), ctx, args)
+	out, e = runToolData(t, NewProcessTool(), ctx, args)
 	a := decodeProcess(t, out, e)
-	out, e = runTool(t, NewProcessTool(), ctx, args)
+	out, e = runToolData(t, NewProcessTool(), ctx, args)
 	b := decodeProcess(t, out, e)
 	if a.Output != b.Output || !strings.Contains(a.Output, "中文 marker") || a.ExitCode == nil || *a.ExitCode != 0 {
 		t.Fatal(a, b)
@@ -94,9 +96,9 @@ func TestCompletedProcessRetentionIsBounded(t *testing.T) {
 
 func TestUnifiedProcessStopRemovesHandle(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, err)
-	out, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "stop"})
+	out, err = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "stop"})
 	stopped := decodeProcess(t, out, err)
 	if stopped.Log != "" || !strings.Contains(stopped.Warning, "released") || strings.Contains(stopped.Warning, "use Process") {
 		t.Fatal("stop advertised an unavailable log/continuation", stopped)
@@ -110,7 +112,7 @@ func TestUnifiedProcessStopRemovesHandle(t *testing.T) {
 }
 func TestCompletedLargeOutputCanContinue(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "awk 'BEGIN { for(i=0;i<9000;i++) print \"abcdefghijk\" }'"})
+	out, e := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "awk 'BEGIN { for(i=0;i<9000;i++) print \"abcdefghijk\" }'"})
 	v := decodeProcess(t, out, e)
 	mp, _ := ctx.Resources.Processes.Get(v.ID)
 	select {
@@ -121,7 +123,7 @@ func TestCompletedLargeOutputCanContinue(t *testing.T) {
 	var collected strings.Builder
 	offset := 0
 	for {
-		out, e = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read", "offset": offset})
+		out, e = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read", "offset": offset})
 		v = decodeProcess(t, out, e)
 		collected.WriteString(v.Output)
 		if v.Next == offset {
@@ -135,28 +137,28 @@ func TestCompletedLargeOutputCanContinue(t *testing.T) {
 }
 func TestProcessWaitCancellationDoesNotKillProcess(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
+	out, e := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe", "background": true})
 	v := decodeProcess(t, out, e)
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	copy := *ctx
 	copy.Context = cancelCtx
 	for _, action := range []string{"read", "wait"} {
-		if _, e = runTool(t, NewProcessTool(), &copy, map[string]any{"id": v.ID, "action": action}); e == nil {
+		if _, e = runToolData(t, NewProcessTool(), &copy, map[string]any{"id": v.ID, "action": action}); e == nil {
 			t.Fatalf("%s ignored cancellation", action)
 		}
 	}
-	if _, e = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "input": "still alive\n", "eof": true}); e != nil {
+	if _, e = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "write", "input": "still alive\n", "eof": true}); e != nil {
 		t.Fatal(e)
 	}
 }
 func TestBashTTY(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "test -t 1 && printf tty-ok", "tty": true})
+	out, e := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "test -t 1 && printf tty-ok", "tty": true})
 	v := decodeProcess(t, out, e)
 	mp, _ := ctx.Resources.Processes.Get(v.ID)
 	<-mp.done
-	out, e = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read"})
+	out, e = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read"})
 	v = decodeProcess(t, out, e)
 	if !strings.Contains(v.Output, "tty-ok") {
 		t.Fatal(v)
@@ -165,14 +167,14 @@ func TestBashTTY(t *testing.T) {
 
 func TestProcessUTF8OffsetsAndInvalidBytes(t *testing.T) {
 	ctx := freshCtx(t)
-	out, e := runTool(t, NewBashTool(), ctx, map[string]any{"command": "printf 'a中文b'"})
+	out, e := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "printf 'a中文b'"})
 	v := decodeProcess(t, out, e)
 	mp, _ := ctx.Resources.Processes.Get(v.ID)
 	<-mp.done
 	var result strings.Builder
 	offset := 0
 	for i := 0; i < 10; i++ {
-		out, e = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read", "offset": offset, "limit_bytes": 4})
+		out, e = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read", "offset": offset, "limit_bytes": 4})
 		v = decodeProcess(t, out, e)
 		result.WriteString(v.Output)
 		if v.Next == offset {
@@ -183,7 +185,7 @@ func TestProcessUTF8OffsetsAndInvalidBytes(t *testing.T) {
 	if result.String() != "a中文b" {
 		t.Fatal(result.String())
 	}
-	out, e = runTool(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read", "offset": 2, "limit_bytes": 4})
+	out, e = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": v.ID, "action": "read", "offset": 2, "limit_bytes": 4})
 	v = decodeProcess(t, out, e)
 	if v.Next <= 2 || !strings.Contains(v.Warning, "boundary") {
 		t.Fatal(v)

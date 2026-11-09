@@ -21,6 +21,7 @@ type Tool interface {
 // Result keeps execution output separate from its presentation and validation.
 // An invalid Data value does not undo an otherwise successful operation.
 type Result struct {
+	Failure       *protocol.ToolFailure `json:",omitempty"`
 	Image         *messages.ImageAttachment
 	Process       *protocol.ProcessOutput
 	CompletionIDs []string

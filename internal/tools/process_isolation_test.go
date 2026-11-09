@@ -48,7 +48,7 @@ func TestUnixSocketCannotReachFutureSiblingEnvironment(t *testing.T) {
 			// root must still exclude every owner except this command's own scratch.
 			workspace := filepath.Dir(filepath.Dir(first.ScratchDir()))
 			ctx := first.Context(context.Background(), workspace, sandbox.New(workspace))
-			out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.stdin.readline().strip()); print("CONNECTED")'`, "stdin": "pipe"})
+			out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.stdin.readline().strip()); print("CONNECTED")'`, "stdin": "pipe"})
 			process := decodeProcess(t, out, err)
 			executor := ""
 			if shared {
@@ -65,10 +65,10 @@ func TestUnixSocketCannotReachFutureSiblingEnvironment(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer listener.Close()
-			if _, err := runTool(t, NewProcessTool(), ctx, map[string]any{"id": process.ID, "action": "write", "input": path + "\n", "eof": true}); err != nil {
+			if _, err := runToolData(t, NewProcessTool(), ctx, map[string]any{"id": process.ID, "action": "write", "input": path + "\n", "eof": true}); err != nil {
 				t.Fatal(err)
 			}
-			out, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": process.ID, "action": "wait"})
+			out, err = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": process.ID, "action": "wait"})
 			result := decodeProcess(t, out, err)
 			if result.ExitCode == nil || *result.ExitCode == 0 || !strings.Contains(result.Output, "Operation not permitted") {
 				t.Fatalf("old profile exposed future sibling socket: %+v", result)
@@ -89,7 +89,7 @@ func testPrivateRuntimeFutureSibling(t *testing.T, shared bool) {
 	defer first.Close()
 	ctx := first.Context(context.Background(), workspace, sandbox.New(workspace))
 	// This command's immutable profile predates the other owner/environment.
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": `python3 -u -c 'import sys; from pathlib import Path; print(Path(sys.stdin.readline().strip()).read_text())'`, "stdin": "pipe"})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": `python3 -u -c 'import sys; from pathlib import Path; print(Path(sys.stdin.readline().strip()).read_text())'`, "stdin": "pipe"})
 	running := decodeProcess(t, out, err)
 	executorID := ""
 	if shared {
@@ -108,10 +108,10 @@ func testPrivateRuntimeFutureSibling(t *testing.T, shared bool) {
 	if result, err := NewReadTool().Execute(ctx, map[string]any{"file_path": path}); err == nil {
 		t.Fatalf("Read crossed owner boundary: %s", result.Text)
 	}
-	if _, err := runTool(t, NewProcessTool(), ctx, map[string]any{"id": running.ID, "action": "write", "input": path + "\n", "eof": true}); err != nil {
+	if _, err := runToolData(t, NewProcessTool(), ctx, map[string]any{"id": running.ID, "action": "write", "input": path + "\n", "eof": true}); err != nil {
 		t.Fatal(err)
 	}
-	out, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": running.ID, "action": "wait"})
+	out, err = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": running.ID, "action": "wait"})
 	done := decodeProcess(t, out, err)
 	if strings.Contains(done.Output, secret) || !strings.Contains(done.Output, "Operation not permitted") {
 		t.Fatalf("old profile did not isolate future scratch: %+v", done)
@@ -130,7 +130,7 @@ func testPrivateRuntimeFutureSibling(t *testing.T, shared bool) {
 	if _, err := NewReadTool().Execute(ctx, map[string]any{"file_path": alias}); err == nil {
 		t.Fatal("Read followed private alias")
 	}
-	out, err = runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat " + execution.QuoteArg(alias)})
+	out, err = runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat " + execution.QuoteArg(alias)})
 	if v := decodeProcess(t, out, err); v.ExitCode == nil || *v.ExitCode == 0 || strings.Contains(v.Output, secret) {
 		t.Fatal("Bash followed private alias", v)
 	}
@@ -138,7 +138,7 @@ func testPrivateRuntimeFutureSibling(t *testing.T, shared bool) {
 	if _, err := NewReadTool().Execute(ctx, map[string]any{"file_path": own}); err == nil {
 		t.Fatal("scratch grant overrode explicit deny")
 	}
-	out, err = runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat " + execution.QuoteArg(own)})
+	out, err = runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat " + execution.QuoteArg(own)})
 	if v := decodeProcess(t, out, err); v.ExitCode == nil || *v.ExitCode == 0 || strings.Contains(v.Output, "own-readable") {
 		t.Fatal("Bash scratch grant overrode explicit deny", v)
 	}
@@ -174,7 +174,7 @@ func TestProcessIDSubprocessHelper(t *testing.T) {
 	r := NewResources("same-session", "", filepath.Join(root, "runtime"))
 	defer r.Close()
 	ctx := r.Context(context.Background(), root, sandbox.New(root))
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
 	p := decodeProcess(t, out, err)
 	path := filepath.Join(root, "old-id.json")
 	if stage == "old" {
@@ -195,13 +195,13 @@ func TestProcessIDSubprocessHelper(t *testing.T) {
 	if old == p.ID {
 		t.Fatal("new runtime reused an old handle")
 	}
-	if _, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": old, "action": "stop"}); err == nil || !strings.Contains(err.Error(), "stale_process") {
+	if _, err = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": old, "action": "stop"}); err == nil || !strings.Contains(err.Error(), "stale_process") {
 		t.Fatal("old stop was not rejected", err)
 	}
-	if _, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": p.ID, "action": "write", "input": "still-alive", "eof": true}); err != nil {
+	if _, err = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": p.ID, "action": "write", "input": "still-alive", "eof": true}); err != nil {
 		t.Fatal(err)
 	}
-	out, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": p.ID, "action": "wait"})
+	out, err = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": p.ID, "action": "wait"})
 	if done := decodeProcess(t, out, err); done.Output != "still-alive" {
 		t.Fatal("old handle affected new process", done)
 	}

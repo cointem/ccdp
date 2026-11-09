@@ -135,16 +135,7 @@ func TestAstraAcceptanceDraftAndInputHistory(t *testing.T) {
 	}
 }
 
-func TestAstraAcceptanceNavigationNeverErasesNativeHistory(t *testing.T) {
-	var terminal bytes.Buffer
-	reset := &resetAgentTerminal{}
-	reset.SetStdout(&terminal)
-	if err := reset.Run(); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(terminal.String(), "\x1b[3J") {
-		t.Fatal("navigation still erases native terminal scrollback")
-	}
+func TestAstraAcceptanceNavigationPreservesSessionSettingsAndDrafts(t *testing.T) {
 	m, directory := routingTestModel()
 	t.Cleanup(m.watchCancel)
 	directory.clients["root"].snapshot.Settings.ContextWindow = 200000
@@ -194,10 +185,6 @@ func (m astraTerminalCommandModel) Update(message tea.Msg) (tea.Model, tea.Cmd) 
 	return m, nil
 }
 func (astraTerminalCommandModel) View() string { return "acceptance transition" }
-
-func astraTerminalCommandOutput(t *testing.T, command tea.Cmd) string {
-	return astraTerminalCommandsOutput(t, command)
-}
 
 func astraTerminalCommandsOutput(t *testing.T, commands ...tea.Cmd) string {
 	t.Helper()

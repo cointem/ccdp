@@ -53,7 +53,6 @@ type Model struct {
 	watchRetry        int
 	snapshot          protocol.SessionView
 	hasSnapshot       bool
-	commandSeq        uint64
 	reportGeneration  uint64
 	receiptKeys       map[protocol.CommandID]string
 	// receiptOrder bounds the UI-only duplicate-display cache. Runtime command

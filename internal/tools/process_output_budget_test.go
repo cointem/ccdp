@@ -27,13 +27,13 @@ func TestProcessPagesUseActualEncodedBudget(t *testing.T) {
 		defer delete(manager.procs, id) // synthetic process has no child to stop
 		var recovered strings.Builder
 		for offset := 0; offset < len(text); {
-			out, err := runTool(t, NewProcessTool(), ctx, map[string]any{"id": id, "action": "read", "offset": offset, "limit_bytes": 51200})
+			out, err := runToolData(t, NewProcessTool(), ctx, map[string]any{"id": id, "action": "read", "offset": offset, "limit_bytes": 51200})
 			page := decodeProcess(t, out, err)
 			if len(out) > ctx.OutputLimit || page.Next <= offset {
 				t.Fatalf("invalid page size/progress: bytes=%d offset=%d next=%d", len(out), offset, page.Next)
 			}
-			if page.Truncated && !strings.Contains(page.Warning, fmt.Sprintf("action=read offset=%d (bytes)", page.Next)) {
-				t.Fatal("missing exact continuation", page.Warning)
+			if page.Truncated && !strings.Contains(page.Text(), fmt.Sprintf("action=read offset=%d", page.Next)) {
+				t.Fatal("missing exact continuation", page.Text())
 			}
 			if len(text) < 20000 && (page.Truncated || page.Output != text) {
 				t.Fatal("ordinary output was needlessly truncated")

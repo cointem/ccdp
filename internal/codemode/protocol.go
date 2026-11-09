@@ -21,6 +21,7 @@ const MaxQueue = 32
 const MaxResults = 8 << 20
 
 type Result struct {
+	Failure       *protocol.ToolFailure   `json:"failure,omitempty"`
 	Process       *protocol.ProcessOutput `json:"-"`
 	CompletionIDs []string                `json:"-"`
 	CallID        string                  `json:"call_id,omitempty"`

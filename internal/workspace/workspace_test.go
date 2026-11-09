@@ -12,16 +12,9 @@ import (
 )
 
 func TestGitignoreMatch(t *testing.T) {
-	m, _ := NewMatcher()
-	// Simulate a root .gitignore
-	dir := t.TempDir()
+	m := NewMatcher()
 	gitignore := "*.log\nnode_modules/\n!important.log\nbuild/**\n/top.go\nnested/deep.txt\n"
-	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(gitignore), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.LoadGitignores(dir); err != nil {
-		t.Fatal(err)
-	}
+	m.AddGitignore([]byte(gitignore), "")
 
 	cases := []struct {
 		path   string

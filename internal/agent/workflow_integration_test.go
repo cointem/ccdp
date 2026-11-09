@@ -157,37 +157,6 @@ func readWorkflowLog(t *testing.T, path string) []string {
 	return strings.Split(text, "\n")
 }
 
-func readWorkflowOutput(t *testing.T, setup workflowTestSetup, completed session.CommandCompleted) string {
-	t.Helper()
-	if completed.Output == nil {
-		t.Fatal("workflow completion has no output artifact")
-	}
-	artifacts, err := setup.ag.persistenceHandle().RequestArtifacts()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if artifacts == nil {
-		t.Fatal("workflow completion has no artifact store")
-	}
-	data, err := artifacts.Read(*completed.Output, 1<<20)
-	if err != nil {
-		t.Fatalf("read workflow output artifact: %v", err)
-	}
-	return string(data)
-}
-
-func waitForWorkflowFile(t *testing.T, path string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("workflow did not reach %s", path)
-}
-
 func TestCommandRunWorkflowDeniedDoesNotMutate(t *testing.T) {
 	t.Run("hard deny", func(t *testing.T) {
 		setup := newWorkflowTestSetup(t, permissions.ModeAuto, []string{"Bash"},

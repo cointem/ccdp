@@ -36,6 +36,7 @@ type ProcessResultsProjected struct {
 	ToolCalls map[string]string        `json:"tool_calls,omitempty"`
 	IDs       []string                 `json:"process_ids"`
 	Outputs   []protocol.ProcessOutput `json:"outputs,omitempty"`
+	Texts     []string                 `json:"texts,omitempty"`
 	Budget    Budget                   `json:"budget"`
 }
 
@@ -82,6 +83,9 @@ func (e ProcessResultsProjected) validate() error {
 	}
 	if len(e.Outputs) != 0 && len(e.Outputs) != len(e.IDs) {
 		return fmt.Errorf("process projection count mismatch")
+	}
+	if len(e.Texts) != 0 && len(e.Texts) != len(e.Outputs) {
+		return fmt.Errorf("process projection text count mismatch")
 	}
 	for i, id := range e.IDs {
 		if err := requireID("process_id", id); err != nil {

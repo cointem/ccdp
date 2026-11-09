@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -73,8 +72,7 @@ func TestBashProgressDoesNotAddModelRequests(t *testing.T) {
 	}
 	for _, message := range a.History() {
 		if message.Role == messages.RoleTool {
-			var p protocol.ProcessOutput
-			if err := json.Unmarshal([]byte(message.Content), &p); err != nil || !p.Terminal() || p.Output != "firstlast" {
+			if message.Content != "Exit code: 0\nfirstlast" {
 				t.Fatalf("model received an unfinished result: %s", message.Content)
 			}
 		}

@@ -77,13 +77,19 @@ func ApplyOutputBudget(calls []messages.ToolCall, results []Result, perResultLim
 			budget.Truncated = budget.Truncated || shortened
 			projected[i].DisplayTruncated = projected[i].DisplayTruncated || shortened
 		} else if projected[i].Process != nil {
-			p, encoded := protocol.FitProcessOutput(*projected[i].Process, int(outputLimit))
+			// Keep execution errors and post-tool hook context around the
+			// process body. They are not part of the command's raw log.
+			prefix, suffix := "", ""
+			if before, after, ok := strings.Cut(out, projected[i].Process.Text()); ok {
+				prefix, suffix = before, after
+			}
+			p, encoded := protocol.FitProcessOutput(*projected[i].Process, int(outputLimit)-len(prefix)-len(suffix))
 			if encoded == "" {
 				omit()
 				continue
 			}
 			projected[i].Process = &p
-			out = encoded
+			out = prefix + encoded + suffix
 			projected[i].DisplayTruncated = projected[i].DisplayTruncated || p.Truncated
 			budget.Truncated = budget.Truncated || p.Truncated
 		} else if int64(len(out)) > outputLimit {

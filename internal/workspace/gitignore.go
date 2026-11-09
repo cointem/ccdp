@@ -1,10 +1,7 @@
 package workspace
 
 import (
-	"context"
-	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -27,67 +24,7 @@ type ignoreRule struct {
 }
 
 // NewMatcher returns an empty matcher.
-func NewMatcher() (*Matcher, error) { return &Matcher{}, nil }
-
-// NewMatcherSafe returns an empty matcher (no error path).
-func NewMatcherSafe() *Matcher { return &Matcher{} }
-
-// LoadGitignores loads every .gitignore from repoRoot downward, deepest last
-// (mirroring git precedence: deeper files override shallower ones).
-func (m *Matcher) LoadGitignores(repoRoot string) error {
-	return m.LoadGitignoresContext(context.Background(), repoRoot)
-}
-
-func (m *Matcher) LoadGitignoresContext(ctx context.Context, repoRoot string) error {
-	if m == nil {
-		m = &Matcher{}
-	}
-	var files []string
-	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() && d.Name() == ".git" {
-			return filepath.SkipDir
-		}
-		if !d.IsDir() && d.Name() == ".gitignore" {
-			files = append(files, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	sortDepthAsc(files)
-	for _, f := range files {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		base, err := filepath.Rel(repoRoot, filepath.Dir(f))
-		if err != nil {
-			continue
-		}
-		base = filepath.ToSlash(base)
-		if base == "." {
-			base = ""
-		}
-		if err := m.loadFile(f, base); err != nil {
-			continue
-		}
-	}
-	return nil
-}
-
-func sortDepthAsc(paths []string) {
-	depths := make(map[string]int, len(paths))
-	for _, path := range paths {
-		depths[path] = strings.Count(filepath.ToSlash(path), "/")
-	}
-	sort.SliceStable(paths, func(i, j int) bool { return depths[paths[i]] < depths[paths[j]] })
-}
+func NewMatcher() *Matcher { return &Matcher{} }
 
 // AddGitignore adds bounded, already-authorized file contents relative to baseDir.
 func (m *Matcher) AddGitignore(data []byte, baseDir string) {

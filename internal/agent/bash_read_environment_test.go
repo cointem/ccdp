@@ -63,7 +63,7 @@ func TestBashCreatedFileRemainsReadableAfterSettingsChanges(t *testing.T) {
 				Next     int    `json:"next_offset"`
 			}
 			for {
-				if err := json.Unmarshal([]byte(result.Text), &process); err != nil {
+				if err := json.Unmarshal(result.Data, &process); err != nil {
 					t.Fatal(err)
 				}
 				if process.Status != "running" {

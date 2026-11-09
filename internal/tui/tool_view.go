@@ -114,10 +114,11 @@ func renderToolPresentation(p toolPresentation, width int) string {
 	}
 	meta := toolArgumentSummary(p.Name, p.Args, p.Arguments)
 	settled := protocol.ToolTerminal(p.Status)
-	if p.Process != nil && p.Name == "Bash" && !toolStatusIsFailure(p.Status) {
+	toolFailed := toolStatusIsFailure(p.Status)
+	if p.Process != nil && p.Name == "Bash" && !toolFailed {
 		p.Status = processPresentationStatus(*p.Process)
 	}
-	if p.Process != nil && settled && !p.Expanded {
+	if p.Process != nil && settled && !p.Expanded && !toolFailed {
 		p.Output = sanitizeANSI(p.Process.Output)
 		if p.Process.Tail != "" {
 			p.Output = "…\n" + sanitizeANSI(p.Process.Tail)
@@ -151,9 +152,13 @@ func renderToolPresentation(p toolPresentation, width int) string {
 			meta = sanitizeANSI(p.Process.Command)
 		}
 	case "write":
-		name = "Wrote"
+		if toolStatusComplete(p.Status) && !toolStatusIsFailure(p.Status) {
+			name = "Wrote"
+		}
 	case "edit":
-		name = "Edited"
+		if toolStatusComplete(p.Status) && !toolStatusIsFailure(p.Status) {
+			name = "Edited"
+		}
 	}
 	status := strings.ToLower(strings.TrimSpace(p.Status))
 	mark, stateStyle, stateText := "●", styleToolRun, "running"

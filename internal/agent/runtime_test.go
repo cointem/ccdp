@@ -19,15 +19,6 @@ import (
 	"ccdp/internal/session/archive"
 )
 
-// truncateForLog shortens a message for test failure dumps.
-func truncateForLog(s string) string {
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	if len(s) > 60 {
-		return s[:60] + "…"
-	}
-	return s
-}
-
 // newRuntimeAgent builds an agent for runtime-loop tests with its event
 // channel drained in the background.
 func newRuntimeAgent(t *testing.T) *Agent {

@@ -186,7 +186,7 @@ func (a *Agent) projectPendingProcessesOwned() error {
 		if maxBytes <= 0 {
 			maxBytes = 8192
 		}
-		const prefix = protocol.ProcessCompletionLabel
+		prefix := protocol.ProcessCompletionLabel + "process_id=" + p.ID + "\n"
 		if limit > 0 {
 			maxBytes = min(maxBytes, max(0, limit-int(fact.Budget.Used)))
 		}
@@ -196,6 +196,7 @@ func (a *Agent) projectPendingProcessesOwned() error {
 		}
 		fact.IDs = append(fact.IDs, p.ID)
 		fact.Outputs = append(fact.Outputs, view)
+		fact.Texts = append(fact.Texts, prefix+text)
 		fact.Budget.Used += int64(len(prefix) + len(text))
 	}
 	if len(fact.IDs) == 0 {

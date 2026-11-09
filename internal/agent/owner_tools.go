@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 
 	"ccdp/internal/jsonvalue"
 	"ccdp/internal/messages"
@@ -128,6 +129,7 @@ func (a *Agent) projectToolsOwned(request toolProjectionRequested) toolProjectio
 	cancelled := a.turn.interruptFlag || a.turn.turnCtx != nil && a.turn.turnCtx.Err() != nil || request.journal.context != nil && request.journal.context.Err() != nil
 	for i := range raw {
 		r := &raw[i]
+		originalProcess := r.Process
 		if r.Process != nil {
 			if p, ok := a.conversation.durable.Processes[r.Process.ID]; ok && p.State.Released {
 				r.Process = protocol.CloneProcessOutput(r.Process)
@@ -147,6 +149,9 @@ func (a *Agent) projectToolsOwned(request toolProjectionRequested) toolProjectio
 		}
 		if r.Process != nil && len(r.CompletionIDs) > 0 {
 			claimed[r.Process.ID] = true
+		}
+		if originalProcess != nil && originalProcess != r.Process {
+			r.Output = strings.Replace(r.Output, originalProcess.Text(), r.Process.Text(), 1)
 		}
 		if r.Code != nil {
 			code := *r.Code
@@ -187,6 +192,11 @@ func (a *Agent) projectToolsOwned(request toolProjectionRequested) toolProjectio
 	}
 	if err := a.persistToolResultsProjected(request.journal, request.calls, results, budget); err != nil {
 		return toolProjectionResult{results: results, budget: budget, err: err}
+	}
+	for _, result := range results {
+		if !result.IsError && result.ObserveOutput != nil {
+			result.ObserveOutput(result.Output)
+		}
 	}
 	a.mu.Lock()
 	a.budget.outputBudget = int(budget.Used)

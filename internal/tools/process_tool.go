@@ -30,8 +30,6 @@ func (*ProcessTool) Parameters() map[string]any {
 	}, "required": []string{"id", "action"}}
 }
 
-type processView = protocol.ProcessOutput
-
 func startCommand(ctx *Context) (string, error) {
 	if ctx.Context != nil && ctx.Context.Err() != nil {
 		return "", ctx.Context.Err()
@@ -321,20 +319,21 @@ func (mp *managedProcess) viewResult(ctx *Context, id string, offset, limit int,
 			v.Tail = strings.ToValidUTF8(tailBytes, "�")
 		}
 		v.Warning = baseWarning
-		if exited && v.OutputID != "" && int64(v.Next) < size {
-			v.Warning += fmt.Sprintf(" Read retained output with ReadOutput output_id=%q offset=%d.", v.OutputID, v.Next)
-		} else if releasing {
+		if releasing && v.OutputID == "" {
 			v.Warning += " Process handle and temporary log released; any output omitted from this response is no longer available through Process or log_path."
-		} else if int64(v.Next) < size {
-			v.Warning += fmt.Sprintf(" More retained output, if needed: Read file_path=%q (lines); or Process id=%s action=read offset=%d (bytes).", v.Log, id, v.Next)
 		}
-		ctx.recordProcess(v, v.Terminal() && StringArg(ctx.Args, "action", "") != "read" && StringArg(ctx.Args, "action", "") != "write")
 		data, err := json.Marshal(v)
 		return data, n, err
+	}
+	record := func() {
+		ctx.recordProcess(v, v.Terminal() && StringArg(ctx.Args, "action", "") != "read" && StringArg(ctx.Args, "action", "") != "write")
 	}
 	budget := ctx.outputLimit()
 	data, _, err := encode(len(raw))
 	if err != nil || len(data) <= budget {
+		if err == nil {
+			record()
+		}
 		return string(data), err
 	}
 	low, high := 0, len(raw)
@@ -354,6 +353,7 @@ func (mp *managedProcess) viewResult(ctx *Context, id string, offset, limit int,
 	if len(data) > budget || len(raw) > 0 && consumed == 0 {
 		return "", fmt.Errorf("Process: output budget too small for metadata and output")
 	}
+	record()
 	return string(data), err
 }
 func truncateUTF8(s string, n int) string {

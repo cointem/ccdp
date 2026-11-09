@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"bytes"
 	"ccdp/internal/protocol"
 	"context"
 	"errors"
@@ -106,15 +105,6 @@ func TestAgentPrintBarrierJoinsOldPrintAndRejectsStaleOutput(t *testing.T) {
 	m = modelValue(t, next)
 	if len(m.routing.printQueue) != 0 {
 		t.Fatal("stale text entered child terminal")
-	}
-	var output bytes.Buffer
-	reset := &resetAgentTerminal{}
-	reset.SetStdout(&output)
-	if err := reset.Run(); err != nil {
-		t.Fatal(err)
-	}
-	if output.String() != "\x1b[2J\x1b[H" {
-		t.Fatal("reset did not clear only the managed frame")
 	}
 }
 

@@ -733,26 +733,6 @@ func (m *Model) runApply(path string) tea.Cmd {
 		Apply: &protocol.ApplyCommand{Path: path}}, "apply request submitted")
 }
 
-// looksLikePatch reports whether text looks like a unified diff.
-func looksLikePatch(text string) bool {
-	if len(text) > 16*1024*1024 {
-		return false
-	}
-	lines := strings.Split(text, "\n")
-	// Accept common patch headers within the first few lines.
-	probe := lines
-	if len(probe) > 8 {
-		probe = probe[:8]
-	}
-	for _, l := range probe {
-		l = strings.TrimSpace(l)
-		if strings.HasPrefix(l, "diff --git ") || strings.HasPrefix(l, "--- ") || strings.HasPrefix(l, "+++ ") {
-			return true
-		}
-	}
-	return false
-}
-
 // renderContext visualizes how much of the model's context window the session
 // currently occupies. It uses only authoritative numbers: the runtime's live
 // context estimate and window, plus cumulative request accounting. It never

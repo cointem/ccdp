@@ -1,6 +1,7 @@
 package fsops
 
 import (
+	"ccdp/internal/atomicfile"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -101,14 +102,17 @@ func publishEntry(ctx context.Context, r *os.Root, rel, kind string, mode os.Fil
 		}
 		// Unlink before recording ctime: our own cleanup changes link metadata.
 		if e := r.Remove(tmp); e != nil {
-			return e
+			return &atomicfile.PublishedError{Err: e}
 		}
 	} else if e := r.Rename(tmp, rel); e != nil {
 		return e
 	}
 	d, e := r.Open(parent)
 	if e != nil {
-		return e
+		return &atomicfile.PublishedError{Err: e}
 	}
-	return errors.Join(d.Sync(), d.Close())
+	if e := errors.Join(d.Sync(), d.Close()); e != nil {
+		return &atomicfile.PublishedError{Err: e}
+	}
+	return nil
 }

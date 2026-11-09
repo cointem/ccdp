@@ -15,8 +15,9 @@ func TestProcessStateControlsCommandPresentation(t *testing.T) {
 	}
 	code := 1
 	p.Process.Status, p.Process.ExitCode = "exited", &code
+	p.Output, p.Process.Output = "Running; process_id=p.test", "compiler error"
 	got = sanitizeANSI(renderToolPresentation(p, 100))
-	if !strings.Contains(got, "error") || !strings.Contains(got, "go test") {
+	if !strings.Contains(got, "compiler error") || !strings.Contains(got, "go test") || strings.Contains(got, "Running;") {
 		t.Fatal(got)
 	}
 }
@@ -36,7 +37,8 @@ func TestProcessObservationsCollapseButInputAndFailureRemainVisible(t *testing.T
 		t.Fatal(got)
 	}
 	p.Args["action"], p.Status = "read", "error"
-	if got := renderToolPresentation(p, 100); got == "" {
+	p.Output = "Process failed: observation cancelled"
+	if got := sanitizeANSI(renderToolPresentation(p, 100)); !strings.Contains(got, "observation cancelled") {
 		t.Fatal("failure hidden")
 	}
 }

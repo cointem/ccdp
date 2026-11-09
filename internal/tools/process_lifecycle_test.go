@@ -19,7 +19,7 @@ func TestBashForegroundStreamsWithoutYieldingToModel(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "printf first; sleep 0.8; printf last"})
+		out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "printf first; sleep 0.8; printf last"})
 		done <- result{out, err}
 	}()
 	select {
@@ -52,7 +52,7 @@ func TestBashForegroundCancellationReclaimsProcess(t *testing.T) {
 	defer cancel()
 	ctx.Context = call
 	ctx.ProcessProgress = func(protocol.ProcessProgress, string) { cancel() }
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "printf started; sleep 30"})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "printf started; sleep 30"})
 	if err == nil || ctx.Resources.Processes.Count() != 0 {
 		t.Fatalf("foreground survived cancellation: %v %s", err, out)
 	}
@@ -61,7 +61,7 @@ func TestBashForegroundCancellationReclaimsProcess(t *testing.T) {
 func TestBashUndeliverableHandleReclaimsProcess(t *testing.T) {
 	ctx := freshCtx(t)
 	ctx.OutputLimit = 32
-	_, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
+	_, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
 	if err == nil || !strings.Contains(err.Error(), "stopped and released") || ctx.Resources.Processes.Count() != 0 {
 		t.Fatalf("undeliverable process left running: %v", err)
 	}
@@ -77,12 +77,12 @@ func TestBashBackgroundCompletionNotifiesWithoutReads(t *testing.T) {
 		}
 		return "", nil
 	}
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
 	p := decodeProcess(t, out, err)
 	if p.Terminal() {
 		t.Fatal(p)
 	}
-	_, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": p.ID, "action": "write", "input": "result\n", "eof": true})
+	_, err = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": p.ID, "action": "write", "input": "result\n", "eof": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestProcessWaitSettlesAfterDurableCompletion(t *testing.T) {
 		}
 		return "saved-output", nil
 	}
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
 	p := decodeProcess(t, out, err)
 	mp, _ := ctx.Resources.Processes.Get(p.ID)
 	if err := mp.cmd.CloseInput(); err != nil {
@@ -143,10 +143,10 @@ func TestProcessWaitSettlesAfterDurableCompletion(t *testing.T) {
 
 func TestProcessReadIsImmediateAndRejectsWaitArguments(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "cat", "stdin": "pipe"})
 	p := decodeProcess(t, out, err)
 	start := time.Now()
-	out, err = runTool(t, NewProcessTool(), ctx, map[string]any{"id": p.ID, "action": "read"})
+	out, err = runToolData(t, NewProcessTool(), ctx, map[string]any{"id": p.ID, "action": "read"})
 	if read := decodeProcess(t, out, err); read.Terminal() || time.Since(start) > 250*time.Millisecond {
 		t.Fatal("read waited", read)
 	}
@@ -159,9 +159,19 @@ func TestProcessReadIsImmediateAndRejectsWaitArguments(t *testing.T) {
 
 func TestBashFailureKeepsDiagnosticTailInBoundedResult(t *testing.T) {
 	ctx := freshCtx(t)
-	out, err := runTool(t, NewBashTool(), ctx, map[string]any{"command": "awk 'BEGIN { for(i=0;i<20000;i++) print \"ordinary progress\"; print \"FINAL FAILURE\"; exit 1 }'"})
+	out, err := runToolData(t, NewBashTool(), ctx, map[string]any{"command": "awk 'BEGIN { for(i=0;i<20000;i++) print \"ordinary progress\"; print \"FINAL FAILURE\"; exit 1 }'"})
 	p := decodeProcess(t, out, err)
 	if !p.Truncated || p.ExitCode == nil || *p.ExitCode != 1 || !strings.Contains(p.Tail, "FINAL FAILURE") || len(out) > 14000 {
 		t.Fatalf("lost bounded failure diagnostic: bytes=%d tail=%q", len(out), p.Tail)
+	}
+}
+
+func TestCompletionTailLeavesMissingPrefixUnread(t *testing.T) {
+	p := &managedProcess{}
+	p.identity.ID, p.identity.OutputID = "p.test", "saved-output"
+	p.appendOutput([]byte(strings.Repeat("progress\n", 2000) + "final marker"))
+	view := p.completion()
+	if !view.Truncated || view.Output != "" || !strings.HasSuffix(view.Tail, "final marker") || view.Next != 0 || !strings.Contains(view.Text(), `ReadOutput output_id="saved-output" offset=0`) {
+		t.Fatalf("tail skipped missing prefix: %+v", view)
 	}
 }
