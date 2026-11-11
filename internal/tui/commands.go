@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -26,6 +27,30 @@ var statuslineTokens = map[string]bool{
 var commandCatalog = commands.Default()
 
 var commandNames = commandCatalog.Names()
+
+// isSlashCommand admits only known commands with parseable arguments. A slash
+// prefix alone also occurs in source comments and paths; those remain literal
+// messages, including their whitespace and any attached images.
+func (m *Model) isSlashCommand(text string) bool {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "/") || strings.HasPrefix(text, "//") {
+		return false
+	}
+	name := text[1:]
+	if end := strings.IndexFunc(name, unicode.IsSpace); end >= 0 {
+		name = name[:end]
+	}
+	if canonical, ok := commandCatalog.Canonical(name); ok {
+		// /goal intentionally accepts literal prose with unmatched quotes.
+		if canonical == "goal" {
+			return true
+		}
+	} else if m.findCustomCommand(name) == nil {
+		return false
+	}
+	_, err := commands.ParseLine(text)
+	return err == nil
+}
 
 // runCommand executes a slash command entered in the input box. Commands that
 // need the tea runtime (e.g. quitting) return a tea.Cmd alongside the model.

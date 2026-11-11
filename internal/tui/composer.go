@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const composerPlaceholder = "Ask CCDP to do anything"
@@ -377,7 +378,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "tab":
 		// Completion menus take priority above. Slash commands still require
 		// Enter so queueing a draft cannot execute a command immediately.
-		if m.busy && !strings.HasPrefix(strings.TrimSpace(m.textarea.Value()), "/") {
+		if m.busy && !m.isSlashCommand(m.textarea.Value()) {
 			return m.submitInput(protocol.InputFollowup)
 		}
 
@@ -446,7 +447,7 @@ func (m *Model) cmdSuggestionPageSize() int {
 func (m *Model) refreshCmdSuggest() {
 	m.closeCmdSuggest()
 	val := m.textarea.Value()
-	if len(val) < 1 || val[0] != '/' || strings.ContainsAny(val, " \t") {
+	if len(val) < 1 || val[0] != '/' || strings.HasPrefix(val, "//") || strings.IndexFunc(val, unicode.IsSpace) >= 0 {
 		return
 	}
 	prefix := strings.TrimPrefix(val, "/")
@@ -490,11 +491,12 @@ func (m *Model) submit() (tea.Model, tea.Cmd) {
 
 func (m *Model) submitInput(strategy protocol.InputStrategy) (tea.Model, tea.Cmd) {
 	raw := m.textarea.Value()
-	if m.watchDisconnected && !strings.HasPrefix(strings.TrimSpace(raw), "/") {
+	isCommand := m.isSlashCommand(raw)
+	if m.watchDisconnected && !isCommand {
 		m.pushStatus("connection unavailable; draft preserved · /reconnect")
 		return m, nil
 	}
-	if m.missingHistoryImages && !strings.HasPrefix(strings.TrimSpace(raw), "/") {
+	if m.missingHistoryImages && !isCommand {
 		m.pushStatus("older image attachments expired from input history; paste them again or clear the draft")
 		return m, nil
 	}
@@ -510,7 +512,7 @@ func (m *Model) submitInput(strategy protocol.InputStrategy) (tea.Model, tea.Cmd
 		return m, nil
 	}
 	text := raw
-	if strings.HasPrefix(strings.TrimSpace(raw), "/") {
+	if isCommand {
 		text = strings.TrimSpace(raw)
 	}
 	m.textarea.Reset()
@@ -526,7 +528,7 @@ func (m *Model) submitInput(strategy protocol.InputStrategy) (tea.Model, tea.Cmd
 	// replaces it with fresh status or clears it before producing durable output.
 	m.clearTransientNotices()
 
-	if strings.HasPrefix(text, "/") {
+	if isCommand {
 		// Keep query/report commands in the transcript, but treat selectors and
 		// actions like /model and /mode as composer-adjacent transient state.
 		if slashCommandHasTranscriptOutput(text) {
