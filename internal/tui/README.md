@@ -111,6 +111,15 @@ Markdown file and web links emit validated OSC 8 hyperlinks; relative file targe
 
 The managed transcript enables mouse reporting. Each SpawnAgent card opens its own child session; there is no batch Task/group renderer. Esc returns from a child to its parent. Native terminal text selection uses the terminal mouse override (usually Shift-drag).
 
+`NewProgram` repairs SGR mouse reports split across Bubble Tea v1 input reads
+before routing events to any panel or composer. The program-wide filter retains
+only ESC-prefixed candidates, preserves literal/bracketed-paste text, and replays
+incomplete keyboard prefixes after 100 ms. Raw-input regression tests cover
+every split position, 256-byte read boundaries, bursts, mouse modifiers and
+keyboard/paste preservation.
+The focused PTY regression uses the same compiled fixture and Python dependencies:
+`PYTHONPATH=<isolated-directory> python3 internal/tui/testdata/pty_mouse.py /tmp/ccdp-tui.test /tmp/ccdp-mouse-results.json`.
+
 All transient surfaces (tool/thought details, model/permission/effort selectors, approvals, questions, history search, tasks, context and completion menus) overlay the base frame. They do not reserve transcript rows or change its scroll offset. Focus-owning dialogs may cover the composer; closing reveals its original position and draft. Tool/thought details start at the clicked transcript record and cover subsequent rows in place; they scroll independently, and popup wheel events never scroll the underlying transcript. The full transcript reader remains an explicit separate screen.
 
 SpawnAgent cards use supervisor projections for live child status. WaitAgent() has no target and only returns an event reason: collaboration, user_input, attention, or no_pending_work. Routine waits are hidden in the default conversation and native scrollback, without blank rows or click targets. Attention, failures, interruptions, and unrecognized results remain visible. All wait calls and their raw results remain in the full transcript reader; hiding a running call never finalizes its history entry early. Typed collaboration cells show progress with its source or a compact final-result notice, never a raw JSON user bubble. Followup/Stop receipts describe control acceptance, not task completion.

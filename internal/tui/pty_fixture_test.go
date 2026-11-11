@@ -78,4 +78,7 @@ func TestPTYRearchitectureFixture(t *testing.T) {
 	if current.delivery.pending != nil {
 		t.Fatal("unacknowledged history at exit")
 	}
+	if want := os.Getenv("CCDP_TUI_PTY_EXPECT_DRAFT"); want != "" && current.textarea.Value() != want {
+		t.Fatalf("terminal input changed draft: got %q, want %q", current.textarea.Value(), want)
+	}
 }

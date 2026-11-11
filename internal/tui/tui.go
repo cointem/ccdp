@@ -295,6 +295,16 @@ func (m Model) Init() tea.Cmd {
 
 // Update handles messages.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if messages, ok := msg.(terminalInputBatchMsg); ok {
+		var next tea.Model = m
+		var cmds []tea.Cmd
+		for _, message := range messages {
+			var cmd tea.Cmd
+			next, cmd = next.Update(message)
+			cmds = append(cmds, cmd)
+		}
+		return next, tea.Batch(cmds...)
+	}
 	next, cmd := m.update(msg)
 	// Every event can change wrapped chrome: receipts, expiry, and catalog
 	// updates do not necessarily change input height or terminal dimensions.

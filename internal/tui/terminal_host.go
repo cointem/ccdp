@@ -161,8 +161,11 @@ func (h *TerminalHost) close() error {
 func NewProgram(model Model, options ...tea.ProgramOption) *tea.Program {
 	host := NewTerminalHost(os.Stdout)
 	model.terminal = host
+	var program *tea.Program
+	input := &terminalInput{send: func(msg tea.Msg) { program.Send(msg) }}
+	options = append([]tea.ProgramOption{tea.WithFilter(input.filter)}, options...)
 	options = append(options, tea.WithOutput(host))
-	program := tea.NewProgram(model, options...)
+	program = tea.NewProgram(model, options...)
 	host.onError = func(err error) { go program.Send(terminalErrorMsg{err: err}) }
 	return program
 }
