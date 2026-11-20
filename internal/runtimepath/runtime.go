@@ -4,12 +4,15 @@ package runtimepath
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
+
+	"ccdp/internal/fsops"
+	"golang.org/x/sys/unix"
 )
 
 func ID() (string, error) {
@@ -49,46 +52,40 @@ func EnsurePrivate(path string) (string, error) {
 	if runtime.GOOS == "darwin" && (strings.HasPrefix(abs, "/var/") || strings.HasPrefix(abs, "/tmp/")) {
 		abs = "/private" + abs
 	}
-	r, err := os.OpenRoot(string(filepath.Separator))
+	dir, err := fsops.OpenDirectoryAt(unix.AT_FDCWD, string(filepath.Separator))
 	if err != nil {
-		return "", err
+		return "", &os.PathError{Op: "open private runtime", Path: abs, Err: err}
 	}
-	defer func() { _ = r.Close() }()
+	defer func() { _ = unix.Close(dir) }()
 	parts := strings.Split(strings.TrimPrefix(filepath.Clean(abs), "/"), "/")
-	for i, part := range parts {
+	current := string(filepath.Separator)
+	for _, part := range parts {
 		if part == "" || part == "." || part == ".." {
 			return "", fmt.Errorf("invalid private runtime path")
 		}
-		info, statErr := r.Lstat(part)
-		if os.IsNotExist(statErr) {
-			if err := r.Mkdir(part, 0700); err != nil && !os.IsExist(err) {
-				return "", err
+		current = filepath.Join(current, part)
+		next, err := fsops.OpenDirectoryAt(dir, part)
+		if errors.Is(err, unix.ENOENT) {
+			if err := unix.Mkdirat(dir, part, 0700); err != nil && !errors.Is(err, unix.EEXIST) {
+				return "", &os.PathError{Op: "mkdir private runtime", Path: current, Err: err}
 			}
-			info, statErr = r.Lstat(part)
+			next, err = fsops.OpenDirectoryAt(dir, part)
 		}
-		if statErr != nil {
-			return "", statErr
-		}
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return "", fmt.Errorf("private runtime component %q is not a real directory", part)
-		}
-		if i == len(parts)-1 {
-			st, ok := info.Sys().(*syscall.Stat_t)
-			if !ok || int(st.Uid) != os.Getuid() || info.Mode().Perm()&0077 != 0 {
-				return "", fmt.Errorf("private runtime directory must be owned by this user with mode 0700")
-			}
-		}
-		next, err := r.OpenRoot(part)
 		if err != nil {
-			return "", err
+			return "", &os.PathError{Op: "open private runtime", Path: current, Err: err}
 		}
-		actual, e := next.Stat(".")
-		if e != nil || !os.SameFile(info, actual) {
-			next.Close()
-			return "", fmt.Errorf("private runtime directory changed during preparation")
-		}
-		_ = r.Close()
-		r = next
+		_ = unix.Close(dir)
+		dir = next
+	}
+	// O_DIRECTORY|O_NOFOLLOW checked each component atomically. Verify the
+	// owned boundary on its pinned descriptor, not a path that could be swapped
+	// between lstat and open.
+	var st unix.Stat_t
+	if err := unix.Fstat(dir, &st); err != nil {
+		return "", &os.PathError{Op: "stat private runtime", Path: abs, Err: err}
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR || int(st.Uid) != os.Getuid() || st.Mode&0077 != 0 {
+		return "", fmt.Errorf("private runtime directory %q must be owned by this user with mode 0700", abs)
 	}
 	return abs, nil
 }

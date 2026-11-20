@@ -26,6 +26,10 @@ func (a *Agent) applySetModel(cmd protocol.Command, owned ...bool) protocol.Rece
 	requested := strings.TrimSpace(cmd.Model.Model)
 	return a.applySettingsCommand(cmd, func(target *session.Settings) error {
 		target.Model = requested
+		if effort := cmd.Model.ReasoningEffort; effort != "" {
+			target.ReasoningEffort = effort
+			target.GenerationOptionsSet = true
+		}
 		return nil
 	}, owned...)
 }
@@ -43,13 +47,15 @@ func (a *Agent) registerBindingRoutes(binding modelBinding, cfg config.Config) {
 }
 
 func (a *Agent) applyBindingLocked(binding modelBinding) {
+	if binding.model != a.modelsState.activeBinding.model {
+		a.conversation.modelSwitchMsg = "# Model\nYou have been switched to the model \"" + binding.model + "\". Adjust your responses to its capabilities."
+	}
 	a.modelsState.activeBinding = binding
 	a.services.client = binding.client
 	a.modelsState.primaryBinding = binding
 	a.modelsState.activeModel = binding.model
 	a.services.cfg.Model = binding.model
 	a.services.baseCfg.Model = binding.model
-	a.conversation.modelSwitchMsg = "# Model\nYou have been switched to the model \"" + binding.model + "\". Adjust your responses to its capabilities."
 }
 
 func (a *Agent) beginStep() stepRuntime {
@@ -334,7 +340,7 @@ func (a *Agent) toolDefsSnapshotFromLease(lease *tools.Lease) []llm.ToolDef {
 		if a.children.childState != nil && a.children.childState.allowed != nil && !a.children.childState.allowed[name] {
 			return false
 		}
-		return !deferred[name] || discovered[name]
+		return discovered[name] || !(deferred[name] || protocol.IsMCPToolName(name))
 	})
 	defs := make([]llm.ToolDef, 0, len(schemas))
 	for _, schema := range schemas {

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"ccdp/internal/messages"
+	"ccdp/internal/protocol"
 )
 
 // restoreContextSnippet assembles a short "session context to restore" block
@@ -16,11 +17,13 @@ func (a *Agent) restoreContextSnippet(keptTail []messages.Message) string {
 
 	// Discovered deferred tools stay available after compaction.
 	var disc []string
-	for n := range a.discovery.deferTools {
-		if a.isDiscovered(n) {
+	a.mu.Lock()
+	for n := range a.discovery.discovered {
+		if a.discovery.deferTools[n] || protocol.IsMCPToolName(n) {
 			disc = append(disc, n)
 		}
 	}
+	a.mu.Unlock()
 	if len(disc) > 0 {
 		sort.Strings(disc)
 		fmt.Fprintf(&sb, "Discovered tools available to you: %s\n", strings.Join(disc, ", "))

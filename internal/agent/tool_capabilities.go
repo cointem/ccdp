@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"ccdp/internal/mcp"
 	"ccdp/internal/permissions"
 	"ccdp/internal/tools"
 )
@@ -8,6 +9,9 @@ import (
 // toolKind is the sole built-in implementation classification. Names remain
 // labels for user rules; a plugin shadowing Read never inherits its capability.
 func toolKind(tool tools.Tool) permissions.ToolKind {
+	if mcp.IsExaSearch(tool) {
+		return permissions.KindNetwork
+	}
 	switch tool.(type) {
 	case *tools.RunCodeTool:
 		return permissions.KindOrchestration
@@ -27,7 +31,7 @@ func toolKind(tool tools.Tool) permissions.ToolKind {
 		return permissions.KindProcess
 	case *tools.AgentTool:
 		return permissions.KindDelegate
-	case *tools.WebFetchTool, *tools.WebSearchTool:
+	case *tools.WebFetchTool:
 		return permissions.KindNetwork
 	default:
 		return permissions.KindUnknown

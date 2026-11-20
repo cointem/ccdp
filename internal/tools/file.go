@@ -29,6 +29,13 @@ func (*ReadTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 	return executeFileWorker(ctx, "Read", args)
 }
 
+func readPathError(err error) error {
+	if os.IsNotExist(err) {
+		return fmt.Errorf("locate the file with Glob or list the directory with LS before retrying: %w", err)
+	}
+	return err
+}
+
 // executeRead runs only inside the fixed file worker.
 func executeRead(ctx *Context, args map[string]any) (Result, error) {
 	return executeText(ctx, args, func(ctx *Context) (string, error) {
@@ -41,7 +48,7 @@ func executeRead(ctx *Context, args map[string]any) (Result, error) {
 		}
 		path, e := ctx.ResolveRead(raw)
 		if e != nil {
-			return "", e
+			return "", readPathError(e)
 		}
 		offset, e := IntArgChecked(ctx.Args, "offset", 1)
 		if e != nil || offset < 1 {
@@ -57,7 +64,7 @@ func executeRead(ctx *Context, args map[string]any) (Result, error) {
 		}
 		f, e := fsops.OpenAuthorizedRegular(ctx.ReadRoot, path, ctx.ResolveRead)
 		if e != nil {
-			return "", e
+			return "", readPathError(e)
 		}
 		defer f.Close()
 		info, e := f.Stat()

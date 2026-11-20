@@ -57,6 +57,7 @@ type Transcript struct {
 	window            int
 	mu                sync.Mutex
 	items             []protocol.TranscriptItem
+	leadingPrompt     *protocol.TranscriptItem
 	more              bool
 	reasoningID       string
 	closedReasoningID string
@@ -198,6 +199,9 @@ func (t *Transcript) put(item protocol.TranscriptItem) {
 	if len(t.items) > window {
 		for _, old := range t.items[:len(t.items)-window] {
 			delete(t.buffers, old.ID)
+			if old.Kind == "user" {
+				t.leadingPrompt = &old
+			}
 		}
 		t.items = append([]protocol.TranscriptItem(nil), t.items[len(t.items)-window:]...)
 		t.more = true
@@ -205,8 +209,16 @@ func (t *Transcript) put(item protocol.TranscriptItem) {
 }
 
 func (t *Transcript) Snapshot() ([]protocol.TranscriptItem, bool) {
+	items, more, _ := t.SnapshotWithPrompt()
+	return items, more
+}
+
+// SnapshotWithPrompt also supplies the last user input before the window when
+// the visible prefix still belongs to its turn. The prompt has no page ordinal
+// here and is never inserted into the paginated transcript.
+func (t *Transcript) SnapshotWithPrompt() ([]protocol.TranscriptItem, bool, *protocol.TranscriptItem) {
 	if t == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -215,7 +227,14 @@ func (t *Transcript) Snapshot() ([]protocol.TranscriptItem, bool) {
 		items[i] = t.materialize(items[i])
 		items[i].Args = append(json.RawMessage(nil), items[i].Args...)
 	}
-	return items, t.more
+	var prompt *protocol.TranscriptItem
+	if len(items) > 0 && t.leadingPrompt != nil && t.leadingPrompt.TurnID != "" && items[0].Kind != "user" &&
+		strings.TrimPrefix(string(t.leadingPrompt.TurnID), "turn-") == strings.TrimPrefix(string(items[0].TurnID), "turn-") {
+		p := t.materialize(*t.leadingPrompt)
+		p.Args = nil
+		prompt = &p
+	}
+	return items, t.more, prompt
 }
 
 func (t *Transcript) Facts(events []session.Event) {
@@ -293,6 +312,7 @@ func transcriptRelevantEvent(typ session.EventType) bool {
 }
 
 func (t *Transcript) applyConversationReset() {
+	t.leadingPrompt = nil
 	if t.index == nil {
 		t.items = nil
 		t.buffers = nil
@@ -403,7 +423,10 @@ func (t *Transcript) applyAssistantCommitted(b []byte) {
 	}
 	if text.Len() > 0 && !segmented {
 		kind := e.Message.Role
-		if e.Message.InternalSource != "" {
+		switch {
+		case e.Message.InternalSource == protocol.CollaborationSource:
+			kind = "collaboration"
+		case e.Message.InternalSource != "":
 			kind = "system"
 		}
 		t.put(protocol.TranscriptItem{ID: e.Message.MessageID, PreviousID: previousID, Kind: kind, TurnID: protocol.TurnID(e.TurnID), Text: text.String(), Status: "completed"})

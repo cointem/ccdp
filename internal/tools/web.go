@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
 	"time"
 
 	"ccdp/internal/netguard"
@@ -29,10 +30,7 @@ func NewWebFetchTool() *WebFetchTool { return &WebFetchTool{} }
 func (t *WebFetchTool) Name() string { return "WebFetch" }
 
 func (t *WebFetchTool) Description() string {
-	return `Fetch a URL and return its content as readable plain text. Use this to
-read documentation, error pages or any public web resource. HTML is stripped
-to text. Preview defaults to 8000 chars; use ReadOutput for the saved full text. Network access requires
-approval in default permission mode.`
+	return `Read HTML or text from a known public HTTP(S) URL. To find URLs, use ToolSearch to discover a web search MCP. PDF and other binary formats are unsupported. Preview defaults to 8000 characters; use ReadOutput for the saved full text. Requires outbound network access.`
 }
 
 func (t *WebFetchTool) Parameters() map[string]any {
@@ -45,6 +43,8 @@ func (t *WebFetchTool) Parameters() map[string]any {
 			},
 			"max_chars": map[string]any{"default": 8000,
 				"type":        "integer",
+				"minimum":     256,
+				"maximum":     40000,
 				"description": "Optional character cap for the returned text (default 8000).",
 			},
 		},
@@ -60,7 +60,7 @@ func (t *WebFetchTool) Execute(ctx *Context, args map[string]any) (Result, error
 		if !ctx.HostNetworkAllowed {
 			return "", errors.New("WebFetch: outbound network access is not authorized for this call")
 		}
-		raw := StringArg(ctx.Args, "url", "")
+		raw := strings.TrimSpace(StringArg(ctx.Args, "url", ""))
 		u, err := url.Parse(raw)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 			return "", fmt.Errorf("WebFetch: invalid URL %q (only http/https)", raw)
@@ -110,118 +110,10 @@ func (t *WebFetchTool) Execute(ctx *Context, args map[string]any) (Result, error
 	})
 }
 
-// ---------- WebSearch ----------
-
-// WebSearchTool performs a best-effort web search through DuckDuckGo's HTML
-// endpoint (no API key required). Results are title + URL + snippet.
-type WebSearchTool struct{}
-
-// NewWebSearchTool creates the web search tool.
-func NewWebSearchTool() *WebSearchTool { return &WebSearchTool{} }
-
-func (t *WebSearchTool) Name() string { return "WebSearch" }
-
-func (t *WebSearchTool) Description() string {
-	return `Search the web for a query and return the top results with titles, URLs
-and snippets. Useful for up-to-date information, library versions, error
-messages and documentation lookups. Backed by DuckDuckGo's public HTML
-endpoint; results may be limited. Network access requires approval.`
-}
-
-func (t *WebSearchTool) Parameters() map[string]any {
-	return WithCapabilityRequest(map[string]any{
-		"type": "object", "additionalProperties": false,
-		"properties": map[string]any{
-			"query": map[string]any{
-				"type":        "string",
-				"description": "The search query.",
-			},
-			"max_results": map[string]any{"default": 5,
-				"type":        "integer",
-				"description": "Optional maximum number of results (default 5, max 10).",
-			},
-		},
-		"required": []string{"query"},
-	})
-}
-
-func (t *WebSearchTool) Execute(ctx *Context, args map[string]any) (Result, error) {
-	return executeText(ctx, args, func(ctx *Context) (string, error) {
-		if err := ctx.checkResources(); err != nil {
-			return "", err
-		}
-		if !ctx.HostNetworkAllowed {
-			return "", errors.New("WebSearch: outbound network access is not authorized for this call")
-		}
-		q := StringArg(ctx.Args, "query", "")
-		if strings.TrimSpace(q) == "" {
-			return "", fmt.Errorf("WebSearch: empty query")
-		}
-		max, err := IntArgChecked(ctx.Args, "max_results", 5)
-		if err != nil {
-			return "", fmt.Errorf("WebSearch: %w", err)
-		}
-		if max < 1 {
-			max = 1
-		}
-		if max > 10 {
-			max = 10
-		}
-
-		endpoint := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(q)
-		body, _, _, _, err := httpGetDetails(ctx.Context, endpoint, webProxy(ctx))
-		if err != nil {
-			return "", fmt.Errorf("WebSearch: %w", err)
-		}
-		results := parseDuckDuckGo(string(body), max)
-		if len(results) == 0 {
-			if strings.Contains(strings.ToLower(string(body)), "no results") {
-				return fmt.Sprintf("WebSearch: no results for %q", q), nil
-			}
-			return "", fmt.Errorf("WebSearch: response contained no recognized results (blocked or changed page format)")
-		}
-
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "%d result(s) for %q:\n", len(results), q)
-		for i, r := range results {
-			fmt.Fprintf(&sb, "\n%d. %s\n   %s\n   %s\n", i+1, r.Title, r.URL, r.Snippet)
-		}
-		return boundedToolString(ctx, sb.String()), nil
-	})
-}
-
-// searchResult is one parsed search hit.
-type searchResult struct {
-	Title   string
-	URL     string
-	Snippet string
-}
-
-var (
-	reResult = regexp.MustCompile(`(?s)<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?<a[^>]+class="result__snippet"[^>]*>(.*?)</a>`)
-	reTag    = regexp.MustCompile(`<[^>]+>`)
-)
-
-// parseDuckDuckGo extracts search results from the DDG HTML page.
-func parseDuckDuckGo(html string, max int) []searchResult {
-	var out []searchResult
-	for _, m := range reResult.FindAllStringSubmatch(html, max) {
-		if len(m) < 4 {
-			continue
-		}
-		href := htmlUnescape(reTag.ReplaceAllString(m[1], ""))
-		title := htmlUnescape(reTag.ReplaceAllString(m[2], ""))
-		snippet := htmlUnescape(reTag.ReplaceAllString(m[3], ""))
-		if href == "" || title == "" {
-			continue
-		}
-		out = append(out, searchResult{Title: strings.TrimSpace(title), URL: href, Snippet: strings.TrimSpace(snippet)})
-	}
-	return out
-}
+var reTag = regexp.MustCompile(`<[^>]+>`)
 
 // errBlockedPrivate is returned when a request targets a loopback, private or
-// link-local address: WebFetch/WebSearch must not be usable to reach cloud
+// link-local address: WebFetch must not be usable to reach cloud
 // metadata endpoints, localhost services or the internal network (SSRF).
 var errBlockedPrivate = errors.New("blocked: request to internal/private address")
 
@@ -319,6 +211,19 @@ func httpGetDetails(ctx context.Context, u string, proxies ...string) (body []by
 	if len(proxies) > 0 {
 		proxy = proxies[0]
 	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	body, finalURL, contentType, status, err = httpGetOnce(ctx, u, proxy)
+	if ctx.Err() == nil && netguard.Interrupted(err) {
+		body, finalURL, contentType, status, err = httpGetOnce(ctx, u, proxy)
+		if err != nil && netguard.Interrupted(err) && ctx.Err() == nil {
+			err = fmt.Errorf("could not read a complete response after two GET attempts; check the source URL and network route: %w", err)
+		}
+	}
+	return
+}
+
+func httpGetOnce(ctx context.Context, u, proxy string) (body []byte, finalURL, contentType string, status int, err error) {
 	validate := validateExternalURL
 	if proxy != "" {
 		validate = func(ctx context.Context, raw string) error {
@@ -335,10 +240,7 @@ func httpGetDetails(ctx context.Context, u string, proxies ...string) (body []by
 	if err := validate(ctx, u); err != nil {
 		return nil, "", "", 0, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(cctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, "", "", 0, err
 	}

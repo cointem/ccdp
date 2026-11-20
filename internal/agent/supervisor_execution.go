@@ -50,19 +50,19 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 			s.publishChildOutcome(r)
 		}
 	}
-	var child supervision.ChildRuntime
+	var child *Agent
 	var output string
 	if err == nil && r.reviewCommand != nil {
 		child, output, err = s.executeReview(r, ctx)
 	} else {
 		if err == nil {
-			var factory supervision.ChildFactory = childFactory{
+			factory := childFactory{
 				config: cloneConfig(&r.cfg), options: r.opts, initial: initial,
 				history: r.forkHistory, historySource: r.parent,
 				tools: r.toolLease, preHooks: r.preHooks,
 				recoveryID: string(r.fact.Child.Run.ID) + "-recovery",
 			}
-			child, err = factory.Open(ctx)
+			child, err = factory.openAgent(ctx)
 		}
 		// Release the copied prefix even if cancellation prevented construction.
 		r.forkHistory = nil
@@ -78,7 +78,7 @@ func (s *SessionSupervisor) execute(r *managedRun, ctx context.Context, text str
 			}
 		}
 		if err == nil {
-			err = s.flushChildMessages(r, child)
+			err = s.flushChildMessages(ctx, r, child)
 			if err == nil {
 				output, err = s.drive(r, child, ctx, text)
 			}
@@ -171,6 +171,15 @@ type childRunBoundary struct {
 	supervisor *SessionSupervisor
 	run        *managedRun
 	child      supervision.ChildRuntime
+}
+
+// Deliver assignments accepted while the child waited for a worker slot only
+// after the original task has been admitted. Both keep their durable input IDs.
+func (b childRunBoundary) InputStarted(ctx context.Context) error {
+	b.run.mu.Lock()
+	b.run.inputStarted = true
+	b.run.mu.Unlock()
+	return b.supervisor.flushChildMessages(ctx, b.run, b.child)
 }
 
 func (b childRunBoundary) Publish(update protocol.Update) {

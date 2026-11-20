@@ -11,6 +11,8 @@ import (
 // RunBoundary owns admission for the logical run. FinishIfIdle checks the live
 // runtime and reserves settlement atomically against follow-up input admission.
 type RunBoundary interface {
+	Changes() <-chan struct{}
+	InputStarted(context.Context) error
 	Publish(protocol.Update)
 	FinishIfIdle(context.Context, protocol.TurnID) (protocol.SessionView, bool, error)
 }
@@ -43,10 +45,10 @@ func Drive(ctx context.Context, child ChildRuntime, input protocol.Command, boun
 	if receipt.Rejected() {
 		return "", fmt.Errorf("child input rejected: %v", receipt.Error)
 	}
-	var changes <-chan struct{}
-	if source, ok := boundary.(interface{ Changes() <-chan struct{} }); ok {
-		changes = source.Changes()
+	if err := boundary.InputStarted(ctx); err != nil {
+		return "", err
 	}
+	changes := boundary.Changes()
 	for {
 		select {
 		case <-ctx.Done():
@@ -81,7 +83,7 @@ func Drive(ctx context.Context, child ChildRuntime, input protocol.Command, boun
 		case protocol.TurnCancelled:
 			return output, context.Canceled
 		default:
-			return output, child.RunBudgetError()
+			return output, nil
 		}
 	}
 }

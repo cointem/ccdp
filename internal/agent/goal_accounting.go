@@ -188,7 +188,7 @@ func (a *Agent) recoverGoalAccountingState() (ready bool, err error) {
 			if visited[childID] {
 				continue
 			}
-			childRecords, _, err := a.services.supervisor.readRecordedSessionRecords(ctx, protocol.SessionID(childID))
+			childRecords, _, _, err := a.services.supervisor.readRecordedSessionRecords(ctx, protocol.SessionID(childID))
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}

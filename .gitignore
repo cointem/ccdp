@@ -1,5 +1,11 @@
 # Build artifacts
 /ccdp
+/ccdp-desktop
+/build/
+/.mygo/
+/resources/darwin-*/bin/
+/assets/icon.png
+/output/imagegen/
 *.exe
 *.test
 *.out

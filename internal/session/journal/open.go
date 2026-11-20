@@ -11,12 +11,11 @@ import (
 )
 
 type OpenOptions struct {
-	SessionID, SessionDir, Source, ParentID, Workspace, Model string
-	CreatedAt                                                 time.Time
-	NoSessionPersistence, RejectExisting                      bool
-	ProjectMemoryEnabled                                      bool
-	MemoryReadOnly, MemoryHistory                             bool
-	Backend                                                   BackendOptions
+	SessionID, SessionDir, Source, ParentID string
+	CreatedAt                               time.Time
+	NoSessionPersistence, RejectExisting    bool
+	InitialSettings                         session.Settings
+	Backend                                 BackendOptions
 }
 
 func validateID(id string) error {
@@ -85,13 +84,8 @@ func Open(o OpenOptions) (*Writer, error) {
 			ParentID:      parentID,
 			CreatedAt:     createdAt,
 		}}
-		if cfg.Workspace != "" || cfg.Model != "" {
-			initialEvents = append(initialEvents, session.SettingsChanged{Revision: 1, Settings: session.Settings{
-				Workspace:            cfg.Workspace,
-				Model:                cfg.Model,
-				ProjectMemoryEnabled: cfg.ProjectMemoryEnabled,
-				MemoryReadOnly:       cfg.MemoryReadOnly, MemoryHistory: cfg.MemoryHistory,
-			}})
+		if settings := cfg.InitialSettings; settings.Workspace != "" || settings.Model != "" {
+			initialEvents = append(initialEvents, session.SettingsChanged{Revision: 1, Settings: settings})
 		}
 		_, err := p.commitLocked(session.Batch{
 			TransactionID: "session-created-" + sessionID,

@@ -7,7 +7,7 @@ import (
 	"log"
 	"reflect"
 	"sort"
-	"strings"
+
 	"sync"
 
 	"ccdp/internal/protocol"
@@ -86,7 +86,7 @@ func (m *Manager) StartChecked(ctx context.Context, servers map[string]ServerCon
 	}
 	for _, name := range sortedServerNames(servers) {
 		cfg := servers[name]
-		if !strings.EqualFold(cfg.Transport, "sse") && cfg.Command == "" {
+		if !cfg.remote() && cfg.Command == "" {
 			cleanup()
 			return fmt.Errorf("mcp: server %q has no command", name)
 		}
@@ -240,7 +240,7 @@ func (m *Manager) PrepareRefresh(ctx context.Context, servers map[string]ServerC
 	candidates := make([]refreshClient, 0, len(servers))
 	for _, name := range sortedServerNames(servers) {
 		cfg := servers[name]
-		if !strings.EqualFold(cfg.Transport, "sse") && cfg.Command == "" {
+		if !cfg.remote() && cfg.Command == "" {
 			cleanup(candidates)
 			m.refreshMu.Unlock()
 			return nil, fmt.Errorf("mcp: server %q has no command", name)

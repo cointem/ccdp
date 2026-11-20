@@ -10,13 +10,10 @@ import (
 // Capture the runs under the directory lock so cancellation cannot target a
 // subsequent follow-up which reuses the same agent identity.
 func (s *SessionSupervisor) cancelDelegated(parent *Agent) {
-	runs := make([]*managedRun, 0, len(s.directory.Children()))
 	for _, run := range s.directory.Children() {
-		if run.parent == parent {
-			runs = append(runs, run)
+		if run.parent != parent {
+			continue
 		}
-	}
-	for _, run := range runs {
 		run.mu.Lock()
 		if run.fact.Child.Run.WaitPolicy == "notify" && run.fact.Child.Run.Active() && run.cancel != nil {
 			run.cancel()

@@ -70,13 +70,10 @@ func resolveChildTask(task childTask) (childTask, error) {
 		task.Role = "worker"
 	}
 	if task.WorkspaceMode == "" {
-		task.WorkspaceMode = "isolated"
-		if task.Role == "explorer" {
-			task.WorkspaceMode = "shared"
-		}
+		task.WorkspaceMode = "shared"
 	}
 	if task.ContextMode == "" {
-		task.ContextMode = "fresh"
+		task.ContextMode = "fork"
 	}
 	if task.Role != "worker" && task.Role != "explorer" {
 		return task, errors.New("role must be worker or explorer")

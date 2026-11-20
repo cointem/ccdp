@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -55,6 +56,34 @@ type Snapshot struct {
 	StepSeq uint64 `json:"-"`
 }
 
+// AgentParent returns the owning chat for a delegated run. User-created
+// forks also have ParentID, but acquire it from a SessionImported event.
+func (s *Snapshot) AgentParent() string {
+	if s.ParentID == "" {
+		return ""
+	}
+	var parent string
+	for _, record := range s.Records {
+		switch e := record.Event.(type) {
+		case *session.SessionCreated:
+			if e.ParentID == "" {
+				return ""
+			}
+			switch e.Source {
+			case "task", "guardian", "review":
+				return e.ParentID
+			case "agent", "": // Older delegated sessions used the default source.
+				parent = e.ParentID
+			}
+		case *session.SessionImported:
+			if e.Source == "fork" {
+				return ""
+			}
+		}
+	}
+	return parent
+}
+
 func FromRecords(records []session.Record, id string) (*Snapshot, error) {
 	projection, err := replay.Records(records)
 	if err != nil {
@@ -102,4 +131,26 @@ func SnapshotSettings(settings session.Settings) *session.Settings {
 	}
 	copy := settings.Clone()
 	return &copy
+}
+
+// The old session-created transaction recorded only workspace, model and
+// memory settings. Its two zero network flags did not describe a policy.
+func (s *Snapshot) HasLegacyCreationSettings() bool {
+	settings := s.Settings
+	if settings == nil || settings.PermissionPolicy != "" || len(s.Records) < 2 {
+		return false
+	}
+	legacy := session.Settings{
+		Workspace: settings.Workspace, Model: settings.Model, ProjectMemoryEnabled: settings.ProjectMemoryEnabled,
+		MemoryReadOnly: settings.MemoryReadOnly, MemoryHistory: settings.MemoryHistory,
+	}
+	if !reflect.DeepEqual(*settings, legacy) {
+		return false
+	}
+	for _, r := range slices.Backward(s.Records) {
+		if _, ok := r.Event.(*session.SettingsChanged); ok {
+			return r.Seq == 2 && r.TransactionID == "session-created-"+s.ID
+		}
+	}
+	return false
 }

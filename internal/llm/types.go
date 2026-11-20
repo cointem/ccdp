@@ -179,6 +179,8 @@ type ThinkingConfig struct {
 // CompletionRequest is the provider-neutral prepared request, including internal
 // prompt metadata. Each adapter projects it into its own API request body.
 type CompletionRequest struct {
+	// Models advertising native xhigh should receive that value on the Messages wire.
+	NativeXHigh     bool            `json:"-"`
 	Thinking        *ThinkingConfig `json:"thinking,omitempty"`
 	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
 	Verbosity       string          `json:"verbosity,omitempty"`

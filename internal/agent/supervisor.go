@@ -31,6 +31,8 @@ type SessionSupervisor struct {
 }
 
 type managedRun struct {
+	followupMu           sync.Mutex    // serialize parent assignments across idle-to-running admission
+	inputStarted         bool          // the original assignment has reached the child
 	handoff              chan struct{} // previous run mailbox waits for continuation admission
 	commandsInFlight     int
 	commandChanges       chan struct{}

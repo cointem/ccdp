@@ -27,9 +27,9 @@ func (d *agentToolDirectory) Control(_ context.Context, c protocol.AgentControl)
 func TestSpawnAgentDefaultsAndOverrides(t *testing.T) {
 	for _, explicit := range []bool{false, true} {
 		args := map[string]any{"task": "inspect"}
-		role, workspace, contextMode := "worker", "", "fresh"
+		role, workspace, contextMode := "worker", "shared", "fork"
 		if explicit {
-			role, workspace, contextMode = "explorer", "isolated", "fork"
+			role, workspace, contextMode = "explorer", "isolated", "fresh"
 			args["role"], args["workspace"], args["context"] = role, workspace, contextMode
 		}
 		var got SpawnAgentRequest
@@ -85,7 +85,7 @@ func TestFollowupAndStopUseStableAgentIdentity(t *testing.T) {
 		if err != nil || d.control.RunID != "" || d.control.SessionID != "child" {
 			t.Fatalf("%s %+v %v", out, d.control, err)
 		}
-		if name == "FollowupAgent" && d.control.Action != "continue" {
+		if name == "FollowupAgent" && d.control.Action != "followup" {
 			t.Fatal(d.control)
 		}
 	}
@@ -105,14 +105,14 @@ func TestAgentToolsRejectOldRunParameters(t *testing.T) {
 		}
 	}
 }
-func TestReadAgentDefaultsToResult(t *testing.T) {
+func TestReadAgentAllowsBareAgentID(t *testing.T) {
 	d := &agentToolDirectory{}
 	var got protocol.AgentReadRequest
 	out, err := executeToolText(NewAgentTool("ReadAgent"), &Context{Context: context.Background(), Args: map[string]any{"agent_id": "child"}, Sessions: d, ReadAgent: func(_ context.Context, req protocol.AgentReadRequest, _ int) (string, error) {
 		got = req
 		return "saved", nil
 	}})
-	if err != nil || out != "saved" || got.View != "result" || got.AgentID != "child" {
+	if err != nil || out != "saved" || got.View != "" || got.AgentID != "child" {
 		t.Fatalf("%+v %s %v", got, out, err)
 	}
 }

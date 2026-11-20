@@ -38,7 +38,7 @@ func TestAutoDevelopmentAndProcessControls(t *testing.T) {
 
 func TestWebLookupAllowedWithoutPerCallApproval(t *testing.T) {
 	for _, mode := range []Mode{ModeAuto, ModeManual} {
-		for _, name := range []string{"WebSearch", "WebFetch"} {
+		for _, name := range []string{"WebFetch", "mcp__exa__web_search_advanced_exa"} {
 			m := NewManager(mode, Policy{})
 			if decision, reason := m.Check(name, nil, KindNetwork); decision != DecisionAllow {
 				t.Errorf("%s/%s: %s (%s)", mode, name, decision, reason)

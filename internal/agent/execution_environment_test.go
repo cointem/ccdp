@@ -29,7 +29,7 @@ func TestReviewerMalformedOrExhaustedDoesNotGrantAccess(t *testing.T) {
 	a.mu.Lock()
 	a.turnMemory.guardianUses = 3
 	a.mu.Unlock()
-	if err := a.guardianCheck(messages.ToolCall{Name: "Write"}); !errors.Is(err, errGuardianUnavailable) {
+	if err := a.guardianCheck(t.Context(), messages.ToolCall{Name: "Write"}); !errors.Is(err, errGuardianUnavailable) {
 		t.Fatalf("exhausted reviewer: %v", err)
 	}
 }

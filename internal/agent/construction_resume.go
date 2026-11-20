@@ -85,7 +85,7 @@ func ResolveResumeConfig(cfg *config.Config, snap *archive.Snapshot) (config.Con
 		}
 		resolved.Workspace = abs
 	}
-	if snap.Model != "" && cfg.SourceOf("model") != config.SourceCLI && cfg.SourceOf("model") != config.SourceEnvironment {
+	if snap.Model != "" && cfg.SourceOf("model") != config.SourceCLI && cfg.SourceOf("model") != config.SourceEnvironment && cfg.ValidateModelSelection(snap.Model) == nil {
 		resolved.Model = snap.Model
 	}
 	return buildEffectiveConfig(resolved, snap, false, Options{})

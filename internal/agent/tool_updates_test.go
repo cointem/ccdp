@@ -130,6 +130,49 @@ func TestStepToolCatalogRestartAfterCompaction(t *testing.T) {
 	a.releaseStepContext(step)
 }
 
+func TestChildReplacesCatalogInheritedFromRoot(t *testing.T) {
+	cfg := isolatedTestConfig(t, "explorer-test")
+	allowed := map[string]bool{"Read": true}
+	a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, Purpose: childPurposeTask, AllowedTools: allowed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+	step, err := a.beginStepChecked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.releaseStepContext(step)
+	original := lastToolUpdate(step.history)
+	if original == nil || !original.Initial || len(original.Added) != 1 || original.Added[0].Name != "Read" {
+		t.Fatal("expected a read-only child catalog")
+	}
+	for _, update := range []*messages.ToolUpdate{
+		{Added: []messages.ToolDefinition{{Name: "SpawnAgent"}}}, {Removed: []string{"SpawnAgent"}},
+	} {
+		if err := a.appendHistory(messages.Message{Role: messages.RoleSystem, ToolUpdate: update}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	step, err = a.beginStepChecked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.releaseStepContext(step)
+	if baseline := lastToolUpdate(step.history); !reflect.DeepEqual(baseline, original) {
+		t.Fatalf("child did not restore its original declarations: %+v", baseline)
+	}
+	n := len(step.history)
+	step, err = a.beginStepChecked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.releaseStepContext(step)
+	if len(step.history) != n {
+		t.Fatal("ordinary followup rewrote the catalog again")
+	}
+}
+
 func lastToolUpdate(history []messages.Message) *messages.ToolUpdate {
 	for i := len(history) - 1; i >= 0; i-- {
 		if history[i].ToolUpdate != nil {

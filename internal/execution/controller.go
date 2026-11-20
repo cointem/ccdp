@@ -141,12 +141,18 @@ func NewController(roots ...string) *Controller {
 		root = roots[0]
 	}
 	if err == nil {
+		err = sandbox.VerifyHost(context.Background())
+		if err != nil {
+			c.failure = fmt.Errorf("%w: %w", ErrEnvironmentUnavailable, err)
+		}
+	}
+	if err == nil {
 		c.privateRoot, err = runtimepath.EnsurePrivate(root)
 	}
 	if err == nil {
 		c.root, err = runtimepath.EnsurePrivate(filepath.Join(c.privateRoot, "executors", id))
 	}
-	if err != nil {
+	if err != nil && c.failure == nil {
 		c.failure = fmt.Errorf("%w: private runtime preparation: %v", ErrEnvironmentUnavailable, err)
 	}
 	controllers.Store(c.ID, c)

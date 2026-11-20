@@ -39,7 +39,7 @@ func commitMemoryAccountingRequest(t *testing.T, p *sessionPersistence, rootID, 
 
 func retainAccountingRun(t *testing.T, root *Agent, p *sessionPersistence, fact session.ChildRunRecorded) {
 	t.Helper()
-	records, artifacts, err := p.ReadSnapshot()
+	records, artifacts, _, err := p.ReadSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestMemoryAccountingRecoversLatestPrefixesAndNestedChildrenOnce(t *testing.
 		if got := a.goalSnapshot(); got.TokensUsed != 35 || got.ModelCalls != 3 || !got.TokensEstimated {
 			t.Fatalf("reopen %d goal lost bindings or counted twice: %+v", reopen, got)
 		}
-		rows, _, err := a.services.supervisor.readRecordedSessionRecords(context.Background(), "memory-account-grandchild")
+		rows, _, _, err := a.services.supervisor.readRecordedSessionRecords(context.Background(), "memory-account-grandchild")
 		if err != nil || len(rows) == 0 {
 			t.Fatalf("reopen %d lost nested journal: records=%d err=%v", reopen, len(rows), err)
 		}
@@ -186,7 +186,7 @@ func TestMemoryAccountingRecoversChildSettlingAfterParentSnapshot(t *testing.T) 
 		close(release)
 		deadline := time.Now().Add(3 * time.Second)
 		for time.Now().Before(deadline) {
-			rows, _, err := child.ReadRunRecords(context.Background())
+			rows, _, _, err := child.ReadRunRecords(context.Background())
 			if err != nil {
 				t.Error(err)
 				return

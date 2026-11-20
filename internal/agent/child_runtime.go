@@ -51,7 +51,8 @@ var guardianReadOnlyTools = map[string]bool{
 func childReadOnlyTools(purpose string) map[string]bool {
 	allowed := cloneChildAllowed(guardianReadOnlyTools)
 	if purpose != childPurposeGuardian {
-		allowed["WebSearch"], allowed["WebFetch"] = true, true
+		allowed["WebFetch"] = true
+		allowed[mcp.ExaToolName()] = true
 	}
 	if isTaskChild(purpose) {
 		allowed["SendMessage"] = true

@@ -26,6 +26,11 @@
 
 运行中按 `Enter` 补充当前任务，按 `Tab` 将消息排到下一轮；命令或文件补全菜单打开时，`Tab` 优先补全。子任务审批会先提示，通过 `/pending` 或 `/agents` 进入处理。
 
+普通子任务默认共享当前项目目录，并继承派发时已完成的对话。子 agent 写入的报告和代码可直接在主工作区查看。多个子 agent 同时写代码时，应分配不同文件。需要独立副本时，派发时指定 `workspace=isolated`；需要空白上下文时指定 `context=fresh`。
+
+子任务结束后，主 agent 自动收到最终答复。中途同步用 `SendMessage`，消息在后台投递，只有失败时才在界面提示。追加任务用 `FollowupAgent`。两者都使用派发时返回的 `agent_id`。
+
+
 以 `/` 开头但未匹配到命令的输入（例如 `//` 代码注释、`/tmp/example.go` 路径），以及无法解析的命令输入，会原样作为普通消息发送，保留缩进和换行。
 
 `/rewind` 回退对话历史；文件恢复使用检查点和恢复流程。查看子 Agent 会话不会自动授予审批权限。
@@ -64,6 +69,8 @@ macOS 图片粘贴使用 **Control+V**。普通聊天的滚轮滚动由 TUI 处�
 
 OpenAI 兼容服务和本地模型服务可通过 `base_url` 接入。实际支持的工具调用、图片、推理参数和输出格式取决于模型与服务端。
 
+`anthropic` 优先使用增量工具声明。网关明确拒绝这项 Beta 时，ccdp 会在同一 Messages 接口用顶层 `tools` 重试，当前客户端后续请求这个模型时会沿用普通格式。
+
 - `api_key_env` 指定密钥环境变量；也可用 `api_key`，两者不能同时配置。
 - `context_window` 和 `max_output_tokens` 按模型配置，建议填写服务端支持的值。省略时分别使用 200000 和 32000；输出上限必须小于上下文窗口。
 - `fallback_model` 使用完整的 `provider/model`，在主模型失败时提供兜底。
@@ -101,6 +108,8 @@ OpenAI 兼容服务和本地模型服务可通过 `base_url` 接入。实际支�
 
 `reasoning_effort` 接受 `none|minimal|low|medium|high|xhigh|max`；`verbosity` 接受 `low|medium|high`。模型是否支持这些档位由服务商决定。`max_turns: 0` 表示不限制每轮模型调用次数。
 
+在桌面端点击输入框右下角的模型名，可以调整当前会话的推理强度或切换模型。回复生成中或工具执行中也可以调整，新设置从下一次模型请求生效。滑杆只列出该模型支持的档位。自定义模型可在 `providers.<id>.models.<model>` 的 `supported_reasoning_efforts` 中列出服务商支持的值，例如 `["low", "medium", "high"]`。空数组可隐藏该模型的档位。
+
 项目覆盖配置位于 `.ccdp/settings.json`，用 `/reload` 重新加载。CLI 和环境变量中的显式设置优先；用 `/config` 检查最终生效值。
 
 `max_parallel_tools` 控制同一请求中的工具并发，`max_concurrent_agents` 控制运行中的普通子任务；默认均为 4，范围均为 1–16。修改会影响后续调度，不会中止已经运行的任务。
@@ -108,6 +117,12 @@ OpenAI 兼容服务和本地模型服务可通过 `base_url` 接入。实际支�
 `bash_timeout_seconds` 设置前台命令的默认超时，后台命令默认不设执行期限。工具输出预算使用字节：`max_result_size_bytes` 限制单个结果，`max_tool_output_bytes_per_turn` 限制整轮结果。
 
 长输出通过 `ReadOutput(output_id, offset, limit)` 按字节续读，包括 WebFetch 全文和已结束命令的保留日志。停止进程或释放临时日志后，已保存的输出仍可读取；运行中的命令通过 `Process` 查看进度或发送输入。
+
+查文件名用 `Glob`，查文件内容用 `Rg`。例如 `Rg(pattern="Start(", literal=true, path="src")` 会列出对应路径和行号，可直接交给 `Read`。`context`、`before` 和 `after` 可以扩大命中附近的摘录，超过预算时结果会注明实际保留的行数。
+
+Exa 是 ccdp 默认安装的托管 MCP 服务，可在桌面端「自定义 → MCP」或会话的 `/mcp` 中查看。模型通过 `mcp__exa__web_search_advanced_exa` 搜索，支持按域名、日期和类别筛选。可直接使用匿名额度。要使用个人额度，在桌面端「设置 → MCP → exa → 配置 MCP」填写 Exa API 密钥并保存，或在用户配置文件设置 `exa_api_key`。留空时读取启动 ccdp 的环境变量 `EXA_API_KEY`，两者均为空时匿名搜索。[Exa MCP 服务说明](https://exa.ai/mcp)
+
+Exa 额度用尽或限流时，工具会返回相应错误。已有来源网址时可以用 `WebFetch` 读取 HTML 或文本。
 
 </details>
 
@@ -131,6 +146,8 @@ OpenAI 兼容服务和本地模型服务可通过 `base_url` 接入。实际支�
 工作区、额外可写目录、当前会话临时目录和项目缓存内默认允许 Unix stream/datagram socket 的监听和连接，不依赖外网开关。只读、禁读、受保护目录和其他会话仍不可通过 socket 访问。临时 IPC 使用 `$TMPDIR` 或 `$XDG_RUNTIME_DIR`，二者指向短路径的私有目录，避免 macOS Unix socket 路径长度限制；直接写公共 `/tmp` 不在默认授权内。用 `/add-dir <dir>` 增加读写及目录内 Unix socket 权限，`/add-dir --read-only <dir>` 指定只读目录，`/sandbox` 查看环境状态。
 
 开发进程可以创建自己的伪终端，Python `multiprocessing` 的随机命名信号量可用；匿名 socket、文件锁和文件映射共享内存也可正常使用。macOS 的 setuid `/bin/ps` 在 Seatbelt 下仍无法执行，可用已有 `Process` 句柄管理命令，或用 `lsof` 检查文件和端口。
+
+子进程继承当前 Seatbelt。需要再次初始化 Seatbelt 的程序（包括 CCDP 自身的执行器集成测试）应从沙箱外的宿主终端运行。运行时会在创建私有目录前检查后端；若提示 `sandbox backend unavailable` 和 `sandbox_apply: Operation not permitted`，增加目录授权或修改 `TMPDIR` 无法修复这类初始化失败。普通项目测试不需要另起 Seatbelt，可继续在 Bash 中执行。
 
 额外访问按资源合并等待，批准后继续原调用；父会话与普通子任务共享资源决定，once 授权不扩散。相同拒绝不再重复审核或弹窗，连续三轮重复拒绝会结束无效工具循环。可选 guardian 只审例外，格式错误、额度耗尽或不可用都不会自动放行。
 
@@ -270,7 +287,13 @@ Code Mode 默认开启。模型可以通过 `RunCode` 在一次调用里组合�
 }
 ```
 
-HTTP 连接优先使用 Streamable HTTP，初始化返回 404/405 时回退旧 SSE。`network_authorized` 授权连接服务器，每次工具操作仍受权限和网络能力检查。MCP 支持工具目录热刷新与断连清理。
+桌面端「自定义 → MCP」与「设置 → MCP」打开同一管理页。新增服务写入用户配置的 `mcp_servers`。已有服务的详情标明来源和文件路径，编辑或卸载会更新该文件，新会话使用新配置。卸载默认 Exa 会同时移除文件中的个人 Exa 密钥，并写入 `"exa": null`，之后可以从 MCP 页重新安装。
+
+用户配置中添加其他服务时会保留 Exa。用 `"mcp_servers": {"exa": {"disabled": true}}` 可停用它。显式空表 `"mcp_servers": {}` 会关闭全部 MCP 服务。已信任项目显式配置的服务表会替换用户服务表。
+
+`http` 使用 Streamable HTTP 连接公网服务，支持配置的网络代理。`on_demand_tools` 可以提供离线工具目录，调用时再连接并核对远端目录。
+
+`sse` 连接优先使用 Streamable HTTP，初始化返回 404/405 时回退旧 SSE。`network_authorized` 授权连接服务器，每次工具操作仍受权限和网络能力检查。MCP 支持工具目录热刷新与断连清理。
 
 Hooks 可通过 `{"decision":"ask"}` 请求审批、退出码 `2` 阻断操作、`{"continue":false}` 停止会话循环。
 

@@ -39,18 +39,19 @@ type rgLine struct {
 }
 
 type rgRequest struct {
-	singleFile string
-	pattern    string
-	literal    bool
-	base       string
-	globs      []string
-	types      []string
-	ignoreCase bool
-	multiline  bool
-	before     int
-	after      int
-	onlyMatch  bool
-	outputMode string
+	singleFile     string
+	pattern        string
+	literal        bool
+	base           string
+	globs          []string
+	types          []string
+	ignoreCase     bool
+	multiline      bool
+	before         int
+	after          int
+	contextLimited bool
+	onlyMatch      bool
+	outputMode     string
 	// maxLines bounds the lines reported to the model; fetchLines adds the
 	// offset so pagination still sees real results.
 	maxLines int
@@ -98,6 +99,12 @@ func searchRg(ctx *Context, r *rgRequest) (string, error) {
 		return "", err
 	}
 	page := newRgPage(lines, r, truncated)
+	// rg emits paths relative to its search directory; Read resolves them
+	// against the workspace. Keep external, separately authorized paths absolute.
+	base := rgResultBase(ctx.Sandbox.Workspace, r.base)
+	for i := range page.lines {
+		page.lines[i].file = filepath.ToSlash(filepath.Join(base, page.lines[i].file))
+	}
 	text := formatRgPage(page, r)
 	if ctx.dataResult != nil {
 		entries := make([]map[string]any, 0, len(page.lines))
@@ -110,9 +117,29 @@ func searchRg(ctx *Context, r *rgRequest) (string, error) {
 			entries = append(entries, entry)
 		}
 		incomplete := page.truncated || len(text) > ctx.outputLimit()
-		ctx.recordData(map[string]any{"mode": r.outputMode, "entries": entries, "offset": r.offset, "next_offset": page.nextOffset, "truncated": incomplete}, incomplete)
+		data := map[string]any{"mode": r.outputMode, "entries": entries, "offset": r.offset, "next_offset": page.nextOffset, "truncated": incomplete}
+		if r.contextLimited {
+			data["before"], data["after"], data["context_limited"] = r.before, r.after, true
+		}
+		ctx.recordData(data, incomplete)
 	}
 	return text, nil
+}
+
+func rgResultBase(workspace, base string) string {
+	if rel, err := filepath.Rel(workspace, base); err == nil && filepath.IsLocal(rel) {
+		return rel
+	}
+	// On macOS the working directory may use /var while the sandbox stores
+	// /private/var. Both names address the same workspace.
+	root, rootErr := filepath.EvalSymlinks(workspace)
+	dir, dirErr := filepath.EvalSymlinks(base)
+	if rootErr == nil && dirErr == nil {
+		if rel, err := filepath.Rel(root, dir); err == nil && filepath.IsLocal(rel) {
+			return rel
+		}
+	}
+	return base
 }
 
 func clipLine(s string) string {
@@ -505,6 +532,9 @@ func rgMatchedLineCount(lines []rgLine) int {
 
 func formatRgPage(page rgPage, r *rgRequest) string {
 	var sb strings.Builder
+	if r.contextLimited {
+		fmt.Fprintf(&sb, "Context limited to %d lines before and %d after each match. Use Read on a returned path for a larger excerpt.\n", r.before, r.after)
+	}
 	switch r.outputMode {
 	case rgModeFiles:
 		fmt.Fprintf(&sb, "Found %d file(s):\n", len(page.lines))

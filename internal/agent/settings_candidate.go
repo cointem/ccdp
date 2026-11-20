@@ -107,7 +107,7 @@ func (a *Agent) prepareSettingsCandidate(workspace string) (*settingsCandidate, 
 		sourceSandboxRevision: sourceSandboxRevision, sourceSettingsRevision: sourceSettingsRevision,
 		hooks: cloneHookConfig(effective.Hooks), webTools: effective.WebToolsEnabled(),
 		tools: cloneToolSpecs(effective.Tools), customPerms: customPerms,
-		mcpServers: cloneMCPConfig(effective.MCPServers)}, nil
+		mcpServers: effective.RuntimeMCPServers()}, nil
 }
 
 func (a *Agent) commitSettingsCandidate(candidate *settingsCandidate) error {
@@ -151,7 +151,7 @@ func (a *Agent) commitSettingsCandidateContext(ctx context.Context, candidate *s
 		a.mu.Unlock()
 		return fmt.Errorf("settings changed while candidate was being prepared")
 	}
-	oldMCP := cloneMCPConfig(oldCfg.MCPServers)
+	oldMCP := oldCfg.RuntimeMCPServers()
 	binding := candidate.binding
 	settings := a.settingsForCandidateLocked(candidate)
 	nextRevision := a.sequences.settingsRev + 1
@@ -320,22 +320,6 @@ func cloneToolSpecs(src []config.ToolSpec) []config.ToolSpec {
 		if out[i].InputSchema != nil {
 			out[i].InputSchema = cloneMap(out[i].InputSchema)
 		}
-	}
-	return out
-}
-
-func cloneMCPConfig(src map[string]mcp.ServerConfig) map[string]mcp.ServerConfig {
-	out := make(map[string]mcp.ServerConfig, len(src))
-	for name, cfg := range src {
-		cfg.Args = append([]string(nil), cfg.Args...)
-		if cfg.Env != nil {
-			env := make(map[string]string, len(cfg.Env))
-			for k, v := range cfg.Env {
-				env[k] = v
-			}
-			cfg.Env = env
-		}
-		out[name] = cfg
 	}
 	return out
 }

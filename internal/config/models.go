@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
+
+	"ccdp/internal/protocol"
 )
 
 const DefaultMaxOutputTokens = 32000
@@ -21,6 +24,8 @@ const DefaultReasoningEffort = "medium"
 type ModelConfig struct {
 	ContextWindow   int `json:"context_window,omitempty"`
 	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
+	// An explicitly empty list means that the model has no effort control.
+	SupportedReasoningEfforts []string `json:"supported_reasoning_efforts,omitzero"`
 }
 
 func (p *ProviderConfig) UnmarshalJSON(data []byte) error {
@@ -100,6 +105,34 @@ func (c *Config) ReasoningEffortFor(model string) string {
 	return DefaultReasoningEffort
 }
 
+// ReasoningEffortsFor returns the model's selectable levels from least to most
+// effort. An explicitly empty profile overrides the built-in model profile.
+func (c *Config) ReasoningEffortsFor(model string) []string {
+	if levels := c.ModelConfigFor(model).SupportedReasoningEfforts; levels != nil {
+		var sorted []string
+		for _, effort := range []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"} {
+			if slices.Contains(levels, effort) {
+				sorted = append(sorted, effort)
+			}
+		}
+		return sorted
+	}
+	switch strings.ToLower(c.APIModelFor(model)) {
+	case "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano":
+		return []string{"none", "low", "medium", "high", "xhigh"}
+	case "minimax-m3.1-flash", "gpt-6.2-astra", "gpt-6.2-sol",
+		"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7":
+		return []string{"low", "medium", "high", "xhigh", "max"}
+	case "claude-opus-4-6", "claude-sonnet-4-6":
+		return []string{"low", "medium", "high", "max"}
+	}
+	return nil
+}
+
+func (c *Config) SupportsReasoningEffort(model, effort string) bool {
+	return slices.Contains(c.ReasoningEffortsFor(model), effort)
+}
+
 // ValidateModelSelection is also applied to interactive model switches, where
 // a misspelled provider must never silently select the global endpoint.
 func (c *Config) ValidateModelSelection(model string) error {
@@ -147,6 +180,11 @@ func (c *Config) validateModelConfigs() error {
 		for name, m := range p.ModelConfigs {
 			if strings.TrimSpace(name) == "" {
 				return fmt.Errorf("providers.%s: model name is empty", id)
+			}
+			for _, level := range m.SupportedReasoningEfforts {
+				if level == "" || protocol.ValidateGeneration(level, "") != nil {
+					return fmt.Errorf("providers.%s.models.%s: invalid supported reasoning effort %q", id, name, level)
+				}
 			}
 			if m.ContextWindow != 0 && m.ContextWindow < 4000 {
 				return fmt.Errorf("providers.%s.models.%s.context_window must be at least 4000", id, name)

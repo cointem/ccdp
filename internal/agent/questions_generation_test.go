@@ -77,6 +77,14 @@ func TestQuestionRoundTripAndReasoningWire(t *testing.T) {
 	if !submitAnswer("invalid", invalid).Rejected() {
 		t.Fatal("invalid answer accepted")
 	}
+	// Change both settings while AskUserQuestion is still executing.
+	if receipt := submitTestCommand(t, ag, protocol.NewSetModel("switch-model", view.SessionID, "deepseek-followup")); !receipt.Applied() {
+		t.Fatal(receipt.Error)
+	}
+	effort := "medium"
+	if receipt := submitTestCommand(t, ag, protocol.Command{ID: "switch-effort", SessionID: view.SessionID, Type: protocol.CommandSetGeneration, Generation: &protocol.SetGeneration{ReasoningEffort: &effort}}); !receipt.Applied() {
+		t.Fatal(receipt.Error)
+	}
 	answer := protocol.AnswerQuestion{RequestID: request.ID, Answers: []protocol.QuestionAnswer{{Selected: []string{"SQLite"}, Text: "离线使用"}}}
 	if receipt := submitAnswer("answer", answer); receipt.Rejected() {
 		t.Fatal(receipt.Error)
@@ -86,8 +94,11 @@ func TestQuestionRoundTripAndReasoningWire(t *testing.T) {
 	}
 	drainUntil(t, events, 5*time.Second, func(ev protocol.EventView) bool { return ev.Kind == protocol.EventTurnDone })
 	first, second := <-requests, <-requests
-	if first.ReasoningEffort != "high" || first.Verbosity != "low" || first.Thinking == nil || first.Thinking.Type != "enabled" {
+	if first.Model != "deepseek-test" || first.ReasoningEffort != "high" || first.Verbosity != "low" || first.Thinking == nil || first.Thinking.Type != "enabled" {
 		t.Fatalf("missing generation controls: %+v", first)
+	}
+	if second.Model != "deepseek-followup" || second.ReasoningEffort != effort {
+		t.Fatalf("request after tool completion used model %q and effort %q", second.Model, second.ReasoningEffort)
 	}
 	var foundReasoning, foundAnswer bool
 	for _, msg := range second.Messages {

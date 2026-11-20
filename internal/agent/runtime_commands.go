@@ -48,6 +48,9 @@ func (a *Agent) applyReloadSettingsCommand(cmd protocol.Command) protocol.Receip
 	if cmd.Reload == nil {
 		return a.rejectedReceipt(cmd, protocol.ErrorInvalidCommand, "reload payload is required")
 	}
+	if cmd.Reload.UserPreferences {
+		return a.reloadUserPreferences(cmd)
+	}
 	return a.scheduleCommandOperation(cmd, "reload", func(ctx context.Context) (string, error) {
 		a.mu.Lock()
 		workspace := a.services.cfg.Workspace

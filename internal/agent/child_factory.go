@@ -8,7 +8,6 @@ import (
 	"ccdp/internal/messages"
 	"ccdp/internal/plugin"
 	"ccdp/internal/session/archive"
-	"ccdp/internal/supervision"
 	"ccdp/internal/tools"
 )
 
@@ -24,14 +23,6 @@ type childFactory struct {
 	tools         *tools.Lease
 	preHooks      []plugin.PreToolHook
 	recoveryID    string
-}
-
-func (f childFactory) Open(ctx context.Context) (supervision.ChildRuntime, error) {
-	child, err := f.openAgent(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return child, nil
 }
 
 func (f childFactory) openAgent(ctx context.Context) (*Agent, error) {
@@ -59,5 +50,3 @@ func (f childFactory) openAgent(ctx context.Context) (*Agent, error) {
 	child.inheritBorrowedPreHooks(f.preHooks)
 	return child, nil
 }
-
-var _ supervision.ChildFactory = childFactory{}

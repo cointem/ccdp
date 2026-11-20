@@ -250,5 +250,8 @@ func trustedReadOnlyCommand(name string) bool {
 		return false
 	}
 	path, absolute := executable.Resolve(name, os.Getenv("PATH"), dir)
-	return absolute && executable.Trusted(path)
+	if !absolute || path == "" {
+		return false
+	}
+	return executable.Trusted(path) || name == "rg" && path == executable.FindTrusted("rg", os.Getenv("PATH"))
 }

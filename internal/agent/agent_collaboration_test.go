@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +12,17 @@ import (
 	"ccdp/internal/session"
 	"ccdp/internal/testenv"
 )
+
+func (a *Agent) hasAgentMessage() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, input := range a.conversation.durable.PendingInputViews() {
+		if input.Strategy == protocol.InputMessage {
+			return true
+		}
+	}
+	return false
+}
 
 func TestDelegatedResultsResumeSameParentTurnWithoutReadOrWait(t *testing.T) {
 	release := map[string]chan struct{}{"child-a": make(chan struct{}), "child-b": make(chan struct{})}
@@ -31,7 +41,7 @@ func TestDelegatedResultsResumeSameParentTurnWithoutReadOrWait(t *testing.T) {
 			}
 			if isTaskMessage(m) {
 				text, _ := m.Content.(string)
-				if first == "" {
+				if _, child := release[text]; child {
 					first = text
 				}
 				if msg, ok := protocol.DecodeCollaboration(text); ok && msg.Kind == "final_result" {
@@ -110,7 +120,7 @@ waitingForB:
 	if view.Phase != protocol.PhaseIdle {
 		t.Fatalf("completed parent retained wait phase: %s", view.Phase)
 	}
-	records, _, err := a.services.supervisor.readSessionRecords(ctx, protocol.SessionID(a.conversation.sessionID))
+	records, _, _, err := a.services.supervisor.readSessionRecords(ctx, protocol.SessionID(a.conversation.sessionID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,9 +227,13 @@ func TestAgentWaitMessageCancellationAndBusyFollowup(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := r.fact.Child.SessionID
-	if _, err := a.services.supervisor.Control(context.Background(), protocol.AgentControl{ID: "busy-next", SessionID: id, Action: "continue", Text: "next"}); err == nil || !strings.Contains(err.Error(), "busy") {
-		t.Fatalf("busy follow-up was not rejected: %v", err)
+	followup := protocol.AgentControl{ID: "busy-next", SessionID: id, Action: "followup", Text: "next", Strategy: protocol.InputFollowup}
+	for i := 0; i < 2; i++ {
+		if run, err := a.services.supervisor.Control(context.Background(), followup); err != nil || !run.Active() {
+			t.Fatalf("active followup: %+v %v", run, err)
+		}
 	}
+
 	for i := 0; i < 10; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		result := make(chan string, 1)
@@ -266,6 +280,92 @@ func TestAgentWaitMessageCancellationAndBusyFollowup(t *testing.T) {
 	}
 	if a.isBusy() {
 		t.Fatal("late final result restarted idle parent")
+	}
+}
+
+// Hold the only execution slot to exercise delivery before there is a
+// child runtime. Then send another assignment during an actual model call.
+func TestFollowupAcrossQueuedRunningAndIdle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	started, release := make(chan struct{}), make(chan struct{})
+	var first sync.Once
+	p := &childRuntimeTestProvider{name: "followup-routing"}
+	p.stream = func(ctx context.Context, req llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
+		first.Do(func() {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		})
+		return llm.StreamResult{Text: "done", FinishReason: "stop"}, nil
+	}
+	a, _ := newChildRuntimeTestAgent(t, p)
+	a.services.cfg.MaxConcurrentAgents = 1
+	slots := slotsForParent(a, childPurposeTask)
+	if err := slots.acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	unblock := sync.OnceFunc(slots.release)
+	defer unblock()
+	releaseModel := sync.OnceFunc(func() { close(release) })
+	defer releaseModel()
+
+	sup := a.services.supervisor
+	run, err := sup.launch(a, ctx, childTask{Description: "initial"}, childPurposeTask, "launch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := run.fact.Child.SessionID
+	request := func(text string) protocol.AgentControl {
+		return protocol.AgentControl{ID: protocol.CommandID(text), SessionID: id, Action: "followup", Text: text, Strategy: protocol.InputFollowup}
+	}
+	send := func(text string) {
+		t.Helper()
+		if _, err := sup.Control(ctx, request(text)); err != nil {
+			t.Fatalf("followup %s: %v", text, err)
+		}
+	}
+	send("queued")
+	send("queued")
+	unblock()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("child never started")
+	}
+	send("running")
+	releaseModel()
+	waitManaged(t, run)
+	send("running")
+	if current, _ := sup.lookup(id); current != run {
+		t.Fatal("replaying an admitted steer started a new run")
+	}
+	conflict := request("running")
+	conflict.Text = "different"
+	if _, err := sup.Control(ctx, conflict); err == nil {
+		t.Fatal("reused id accepted different task")
+	}
+	send("idle")
+	next, _ := sup.lookup(id)
+	if next == run {
+		t.Fatal("idle followup did not resume the child")
+	}
+	waitManaged(t, next)
+	send("idle")
+	if current, _ := sup.lookup(id); current != next {
+		t.Fatal("replaying the idle followup started another run")
+	}
+	records, _, _, err := sup.readSessionRecords(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := durableInputs(records)
+	for _, key := range []protocol.InputID{"queued", "running"} {
+		if inputs[key] == nil || inputs[key].receipt("", id).Status != protocol.ReceiptApplied {
+			t.Fatalf("%s assignment did not reach child: %+v", key, inputs[key])
+		}
 	}
 }
 

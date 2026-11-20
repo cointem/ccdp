@@ -57,10 +57,7 @@ func TestBuiltinDefaultsArePublishedAndPrepared(t *testing.T) {
 		t.Fatalf("Read defaults: %#v %v", args, err)
 	}
 	spawn, err := registry.Acquire().PrepareArguments("SpawnAgent", map[string]any{"task": "inspect"})
-	if err != nil || spawn["role"] != "worker" || spawn["context"] != "fresh" {
+	if err != nil || spawn["role"] != "worker" || spawn["context"] != "fork" || spawn["workspace"] != "shared" {
 		t.Fatalf("SpawnAgent defaults: %#v %v", spawn, err)
-	}
-	if _, exists := spawn["workspace"]; exists {
-		t.Fatal("workspace must be selected from the role by the child runtime")
 	}
 }

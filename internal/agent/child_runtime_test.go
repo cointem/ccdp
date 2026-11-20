@@ -431,7 +431,7 @@ func TestChildHooksApplyToEachIndependentLaunch(t *testing.T) {
 	}
 	// Guardians have a separate read-only path and must not trigger Task
 	// lifecycle hooks.
-	if _, err := a.runGuardianChild("guardian-hook"); err != nil {
+	if _, err := a.runGuardianChild(t.Context(), "guardian-hook"); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(hookFile)
@@ -607,7 +607,7 @@ func TestChildToolGateHardPolicies(t *testing.T) {
 		nonInteractive: true,
 		perms:          permissions.NewManager(permissions.ModeAuto, permissions.Policy{}),
 	}}}
-	for _, name := range []string{"Write", "Edit", "Bash", "WebSearch", "SpawnAgent", "EnterPlanMode", "ExitPlanMode", "unknown"} {
+	for _, name := range []string{"Write", "Edit", "Bash", "WebFetch", "SpawnAgent", "EnterPlanMode", "ExitPlanMode", "unknown"} {
 		if denied, reason := ChildToolGate(guardian, messages.ToolCall{Name: name}, nil); !denied || reason == "" {
 			t.Fatalf("guardian tool %q escaped hard gate: denied=%v reason=%q", name, denied, reason)
 		}

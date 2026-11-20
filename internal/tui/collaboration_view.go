@@ -5,21 +5,18 @@ import (
 	"fmt"
 )
 
-func renderCollaborationCell(text string, width int) string {
+func renderCollaborationCell(text string) string {
 	message, ok := protocol.DecodeCollaboration(text)
-	if !ok {
-		return styleStatus.Render("· 协作消息") + "\n" + renderAssistantCell(text, width)
+	if !ok || message.Kind != "final_result" {
+		return ""
 	}
 	name := displayLabel(message.Name)
 	if name == "" {
 		name = shortID(displayLabel(string(message.AgentID)))
 	}
-	if message.Kind == "final_result" {
-		_, _, label := agentMarkerStatus(message.Outcome)
-		if label == "Done" {
-			label = "已完成"
-		}
-		return styleStatus.Render(fmt.Sprintf("· %s：%s · 结果已交付", name, label))
+	_, _, label := agentMarkerStatus(message.Outcome)
+	if label == "Done" {
+		label = "已完成"
 	}
-	return styleStatus.Render("· "+name+" 的消息") + "\n" + renderAssistantCell(sanitizeANSI(message.Text), width)
+	return styleStatus.Render(fmt.Sprintf("· %s：%s · 结果已交付", name, label))
 }

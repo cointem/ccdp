@@ -62,6 +62,9 @@ func (p *State) Apply(event session.Event) (err error) {
 		p.pendingInput[e.InputID] = cloneInput(*e)
 		if e.Text != "" || len(e.Attachments) > 0 {
 			pending := messages.Message{Role: messages.RoleUser, Content: e.Text, CreatedAt: e.CreatedAt}
+			if e.Strategy == string(protocol.InputMessage) {
+				pending.InternalSource = protocol.CollaborationSource
+			}
 			pending.ID = e.MessageID
 			if pending.ID == "" {
 				pending.ID = protocol.InputMessageID(protocol.InputID(e.InputID))

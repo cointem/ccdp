@@ -1,10 +1,36 @@
 package runtimepath
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestPrivateRootRejectsNonDirectoriesAndReportsFullPath(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "file")
+	if err := os.WriteFile(file, []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := EnsurePrivate(filepath.Join(file, "child"))
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
+		t.Fatalf("missing path error: %v", err)
+	}
+	canonical, err := filepath.EvalSymlinks(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pathErr.Path != canonical {
+		t.Fatalf("error path=%q, want %q", pathErr.Path, canonical)
+	}
+	for _, path := range []string{"", "/"} {
+		if _, err := EnsurePrivate(path); err == nil {
+			t.Fatalf("accepted invalid private root %q", path)
+		}
+	}
+}
 
 func TestPrivateRootRejectsLinksAndInsecureMode(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "runtime")

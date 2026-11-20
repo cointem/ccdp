@@ -12,6 +12,7 @@ type SessionState struct {
 	Question          *QuestionRequest   `json:"question,omitempty"`
 	RunID             RunID              `json:"run_id,omitempty"`
 	Transcript        []TranscriptItem   `json:"transcript,omitempty"`
+	TranscriptPrompt  *TranscriptItem    `json:"transcript_prompt,omitempty"`
 	TranscriptMore    bool               `json:"transcript_more,omitempty"`
 	SessionID         SessionID          `json:"session_id"`
 	Revision          Revision           `json:"revision"`
@@ -42,6 +43,7 @@ func (v *SessionView) ApplyState(s SessionState) {
 	v.RunID = s.RunID
 	v.Transcript = s.Transcript
 	v.TranscriptMore = s.TranscriptMore
+	v.TranscriptPrompt = s.TranscriptPrompt
 	v.SessionID = s.SessionID
 	v.Revision = s.Revision
 	v.Phase = s.Phase
@@ -66,16 +68,17 @@ func (v *SessionView) ApplyState(s SessionState) {
 // State returns the ordinary-update projection without copying history or catalog.
 func (v SessionView) State() SessionState {
 	return SessionState{
-		HistoryLength:   v.HistoryLength,
-		OutstandingWork: v.OutstandingWork,
-		Goal:            v.Goal,
-		Question:        v.Question,
-		RunID:           v.RunID,
-		Transcript:      v.Transcript,
-		TranscriptMore:  v.TranscriptMore,
-		SessionID:       v.SessionID,
-		Revision:        v.Revision,
-		Phase:           v.Phase,
+		HistoryLength:    v.HistoryLength,
+		OutstandingWork:  v.OutstandingWork,
+		Goal:             v.Goal,
+		Question:         v.Question,
+		RunID:            v.RunID,
+		Transcript:       v.Transcript,
+		TranscriptMore:   v.TranscriptMore,
+		TranscriptPrompt: v.TranscriptPrompt,
+		SessionID:        v.SessionID,
+		Revision:         v.Revision,
+		Phase:            v.Phase,
 
 		Busy:              v.Busy,
 		WorkLabel:         v.WorkLabel,

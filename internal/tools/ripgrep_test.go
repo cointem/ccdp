@@ -3,7 +3,9 @@ package tools
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -87,6 +89,76 @@ func TestRgMissingDependencyFailsWithoutFallback(t *testing.T) {
 	output, err := executeToolText(NewRgTool(), ctx)
 	if err == nil || !strings.Contains(err.Error(), "ripgrep (rg) is required") || output != "" {
 		t.Fatalf("missing native dependency silently fell back: %q %v", output, err)
+	}
+}
+
+func TestRgFromFinderWithHomebrewInstallation(t *testing.T) {
+	if runtime.GOOS != "darwin" || executable.File("/opt/homebrew/bin/rg") == "" && executable.File("/usr/local/bin/rg") == "" {
+		t.Skip("requires macOS with Homebrew ripgrep")
+	}
+	t.Setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+	root := t.TempDir()
+	reviewRgWrite(t, root, "fixture.go", "package lockservice\n")
+	ctx := rgCtx(t, root)
+	ctx.Args = map[string]any{"pattern": "lockservice"}
+	got, err := executeToolText(NewRgTool(), ctx)
+	if err != nil || !strings.Contains(got, "fixture.go:1:package lockservice") {
+		t.Fatalf("Finder search: %q, %v", got, err)
+	}
+}
+
+func TestRgFromDesktopBundle(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS app bundle")
+	}
+	if os.Getenv("CCDP_TEST_BUNDLED_SEARCH") == "1" {
+		t.Setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+		if err := executable.UseDesktopBundle(); err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(executable.DesktopBundle(), "Contents", "Resources", "bin", "rg")
+		shellPath, err := exec.LookPath("rg")
+		if shellPath != want || err != nil || executable.FindTrusted("rg", "/opt/homebrew/bin") != want {
+			t.Fatalf("could not use the bundled rg for both native and shell searches: %q, %v", shellPath, err)
+		}
+		root := t.TempDir()
+		reviewRgWrite(t, root, "fixture.go", "package lockservice\n")
+		ctx := rgCtx(t, root)
+		ctx.Args = map[string]any{"pattern": "lockservice"}
+		got, err := executeToolText(NewRgTool(), ctx)
+		if err != nil || !strings.Contains(got, "fixture.go:1:package lockservice") {
+			t.Fatalf("bundled search: %q, %v", got, err)
+		}
+		return
+	}
+	// Run the real search adapter from the layout MyGo produces, independent
+	// of Homebrew and without changing the test process's executable lookup.
+	contents := filepath.Join(t.TempDir(), "ccdp.app", "Contents")
+	host := filepath.Join(contents, "MacOS", "ccdp")
+	rg := filepath.Join(contents, "Resources", "bin", "rg")
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join("..", "..", "resources", "darwin-"+runtime.GOARCH, "bin", "rg")
+	if executable.File(source) == "" {
+		source = executable.FindTrusted("rg", os.Getenv("PATH"))
+		if source == "" {
+			t.Skip("build the desktop bundle or install ripgrep to exercise bundled search")
+		}
+	}
+	for src, dst := range map[string]string{self: host, source: rg} {
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("/bin/cp", src, dst).CombinedOutput(); err != nil {
+			t.Fatalf("copy bundle fixture: %v: %s", err, out)
+		}
+	}
+	cmd := exec.Command(host, "-test.run=^TestRgFromDesktopBundle$")
+	cmd.Env = append(os.Environ(), "CCDP_TEST_BUNDLED_SEARCH=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("desktop search: %v\n%s", err, out)
 	}
 }
 

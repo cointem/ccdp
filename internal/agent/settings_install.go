@@ -89,9 +89,9 @@ func (a *Agent) installSettingsCandidate(input settingsCandidateInstall) error {
 		customTools = append(customTools, tools.NewCommandTool(name, spec.Description, spec.Command, spec.InputSchema))
 		customPerms[name] = candidate.customPerms[name]
 	}
-	webTools := make([]tools.Tool, 0, 2)
+	var webTools []tools.Tool
 	if candidate.webTools {
-		webTools = append(webTools, tools.NewWebFetchTool(), tools.NewWebSearchTool())
+		webTools = []tools.Tool{tools.NewWebFetchTool()}
 	}
 	var codeTools []tools.Tool
 	if candidate.cfg.CodeModeEnabled && codemode.Available {

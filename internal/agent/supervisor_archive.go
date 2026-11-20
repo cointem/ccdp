@@ -13,13 +13,14 @@ import (
 	"ccdp/internal/session"
 	"ccdp/internal/session/journal"
 	"ccdp/internal/sessionview"
+	"ccdp/internal/supervision"
 )
 
 func (s *SessionSupervisor) ReadTranscript(ctx context.Context, id protocol.SessionID, before uint64, limit int) (protocol.TranscriptPage, error) {
 	if limit <= 0 || limit > sessionview.Window {
 		limit = sessionview.Window
 	}
-	records, _, recoveredThrough, err := s.readSessionRecordsWithRecovery(ctx, id)
+	records, _, recoveredThrough, err := s.readSessionRecords(ctx, id)
 	if err != nil {
 		return protocol.TranscriptPage{}, err
 	}
@@ -30,24 +31,15 @@ func (s *SessionSupervisor) ReadTranscript(ctx context.Context, id protocol.Sess
 	if err := t.ReplayRecords(ctx, records, recoveredThrough); err != nil {
 		return protocol.TranscriptPage{}, err
 	}
-	items, _ := t.Snapshot()
+	items, _, prompt := t.SnapshotWithPrompt()
 	var cursor uint64
 	if len(items) > 0 {
 		cursor = t.Position(items[0].ID)
 	}
-	return protocol.TranscriptPage{Items: items, Before: cursor, More: cursor > 1}, nil
+	return protocol.TranscriptPage{Items: items, Prompt: prompt, Before: cursor, More: cursor > 1}, nil
 }
 
-type outputReader interface {
-	Read(session.BlobRef, int64) ([]byte, error)
-}
-
-func (s *SessionSupervisor) readSessionRecords(ctx context.Context, id protocol.SessionID) ([]session.Record, outputReader, error) {
-	records, blobs, _, err := s.readSessionRecordsWithRecovery(ctx, id)
-	return records, blobs, err
-}
-
-func (s *SessionSupervisor) readSessionRecordsWithRecovery(ctx context.Context, id protocol.SessionID) ([]session.Record, outputReader, session.Cursor, error) {
+func (s *SessionSupervisor) readSessionRecords(ctx context.Context, id protocol.SessionID) ([]session.Record, journal.ArtifactReader, session.Cursor, error) {
 	if id != protocol.SessionID(s.root.SessionID()) {
 		r, err := s.lookup(id)
 		if err != nil {
@@ -57,24 +49,17 @@ func (s *SessionSupervisor) readSessionRecordsWithRecovery(ctx context.Context, 
 		id = r.fact.Child.SessionID
 		r.mu.Unlock()
 	}
-	return s.readRecordedSessionRecordsWithRecovery(ctx, id)
+	return s.readRecordedSessionRecords(ctx, id)
 }
 
 // readRecordedSessionRecords also serves accounting traversal of descendant
 // IDs found in the journal, including older nested children outside the live
 // directory. Public child readers validate directory membership above.
-func (s *SessionSupervisor) readRecordedSessionRecords(ctx context.Context, id protocol.SessionID) ([]session.Record, outputReader, error) {
-	records, blobs, _, err := s.readRecordedSessionRecordsWithRecovery(ctx, id)
-	return records, blobs, err
-}
-
-func (s *SessionSupervisor) readRecordedSessionRecordsWithRecovery(ctx context.Context, id protocol.SessionID) ([]session.Record, outputReader, session.Cursor, error) {
+func (s *SessionSupervisor) readRecordedSessionRecords(ctx context.Context, id protocol.SessionID) ([]session.Record, journal.ArtifactReader, session.Cursor, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, 0, err
 	}
-	var reader interface {
-		ReadRunRecords(context.Context) ([]session.Record, journal.ArtifactReader, error)
-	}
+	var reader supervision.RunRecordReader
 	if id == protocol.SessionID(s.root.SessionID()) {
 		reader = s.root
 	} else if r := s.directory.Current(id); r != nil {
@@ -85,27 +70,16 @@ func (s *SessionSupervisor) readRecordedSessionRecordsWithRecovery(ctx context.C
 	if reader != nil {
 		// Keep the writer/reader handle alive for this read. Closing the owner
 		// may detach it, but cannot invalidate the copied immutable records.
-		if live, ok := reader.(interface {
-			ReadRunRecordsWithRecovery(context.Context) ([]session.Record, journal.ArtifactReader, session.Cursor, error)
-		}); ok {
-			records, blobs, recoveredThrough, err := live.ReadRunRecordsWithRecovery(ctx)
-			if !errors.Is(err, session.ErrClosed) {
-				return records, blobs, recoveredThrough, err
-			}
-		} else {
-			// Alternate live runtime adapters have no recovered prefix unless
-			// they explicitly expose a recovery boundary.
-			records, blobs, err := reader.ReadRunRecords(ctx)
-			if !errors.Is(err, session.ErrClosed) {
-				return records, blobs, 0, err
-			}
+		records, blobs, recoveredThrough, err := reader.ReadRunRecords(ctx)
+		if !errors.Is(err, session.ErrClosed) {
+			return records, blobs, recoveredThrough, err
 		}
 	}
 	// Continuations keep complete prefixes of the same session log. A newly
 	// queued run may have no runtime yet, so select the newest retained prefix,
 	// rather than concatenating overlapping histories or choosing an old run.
 	var saved []session.Record
-	var artifacts outputReader
+	var artifacts journal.ArtifactReader
 	// Nested archived children need not be executable directory entries, but
 	// their journals still belong to accounting traversal after a memory reopen.
 	for _, child := range s.memoryChildren {
@@ -161,7 +135,7 @@ func (s *SessionSupervisor) ReadOutput(ctx context.Context, id protocol.SessionI
 	if limit <= 0 || limit > 64<<10 {
 		limit = 64 << 10
 	}
-	records, blobs, err := s.readSessionRecords(ctx, id)
+	records, blobs, _, err := s.readSessionRecords(ctx, id)
 	if err != nil {
 		return protocol.OutputPage{}, err
 	}

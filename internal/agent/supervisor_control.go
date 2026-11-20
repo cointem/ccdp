@@ -47,6 +47,9 @@ func (s *SessionSupervisor) Control(ctx context.Context, c protocol.AgentControl
 	if err != nil {
 		return protocol.RunView{}, err
 	}
+	if c.Action == "followup" {
+		return s.followupTask(ctx, c)
+	}
 	if c.Action == "stop_tree" && c.SessionID == protocol.SessionID(s.root.SessionID()) {
 		return protocol.RunView{Status: "cancelled"}, s.stopTree(ctx, c.ID)
 	}
@@ -93,7 +96,7 @@ func (s *SessionSupervisor) Control(ctx context.Context, c protocol.AgentControl
 	}()
 	row := r.fact.Child
 	if c.RunID != "" && c.RunID != row.Run.ID {
-		return row.Run, errors.New("stale run id")
+		return row.Run, protocol.ErrStaleRun
 	}
 	if c.Action == "cancel" {
 		if row.Run.Active() {
@@ -126,7 +129,7 @@ func (s *SessionSupervisor) Control(ctx context.Context, c protocol.AgentControl
 	cmd := protocol.Command{ID: c.ID, SessionID: row.SessionID}
 	switch c.Action {
 	case "send":
-		if row.Purpose != childPurposeTask && row.Purpose != childPurposeReview {
+		if !isTaskChild(row.Purpose) {
 			return row.Run, errors.New("guardian is read-only")
 		}
 		strategy := c.Strategy
@@ -157,6 +160,102 @@ func (s *SessionSupervisor) Control(ctx context.Context, c protocol.AgentControl
 	return row.Run, err
 }
 
+// Model assignments follow the stable session. Interactive controls may still
+// target a particular run and must retain their stale-run checks.
+func (s *SessionSupervisor) followupTask(ctx context.Context, c protocol.AgentControl) (protocol.RunView, error) {
+	cmd := protocol.NewSubmitInput(c.ID, c.SessionID, protocol.InputID(c.ID), c.Text, protocol.InputSteer)
+	if _, err := cmd.Normalize(); err != nil {
+		return protocol.RunView{}, err
+	}
+	// The idle path uses the original text-only continuation identity, including
+	// its strategy, so calls persisted before this change remain replayable.
+	c.Action = "continue"
+	for {
+		r, err := s.lookup(c.SessionID)
+		if err != nil {
+			return protocol.RunView{}, err
+		}
+		r.followupMu.Lock()
+		if r != s.directory.Current(c.SessionID) {
+			r.followupMu.Unlock()
+			continue
+		}
+		run, err := s.admitFollowup(ctx, r, c, cmd)
+		r.followupMu.Unlock()
+		if err != nil && ctx.Err() == nil {
+			// A desktop submission can concurrently win continuation admission.
+			// Re-resolve this stable ID once its new run becomes visible.
+			r.mu.Lock()
+			handoff := r.handoff
+			r.mu.Unlock()
+			if handoff != nil {
+				select {
+				case <-handoff:
+				case <-ctx.Done():
+					return run, ctx.Err()
+				}
+			}
+			if s.directory.Current(c.SessionID) != r {
+				continue
+			}
+		}
+		return run, err
+	}
+}
+
+func (s *SessionSupervisor) admitFollowup(ctx context.Context, r *managedRun, c protocol.AgentControl, cmd protocol.Command) (protocol.RunView, error) {
+	if s.directory.Run(protocol.RunID("continue-"+string(c.ID))) != nil {
+		return s.Control(ctx, c)
+	}
+	receipt, found, err := s.priorChildInputReceipt(ctx, r, cmd)
+	r.mu.Lock()
+	row := r.fact.Child
+	if err != nil || found {
+		r.mu.Unlock()
+		if receipt.Rejected() {
+			return row.Run, receipt.Error
+		}
+		return row.Run, err
+	}
+	if !isTaskChild(row.Purpose) {
+		r.mu.Unlock()
+		return row.Run, errors.New("this child cannot receive assignments")
+	}
+	if !row.Run.Active() || row.Run.Status == "settling" || row.Run.Status == "stopping" {
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return row.Run, ctx.Err()
+		case <-r.done:
+			return s.Control(ctx, c)
+		}
+	}
+
+	// Reserve the active run before releasing its lock. An otherwise idle
+	// driver must observe this input before publishing its terminal result.
+	r.beginRuntimeCommand()
+	defer r.finishRuntimeCommand()
+	child, started := r.agent, r.inputStarted
+	if started && child != nil && len(r.fact.PendingMessages) == 0 {
+		r.mu.Unlock()
+		receipt, err := child.Submit(ctx, cmd)
+		if err == nil && receipt.Rejected() {
+			err = receipt.Error
+		}
+		return row.Run, err
+	}
+
+	reply, err := enqueueDormantMessageLocked(r, c.ID, c.Text, protocol.InputSteer)
+	r.mu.Unlock()
+	if err == nil {
+		err = persistQueuedChildInput(r, c.ID, reply)
+	}
+	if err == nil && started && child != nil {
+		err = s.flushChildMessages(ctx, r, child)
+	}
+	return row.Run, err
+}
+
 func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c protocol.AgentControl) (protocol.RunView, error) {
 	r.mu.Lock()
 	row := r.fact.Child
@@ -173,7 +272,7 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 	memory := append([]session.Record(nil), r.memory...)
 	blobs := r.memoryBlobs
 	r.mu.Unlock()
-	if row.Purpose != childPurposeTask && row.Purpose != childPurposeReview {
+	if !isTaskChild(row.Purpose) {
 		return row.Run, errors.New("guardian cannot continue")
 	}
 	if row.Run.Active() {
@@ -183,7 +282,7 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 		return row.Run, errors.New("child changes were merged and its workspace retired; start a new task")
 	}
 	if c.RunID != "" && c.RunID != row.Run.ID {
-		return row.Run, errors.New("stale run id")
+		return row.Run, protocol.ErrStaleRun
 	}
 	select {
 	case <-r.done:
@@ -269,7 +368,13 @@ func (s *SessionSupervisor) continueRun(ctx context.Context, r *managedRun, c pr
 		return row.Run, err
 	}
 	r.mu.Lock()
-	next.fact.PendingMessages = append([]protocol.InputView(nil), r.fact.PendingMessages...)
+	// Only information crosses a cancelled run boundary. A queued assignment
+	// belonged to that run, just like a steer already in the child's inbox.
+	for _, input := range r.fact.PendingMessages {
+		if input.Strategy == protocol.InputMessage {
+			next.fact.PendingMessages = append(next.fact.PendingMessages, input)
+		}
+	}
 	r.mu.Unlock()
 	next.mu.Lock()
 	reply := enqueueRunRecordLocked(next, "queued")

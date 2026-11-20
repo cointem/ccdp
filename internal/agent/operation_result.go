@@ -6,12 +6,13 @@ import (
 
 	"ccdp/internal/protocol"
 	"ccdp/internal/session"
+	"ccdp/internal/session/journal"
 )
 
 type OperationResult = protocol.OperationResult
 
 func (a *Agent) ReadOperation(ctx context.Context, id protocol.CommandID) (OperationResult, error) {
-	rows, blobs, err := a.ReadRunRecords(ctx)
+	rows, blobs, _, err := a.ReadRunRecords(ctx)
 	if err != nil {
 		return OperationResult{ID: id}, err
 	}
@@ -19,14 +20,14 @@ func (a *Agent) ReadOperation(ctx context.Context, id protocol.CommandID) (Opera
 }
 
 func (a *Agent) ReadInput(ctx context.Context, id protocol.InputID) (protocol.InputResult, error) {
-	rows, _, err := a.ReadRunRecords(ctx)
+	rows, _, _, err := a.ReadRunRecords(ctx)
 	if err != nil {
 		return protocol.InputResult{ID: id}, err
 	}
 	return readInputResult(ctx, rows, id)
 }
 
-func readOperationResult(ctx context.Context, rows []session.Record, blobs outputReader, id protocol.CommandID) (OperationResult, error) {
+func readOperationResult(ctx context.Context, rows []session.Record, blobs journal.ArtifactReader, id protocol.CommandID) (OperationResult, error) {
 	out := OperationResult{ID: id}
 	if err := ctx.Err(); err != nil {
 		return out, err

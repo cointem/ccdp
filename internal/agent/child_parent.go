@@ -42,7 +42,7 @@ type supervisorRoot interface {
 	protocol.SessionClient
 	usageAccountTarget
 	SessionID() string
-	ReadRunRecords(context.Context) ([]session.Record, journal.ArtifactReader, error)
+	supervision.RunRecordReader
 	WaitChildren(context.Context) error
 	rootContext() context.Context
 	signalChildActivity()

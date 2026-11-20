@@ -61,24 +61,6 @@ func TestHTMLToText(t *testing.T) {
 	}
 }
 
-func TestParseDuckDuckGo(t *testing.T) {
-	html := `<div class="result">
-	<a class="result__a" href="//example.com/a">Go Docs</a>
-	<a class="result__snippet">The official Go documentation.</a>
-	</div>
-	<div class="result">
-	<a class="result__a" href="//example.com/b">Go Blog</a>
-	<a class="result__snippet">News from the Go team &amp; more.</a>
-	</div>`
-	results := parseDuckDuckGo(html, 10)
-	if len(results) != 2 {
-		t.Fatalf("want 2 results, got %d: %+v", len(results), results)
-	}
-	if results[0].Title != "Go Docs" || results[1].Snippet != "News from the Go team & more." {
-		t.Errorf("unexpected parse: %+v", results)
-	}
-}
-
 type registryTestTool struct{ name string }
 
 func (t *registryTestTool) Name() string               { return t.name }

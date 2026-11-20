@@ -192,7 +192,8 @@ type SubmitInput struct {
 const MaxSubmitInputTextBytes = 1 << 20
 
 type SetModel struct {
-	Model string `json:"model"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	Model           string `json:"model"`
 }
 
 type SetPermissionPolicy struct {
@@ -408,6 +409,9 @@ func (c Command) Normalize() (Command, error) {
 			return Command{}, err
 		}
 		model := *c.Model
+		if err := ValidateGeneration(model.ReasoningEffort, ""); err != nil {
+			return Command{}, err
+		}
 		c.Model = &model
 		if strings.TrimSpace(c.Model.Model) == "" {
 			return Command{}, errors.New("protocol: model is required")
@@ -719,17 +723,19 @@ type ModelBinding struct {
 }
 
 type SettingsSnapshot struct {
-	Workspace        string           `json:"workspace"`
-	ReasoningEffort  string           `json:"reasoning_effort,omitempty"`
-	Verbosity        string           `json:"verbosity,omitempty"`
-	Revision         uint64           `json:"revision"`
-	Model            ModelBinding     `json:"model"`
-	Permission       PermissionPolicy `json:"permission"`
-	Sandbox          SandboxPolicy    `json:"sandbox"`
-	ContextWindow    int              `json:"context_window"`
-	CompactThreshold float64          `json:"compact_threshold,omitempty"`
-	MaxOutputTokens  int              `json:"max_output_tokens"`
-	MaxTurns         int              `json:"max_turns"`
+	Workspace                string           `json:"workspace"`
+	ReasoningEffort          string           `json:"reasoning_effort,omitempty"`
+	ReasoningEfforts         []string         `json:"reasoning_efforts,omitempty"`
+	ReasoningEffortSupported bool             `json:"reasoning_effort_supported,omitempty"`
+	Verbosity                string           `json:"verbosity,omitempty"`
+	Revision                 uint64           `json:"revision"`
+	Model                    ModelBinding     `json:"model"`
+	Permission               PermissionPolicy `json:"permission"`
+	Sandbox                  SandboxPolicy    `json:"sandbox"`
+	ContextWindow            int              `json:"context_window"`
+	CompactThreshold         float64          `json:"compact_threshold,omitempty"`
+	MaxOutputTokens          int              `json:"max_output_tokens"`
+	MaxTurns                 int              `json:"max_turns"`
 }
 
 type ProviderSnapshot struct {
@@ -921,16 +927,17 @@ type SandboxRuntimeView struct {
 // SessionView is a read-only projection. Agent returns copies of all slices
 // and nested values so a client cannot mutate or race runtime state.
 type SessionView struct {
-	HistoryLength   int              `json:"history_length"`
-	OutstandingWork int              `json:"outstanding_work"`
-	Goal            *Goal            `json:"goal,omitempty"`
-	Question        *QuestionRequest `json:"question,omitempty"`
-	RunID           RunID            `json:"run_id,omitempty"`
-	Transcript      []TranscriptItem `json:"transcript,omitempty"`
-	TranscriptMore  bool             `json:"transcript_more,omitempty"`
-	SessionID       SessionID        `json:"session_id"`
-	Revision        Revision         `json:"revision"`
-	Phase           RuntimePhase     `json:"phase"`
+	HistoryLength    int              `json:"history_length"`
+	OutstandingWork  int              `json:"outstanding_work"`
+	Goal             *Goal            `json:"goal,omitempty"`
+	Question         *QuestionRequest `json:"question,omitempty"`
+	RunID            RunID            `json:"run_id,omitempty"`
+	Transcript       []TranscriptItem `json:"transcript,omitempty"`
+	TranscriptPrompt *TranscriptItem  `json:"transcript_prompt,omitempty"`
+	TranscriptMore   bool             `json:"transcript_more,omitempty"`
+	SessionID        SessionID        `json:"session_id"`
+	Revision         Revision         `json:"revision"`
+	Phase            RuntimePhase     `json:"phase"`
 
 	Busy bool `json:"busy"`
 	// WorkStartedAt is the runtime start of the current turn or exclusive operation.

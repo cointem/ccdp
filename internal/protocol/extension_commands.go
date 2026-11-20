@@ -242,7 +242,10 @@ type TrustProjectCommand struct {
 	Revoke bool `json:"revoke,omitempty"`
 }
 
-type ReloadCommand struct{}
+type ReloadCommand struct {
+	UserPreferences       bool `json:"user_preferences,omitempty"`
+	PermissionModeChanged bool `json:"permission_mode_changed,omitempty"`
+}
 type ProjectMemoryCommand struct {
 	Action  string `json:"action"`
 	Scope   string `json:"scope,omitempty"`

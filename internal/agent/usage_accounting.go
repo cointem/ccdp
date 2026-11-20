@@ -61,7 +61,7 @@ func (a *Agent) reconcileDescendantUsage() error {
 				continue
 			}
 			seen[id] = true
-			rows, _, err := a.services.supervisor.readRecordedSessionRecords(ctx, protocol.SessionID(id))
+			rows, _, _, err := a.services.supervisor.readRecordedSessionRecords(ctx, protocol.SessionID(id))
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}

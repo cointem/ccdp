@@ -176,12 +176,7 @@ func (a *Agent) finishSandboxSettingsChange(clearGrants bool) error {
 	replacement.SetSandbox(a.services.sandbox.Snapshot())
 	replacement.RegisterTools(a.services.registry)
 	a.services.mcp = replacement
-	for name := range a.discovery.deferTools {
-		if len(name) >= 5 && name[:5] == "mcp__" {
-			delete(a.discovery.deferTools, name)
-			delete(a.discovery.discovered, name)
-		}
-	}
+	a.discovery.clearDiscoveredMCP()
 	if clearGrants {
 		clear(a.capabilities.capabilityGrants)
 		a.capabilities.capabilityRevision++

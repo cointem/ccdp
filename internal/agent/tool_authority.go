@@ -112,7 +112,7 @@ func (c *toolAuthority) Approve(reason string, resourcesOnly bool) bool {
 			review.Arguments = map[string]any{}
 		}
 		review.Arguments["missing_access"] = c.capabilities
-		err := c.agent.guardianCheck(review, c.journal.context)
+		err := c.agent.guardianCheck(c.journal.context, review)
 		if err == nil {
 			// The reviewer can grant only this already-validated invocation.
 			// Session authority always requires an explicit user decision.

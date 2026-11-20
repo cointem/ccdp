@@ -33,6 +33,24 @@ func TestClosedRuntimeSnapshotKeepsDurableRevision(t *testing.T) {
 	}
 }
 
+func TestWatchDuringRuntimeCloseReturnsNoSubscription(t *testing.T) {
+	a := newRuntimeAgent(t)
+	// Keep the owner alive in the interval after close begins so it receives
+	// the request and rejects registration.
+	a.mu.Lock()
+	a.lifecycle.closing = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.lifecycle.closing = false
+		a.mu.Unlock()
+	}()
+	sub, err := a.Watch(context.Background(), protocol.Cursor{})
+	if err == nil || sub != nil {
+		t.Fatalf("watch during close returned subscription %T, error %v", sub, err)
+	}
+}
+
 func TestChildWatchPublishesIdleOnRuntimeDetach(t *testing.T) {
 	a := newRuntimeAgent(t)
 	a.mu.Lock()

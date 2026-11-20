@@ -3,13 +3,79 @@ package agent
 import (
 	"context"
 	"testing"
+	"time"
 
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/plugin"
 	"ccdp/internal/protocol"
+	"ccdp/internal/session"
+	"ccdp/internal/session/archive"
 	"ccdp/internal/tools"
 )
+
+func TestReopenSessionNetworkPolicy(t *testing.T) {
+	cfg := testPersistenceConfig(t)
+	for _, tc := range []struct {
+		name            string
+		outbound, local bool
+	}{
+		{"online", true, true}, {"offline", false, false}, {"local-only", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			initial := cfg.Clone()
+			initial.NetworkAccess, initial.LocalDevelopmentNetwork = tc.outbound, tc.local
+			writer, err := openSessionPersistence(&initial, tc.name, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			snap, err := archive.Load(cfg.SessionDir, tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := cfg.Clone()
+			base.NetworkAccess, base.LocalDevelopmentNetwork = true, true
+			resumed, err := ResolveResumeConfig(&base, snap)
+			if err != nil || resumed.NetworkAccess != tc.outbound || resumed.LocalDevelopmentNetwork != tc.local {
+				t.Fatalf("reopened with outbound=%v local=%v err=%v", resumed.NetworkAccess, resumed.LocalDevelopmentNetwork, err)
+			}
+		})
+	}
+}
+
+func TestLegacyCreationWithoutNetworkPolicy(t *testing.T) {
+	cfg := testPersistenceConfig(t)
+	const id = "legacy"
+	metadata := &session.SettingsChanged{Revision: 1, Settings: session.Settings{Workspace: cfg.Workspace, Model: cfg.Model}}
+	records := []session.Record{
+		{Seq: 1, TransactionID: "session-created-legacy", Event: &session.SessionCreated{SessionID: id}},
+		{Seq: 2, TransactionID: "session-created-legacy", Event: metadata},
+	}
+	check := func(outbound, local bool) {
+		t.Helper()
+		snap, err := archive.FromRecords(records, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resumed, err := ResolveResumeConfig(&cfg, snap)
+		if err != nil || resumed.NetworkAccess != outbound || resumed.LocalDevelopmentNetwork != local {
+			t.Fatalf("restored outbound=%v local=%v err=%v", resumed.NetworkAccess, resumed.LocalDevelopmentNetwork, err)
+		}
+	}
+	cfg.NetworkAccess, cfg.LocalDevelopmentNetwork = true, false
+	check(true, false)
+	cfg.NetworkAccess, cfg.LocalDevelopmentNetwork = false, true
+	check(false, true)
+	// An explicit later restriction must still win over the current defaults.
+	cfg.NetworkAccess, cfg.LocalDevelopmentNetwork = true, true
+	records = append(records, session.Record{Seq: 3, TransactionID: "change-policy", Event: &session.SettingsChanged{
+		Revision: 2, Settings: session.Settings{Workspace: cfg.Workspace, PermissionPolicy: "auto"},
+	}})
+	check(false, false)
+}
 
 func TestWorkerInheritsNetworkBaseline(t *testing.T) {
 	for _, enabled := range []bool{true, false} {
@@ -49,19 +115,18 @@ func TestWorkerInheritsNetworkBaseline(t *testing.T) {
 				if child.currentSandbox().Snapshot().NetworkProxy != cfg.NetworkProxy {
 					t.Fatal("child lost trusted network proxy")
 				}
-				for _, name := range []string{"WebSearch", "WebFetch"} {
-					call := messages.ToolCall{Name: name}
-					if denied, reason := ChildToolGate(child, call, capabilityTestTool(t, child, call.Name)); denied {
-						t.Fatalf("%s unexpectedly requires tool approval: %s", name, reason)
+				call := messages.ToolCall{Name: "WebFetch"}
+				tool := capabilityTestTool(t, child, call.Name)
+				if denied, reason := ChildToolGate(child, call, tool); denied {
+					t.Fatalf("WebFetch unexpectedly requires tool approval: %s", reason)
+				}
+				policy, requested, _, err := child.toolCapabilityPolicy(call, tool)
+				if enabled {
+					if err != nil || len(requested) != 0 || !policy.NetworkAllowed() {
+						t.Fatalf("WebFetch did not inherit network: requests=%v err=%v", requested, err)
 					}
-					policy, requested, _, err := child.toolCapabilityPolicy(call, capabilityTestTool(t, child, call.Name))
-					if enabled {
-						if err != nil || len(requested) != 0 || !policy.NetworkAllowed() {
-							t.Fatalf("%s did not inherit network: requests=%v err=%v", name, requested, err)
-						}
-					} else if err == nil && (len(requested) == 0 || policy.NetworkAllowed()) {
-						t.Fatalf("%s bypassed disabled network", name)
-					}
+				} else if err == nil && (len(requested) == 0 || policy.NetworkAllowed()) {
+					t.Fatal("WebFetch bypassed disabled network")
 				}
 			})
 		}
@@ -74,7 +139,7 @@ func TestChildRoleAndWorkspacePreserveSessionNetworkGrant(t *testing.T) {
 			for _, scope := range []string{"session", "once"} {
 				t.Run(role+"/"+workspace+"/"+scope, func(t *testing.T) {
 					parent := capabilityTestAgent(t)
-					call := messages.ToolCall{Name: "WebSearch"}
+					call := messages.ToolCall{Name: "WebFetch"}
 					policy, requested, version, err := parent.toolCapabilityPolicy(call, capabilityTestTool(t, parent, call.Name))
 					if err != nil || len(requested) != 1 {
 						t.Fatalf("network request: %v %v", requested, err)
@@ -103,7 +168,7 @@ func TestChildRoleAndWorkspacePreserveSessionNetworkGrant(t *testing.T) {
 					}
 					t.Cleanup(child.Close)
 					if denied, why := ChildToolGate(child, call, capabilityTestTool(t, child, call.Name)); denied {
-						t.Fatalf("role denied WebSearch: %s", why)
+						t.Fatalf("role denied WebFetch: %s", why)
 					}
 					policy, requested, _, err = child.toolCapabilityPolicy(call, capabilityTestTool(t, child, call.Name))
 					if scope == "session" {

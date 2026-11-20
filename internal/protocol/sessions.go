@@ -3,8 +3,11 @@ package protocol
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 )
+
+var ErrStaleRun = errors.New("stale run id")
 
 type RunID string
 type DelegationID string
@@ -85,6 +88,7 @@ type TranscriptItem struct {
 }
 
 type TranscriptPage struct {
+	Prompt *TranscriptItem  `json:"prompt,omitempty"`
 	Items  []TranscriptItem `json:"items"`
 	Before uint64           `json:"before,omitempty"`
 	More   bool             `json:"more"`

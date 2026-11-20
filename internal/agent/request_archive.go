@@ -13,7 +13,7 @@ func (p *sessionPersistence) loadPreparedRequest(requestID string) (archive.Prep
 	if p == nil {
 		return archive.PreparedRequest{}, errors.New("agent: nil session persistence")
 	}
-	records, blobs, err := p.ReadSnapshot()
+	records, blobs, _, err := p.ReadSnapshot()
 	if err != nil {
 		return archive.PreparedRequest{}, err
 	}

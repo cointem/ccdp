@@ -407,10 +407,6 @@ func toolArgumentSummary(name string, args map[string]any, raw string) string {
 		if url := firstArg(args, "url", "uri", "endpoint"); url != "" {
 			return url
 		}
-	case "websearch":
-		if q := firstArg(args, "query", "q"); q != "" {
-			return fmt.Sprintf("%q", q)
-		}
 	case "todo", "todowrite", "todoread", "todo_write", "todo_read":
 		if action := firstArg(args, "action", "task"); action != "" {
 			return action
@@ -514,11 +510,6 @@ func stripANSI(text string) string {
 // full text stays available through /transcript; the parent transcript only
 // carries enough to recognize the result (aligned with codex's 240-cell mark).
 const agentPreviewLimit = 240
-
-// renderAgentPresentation keeps each delegated task on its own status card.
-func renderAgentPresentation(p toolPresentation, width int) string {
-	return renderAgentSingle(p, p.Agent, width)
-}
 
 // agentMarkerStatus maps a tool or child-run status onto the marker glyph, its
 // color and a short label. A live child is cyan, completion green, failure red.
@@ -664,7 +655,8 @@ func quietAgentWait(p toolPresentation) bool {
 	return false
 }
 
-func renderAgentSingle(p toolPresentation, child *protocol.ChildSession, width int) string {
+func renderAgentPresentation(p toolPresentation, width int) string {
+	child := p.Agent
 	name := strings.TrimSpace(p.Name)
 	// The collapsed spawn records dispatch; the shelf owns live run progress.
 	// Expanded details retain the child's status, usage and failure diagnostics.

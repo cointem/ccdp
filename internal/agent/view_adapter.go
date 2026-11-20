@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"slices"
 	"sort"
 
 	"ccdp/internal/execution"
@@ -94,7 +95,7 @@ func (a *Agent) stateLocked() protocol.SessionState {
 	view.MessagesTokens = messages
 	view.ToolsTokens = tools
 	view.SystemTokens = max(0, used-messages-tools)
-	view.Transcript, view.TranscriptMore = a.transcript.Snapshot()
+	view.Transcript, view.TranscriptMore, view.TranscriptPrompt = a.transcript.SnapshotWithPrompt()
 	return view
 }
 
@@ -155,6 +156,8 @@ func (a *Agent) contextTokenBreakdownLocked() (used, messageTokens, toolTokens i
 
 func (a *Agent) settingsSnapshotLocked() protocol.SettingsSnapshot {
 	b := a.modelsState.activeBinding
+	effort := a.services.cfg.ReasoningEffortFor(b.model)
+	levels := a.services.cfg.ReasoningEffortsFor(b.model)
 	return protocol.SettingsSnapshot{Revision: a.sequences.settingsRev, Workspace: a.services.cfg.Workspace,
 		Model: protocol.ModelBinding{Model: b.model, Provider: b.provider, Endpoint: b.endpoint, BindingVersion: b.version},
 
@@ -163,7 +166,7 @@ func (a *Agent) settingsSnapshotLocked() protocol.SettingsSnapshot {
 			AdditionalDirectories:         append([]string(nil), a.services.cfg.AdditionalDirectories...),
 			AdditionalReadOnlyDirectories: append([]string(nil), a.services.cfg.AdditionalReadOnlyDirectories...),
 			DisallowedDirectories:         append([]string(nil), a.services.cfg.DisallowedDirectories...), Revision: a.sequences.settingsRev},
-		ReasoningEffort: a.services.cfg.ReasoningEffortFor(a.activeModelLocked()), Verbosity: a.services.cfg.Verbosity,
+		ReasoningEffort: effort, ReasoningEfforts: levels, ReasoningEffortSupported: slices.Contains(levels, effort), Verbosity: a.services.cfg.Verbosity,
 		ContextWindow: a.contextWindowLocked(), CompactThreshold: a.services.cfg.CompactThreshold, MaxOutputTokens: a.services.cfg.MaxOutputTokensFor(a.activeModelLocked()), MaxTurns: a.services.cfg.MaxTurns}
 }
 

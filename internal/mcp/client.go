@@ -1,11 +1,14 @@
 package mcp
 
 import (
+	"ccdp/internal/jsonvalue"
 	"context"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,12 +27,32 @@ type ServerConfig struct {
 	Command   string            `json:"command"`
 	Args      []string          `json:"args"`
 	Env       map[string]string `json:"env"`
-	Transport string            `json:"transport"` // "" | "stdio" (default) | "sse"
-	BaseURL   string            `json:"base_url"`  // required when transport = sse
+	Transport string            `json:"transport"` // "" | "stdio" (default) | "http" | "sse"
+	BaseURL   string            `json:"base_url"`  // required for remote transports
 	// NetworkAuthorized is explicit per-server consent for the host process to
 	// keep this remote connection open. Each model-requested remote tool call
 	// still passes the agent's per-call sandbox network capability gate.
-	NetworkAuthorized bool `json:"network_authorized,omitempty"`
+	Disabled          bool              `json:"disabled,omitempty"`
+	DefaultInstall    bool              `json:"-"`
+	NetworkAuthorized bool              `json:"network_authorized,omitempty"`
+	OnDemandTools     []ToolDef         `json:"on_demand_tools,omitempty"`
+	HTTPHeaders       map[string]string `json:"-"`
+}
+
+func (cfg ServerConfig) Clone() ServerConfig {
+	cfg.Args = slices.Clone(cfg.Args)
+	cfg.Env = maps.Clone(cfg.Env)
+	cfg.HTTPHeaders = maps.Clone(cfg.HTTPHeaders)
+	cfg.OnDemandTools = slices.Clone(cfg.OnDemandTools)
+	for i, def := range cfg.OnDemandTools {
+		cfg.OnDemandTools[i].InputSchema = jsonvalue.Clone(def.InputSchema)
+		cfg.OnDemandTools[i].OutputSchema = jsonvalue.Clone(def.OutputSchema)
+	}
+	return cfg
+}
+
+func (cfg ServerConfig) remote() bool {
+	return strings.EqualFold(cfg.Transport, "sse") || cfg.Transport == "http"
 }
 
 // ToolDef is the schema of one tool advertised by an MCP server (tools/list).
@@ -178,10 +201,10 @@ func (c *Client) Name() string { return c.name }
 // RequiresHostNetwork distinguishes a host-process HTTP connection from a
 // stdio server whose command is confined by Seatbelt.
 func (c *Client) RequiresHostNetwork() bool {
-	return c != nil && strings.EqualFold(c.cfg.Transport, "sse")
+	return c != nil && c.cfg.remote()
 }
 
-// Tools returns the tools advertised by the server (empty until Start).
+// Tools returns the published catalog (the bundled manifest for an on-demand connection).
 func (c *Client) Tools() []ToolDef {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -190,8 +213,8 @@ func (c *Client) Tools() []ToolDef {
 	return out
 }
 
-// Start launches the server (stdio process or SSE endpoint) and performs the
-// MCP handshake: initialize → notifications/initialized → tools/list.
+// Start publishes the configured manifest for an on-demand server. Other
+// servers connect immediately and publish the tools returned by tools/list.
 func (c *Client) Start(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -201,11 +224,18 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 	ctx, cancelStartup := context.WithTimeout(ctx, startupTimeout)
 	defer cancelStartup()
-	if strings.EqualFold(c.cfg.Transport, "sse") {
+	if c.cfg.remote() {
 		if !c.cfg.NetworkAuthorized {
 			return fmt.Errorf("mcp %s: remote server requires explicit network_authorized consent", c.name)
 		}
-		return c.startSSE(ctx)
+		if c.cfg.Transport == "http" && len(c.cfg.OnDemandTools) > 0 {
+			c.mu.Lock()
+			c.tools = c.cfg.OnDemandTools
+			c.sessionCtx, c.sessionCancel = context.WithCancel(context.Background())
+			c.mu.Unlock()
+			return nil
+		}
+		return c.startHTTP(ctx)
 	}
 	return c.startStdio(ctx)
 }

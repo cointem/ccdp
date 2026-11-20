@@ -79,7 +79,6 @@ func RegisterBuiltins(registry *Registry, enableWeb bool) {
 	}
 	if enableWeb {
 		registry.RegisterIn("web", NewWebFetchTool())
-		registry.RegisterIn("web", NewWebSearchTool())
 	}
 	for _, t := range builtins {
 		registry.RegisterIn("builtin", t)

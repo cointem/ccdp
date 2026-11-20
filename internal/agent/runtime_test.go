@@ -146,10 +146,15 @@ func TestRequestApprovalConcurrentSerialized(t *testing.T) {
 	ag.turn.turnCancel = cancel
 	ag.mu.Unlock()
 
-	answer := func(ev protocol.EventView) {
+	sub, err := ag.Watch(ctx, protocol.Cursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	answer := func(approval *protocol.ApprovalView) {
 		submitTestCommand(t, ag, protocol.Command{ID: protocol.CommandID(nextRuntimeID("approve")), SessionID: protocol.SessionID(ag.SessionID()),
 			Type:     protocol.CommandApproveTool,
-			Approval: &protocol.ApproveTool{ApprovalID: ev.Approval.ID, Approve: true}})
+			Approval: &protocol.ApproveTool{ApprovalID: approval.ID, Approve: true}})
 	}
 
 	type verdict struct {
@@ -171,13 +176,17 @@ func TestRequestApprovalConcurrentSerialized(t *testing.T) {
 	deadline := time.After(5 * time.Second)
 	for len(seen) < 2 {
 		select {
-		case ev, ok := <-watchTestEvents(t, ag):
+		case update, ok := <-sub.Updates():
 			if !ok {
-				t.Fatal("event channel closed before both approvals surfaced")
+				t.Fatal("subscription closed before both approvals surfaced")
 			}
-			if ev.Kind == protocol.EventApprovalRequest && ev.Approval != nil {
-				seen[ev.Approval.ID] = true
-				answer(ev)
+			// The desktop composer renders the pending approval from session state.
+			if update.State != nil && update.State.Approval != nil {
+				approval := update.State.Approval
+				if !seen[approval.ID] {
+					seen[approval.ID] = true
+					answer(approval)
+				}
 			}
 		case <-deadline:
 			t.Fatalf("timed out waiting for both approval modals; seen=%v", seen)
@@ -579,6 +588,9 @@ func TestReloadSettingsRevokesRemovedProjectRulesAndHooks(t *testing.T) {
 	}
 	if _, ok := ag.services.registry.Get("WebFetch"); !ok {
 		t.Fatal("web tools were not restored after removing the override")
+	}
+	if _, ok := ag.services.registry.Get("WebSearch"); ok {
+		t.Fatal("settings reload registered the removed WebSearch tool")
 	}
 }
 

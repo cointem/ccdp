@@ -497,12 +497,7 @@ func (a *Agent) applyRevokeCapabilities(cmd protocol.Command, owned ...bool) pro
 	replacement.SetSandbox(a.services.sandbox.Snapshot())
 	replacement.RegisterTools(a.services.registry)
 	a.services.mcp = replacement
-	for name := range a.discovery.deferTools {
-		if strings.HasPrefix(name, "mcp__") {
-			delete(a.discovery.deferTools, name)
-			delete(a.discovery.discovered, name)
-		}
-	}
+	a.discovery.clearDiscoveredMCP()
 	for key := range targets {
 		delete(a.capabilities.capabilityGrants, key)
 	}

@@ -119,6 +119,9 @@ func ripgrepSearch(ctx *Context, r *rgRequest) ([]rgLine, bool, error) {
 			return fmt.Errorf("Rg: search timed out")
 		}
 		if res.ExitCode > 1 {
+			if !r.literal && strings.Contains(res.Stderr, "regex parse error") {
+				return fmt.Errorf("Rg: invalid regular expression (use literal=true to search exact text): %s", clipLine(res.Stderr))
+			}
 			return fmt.Errorf("Rg: ripgrep failed: %s", clipLine(res.Stderr))
 		}
 		if parser.err != nil {

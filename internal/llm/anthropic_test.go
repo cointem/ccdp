@@ -452,19 +452,21 @@ func TestAnthropicBodyAdaptiveThinking(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name, effort string
+		nativeXHigh  bool
 		reqThinking  string
 		wantThinking string
 		wantOutput   string
 		wantBetas    string
 	}{
 		{name: "xhigh folds to high", effort: "xhigh", wantThinking: `"thinking":{"type":"adaptive"}`, wantOutput: `"output_config":{"effort":"high"}`, wantBetas: anthropicInterleavedThinkingBeta + ", " + anthropicEffortBeta},
+		{name: "native xhigh passes through", effort: "xhigh", nativeXHigh: true, wantThinking: `"thinking":{"type":"adaptive"}`, wantOutput: `"output_config":{"effort":"xhigh"}`, wantBetas: anthropicInterleavedThinkingBeta + ", " + anthropicEffortBeta},
 		{name: "max passes through", effort: "max", wantThinking: `"thinking":{"type":"adaptive"}`, wantOutput: `"output_config":{"effort":"max"}`, wantBetas: anthropicInterleavedThinkingBeta + ", " + anthropicEffortBeta},
 		{name: "none disables thinking", effort: "none"},
 		{name: "unknown effort falls back", effort: "banana"},
 		{name: "thinking without effort", reqThinking: "enabled", wantThinking: `"thinking":{"type":"adaptive"}`, wantBetas: anthropicInterleavedThinkingBeta},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			req := CompletionRequest{Model: "claude", ReasoningEffort: tc.effort, Messages: []ChatMessage{{Role: "user", Content: "hi"}}}
+			req := CompletionRequest{Model: "claude", ReasoningEffort: tc.effort, NativeXHigh: tc.nativeXHigh, Messages: []ChatMessage{{Role: "user", Content: "hi"}}}
 			if tc.reqThinking != "" {
 				req.Thinking = &ThinkingConfig{Type: tc.reqThinking}
 			}
@@ -587,5 +589,32 @@ func TestAnthropicBodyRead(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, `"stream":true`) {
 		t.Fatalf("stream flag missing: %s", gotBody)
+	}
+}
+
+func TestAnthropicToolInputSources(t *testing.T) {
+	for _, tc := range []struct{ name, start, delta, want string }{
+		{"complete start", `,"input":{"count":9007199254740993}`, "", `{"count":9007199254740993}`},
+		{"zero arguments", `,"input":{}`, "", "{}"},
+		{"missing input", "", "", ""},
+		{"explicit null", `,"input":null`, "", "null"},
+		{"partial supersedes placeholder", `,"input":{}`, `{"count":`, `{"count":`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := "data: " + `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c","name":"lookup"` + tc.start + "}}\n\n"
+			if tc.delta != "" {
+				part, _ := json.Marshal(tc.delta)
+				body += "data: " + `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":` + string(part) + "}}\n\n"
+			}
+			body += "data: " + `{"type":"message_stop"}` + "\n\n"
+			c, err := NewClient(Config{BaseURL: "https://example.invalid/v1", Wire: "anthropic", HTTPClient: &http.Client{Transport: auditTransport{body}}, OneAttempt: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := c.Stream(context.Background(), CompletionRequest{Model: "test"}, nil)
+			if err != nil || len(r.ToolCalls) != 1 || r.ToolCalls[0].Function.Arguments.String() != tc.want {
+				t.Fatalf("tool calls = %+v, err = %v", r.ToolCalls, err)
+			}
+		})
 	}
 }

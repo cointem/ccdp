@@ -62,6 +62,9 @@ func TestAgentResultPagingPinsCompletedTask(t *testing.T) {
 	if latest.Text != "second result" || latest.PreviousTask {
 		t.Fatalf("default result is not latest: %+v", latest)
 	}
+	if result := readAgentPage(t, a, protocol.AgentReadRequest{AgentID: id, View: "output"}, 4096); result.Text != latest.Text || result.View != "result" {
+		t.Fatalf("output without an item did not return the latest final reply: %+v", result)
+	}
 	// A history page is a bounded index; long thinking/output remains readable
 	// by item ID rather than failing the entire page.
 	seen := map[string]bool{}
@@ -75,7 +78,7 @@ func TestAgentResultPagingPinsCompletedTask(t *testing.T) {
 			}
 			seen[item.ID] = true
 			if item.Truncated && item.Kind == "assistant" {
-				output := readAgentPage(t, a, protocol.AgentReadRequest{AgentID: id, View: "output", ItemID: item.ID}, 2048)
+				output := readAgentPage(t, a, protocol.AgentReadRequest{AgentID: id, ItemID: item.ID}, 2048)
 				if output.More && strings.HasPrefix(report, output.Text) {
 					foundLong = true
 				}
@@ -84,7 +87,7 @@ func TestAgentResultPagingPinsCompletedTask(t *testing.T) {
 		if !page.More {
 			break
 		}
-		req.Cursor = page.NextCursor
+		req = protocol.AgentReadRequest{AgentID: id, Cursor: page.NextCursor}
 	}
 	if !foundLong {
 		t.Fatal("oversized history item was lost or not addressable")

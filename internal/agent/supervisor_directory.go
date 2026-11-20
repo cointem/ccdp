@@ -57,7 +57,7 @@ func (s *SessionSupervisor) childRowLocked(r *managedRun) protocol.ChildSession 
 		}
 	}
 	row.DeliveryPending = row.Run.WaitPolicy == "notify" && !r.fact.Delivered
-	row.Capabilities = protocol.AgentCapabilities{Observe: true, Continue: !row.Run.Active() && isTaskChild(row.Purpose), Cancel: row.Run.Active()}
+	row.Capabilities = protocol.AgentCapabilities{Observe: true, Continue: !row.Run.Active() && isTaskChild(row.Purpose) && row.MergeStatus != "merged", Cancel: row.Run.Active()}
 	if row.Approval != nil && row.Purpose == childPurposeReview && r.agent == nil {
 		row.Capabilities.Approve = !r.opts.NonInteractive
 	}

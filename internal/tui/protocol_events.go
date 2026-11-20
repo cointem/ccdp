@@ -50,6 +50,10 @@ func (m *Model) handleProtocolEvent(ev protocol.EventView) {
 	case protocol.EventGoalChanged:
 		m.snapshot.Goal = ev.Goal
 	case protocol.EventUserMessage:
+		if ev.Transcript != nil && ev.Transcript.Kind == "collaboration" {
+			m.upsertTranscript(*ev.Transcript)
+			return
+		}
 		if !m.inline.primed {
 			m.inline.prime(m.items)
 		}

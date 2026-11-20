@@ -23,7 +23,7 @@ func TestTranscriptRecoveryBoundarySurvivesLiveCommits(t *testing.T) {
 			if _, err := first.CommitEvents("old", start("old")); err != nil {
 				t.Fatal(err)
 			}
-			oldRecords, artifacts, err := first.ReadSnapshot()
+			oldRecords, artifacts, _, err := first.ReadSnapshot()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -41,7 +41,7 @@ func TestTranscriptRecoveryBoundarySurvivesLiveCommits(t *testing.T) {
 			if _, err := reopened.CommitEvents("live", start("live")); err != nil {
 				t.Fatal(err)
 			}
-			records, _, recoveredThrough, err := reopened.ReadSnapshotWithRecovery()
+			records, _, recoveredThrough, err := reopened.ReadSnapshot()
 			if err != nil {
 				t.Fatal(err)
 			}

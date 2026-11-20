@@ -146,6 +146,7 @@ func (a *Agent) activateDecision() {
 			a.decisions.approvalResolving = false
 			a.mu.Unlock()
 			a.owner.activeDecision = request
+			a.publishState()
 			a.emit(protocol.EventView{Kind: protocol.EventApprovalRequest, Approval: pending})
 		case decisionQuestion:
 			a.mu.Lock()

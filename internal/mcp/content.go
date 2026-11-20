@@ -30,6 +30,9 @@ func (c *Client) call(ctx context.Context, name string, args map[string]any, dat
 		defer cancel()
 	}
 	if err := c.requestJSON(ctx, "tools/call", params, &resp); err != nil {
+		if c.isHostedExaSearch(name) && exaQuotaHTTPError(err) {
+			return "", errExaQuota
+		}
 		return "", err
 	}
 	if data != nil {
@@ -58,7 +61,7 @@ func (c *Client) call(ctx context.Context, name string, args map[string]any, dat
 			return "", err
 		}
 		if resp.IsError {
-			return string(data), errors.New("MCP tool reported an error")
+			return c.redact(ctx, string(data)), errors.New("MCP tool reported an error")
 		}
 		return string(data), nil
 	}
@@ -68,6 +71,7 @@ func (c *Client) call(ctx context.Context, name string, args map[string]any, dat
 		if out == "" {
 			out = "tool reported an error"
 		}
+		out = c.redact(ctx, out)
 		return out, errors.New(out)
 	}
 	return out, nil

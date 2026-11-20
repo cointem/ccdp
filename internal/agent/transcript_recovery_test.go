@@ -26,7 +26,7 @@ func TestTranscriptReadersShareLiveAndArchivedRecoveryBoundary(t *testing.T) {
 	if _, err := writer.CommitEvents("old-tool", start("old")); err != nil {
 		t.Fatal(err)
 	}
-	records, blobs, err := writer.ReadSnapshot()
+	records, blobs, _, err := writer.ReadSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestTranscriptReadersShareLiveAndArchivedRecoveryBoundary(t *testing.T) {
 		}
 	}
 	check("running")
-	records, blobs, err = child.persistenceHandle().ReadSnapshot()
+	records, blobs, _, err = child.persistenceHandle().ReadSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}

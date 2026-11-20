@@ -279,7 +279,7 @@ func TestGuardianCannotShadowReadWithConfiguredCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer parent.Close()
-	if _, err := parent.runGuardianChild("inspect the fixture"); err != nil {
+	if _, err := parent.runGuardianChild(t.Context(), "inspect the fixture"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {

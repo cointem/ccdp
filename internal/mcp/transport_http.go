@@ -17,15 +17,29 @@ import (
 // Pin a supported stateful protocol: newer SDK defaults can change the handshake.
 const httpProtocolVersion = "2025-11-25"
 
-func (c *Client) startSSE(ctx context.Context) error {
-	transport, err := netguard.OriginTransport(c.cfg.BaseURL)
+func (c *Client) startHTTP(ctx context.Context) error {
+	var transport *http.Transport
+	var err error
+	if c.cfg.Transport == "http" {
+		proxy := ""
+		if c.sandbox != nil {
+			proxy = c.sandbox.Snapshot().NetworkProxy
+		}
+		transport, err = netguard.RoutedTransport(proxy)
+	} else {
+		transport, err = netguard.OriginTransport(c.cfg.BaseURL)
+	}
 	if err != nil {
 		return fmt.Errorf("mcp %s: %w", c.name, err)
 	}
+	return c.connectHTTP(ctx, transport)
+}
+
+func (c *Client) connectHTTP(ctx context.Context, transport http.RoundTripper) error {
 	lifetime, cancel := context.WithCancel(context.Background())
 	origin, _ := url.Parse(c.cfg.BaseURL)
 	client := &http.Client{
-		Transport:     &mcpHTTPTransport{base: transport, origin: origin, lifetime: lifetime},
+		Transport:     &mcpHTTPTransport{base: transport, origin: origin, lifetime: lifetime, public: c.cfg.Transport == "http", headers: c.cfg.HTTPHeaders},
 		CheckRedirect: sameSSEOriginRedirect,
 	}
 	c.mu.Lock()
@@ -43,9 +57,16 @@ func (c *Client) startSSE(ctx context.Context) error {
 		// interrupts a stalled GET/handshake before ownership passes to Close.
 		return remote.Connect(ctx, lifetimeTransport{Transport: t, lifetime: lifetime}, &sdk.ClientSessionOptions{ProtocolVersion: httpProtocolVersion})
 	}
-	session, err := connect(&sdk.StreamableClientTransport{Endpoint: c.cfg.BaseURL, HTTPClient: client, MaxEventSize: maxLineLen})
+	stream := &sdk.StreamableClientTransport{Endpoint: c.cfg.BaseURL, HTTPClient: client, MaxEventSize: maxLineLen}
+	if c.cfg.Transport == "http" {
+		stream.DisableStandaloneSSE, stream.MaxRetries = true, -1
+	}
+	session, err := connect(stream)
+	if c.cfg.Transport == "http" && ctx.Err() == nil && netguard.Interrupted(err) {
+		session, err = connect(stream)
+	}
 	var rejected *httpStatusError
-	if errors.As(err, &rejected) && (rejected.code == 404 || rejected.code == 405) {
+	if c.cfg.Transport != "http" && errors.As(err, &rejected) && (rejected.code == 404 || rejected.code == 405) {
 		session, err = connect(&sdk.SSEClientTransport{Endpoint: c.cfg.BaseURL, HTTPClient: client, MaxEventSize: maxLineLen})
 	}
 	if err != nil {
@@ -89,13 +110,18 @@ func (t lifetimeTransport) Connect(context.Context) (sdk.Connection, error) {
 	return t.Transport.Connect(t.lifetime)
 }
 
-type httpStatusError struct{ code int }
+type httpStatusError struct {
+	code int
+	body string
+}
 
 func (e *httpStatusError) Error() string { return fmt.Sprintf("HTTP status %d", e.code) }
 
 // Keep ccdp's network and response-size boundaries around the SDK. Check every
 // URL (including legacy endpoint events), even when HTTP reuses a connection.
 type mcpHTTPTransport struct {
+	public   bool
+	headers  map[string]string
 	base     http.RoundTripper
 	origin   *url.URL
 	lifetime context.Context
@@ -118,10 +144,29 @@ func (t *mcpHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 	}
 	release := func() { stop(); cancel() }
-	resp, err := t.base.RoundTrip(req.Clone(ctx))
+	if t.public {
+		if err := netguard.ValidateTarget(req.URL); err != nil {
+			release()
+			return nil, err
+		}
+	}
+	request := req.Clone(ctx)
+	for name, value := range t.headers {
+		request.Header.Set(name, value)
+	}
+	resp, err := t.base.RoundTrip(request)
 	if err != nil {
 		release()
 		return nil, err
+	}
+	if t.public && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+		var body []byte
+		if resp.StatusCode == http.StatusPaymentRequired {
+			body, _ = io.ReadAll(io.LimitReader(resp.Body, 8192))
+		}
+		resp.Body.Close()
+		release()
+		return nil, &httpStatusError{code: resp.StatusCode, body: string(body)}
 	}
 	if req.Method == http.MethodPost && req.Header.Get("Mcp-Session-Id") == "" && req.Header.Get("Mcp-Protocol-Version") == "" && (resp.StatusCode == 404 || resp.StatusCode == 405) {
 		resp.Body.Close()
@@ -189,4 +234,26 @@ func sameHTTPOrigin(a, b *url.URL) bool {
 		return "80"
 	}
 	return port(a) == port(b)
+}
+
+type invocationHeadersKey struct{}
+type invocationHeaders struct {
+	client  *Client
+	headers map[string]string
+}
+
+func (c *Client) requestHeaders(ctx context.Context) map[string]string {
+	if binding, ok := ctx.Value(invocationHeadersKey{}).(invocationHeaders); ok && binding.client == c {
+		return binding.headers
+	}
+	return c.cfg.HTTPHeaders
+}
+
+func (c *Client) redact(ctx context.Context, message string) string {
+	for _, secret := range c.requestHeaders(ctx) {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	return message
 }

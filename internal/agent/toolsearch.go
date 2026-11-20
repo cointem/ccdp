@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 
 	"ccdp/internal/tools"
 )
@@ -38,7 +39,7 @@ func (t *toolSearchTool) Parameters() map[string]any {
 			"query": map[string]any{
 				"type":        "string",
 				"minLength":   1,
-				"description": "Keywords to match against tool names and descriptions.",
+				"description": "Describe the task or enter a tool name. Related matches are ranked; select a candidate by name to load it.",
 			},
 		},
 		"oneOf": []any{
@@ -59,28 +60,52 @@ func (t *toolSearchTool) Execute(ctx *tools.Context, args map[string]any) (tools
 			return "", fmt.Errorf("ToolSearch: provide exactly one of name or query")
 		}
 		lease := t.ag.services.registry.Acquire()
-		var matches []string
+		keywords := toolSearchWords(query)
+		type candidate struct {
+			name            string
+			coverage, score int
+		}
+		var matches []candidate
+		exact := false
 		for _, n := range lease.Names() {
 			if t.ag.children.childState != nil && t.ag.children.childState.allowed != nil && !t.ag.children.childState.allowed[n] {
 				continue
 			}
+			if strings.EqualFold(n, name) || strings.EqualFold(n, query) {
+				matches = []candidate{{name: n}}
+				exact = true
+				break
+			}
 			if name != "" {
-				if strings.EqualFold(n, name) {
-					matches = []string{n}
-					break
-				}
 				continue
 			}
 			definition, _ := lease.Definition(n)
-			hay := strings.ToLower(n + " " + definition.Description)
-			if strings.Contains(hay, query) {
-				matches = append(matches, n)
+			if definition.ValidationError() != nil {
+				continue
+			}
+			coverage, score := scoreToolSearch(definition, keywords)
+			if score > 0 {
+				matches = append(matches, candidate{n, coverage, score})
 			}
 		}
 		if len(matches) == 0 {
-			return "", fmt.Errorf("ToolSearch: no allowed tool matches %q", firstNonEmpty(name, query))
+			if name != "" {
+				return fmt.Sprintf("No available tool named %q in this session.", name), nil
+			}
+			return fmt.Sprintf("No available tool matches %q in this session.", query), nil
 		}
-		sort.Strings(matches)
+		sort.SliceStable(matches, func(i, j int) bool {
+			if matches[i].coverage != matches[j].coverage {
+				return matches[i].coverage > matches[j].coverage
+			}
+			return matches[i].score > matches[j].score
+		})
+		load := exact || matches[0].coverage == len(keywords) && (len(matches) == 1 || matches[1].coverage < len(keywords))
+		if load {
+			matches = matches[:1]
+		} else {
+			matches = matches[:min(5, len(matches))]
+		}
 
 		var sb strings.Builder
 		if name != "" {
@@ -88,20 +113,14 @@ func (t *toolSearchTool) Execute(ctx *tools.Context, args map[string]any) (tools
 		} else {
 			fmt.Fprintf(&sb, "Tools matching %q:\n\n", query)
 		}
-		for i, n := range matches {
+		for _, m := range matches {
+			n := m.name
 			definition, _ := lease.Definition(n)
 			if err := definition.ValidationError(); err != nil {
-				if name != "" || len(matches) == 1 {
-					return "", fmt.Errorf("ToolSearch: %s is unavailable because its schema is invalid: %w", n, err)
-				}
-				fmt.Fprintf(&sb, "%s: unavailable (invalid schema)\n", n)
-				continue
+				return "", fmt.Errorf("ToolSearch: %s is unavailable because its schema is invalid: %w", n, err)
 			}
 			description := definition.Description
-			if name == "" && len(matches) > 1 {
-				if i >= 5 {
-					break
-				}
+			if !load {
 				fmt.Fprintf(&sb, "%s: %s\n", n, truncateRunes(description, 240))
 				continue
 			}
@@ -117,25 +136,67 @@ func (t *toolSearchTool) Execute(ctx *tools.Context, args map[string]any) (tools
 			if len(schema)+len(description)+sb.Len()+100 > limit {
 				return "", fmt.Errorf("ToolSearch: complete schema exceeds output budget; tool not loaded")
 			}
-			if i > 0 {
-				sb.WriteString("\n\n")
-			}
 			fmt.Fprintf(&sb, "Loaded %s: %s\nIts complete schema is available in the next tool catalog.", n, description)
 			// Make the discovered tool available for the rest of the session.
 			if err := t.ag.persistToolDiscovery(lease.Version(), n, description, parameters); err != nil {
 				return "", err
 			}
 		}
+		if !load {
+			sb.WriteString("Use name to load a candidate.")
+		}
 		return sb.String(), nil
 	}()
 	return tools.Result{Text: text}, err
 }
 
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
+func toolSearchWords(s string) map[string]bool {
+	words := make(map[string]bool)
+	for _, word := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		switch word {
+		case "a", "an", "the", "to", "for", "of", "and", "with", "in", "by":
+		default:
+			words[word] = true
+		}
 	}
-	return b
+	return words
+}
+
+// Require evidence in the name, primary purpose or input fields. Mentions in
+// usage notes (e.g. Read explains Bash paths) are supporting evidence only.
+func scoreToolSearch(def tools.Definition, query map[string]bool) (coverage, score int) {
+	name := toolSearchWords(def.Name)
+	purpose, _, _ := strings.Cut(def.Description, ".")
+	primary := toolSearchWords(purpose)
+	props, _ := def.Parameters["properties"].(map[string]any)
+	for key := range props {
+		if key != "requested_capabilities" {
+			for word := range toolSearchWords(key) {
+				primary[word] = true
+			}
+		}
+	}
+	description := toolSearchWords(def.Description)
+	anchor := false
+	for word := range query {
+		switch {
+		case name[word]:
+			anchor = true
+			score += 5
+		case primary[word]:
+			anchor = true
+			score += 3
+		case description[word]:
+			score++
+		default:
+			continue
+		}
+		coverage++
+	}
+	if !anchor || coverage*2 < len(query) {
+		return 0, 0
+	}
+	return coverage, score
 }
 
 // markDiscovered records that a deferred tool was surfaced via ToolSearch.

@@ -2,13 +2,6 @@ package llm
 
 import "ccdp/internal/messages"
 
-type toolUpdateMode uint8
-
-const (
-	toolUpdatesAdditions toolUpdateMode = iota
-	toolUpdatesChanges
-)
-
 type toolProjection struct {
 	tools   []ToolDef
 	updates map[int]*messages.ToolUpdate
@@ -33,8 +26,7 @@ func toolDefs(defs []messages.ToolDefinition) []ToolDef {
 
 // projectTools never changes the executable set in req.Tools. Incomplete
 // history or an inconsistent catalog uses the full set.
-// Addition-only transports also fall back after any removal or redefinition.
-func projectTools(req CompletionRequest, mode toolUpdateMode) toolProjection {
+func projectTools(req CompletionRequest) toolProjection {
 	fallback := toolProjection{tools: req.Tools}
 	start := -1
 	for i, message := range req.Messages {
@@ -54,18 +46,6 @@ func projectTools(req CompletionRequest, mode toolUpdateMode) toolProjection {
 			continue
 		}
 		update := message.ToolUpdate
-		if mode == toolUpdatesAdditions {
-			if len(update.Removed) > 0 {
-				return fallback
-			}
-			for _, added := range update.Added {
-				for _, prior := range current {
-					if added.Name == prior.Name {
-						return fallback
-					}
-				}
-			}
-		}
 		current = messages.ApplyToolUpdate(current, update)
 		updates[i] = update
 	}

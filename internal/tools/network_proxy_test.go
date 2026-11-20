@@ -47,3 +47,26 @@ func TestWebProxyUsesUpstreamDNSAndChecksRedirects(t *testing.T) {
 		t.Fatal("proxy bypassed network permission")
 	}
 }
+
+func TestWebFetchRetriesInterruptedReadThroughSameProxy(t *testing.T) {
+	var calls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Host != "public.invalid" || r.Method != http.MethodGet {
+			t.Errorf("unexpected proxied request %s %s", r.Method, r.URL)
+		}
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Length", "200")
+			fmt.Fprint(w, "incomplete")
+			return
+		}
+		fmt.Fprint(w, "complete page")
+	}))
+	defer proxy.Close()
+	ctx := rgCtx(t, t.TempDir())
+	ctx.HostNetworkAllowed = true
+	ctx.Sandbox.NetworkProxy = proxy.URL
+	out, err := NewWebFetchTool().Execute(ctx, map[string]any{"url": "http://public.invalid/page"})
+	if err != nil || calls.Load() != 2 || !strings.Contains(out.Text, "complete page") || strings.Contains(out.Text, "incomplete") {
+		t.Fatalf("calls=%d, result=%q, err=%v", calls.Load(), out.Text, err)
+	}
+}

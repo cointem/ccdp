@@ -42,6 +42,7 @@ func isDeepSeekModel(cfg config.Config, model string) bool {
 func applyGenerationRequest(cfg config.Config, req *llm.CompletionRequest) {
 	cfg.ReasoningEffort = cfg.ReasoningEffortFor(req.Model)
 	req.ReasoningEffort, req.Verbosity = cfg.ReasoningEffort, cfg.Verbosity
+	req.NativeXHigh = cfg.ReasoningEffort == "xhigh" && cfg.SupportsReasoningEffort(req.Model, "xhigh")
 	if isDeepSeekModel(cfg, req.Model) && cfg.ReasoningEffort != "" {
 		req.Thinking = &llm.ThinkingConfig{Type: "enabled"}
 		if cfg.ReasoningEffort == "none" {

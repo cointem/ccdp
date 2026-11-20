@@ -40,6 +40,9 @@ func turnInputFromView(view protocol.InputView) turnInput {
 func (input turnInput) message() messages.Message {
 	message := messages.Message{ID: inputMessageID(string(input.ID)), Role: messages.RoleUser, Content: input.Text, CreatedAt: input.CreatedAt,
 		ImageAttachments: messages.CloneImageAttachments(input.ImageAttachments), ImagesFrozen: input.ImagesFrozen}
+	if input.Strategy == protocol.InputMessage {
+		message.InternalSource = protocol.CollaborationSource
+	}
 	if input.goalContinuation {
 		message.InternalSource = "goal"
 		message.Role = messages.RoleUser

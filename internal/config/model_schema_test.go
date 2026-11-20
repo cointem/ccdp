@@ -56,6 +56,7 @@ func TestRejectOldModelConfiguration(t *testing.T) {
 		`{"providers":{"p":{"models":{"m":{}},"context_windows":{"m":1000000}}}}`,
 		`{"providers":{"p":{"base_url":"https://example.com","wire_api":"chat","models":{"m":{"reasoning_effort":"low"}}}}}`,
 		`{"model":"p/m","providers":{"p":{"base_url":"https://example.com","wire_api":"respinses","models":{"m":{}}}}}`,
+		`{"model":"p/m","providers":{"p":{"base_url":"https://example.com","wire_api":"responses-lite","models":{"m":{}}}}}`,
 	} {
 		path := filepath.Join(t.TempDir(), "config.json")
 		os.WriteFile(path, []byte(data), 0600)
@@ -100,5 +101,28 @@ func TestReasoningEffortBuiltInDefault(t *testing.T) {
 	cfg.ReasoningEffort = "high"
 	if got := cfg.ReasoningEffortFor("p/a"); got != "high" {
 		t.Fatalf("global override lost: %q", got)
+	}
+}
+
+func TestSupportedReasoningEffortsFollowTheSelectedModel(t *testing.T) {
+	cfg := Default()
+	cfg.Providers = map[string]ProviderConfig{"gateway": {ModelConfigs: map[string]ModelConfig{
+		"custom":             {SupportedReasoningEfforts: []string{"high"}},
+		"gpt-5.4-mini":       {SupportedReasoningEfforts: []string{}},
+		"unknown":            {},
+		"MiniMax-M3.1-Flash": {},
+	}}}
+	for _, tc := range []struct {
+		model, level string
+		want         bool
+	}{
+		{"custom", "high", true}, {"custom", "medium", false},
+		{"gpt-5.4-mini", "high", false}, {"unknown", "medium", false},
+		{"MiniMax-M3.1-Flash", "xhigh", true}, {"MiniMax-M3.1-Flash", "none", false},
+	} {
+		clone := cfg.Clone()
+		if got := clone.SupportsReasoningEffort("gateway/"+tc.model, tc.level); got != tc.want {
+			t.Errorf("%s at %s: got %t, want %t", tc.model, tc.level, got, tc.want)
+		}
 	}
 }

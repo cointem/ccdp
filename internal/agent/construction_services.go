@@ -107,7 +107,7 @@ func (a *Agent) startSessionServices(rootCancel context.CancelFunc, isolated boo
 		a.emitStatus("%v", err)
 	}
 	if !isolated && !a.capabilities.capabilityRevoking {
-		if err := a.services.mcp.StartChecked(a.lifecycle.rootCtx, a.services.cfg.MCPServers); err != nil {
+		if err := a.services.mcp.StartChecked(a.lifecycle.rootCtx, a.services.cfg.RuntimeMCPServers()); err != nil {
 			a.abortConstruction(rootCancel, true)
 			return err
 		}
@@ -139,14 +139,12 @@ func (a *Agent) finalizeToolsAndSkills(isolated bool) {
 	a.services.registry.RegisterIn("builtin", &updateProjectMemoryTool{})
 	a.services.registry.RegisterIn("builtin", &toolSearchTool{ag: a})
 	a.services.registry.RegisterIn("builtin", &askUserQuestionTool{ag: a})
+	// Final answers arrive automatically. The transcript reader is only
+	// advertised when explicitly discovered for inspection.
+	a.discovery.deferTools["ReadAgent"] = true
 	for _, spec := range a.services.cfg.Tools {
 		if name := strings.TrimSpace(spec.Name); name != "" {
 			a.discovery.deferTools[name] = true
-		}
-	}
-	for _, names := range a.services.mcp.ToolNames() {
-		for _, n := range names {
-			a.discovery.deferTools[n] = true
 		}
 	}
 	a.services.skills = skills.NewStore()

@@ -62,14 +62,14 @@ func replyOwned[T any](a *Agent, reply chan T, value T) {
 // transcript of the last confirmed view, never read partially installed
 // business state or attach a newer journal cursor to older usage/settings.
 func (a *Agent) publishTranscriptPreviewLocked() {
-	transcript, more := a.transcript.Snapshot()
+	transcript, more, prompt := a.transcript.SnapshotWithPrompt()
 	for {
 		prior := a.publishedSnapshot.Load()
 		if prior == nil {
 			return
 		}
 		next := *prior
-		next.Transcript, next.TranscriptMore = transcript, more
+		next.Transcript, next.TranscriptMore, next.TranscriptPrompt = transcript, more, prompt
 		if a.publishedSnapshot.CompareAndSwap(prior, &next) {
 			return
 		}

@@ -146,14 +146,13 @@ type Model struct {
 type selectorActionKind string
 
 const (
-	selectorEffort      selectorActionKind = "effort"
-	selectorVerbosity   selectorActionKind = "verbosity"
-	selectorModel       selectorActionKind = "model"
-	selectorMode        selectorActionKind = "mode"
-	selectorRewind      selectorActionKind = "rewind"
-	selectorResume      selectorActionKind = "resume"
-	selectorAgent       selectorActionKind = "agent"
-	selectorAgentOutput selectorActionKind = "agent_output"
+	selectorEffort    selectorActionKind = "effort"
+	selectorVerbosity selectorActionKind = "verbosity"
+	selectorModel     selectorActionKind = "model"
+	selectorMode      selectorActionKind = "mode"
+	selectorRewind    selectorActionKind = "rewind"
+	selectorResume    selectorActionKind = "resume"
+	selectorAgent     selectorActionKind = "agent"
 )
 
 type selectorAction struct {

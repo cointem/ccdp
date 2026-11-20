@@ -139,7 +139,7 @@ func (a *Agent) commitChildOutbox(prepared childOutboxPrepared) error {
 		result.OutboxCursor = committed.Cursor
 	}
 	if memory {
-		records, artifacts, readErr := p.ReadSnapshot()
+		records, artifacts, _, readErr := p.ReadSnapshot()
 		result.Records, result.Artifacts = records, artifacts
 		err = errors.Join(err, readErr)
 	}

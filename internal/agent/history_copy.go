@@ -160,7 +160,7 @@ func newForkAgent(cfg *config.Config, opts Options, source historyArtifactSource
 		return nil, err
 	}
 	if cfg.NoSessionPersistence {
-		_, blobs, err := p.ReadSnapshot()
+		_, blobs, _, err := p.ReadSnapshot()
 		if err != nil {
 			return nil, err
 		}

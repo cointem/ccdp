@@ -239,7 +239,7 @@ func transcriptReaderEntries(m *Model) []readerEntry {
 	}
 	items := m.confirmedItems
 	if len(items) == 0 && len(m.snapshot.Transcript) > 0 {
-		return readerEntriesFromTranscript(m.snapshot.Transcript)
+		return readerEntriesFromTranscript(protocol.ChatItems(m.snapshot.Transcript))
 	}
 	if len(items) == 0 {
 		items = m.items

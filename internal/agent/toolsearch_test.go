@@ -5,9 +5,52 @@ import (
 	"testing"
 
 	"ccdp/internal/config"
+	"ccdp/internal/mcp"
 	"ccdp/internal/messages"
 	"ccdp/internal/tools"
 )
+
+func TestWebSearchCatalogUsesConfiguredMCP(t *testing.T) {
+	for _, installed := range []bool{true, false} {
+		cfg := isolatedTestConfig(t, "search-catalog")
+		if !installed {
+			delete(cfg.MCPServers, mcp.ExaServer)
+		}
+		a, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(a.Close)
+		catalog := a.services.registry.Acquire()
+		if _, ok := catalog.Get("WebSearch"); ok {
+			t.Fatal("local WebSearch appeared in the tool catalog")
+		}
+		if tool, ok := catalog.Get(mcp.ExaToolName()); ok != installed || ok && !mcp.IsExaSearch(tool) {
+			t.Fatalf("Exa installed=%t, catalog entry=%v", installed, tool)
+		}
+		if _, ok := catalog.Get("WebFetch"); !ok {
+			t.Fatal("missing URL reader")
+		}
+		if !installed {
+			continue
+		}
+		hasExa := func() bool {
+			for _, def := range a.toolDefsSnapshotFromLease(catalog) {
+				if def.Function.Name == mcp.ExaToolName() {
+					return true
+				}
+			}
+			return false
+		}
+		if hasExa() {
+			t.Fatal("Exa schema was sent before discovery")
+		}
+		search, _ := catalog.Get("ToolSearch")
+		if _, err := executeToolText(search, &tools.Context{Args: map[string]any{"name": mcp.ExaToolName()}}); err != nil || !hasExa() {
+			t.Fatalf("Exa schema missing after discovery: %v", err)
+		}
+	}
+}
 
 // newAgentWithCustomTool builds an agent with one config custom tool (deferred).
 func newAgentWithCustomTool(t *testing.T) *Agent {
@@ -163,10 +206,42 @@ func TestToolSearchRun(t *testing.T) {
 		t.Errorf("exact-name search failed: %v %q", err, out2)
 	}
 
-	// Unknown name errors.
-	_, err = executeToolText(ts2, &tools.Context{WorkingDir: ag2.services.cfg.Workspace, Args: map[string]any{"name": "nope"}})
-	if err == nil {
-		t.Error("expected error for unknown tool")
+	// An empty lookup is a successful search; it loads nothing.
+	out, err = executeToolText(ts2, &tools.Context{WorkingDir: ag2.services.cfg.Workspace, Args: map[string]any{"name": "nope"}})
+	if err != nil || !strings.Contains(out, "No available tool") || ag2.isDiscovered("nope") {
+		t.Fatalf("unknown name: %q, %v", out, err)
+	}
+}
+
+func TestExplorerDiscoversSearchByKeywordsWithinItsRole(t *testing.T) {
+	cfg := isolatedTestConfig(t, "explorer")
+	ag, err := testNewWithOptions(t, &cfg, Options{EffectiveConfigFrozen: true, Purpose: childPurposeTask, ReadOnlyWorkspace: true, AllowedTools: childReadOnlyTools(childPurposeTask)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ag.Close)
+	search := &toolSearchTool{ag: ag}
+	for query, want := range map[string]string{
+		"grep search file contents": "Loaded Rg:", "grep pattern text search": "Loaded Rg:",
+		"grep search file contents regex": "Loaded Rg:", "RG": "Loaded Rg:",
+		"grep search file contents bash shell": "Rg:", "run shell command bash": "No available tool matches",
+	} {
+		out, err := executeToolText(search, &tools.Context{WorkingDir: cfg.Workspace, Args: map[string]any{"query": query}})
+		if err != nil || !strings.Contains(out, want) {
+			t.Fatalf("%q returned %q, %v", query, out, err)
+		}
+	}
+	if out, err := executeToolText(search, &tools.Context{Args: map[string]any{"name": "Bash"}}); err != nil || !strings.Contains(out, "No available tool") || ag.isDiscovered("Bash") {
+		t.Fatalf("restricted tool lookup: %q, %v", out, err)
+	}
+}
+
+func TestPartialToolMatchSuggestsWithoutLoading(t *testing.T) {
+	ag := newAgentWithCustomTool(t)
+	t.Cleanup(ag.Close)
+	out, err := executeToolText(&toolSearchTool{ag: ag}, &tools.Context{Args: map[string]any{"query": "format files prettify"}})
+	if err != nil || !strings.Contains(out, "my-fmt:") || ag.isDiscovered("my-fmt") {
+		t.Fatalf("partial match: %q, %v", out, err)
 	}
 }
 

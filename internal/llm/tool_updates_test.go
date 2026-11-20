@@ -53,41 +53,55 @@ func decodeCatalogProviderBody(t *testing.T, cfg Config, req CompletionRequest) 
 	return doc
 }
 
-func TestResponsesIncrementalToolsAdditionAndFallback(t *testing.T) {
+func TestResponsesGatewayUsesCurrentTopLevelTools(t *testing.T) {
+	catalogs := make(chan []responsesTool, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body responsesBodyRequest
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/responses" || json.NewDecoder(r.Body).Decode(&body) != nil || !body.Stream {
+			http.Error(w, "invalid Responses request", http.StatusBadRequest)
+			return
+		}
+		var items []responsesItem
+		for _, raw := range body.Input {
+			var item responsesItem
+			if json.Unmarshal(raw, &item) != nil || (item.Type != "" && item.Type != "message") {
+				http.Error(w, "unexpected input item", http.StatusBadRequest)
+				return
+			}
+			items = append(items, item)
+		}
+		if len(items) != 4 || items[0].Role != "system" || items[1].Content != "before" || items[2].Content != "previous answer" || items[3].Content != "followup" {
+			http.Error(w, "conversation changed", http.StatusBadRequest)
+			return
+		}
+		catalogs <- body.Tools
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL + "/v1", Wire: "responses", OneAttempt: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	base, added := catalogTool("base", "original"), catalogTool("late", "new")
-	initialReq := catalogRequest([]ToolDef{base}, nil)
-	initialReq.Messages = initialReq.Messages[:3]
-	initial := decodeCatalogBody(t, "responses", initialReq)
-	addition := catalogRequest([]ToolDef{base, added}, &messages.ToolUpdate{Added: toolDefinitions([]ToolDef{added})})
-	doc := decodeCatalogBody(t, "responses", addition)
-	if !reflect.DeepEqual(initial["tools"], doc["tools"]) {
-		t.Fatal("addition rewrote top-level tools")
-	}
-	before, after := initial["input"].([]any), doc["input"].([]any)
-	if len(after) != len(before)+1 || !reflect.DeepEqual(before, after[:len(before)]) {
-		t.Fatalf("prefix changed: %v", after)
-	}
-	update := after[len(before)].(map[string]any)
-	if update["type"] != "additional_tools" || update["role"] != "developer" || len(update["tools"].([]any)) != 1 {
-		t.Fatalf("bad Responses update: %v", update)
-	}
-	for _, tc := range []struct {
-		name string
-		req  CompletionRequest
-	}{
-		{"removed", catalogRequest([]ToolDef{added}, &messages.ToolUpdate{Removed: []string{"base"}, Added: toolDefinitions([]ToolDef{added})})},
-		{"changed", catalogRequest([]ToolDef{catalogTool("base", "changed")}, &messages.ToolUpdate{Removed: []string{"base"}, Added: toolDefinitions([]ToolDef{catalogTool("base", "changed")})})},
-		{"mismatch", catalogRequest([]ToolDef{base}, &messages.ToolUpdate{Added: toolDefinitions([]ToolDef{added})})},
+	changed := catalogTool("base", "changed")
+	for _, req := range []CompletionRequest{
+		catalogRequest([]ToolDef{base, added}, &messages.ToolUpdate{Added: toolDefinitions([]ToolDef{added})}),
+		catalogRequest([]ToolDef{changed}, &messages.ToolUpdate{Removed: []string{"base"}, Added: toolDefinitions([]ToolDef{changed})}),
+		catalogRequest(nil, &messages.ToolUpdate{Removed: []string{"base"}}),
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fallback := decodeCatalogBody(t, "responses", tc.req)
-			if len(fallback["input"].([]any)) != len(before) {
-				t.Fatalf("control message leaked: %v", fallback)
-			}
-			if len(fallback["tools"].([]any)) != len(tc.req.Tools) {
-				t.Fatalf("wrong current tools: %v", fallback)
-			}
-		})
+		req.Messages = append(req.Messages, ChatMessage{Role: "assistant", Content: "previous answer",
+			ProviderWire: "responses", ProviderOrigin: client.providerOrigin,
+			ProviderContent: []json.RawMessage{json.RawMessage(`{"type":"additional_tools","tools":[]}`)}},
+			ChatMessage{Role: "user", Content: "followup"})
+		if _, err := client.Stream(context.Background(), req, nil); err != nil {
+			t.Fatal(err)
+		}
+		got := <-catalogs
+		want := responsesTools(req.Tools)
+		if len(got) != len(want) || len(want) > 0 && !reflect.DeepEqual(got, want) {
+			t.Fatalf("gateway received tools %+v, want %+v", got, want)
+		}
 	}
 }
 
@@ -187,11 +201,11 @@ func TestAnthropicToolUpdateDoesNotSplitToolResultPair(t *testing.T) {
 func TestToolProjectionAfterHistoryRewrite(t *testing.T) {
 	tool := catalogTool("late", "new")
 	req := CompletionRequest{Tools: []ToolDef{tool}, Messages: []ChatMessage{{Role: "system", ToolUpdate: &messages.ToolUpdate{Added: toolDefinitions([]ToolDef{tool})}}}}
-	if projectTools(req, toolUpdatesChanges).native {
+	if projectTools(req).native {
 		t.Fatal("orphan update accepted as baseline")
 	}
 	req.Messages = append(req.Messages, ChatMessage{Role: "system", ToolUpdate: &messages.ToolUpdate{Initial: true, Added: toolDefinitions(req.Tools)}})
-	projection := projectTools(req, toolUpdatesChanges)
+	projection := projectTools(req)
 	if !projection.native || len(projection.updates) != 0 || len(projection.tools) != 1 {
 		t.Fatalf("new baseline not used: %+v", projection)
 	}
@@ -205,8 +219,8 @@ func TestToolUpdateFormatDependsOnlyOnWire(t *testing.T) {
 		name, wire, endpoint string
 		native               bool
 	}{
-		{"responses", "responses", "https://api.openai.com/v1", true},
-		{"responses gateway", "responses", "https://gateway.example/v1", true},
+		{"responses", "responses", "https://api.openai.com/v1", false},
+		{"responses gateway", "responses", "https://gateway.example/v1", false},
 		{"anthropic", "anthropic", "https://api.anthropic.com", true},
 		{"anthropic gateway", "anthropic", "https://gateway.example/v1", true},
 		{"moonshot", "chat", "https://api.moonshot.ai/v1", false},

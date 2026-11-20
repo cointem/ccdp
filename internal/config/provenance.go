@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -75,7 +76,7 @@ var configFieldNames = []string{
 	"max_tool_output_bytes_per_turn", "enable_guardian", "enable_project_memory", "project_memory_dir", "memory_read_only", "memory_history",
 	"max_parallel_tools", "max_concurrent_agents", "code_mode_enabled", "sandbox_limits", "network_access", "network_proxy", "local_development_network",
 	"additional_directories", "additional_read_only_directories", "disallowed_directories",
-	"hooks", "enable_web_tools", "tools", "mcp_servers", "session_dir",
+	"hooks", "enable_web_tools", "exa_api_key", "tools", "mcp_servers", "session_dir",
 	"verbose", "debug", "session_id", "no_session_persistence", "review", "delivery", "automatic_checkpoints", "language_servers",
 }
 
@@ -166,6 +167,45 @@ func (c Config) SourceOf(field string) Source { return c.provenance.source(field
 // It is read-only metadata for diagnostics; callers must not infer permission
 // from the path.
 func (c Config) SourcePath() string { return c.sourcePath }
+
+// ApplyUserMCPServers refreshes the desktop host's baseline for new sessions.
+// Running sessions own their existing connections and project trust decisions.
+func (c *Config) ApplyUserMCPServers(saved Config) {
+	if c.SourceOf("mcp_servers") == SourceCLI {
+		return
+	}
+	c.ensureProvenance()
+	c.MCPServers = cloneMCPServers(saved.MCPServers)
+	c.provenance.set("mcp_servers", saved.SourceReport().Fields["mcp_servers"])
+}
+
+// ApplyUserPreferences updates the fields owned by the desktop settings form
+// from an already resolved user file, keeping runtime paths and CLI overrides.
+func (c *Config) ApplyUserPreferences(saved Config, updateMode bool) {
+	c.ensureProvenance()
+	if c.sourcePath != saved.sourcePath {
+		c.sourcePath = saved.sourcePath
+	}
+	fields := saved.SourceReport().Fields
+	for _, field := range []string{"providers", "model", "fallback_model", "permission_mode", "exa_api_key"} {
+		if c.SourceOf(field) == SourceCLI || (field == "permission_mode" && !updateMode) {
+			continue
+		}
+		switch field {
+		case "providers":
+			c.Providers = saved.Providers
+		case "model":
+			c.Model = saved.Model
+		case "fallback_model":
+			c.FallbackModel = saved.FallbackModel
+		case "exa_api_key":
+			c.ExaAPIKey = saved.ExaAPIKey
+		case "permission_mode":
+			c.PermissionMode = saved.PermissionMode
+		}
+		c.provenance.set(field, fields[field])
+	}
+}
 
 // IsExplicit reports whether the field appeared in any source file or
 // override. An explicit empty, false, or zero value is still explicit.
@@ -358,6 +398,8 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			dst.AutomaticCheckpoints = cloneBool(src.AutomaticCheckpoints)
 		case "api_key":
 			dst.APIKey = src.APIKey
+		case "exa_api_key":
+			dst.ExaAPIKey = strings.TrimSpace(src.ExaAPIKey)
 		case "base_url":
 			dst.BaseURL = src.BaseURL
 		case "reasoning_effort":
@@ -439,6 +481,21 @@ func applyConfigFields(dst, src *Config, raw map[string]json.RawMessage, source 
 			}
 		case "mcp_servers":
 			dst.MCPServers = cloneMCPServers(src.MCPServers)
+			if source == SourceUserFile && len(dst.MCPServers) > 0 {
+				if _, specified := dst.MCPServers[mcp.ExaServer]; !specified {
+					dst.MCPServers[mcp.ExaServer] = mcp.DefaultExaServer()
+				}
+			}
+			// A null entry explicitly removes a server, including a shipped
+			// default that would otherwise return on the next launch.
+			var entries map[string]json.RawMessage
+			if json.Unmarshal(raw[field], &entries) == nil {
+				for name, entry := range entries {
+					if string(entry) == "null" {
+						delete(dst.MCPServers, name)
+					}
+				}
+			}
 		case "session_dir":
 			dst.SessionDir = src.SessionDir
 		case "session_id":
@@ -552,6 +609,7 @@ func cloneProviders(src map[string]ProviderConfig) map[string]ProviderConfig {
 		if v.ModelConfigs != nil {
 			models := make(map[string]ModelConfig, len(v.ModelConfigs))
 			for name, model := range v.ModelConfigs {
+				model.SupportedReasoningEfforts = slices.Clone(model.SupportedReasoningEfforts)
 				models[name] = model
 			}
 			v.ModelConfigs = models
@@ -571,20 +629,7 @@ func cloneProviders(src map[string]ProviderConfig) map[string]ProviderConfig {
 func cloneMCPServers(src map[string]mcp.ServerConfig) map[string]mcp.ServerConfig {
 	dst := make(map[string]mcp.ServerConfig, len(src))
 	for k, v := range src {
-		v.Args = append([]string(nil), v.Args...)
-		v.Env = cloneStringMap(v.Env)
-		dst[k] = v
-	}
-	return dst
-}
-
-func cloneStringMap(src map[string]string) map[string]string {
-	if src == nil {
-		return nil
-	}
-	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
+		dst[k] = v.Clone()
 	}
 	return dst
 }

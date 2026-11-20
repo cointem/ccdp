@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -17,9 +18,9 @@ func (c *Client) sdkClient() *sdk.Client {
 func (c *Client) requestJSON(ctx context.Context, method string, params map[string]any, dst any) error {
 	c.mu.Lock()
 	session := c.session
-	lifetime := c.sessionCtx
+	lifetime, sb := c.sessionCtx, c.sandbox
 	c.mu.Unlock()
-	if session == nil || c.isClosed() {
+	if lifetime == nil || c.isClosed() || (session == nil && len(c.cfg.OnDemandTools) == 0) {
 		return fmt.Errorf("mcp %s: session unavailable", c.name)
 	}
 	if _, ok := ctx.Deadline(); !ok {
@@ -34,6 +35,26 @@ func (c *Client) requestJSON(ctx context.Context, method string, params map[stri
 	defer stop()
 	if err := lifetime.Err(); err != nil {
 		return err
+	}
+	if session == nil {
+		// Each invocation owns its transport. Closing the managed generation
+		// cancels active invocations through lifetime above.
+		cfg := c.cfg
+		cfg.OnDemandTools = nil
+		cfg.HTTPHeaders = c.requestHeaders(ctx)
+		peer := NewClient(c.name, cfg)
+		peer.SetSandbox(sb)
+		defer peer.Close()
+		if err := peer.Start(ctx); err != nil {
+			return err
+		}
+		if method == "tools/call" {
+			name, _ := params["name"].(string)
+			if !slices.ContainsFunc(peer.Tools(), func(def ToolDef) bool { return def.Name == name }) {
+				return fmt.Errorf("mcp %s: server does not advertise tool %q", c.name, name)
+			}
+		}
+		return peer.requestJSON(ctx, method, params, dst)
 	}
 	var result any
 	var err error
@@ -51,7 +72,11 @@ func (c *Client) requestJSON(ctx context.Context, method string, params map[stri
 		}{items}
 	case "tools/call":
 		name, _ := params["name"].(string)
-		result, err = session.CallTool(ctx, &sdk.CallToolParams{Name: name, Arguments: params["arguments"]})
+		reply, callErr := session.CallTool(ctx, &sdk.CallToolParams{Name: name, Arguments: params["arguments"]})
+		if callErr == nil && c.isHostedExaSearch(name) && exaQuotaResponse(reply) {
+			return errExaQuota
+		}
+		result, err = reply, callErr
 	case "resources/list":
 		var items []*sdk.Resource
 		for item, e := range session.Resources(ctx, nil) {

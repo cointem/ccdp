@@ -92,10 +92,9 @@ func (out *observation) follow(ctx, lifetime context.Context, source Observation
 			}
 			attached = available
 			if available {
-				var err error
-				live, err = row.Runtime.Watch(ctx, protocol.Cursor{})
+				sub, err := row.Runtime.Watch(ctx, protocol.Cursor{})
 				if err == nil {
-					updates = live.Updates()
+					live, updates = sub, sub.Updates()
 				} else {
 					attached = false
 					retryAfter = time.Now().Add(100 * time.Millisecond)

@@ -17,11 +17,11 @@ func (t *AgentTool) Name() string         { return t.name }
 func (t *AgentTool) Description() string {
 	switch t.name {
 	case "SpawnAgent":
-		return "Start an independent task. Returns a stable agent_id immediately; final results arrive automatically as collaboration messages. Defaults: worker with an isolated workspace and fresh context; explorers share the workspace. Children cannot delegate."
+		return "Delegate a task with the current project files and completed conversation history. Returns a stable agent_id. The final answer arrives automatically. Use workspace=isolated for a separate copy or context=fresh to omit history."
 	case "SendMessage":
-		return "Send information to an agent (or parent) without starting another task. Not user authorization."
+		return "Queue an update for your task child or parent without starting a turn. Final answers are already delivered automatically. A queued receipt confirms delivery to the mailbox. Messages do not grant permissions."
 	case "FollowupAgent":
-		return "Assign the next task to an idle agent. Busy agents reject follow-ups; use SendMessage for information during a task. Uses the same stable agent_id."
+		return "Give an existing agent another assignment. A working agent receives it at a task boundary. An idle agent resumes its session."
 	case "StopAgent":
 		return "Request cancellation of the agent's current task. Retains its session and saved results."
 	case "WaitAgent":
@@ -29,7 +29,7 @@ func (t *AgentTool) Description() string {
 	case "ListAgents":
 		return "List compact agent identities, live states and outcomes. No report bodies."
 	default:
-		return "Read saved child data without running a model. Defaults to the latest completed result (possibly the previous task if currently busy). Use view=transcript for history, or view=output and item_id for a full item. Continue using next_cursor."
+		return "Look up a saved final answer by agent_id. For diagnostics, request view=transcript, then item_id for a full entry. Use next_cursor to continue a page."
 	}
 }
 func (t *AgentTool) Parameters() map[string]any {
@@ -39,9 +39,10 @@ func (t *AgentTool) Parameters() map[string]any {
 	required := []string{}
 	switch t.name {
 	case "SpawnAgent":
-		props = map[string]any{"task": str("Self-contained assignment"), "name": str("Short display name"), "role": enum("worker", "explorer"), "workspace": enum("shared", "isolated"), "context": enum("fresh", "fork")}
+		props = map[string]any{"task": str("Task and expected deliverable"), "name": str("Short display name"), "role": enum("worker", "explorer"), "workspace": enum("shared", "isolated"), "context": enum("fresh", "fork")}
 		props["role"].(map[string]any)["default"] = "worker"
-		props["context"].(map[string]any)["default"] = "fresh"
+		props["workspace"].(map[string]any)["default"] = "shared"
+		props["context"].(map[string]any)["default"] = "fork"
 		required = []string{"task"}
 	case "SendMessage":
 		props = map[string]any{"agent_id": str("Stable child agent_id, or parent"), "text": str("Information, not a new task")}
@@ -50,12 +51,11 @@ func (t *AgentTool) Parameters() map[string]any {
 		props["agent_id"] = str("Stable agent_id")
 		required = []string{"agent_id"}
 		if t.name == "FollowupAgent" {
-			props["task"] = str("Next assignment for an idle agent")
+			props["task"] = str("Additional assignment")
 			required = append(required, "task")
 		}
 	case "ReadAgent":
-		props = map[string]any{"agent_id": str("Stable agent_id"), "view": enum("result", "transcript", "output"), "cursor": str("next_cursor from the previous page"), "item_id": str("Required only for view=output")}
-		props["view"].(map[string]any)["default"] = "result"
+		props = map[string]any{"agent_id": str("Stable agent_id"), "view": enum("result", "transcript", "output"), "cursor": str("next_cursor from the previous page"), "item_id": str("Transcript entry to read in full")}
 		required = []string{"agent_id"}
 	case "ListAgents":
 		props["cursor"] = str("next_cursor from the previous page")
@@ -92,7 +92,7 @@ func (t *AgentTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 			if task == "" || ctx.SpawnAgent == nil {
 				return "", errors.New("task and child launcher required")
 			}
-			receipt, err := ctx.SpawnAgent(SpawnAgentRequest{Task: task, Name: StringArg(ctx.Args, "name", ""), Role: StringArg(ctx.Args, "role", "worker"), Workspace: StringArg(ctx.Args, "workspace", ""), Context: StringArg(ctx.Args, "context", "fresh")})
+			receipt, err := ctx.SpawnAgent(SpawnAgentRequest{Task: task, Name: StringArg(ctx.Args, "name", ""), Role: StringArg(ctx.Args, "role", "worker"), Workspace: StringArg(ctx.Args, "workspace", "shared"), Context: StringArg(ctx.Args, "context", "fork")})
 			if err != nil {
 				return "", err
 			}
@@ -157,14 +157,14 @@ func (t *AgentTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 			if ctx.ReadAgent == nil {
 				return "", errors.New("agent reader unavailable")
 			}
-			return ctx.ReadAgent(ctx.Context, protocol.AgentReadRequest{AgentID: id, View: StringArg(ctx.Args, "view", "result"), Cursor: StringArg(ctx.Args, "cursor", ""), ItemID: StringArg(ctx.Args, "item_id", "")}, ctx.outputLimit())
+			return ctx.ReadAgent(ctx.Context, protocol.AgentReadRequest{AgentID: id, View: StringArg(ctx.Args, "view", ""), Cursor: StringArg(ctx.Args, "cursor", ""), ItemID: StringArg(ctx.Args, "item_id", "")}, ctx.outputLimit())
 		case "FollowupAgent", "StopAgent":
 			if ctx.AgentCommandID == "" {
 				return "", errors.New("command identity required")
 			}
 			control := protocol.AgentControl{ID: ctx.AgentCommandID, SessionID: id, Action: "cancel"}
 			if t.name == "FollowupAgent" {
-				control.Action = "continue"
+				control.Action = "followup"
 				control.Text = StringArg(ctx.Args, "task", "")
 				control.Strategy = protocol.InputFollowup
 				if strings.TrimSpace(control.Text) == "" {

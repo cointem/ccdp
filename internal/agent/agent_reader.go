@@ -36,21 +36,27 @@ func (s *SessionSupervisor) readAgent(ctx context.Context, req protocol.AgentRea
 	if _, err := s.lookup(req.AgentID); err != nil {
 		return "", err
 	}
-	if req.View == "" {
-		req.View = "result"
-	}
 	c := agentReadCursor{Agent: req.AgentID, View: req.View, Item: req.ItemID}
 	if req.Cursor != "" {
+		var saved agentReadCursor
 		b, err := base64.RawURLEncoding.DecodeString(req.Cursor)
-		if err != nil || json.Unmarshal(b, &c) != nil || c.Agent != req.AgentID || c.View != req.View || c.Offset < 0 {
+		if err != nil || json.Unmarshal(b, &saved) != nil || saved.Agent != req.AgentID || saved.Offset < 0 {
 			return "", errors.New("invalid agent read cursor")
 		}
-		if req.ItemID != "" && c.Item != req.ItemID {
+		if req.ItemID != "" && saved.Item != req.ItemID {
 			return "", errors.New("cursor belongs to another output item")
 		}
+		if req.View != "" && saved.View != req.View && !(req.View == "output" && saved.View == "result" && saved.Item == "") {
+			return "", errors.New("cursor belongs to another view")
+		}
+		c = saved
+	} else if c.View == "" && c.Item != "" {
+		c.View = "output"
+	} else if c.View == "" || (c.View == "output" && c.Item == "") {
+		c.View = "result"
 	}
-	page := protocol.AgentReadPage{AgentID: req.AgentID, View: req.View}
-	switch req.View {
+	page := protocol.AgentReadPage{AgentID: req.AgentID, View: c.View}
+	switch c.View {
 	case "result":
 		if req.ItemID != "" {
 			return "", errors.New("item_id is only valid with view=output")
@@ -160,7 +166,7 @@ func encodeAgentTextPage(page protocol.AgentReadPage, c agentReadCursor, text st
 }
 
 func (s *SessionSupervisor) readAgentTranscript(ctx context.Context, page protocol.AgentReadPage, c agentReadCursor, budget int) (string, error) {
-	records, _, recoveredThrough, err := s.readSessionRecordsWithRecovery(ctx, c.Agent)
+	records, _, recoveredThrough, err := s.readSessionRecords(ctx, c.Agent)
 	if err != nil {
 		return "", err
 	}

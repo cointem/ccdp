@@ -41,6 +41,41 @@ type endedSubscription struct {
 func (s *endedSubscription) Updates() <-chan protocol.Update { return s.ch }
 func (s *endedSubscription) Close() error                    { s.once.Do(func() { s.reader.closes.Add(1) }); return nil }
 
+type retiringReader struct{}
+
+func (retiringReader) Watch(context.Context, protocol.Cursor) (protocol.Subscription, error) {
+	// A Go interface can carry a typed nil alongside an error.
+	return (*endedSubscription)(nil), context.Canceled
+}
+
+func TestObserverFollowsContinuationAfterRejectedAttachment(t *testing.T) {
+	source := &observedSource{run: ObservedRun{ID: "first", Status: "settling", Runtime: retiringReader{}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sub, err := Watch(ctx, ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	expectSnapshot := func(run protocol.RunID) {
+		t.Helper()
+		select {
+		case u := <-sub.Updates():
+			if u.Snapshot == nil || u.Snapshot.RunID != run {
+				t.Fatalf("expected snapshot of %s, got %+v", run, u)
+			}
+		case <-ctx.Done():
+			t.Fatalf("missing snapshot of %s", run)
+		}
+	}
+	expectSnapshot("first") // Initial snapshot.
+	expectSnapshot("first") // The observer attempted its first attachment.
+	source.mu.Lock()
+	source.run = ObservedRun{ID: "second", Status: "running", Runtime: &endedReader{}}
+	source.mu.Unlock()
+	expectSnapshot("second")
+}
+
 func TestObserverClosedRuntimeBacksOffAndFollowsNextRun(t *testing.T) {
 	reader := &endedReader{}
 	source := &observedSource{run: ObservedRun{ID: "first", Status: "running", Runtime: reader}}

@@ -21,14 +21,13 @@ import (
 // responsesItem is an input item (message or function_call) and also the
 // "item" carried by output_item.added / output_item.done events.
 type responsesItem struct {
-	Tools     []responsesTool `json:"tools,omitempty"`
-	Type      string          `json:"type,omitempty"`
-	Role      string          `json:"role,omitempty"`
-	Content   any             `json:"content,omitempty"`
-	CallID    string          `json:"call_id,omitempty"`
-	Output    string          `json:"output,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Arguments string          `json:"arguments,omitempty"`
+	Type      string `json:"type,omitempty"`
+	Role      string `json:"role,omitempty"`
+	Content   any    `json:"content,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Output    string `json:"output,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // responsesTool is a Responses function tool declaration.
@@ -128,16 +127,8 @@ func responsesContent(content any) (any, error) {
 
 // responsesBody builds the Responses request payload from a CompletionRequest.
 func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
-	projection := projectTools(req, toolUpdatesAdditions)
 	input := make([]json.RawMessage, 0, len(req.Messages)+8)
-	for i, m := range req.Messages {
-		if update := projection.updates[i]; update != nil && len(update.Added) > 0 {
-			item, err := marshalItem(responsesItem{Type: "additional_tools", Role: "developer", Tools: responsesTools(toolDefs(update.Added))})
-			if err != nil {
-				return nil, err
-			}
-			input = append(input, item)
-		}
+	for _, m := range req.Messages {
 		if m.ToolUpdate != nil && (m.Content == nil || contentString(m.Content) == "") {
 			continue
 		}
@@ -162,6 +153,11 @@ func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
 				var item responsesItem
 				if err := json.Unmarshal(raw, &item); err != nil {
 					return nil, fmt.Errorf("llm: invalid Responses output item: %w", err)
+				}
+				// Tool declarations always come from the current top-level catalog,
+				// including when replaying items stored by older gateways.
+				if item.Type == "additional_tools" {
+					continue
 				}
 				input = append(input, append(json.RawMessage(nil), raw...))
 				if item.Type == "message" {
@@ -207,7 +203,7 @@ func (c *Client) responsesBody(req CompletionRequest) ([]byte, error) {
 		Input:   input,
 		Stream:  true,
 	}
-	br.Tools = responsesTools(projection.tools)
+	br.Tools = responsesTools(req.Tools)
 	if req.Verbosity != "" {
 		br.Text = &responsesText{Verbosity: req.Verbosity}
 	}

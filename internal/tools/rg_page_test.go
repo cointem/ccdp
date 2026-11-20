@@ -7,6 +7,35 @@ import (
 	"testing"
 )
 
+func TestRgNestedResultCanBeReadWithRequestedContext(t *testing.T) {
+	root := t.TempDir()
+	reviewRgWrite(t, root, "src/entry.txt", strings.Repeat("before\n", 51)+"  [literal]  \n"+strings.Repeat("after\n", 51))
+	reviewRgWrite(t, root, "entry.txt", "different file\n")
+	registry := NewRegistry()
+	registry.Register(NewRgTool())
+	ctx := rgCtx(t, root)
+	for _, path := range []string{"src", "src/entry.txt"} {
+		for _, n := range []int{25, 30, 45, 1000} {
+			args, err := registry.Acquire().PrepareArguments("Rg", map[string]any{"path": path, "pattern": "[literal]", "literal": true, "context": n, "limit": 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx.Args = args
+			res, page := runRgProgramPage(t, ctx)
+			width := min(n, 50)
+			if len(page.Entries) != width*2+1 || page.Entries[width].Path != "src/entry.txt" || !page.Entries[width].Match || strings.Contains(res.Text, "Context limited") != (n > width) {
+				t.Fatalf("path %s, context %d: %s", path, n, res.Text)
+			}
+			entry := page.Entries[width]
+			ctx.Args = map[string]any{"file_path": entry.Path, "offset": entry.Line, "limit": 1}
+			out, err := executeToolText(NewReadTool(), ctx)
+			if err != nil || !strings.Contains(out, "[literal]") {
+				t.Fatalf("read %q line %d: %s, %v", entry.Path, entry.Line, out, err)
+			}
+		}
+	}
+}
+
 type rgProgramPage struct {
 	Entries []struct {
 		Path  string

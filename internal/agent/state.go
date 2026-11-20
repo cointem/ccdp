@@ -168,11 +168,18 @@ type toolDiscoveryData struct {
 	// customPerms holds per-custom-tool permission overrides from config
 	// ("allow" / "deny" / "ask").
 	customPerms map[string]string
-	// deferTools are tools not injected inline (MCP + config custom tools);
-	// the model discovers them via ToolSearch. discovered tracks which of
-	// them have been surfaced this session.
+	// deferTools lists individual tools to load through ToolSearch. MCP tools
+	// are deferred by namespace, including tools added after startup.
 	deferTools map[string]bool
 	discovered map[string]bool
+}
+
+func (d *toolDiscoveryData) clearDiscoveredMCP() {
+	for name := range d.discovered {
+		if protocol.IsMCPToolName(name) {
+			delete(d.discovered, name)
+		}
+	}
 }
 
 // turnLifecycleData groups the per-turn inbox/interrupt state. Guarded by mu.

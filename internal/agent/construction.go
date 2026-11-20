@@ -339,7 +339,12 @@ func (a *Agent) replayOwnedStore(initial *archive.Snapshot, opts Options, rootCa
 				a.abortConstruction(rootCancel, true)
 				return err
 			}
-			if (owned.Model != "" && owned.Model != a.services.cfg.Model) || (owned.Workspace != "" && owned.Workspace != a.services.cfg.Workspace) {
+			modelChanged := owned.Model != "" && owned.Model != a.services.cfg.Model
+			if modelChanged && owned.Model == initial.Model && a.services.cfg.ValidateModelSelection(owned.Model) != nil {
+				// Resume intentionally selected the current default for a retired model.
+				modelChanged = false
+			}
+			if modelChanged || (owned.Workspace != "" && owned.Workspace != a.services.cfg.Workspace) {
 				a.abortConstruction(rootCancel, true)
 				return fmt.Errorf("agent: session settings changed while opening %q; retry resume", a.conversation.sessionID)
 			}

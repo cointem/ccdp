@@ -233,13 +233,6 @@ func (p *Writer) putBlobLocked(ctx context.Context, data []byte, mediaType strin
 	return &ref, nil
 }
 
-// readSnapshot captures records and the matching artifact capability under the
-// same lifetime boundary. Consumers cannot close or replace the owned store.
-func (p *Writer) ReadSnapshot() ([]session.Record, ArtifactAccess, error) {
-	records, blobs, _, err := p.ReadSnapshotWithRecovery()
-	return records, blobs, err
-}
-
 // OutputArtifact resolves a committed output without copying or scanning the log.
 func (p *Writer) OutputArtifact(id string) (session.BlobRef, ArtifactReader, error) {
 	p.mu.Lock()
@@ -255,9 +248,9 @@ func (p *Writer) OutputArtifact(id string) (session.BlobRef, ArtifactReader, err
 	return ref, p.artifactAccess, nil
 }
 
-// ReadSnapshotWithRecovery freezes records and their recovery boundary under
+// ReadSnapshot freezes records and their recovery boundary under
 // the same writer lock. The boundary is internal metadata, not a durable fact.
-func (p *Writer) ReadSnapshotWithRecovery() ([]session.Record, ArtifactAccess, session.Cursor, error) {
+func (p *Writer) ReadSnapshot() ([]session.Record, ArtifactAccess, session.Cursor, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.store == nil {

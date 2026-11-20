@@ -5,6 +5,7 @@ package executable
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -73,7 +74,17 @@ func Within(root, path string) bool {
 // FindTrusted pins a native adapter to a trusted absolute executable. Project
 // PATH candidates are skipped; the system path remains an available fallback.
 func FindTrusted(name, searchPath string) string {
-	for _, entry := range filepath.SplitList(searchPath + ":/usr/bin:/bin") {
+	if name == "rg" {
+		if path := bundledRipgrep(); path != "" {
+			return path
+		}
+	}
+	dirs := append(filepath.SplitList(searchPath), "/usr/bin", "/bin")
+	if runtime.GOOS == "darwin" && name == "rg" {
+		// Finder-launched applications do not inherit the shell's Homebrew PATH.
+		dirs = append(dirs, "/opt/homebrew/bin", "/usr/local/bin")
+	}
+	for _, entry := range dirs {
 		if !filepath.IsAbs(entry) {
 			continue
 		}

@@ -16,22 +16,19 @@ import (
 	"ccdp/internal/session/archive"
 )
 
-func TestIsolatedWorkerDefaultCanWriteWithoutGit(t *testing.T) {
+func TestDefaultWorkerWritesDirectlyToParentWorkspace(t *testing.T) {
 	f := &fakeLLM{script: []string{"tool:Write|file_path=child.txt;content=created", "tool:Bash|command=printf verified", "text:done"}}
 	a, _ := newTestAgent(t, f)
 	rows, err := runTestChildren(a, []childTask{{Description: "write and verify"}}, "worker")
 	if err != nil || len(rows) != 1 || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}
-	data, err := os.ReadFile(filepath.Join(rows[0].Workspace, "child.txt"))
+	data, err := os.ReadFile(filepath.Join(a.services.cfg.Workspace, "child.txt"))
 	if err != nil || string(data) != "created" {
 		t.Fatalf("write=%q %v", data, err)
 	}
-	if rows[0].Role != "worker" || rows[0].WorkspaceMode != "isolated" || rows[0].Workspace == a.services.cfg.Workspace {
+	if rows[0].Role != "worker" || rows[0].WorkspaceMode != "shared" || rows[0].Workspace != a.services.cfg.Workspace {
 		t.Fatalf("wrong defaults: %+v", rows)
-	}
-	if _, err := os.Stat(filepath.Join(a.services.cfg.Workspace, "child.txt")); !os.IsNotExist(err) {
-		t.Fatal("default worker modified parent workspace")
 	}
 	saved, err := archive.Load(a.services.cfg.SessionDir, rows[0].SessionID)
 	if err != nil {
@@ -51,6 +48,7 @@ func TestIsolatedWorkerDefaultCanWriteWithoutGit(t *testing.T) {
 func TestExplorerCanReportButCannotWrite(t *testing.T) {
 	f := &fakeLLM{script: []string{"tool:Write|file_path=forbidden.txt;content=bad", "tool:SendMessage|agent_id=parent;text=write is blocked", "tool:SendMessage|agent_id=parent;text=inspection complete", "text:reported"}}
 	a, _ := newTestAgent(t, f)
+	a.SetChildInteraction(true)
 	rows, err := runTestChildren(a, []childTask{{Description: "inspect", Role: "explorer"}}, "explorer")
 	if err != nil || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
@@ -129,8 +127,10 @@ func TestChildDormantMessagesSurviveContinuation(t *testing.T) {
 		t.Fatalf("%+v %v", rows, err)
 	}
 	id := protocol.SessionID(rows[0].SessionID)
-	if err := a.sendAgentMessage(context.Background(), "queued-message", string(id), "remember this"); err != nil {
-		t.Fatal(err)
+	a.services.perms.SetMode(permissions.ModeManual)
+	output, failed := executeTestTool(t, a, messages.ToolCall{ID: "queued-message", Name: "SendMessage", Arguments: map[string]any{"agent_id": string(id), "text": "remember this"}})
+	if failed || !strings.Contains(output, `"status":"queued"`) {
+		t.Fatalf("parent message was not queued: %s", output)
 	}
 	r, _ := a.services.supervisor.lookup(id)
 	r.mu.Lock()
@@ -159,6 +159,9 @@ func TestChildDormantMessagesSurviveContinuation(t *testing.T) {
 	found := 0
 	for _, m := range saved.History {
 		if strings.Contains(m.Content, "remember this") {
+			if m.Role != messages.RoleUser || m.InternalSource != protocol.CollaborationSource {
+				t.Fatalf("delivered mail lost its model role or mailbox origin: %+v", m)
+			}
 			found++
 		}
 	}
@@ -259,7 +262,7 @@ func TestChildForkCopiesBalancedPrefix(t *testing.T) {
 		{Role: messages.RoleAssistant, ToolCalls: []messages.ToolCall{{ID: "pending", Name: "SpawnAgent"}}},
 	}
 	a.mu.Unlock()
-	rows, err := runTestChildren(a, []childTask{{Description: "child assignment", ContextMode: "fork"}}, "fork")
+	rows, err := runTestChildren(a, []childTask{{Description: "child assignment"}}, "fork")
 	if err != nil || rows[0].Error != "" {
 		t.Fatalf("%+v %v", rows, err)
 	}

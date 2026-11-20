@@ -65,7 +65,7 @@ func (a *Agent) retainMemorySession(c *memorySessionCatalog) error {
 		saved := memoryRunRecords{records: append([]session.Record(nil), run.memory...), blobs: run.memoryBlobs}
 		run.mu.Unlock()
 		if saved.records == nil && child != nil {
-			records, artifacts, err := child.ReadRunRecords(context.Background())
+			records, artifacts, _, err := child.ReadRunRecords(context.Background())
 			if err != nil {
 				return err
 			}
@@ -97,7 +97,7 @@ func retainMemoryPersistence(c *memorySessionCatalog, p *sessionPersistence) err
 }
 
 func readMemorySession(p *sessionPersistence) (*archive.Snapshot, error) {
-	records, artifacts, err := p.ReadSnapshot()
+	records, artifacts, _, err := p.ReadSnapshot()
 	if err != nil {
 		return nil, err
 	}

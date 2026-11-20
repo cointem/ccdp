@@ -4,8 +4,6 @@ import (
 	"ccdp/internal/protocol"
 	"context"
 	tea "github.com/charmbracelet/bubbletea"
-	"strconv"
-	"strings"
 	"time"
 )
 
@@ -40,8 +38,15 @@ func (m *Model) loadAgentHistory(before uint64) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		page, err := directory.ReadTranscript(ctx, protocol.SessionID(id), before, 64)
-		return agentHistoryMsg{sessionID: id, page: page, err: err, request: request, generation: generation}
+		cursor := before
+		for {
+			page, err := directory.ReadTranscript(ctx, protocol.SessionID(id), cursor, 64)
+			page.Items = protocol.ChatItems(page.Items)
+			if err != nil || len(page.Items) != 0 || !page.More || page.Before == 0 || (cursor != 0 && page.Before >= cursor) {
+				return agentHistoryMsg{sessionID: id, page: page, err: err, request: request, generation: generation}
+			}
+			cursor = page.Before
+		}
 	}
 }
 func (m *Model) loadAgentOutput(id string, offset int64) tea.Cmd {
@@ -94,13 +99,6 @@ func (m *Model) applyAgentHistory(msg agentHistoryMsg) bool {
 	}
 	m.reader = r
 	return true
-}
-func (m *Model) agentOutputSelection(id string) tea.Cmd {
-	if strings.HasPrefix(id, "history-before:") {
-		before, _ := strconv.ParseUint(strings.TrimPrefix(id, "history-before:"), 10, 64)
-		return m.loadAgentHistory(before)
-	}
-	return m.loadAgentOutput(id, 0)
 }
 func (m *Model) applyAgentOutput(msg agentOutputMsg) bool {
 	if msg.generation != m.attachmentGeneration || msg.sessionID != m.sessionID || msg.request != 0 && msg.request != m.readerRequest {

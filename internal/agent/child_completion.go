@@ -66,20 +66,7 @@ func (a *Agent) RequestAdmitted(id string) bool {
 	return p != nil && p.RequestAdmitted(id)
 }
 
-func (a *Agent) ReadRunRecords(ctx context.Context) ([]session.Record, journal.ArtifactReader, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-	p := a.persistenceHandle()
-	if p == nil {
-		return nil, nil, session.ErrClosed
-	}
-	return p.ReadSnapshot()
-}
-
-// ReadRunRecordsWithRecovery is the transcript reader's immutable log snapshot.
-// Ordinary artifact/output readers retain the smaller ReadRunRecords contract.
-func (a *Agent) ReadRunRecordsWithRecovery(ctx context.Context) ([]session.Record, journal.ArtifactReader, session.Cursor, error) {
+func (a *Agent) ReadRunRecords(ctx context.Context) ([]session.Record, journal.ArtifactReader, session.Cursor, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, 0, err
 	}
@@ -87,7 +74,7 @@ func (a *Agent) ReadRunRecordsWithRecovery(ctx context.Context) ([]session.Recor
 	if p == nil {
 		return nil, nil, 0, session.ErrClosed
 	}
-	return p.ReadSnapshotWithRecovery()
+	return p.ReadSnapshot()
 }
 
 func (a *Agent) PersistenceFailure() error { return a.persistenceFailure() }

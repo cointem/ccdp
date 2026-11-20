@@ -40,7 +40,7 @@ func applySessionSettingsToConfig(cfg *config.Config, settings session.Settings)
 	if !launchOverride("memory_history") {
 		cfg.MemoryHistory = settings.MemoryHistory
 	}
-	if settings.Model != "" && !launchOverride("model") {
+	if settings.Model != "" && !launchOverride("model") && cfg.ValidateModelSelection(settings.Model) == nil {
 		cfg.Model = settings.Model
 	}
 	// settings.Endpoint is a record of which endpoint served the previous
@@ -172,7 +172,12 @@ func buildEffectiveConfig(base config.Config, initial *archive.Snapshot, isolate
 	}
 	base.TrustStore = trustStore
 	if initial != nil && initial.Settings != nil {
-		applySessionSettingsToConfig(&base, *initial.Settings)
+		saved := *initial.Settings
+		if initial.HasLegacyCreationSettings() {
+			saved.NetworkAccess = base.NetworkAccess
+			saved.LocalDevelopmentNetwork = base.LocalDevelopmentNetwork
+		}
+		applySessionSettingsToConfig(&base, saved)
 	}
 	if !isolated && !opts.EffectiveConfigFrozen {
 		if err := base.ApplyProjectPermission(); err != nil {

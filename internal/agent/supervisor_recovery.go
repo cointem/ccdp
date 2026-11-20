@@ -31,7 +31,7 @@ func (s *SessionSupervisor) readChildOutboxes() {
 		records := r.memory
 		if records == nil {
 			var err error
-			records, _, err = s.readRecordedSessionRecords(ctx, r.fact.Child.SessionID)
+			records, _, _, err = s.readRecordedSessionRecords(ctx, r.fact.Child.SessionID)
 			if err != nil {
 				if !errors.Is(err, os.ErrNotExist) {
 					r.fact.Child.Run.Error = fmt.Sprintf("child history unavailable: %v", err)

@@ -15,6 +15,7 @@ import (
 	processExecution "ccdp/internal/execution"
 	"ccdp/internal/fsops"
 	"ccdp/internal/hooks"
+	"ccdp/internal/mcp"
 	"ccdp/internal/messages"
 	"ccdp/internal/permissions"
 	"ccdp/internal/protocol"
@@ -117,6 +118,9 @@ func (a *Agent) runToolWithJournalPolicy(tc messages.ToolCall, tool tools.Tool, 
 	a.emitStatus("%s running…", tc.Name)
 	start := time.Now()
 	tctx := a.buildToolContext(tc, turnCtx, cfg, sb, resources, skills)
+	if mcp.IsExaSearch(tool) {
+		tctx.Context = mcp.BindExaCredential(tctx.Context, tool, cfg.ExaCredential())
+	}
 	tctx.ObserveRead = func(path string, version fsops.Version) {
 		observeRead = func(delivered string) {
 			// At least the first content rune (or the empty-file marker) must

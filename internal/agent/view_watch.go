@@ -165,7 +165,10 @@ func (a *Agent) Watch(ctx context.Context, cursor protocol.Cursor) (protocol.Sub
 	}
 	select {
 	case result := <-request.result:
-		return result.subscription, result.err
+		if result.err != nil {
+			return nil, result.err
+		}
+		return result.subscription, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-a.owner.done:

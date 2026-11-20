@@ -72,14 +72,14 @@ func OpenAuthorizedRegular(root, path string, authorize func(string) (string, er
 }
 
 func openCanonicalRegular(path string) (*os.File, error) {
-	dir, err := unix.Open(string(filepath.Separator), directorySearchFlags, 0)
+	dir, err := OpenDirectoryAt(unix.AT_FDCWD, string(filepath.Separator))
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
 	defer func() { _ = unix.Close(dir) }()
 	parts := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
 	for _, part := range parts[:len(parts)-1] {
-		next, err := unix.Openat(dir, part, directorySearchFlags, 0)
+		next, err := OpenDirectoryAt(dir, part)
 		if err != nil {
 			return nil, &os.PathError{Op: "open", Path: path, Err: err}
 		}
@@ -91,4 +91,17 @@ func openCanonicalRegular(path string) (*os.File, error) {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
 	return regularFile(os.NewFile(uintptr(fd), path), nil, path)
+}
+
+// OpenDirectoryAt pins a directory for traversal without requesting its
+// contents. Callers walk one component at a time so O_NOFOLLOW protects every
+// ancestor, including when Seatbelt permits metadata but denies listings.
+// The caller owns the returned descriptor.
+func OpenDirectoryAt(parent int, name string) (int, error) {
+	for {
+		fd, err := unix.Openat(parent, name, directorySearchFlags, 0)
+		if err != unix.EINTR {
+			return fd, err
+		}
+	}
 }

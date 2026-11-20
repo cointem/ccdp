@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -113,12 +114,19 @@ type Client struct {
 	retryDelay time.Duration
 	// Opaque state belongs to one endpoint/account, independently of wire type.
 	providerOrigin string
+	// Protocol capability learned for a wire model on this endpoint/account.
+	plainAnthropicTools sync.Map // map[string]struct{}
 }
 
 // NewClient validates the config and returns a client.
 func NewClient(cfg Config) (*Client, error) {
 	if cfg.BaseURL == "" {
 		return nil, errors.New("llm: base_url is required")
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Wire)) {
+	case "", "chat", "anthropic", "responses":
+	default:
+		return nil, fmt.Errorf("llm: unsupported wire format %q", cfg.Wire)
 	}
 	baseURL := normalizeBaseURL(cfg.BaseURL)
 	httpc := cfg.HTTPClient
@@ -218,6 +226,18 @@ func (c *Client) stream(ctx context.Context, req CompletionRequest, onDelta func
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
+		if !emitted && c.isAnthropic() && rejectsAnthropicInlineTools(rerr, body) {
+			c.plainAnthropicTools.Store(c.wireModel(req.Model), struct{}{})
+			// Runtime callers journal each HTTP attempt. Return the rejection
+			// as retryable so their next attempt uses the ordinary Messages body.
+			rerr = &RetryableError{Err: rerr}
+			if attempt < c.maxRetries {
+				body, err = c.marshalRequestBody(req)
+				if err != nil {
+					return result, fmt.Errorf("llm: marshal fallback request: %w", err)
+				}
+			}
+		}
 		// Retrying replays the stream from the start: if any delta already
 		// reached the caller (UI + history), a retry would duplicate it.
 		retryAfter, retryable := RetryAfter(rerr)
@@ -281,11 +301,16 @@ func isLoopbackHost(host string) bool {
 	return false
 }
 
+func (c *Client) wireModel(model string) string {
+	if c.cfg.APIModel != "" {
+		return c.cfg.APIModel
+	}
+	return model
+}
+
 // marshalRequestBody builds the wire-specific request payload.
 func (c *Client) marshalRequestBody(req CompletionRequest) ([]byte, error) {
-	if c.cfg.APIModel != "" {
-		req.Model = c.cfg.APIModel
-	}
+	req.Model = c.wireModel(req.Model)
 	if c.isResponses() {
 		return c.responsesBody(req)
 	}

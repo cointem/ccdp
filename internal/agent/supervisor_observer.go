@@ -58,7 +58,7 @@ func (c *managedClient) Snapshot(ctx context.Context) (protocol.SessionView, err
 			if err != nil {
 				return view, err
 			}
-			view.Transcript, view.TranscriptMore = page.Items, page.More
+			view.Transcript, view.TranscriptMore, view.TranscriptPrompt = page.Items, page.More, page.Prompt
 		}
 		data, _ := json.Marshal(view)
 		var clone protocol.SessionView
@@ -77,7 +77,7 @@ func (c *managedClient) Snapshot(ctx context.Context) (protocol.SessionView, err
 	if err != nil && !errors.Is(err, os.ErrNotExist) && row.Run.Status != "queued" && row.Run.Status != "starting" {
 		return view, err
 	}
-	view.Transcript, view.TranscriptMore = page.Items, page.More
+	view.Transcript, view.TranscriptMore, view.TranscriptPrompt = page.Items, page.More, page.Prompt
 	if row.Purpose == childPurposeReview && !row.Run.Active() && len(view.Transcript) == 0 {
 		text := row.Run.Output
 		if text == "" {
@@ -88,7 +88,7 @@ func (c *managedClient) Snapshot(ctx context.Context) (protocol.SessionView, err
 		}
 	}
 	// Recover presentation metadata without starting a runtime/provider.
-	records, _, readErr := c.supervisor.readSessionRecords(ctx, row.SessionID)
+	records, _, _, readErr := c.supervisor.readSessionRecords(ctx, row.SessionID)
 	if readErr == nil {
 		for _, record := range records {
 			if usage, ok := record.Event.(*session.UsageChanged); ok {
@@ -130,7 +130,7 @@ func (c *managedClient) Watch(ctx context.Context, cursor protocol.Cursor) (prot
 }
 
 func (c *managedClient) ReadOperation(ctx context.Context, id protocol.CommandID) (protocol.OperationResult, error) {
-	records, blobs, err := c.supervisor.readSessionRecords(ctx, c.id)
+	records, blobs, _, err := c.supervisor.readSessionRecords(ctx, c.id)
 	if err != nil {
 		return protocol.OperationResult{ID: id}, err
 	}
@@ -138,7 +138,7 @@ func (c *managedClient) ReadOperation(ctx context.Context, id protocol.CommandID
 }
 
 func (c *managedClient) ReadInput(ctx context.Context, id protocol.InputID) (protocol.InputResult, error) {
-	records, _, err := c.supervisor.readSessionRecords(ctx, c.id)
+	records, _, _, err := c.supervisor.readSessionRecords(ctx, c.id)
 	if err != nil {
 		return protocol.InputResult{ID: id}, err
 	}
@@ -207,14 +207,14 @@ func (c *managedClient) Submit(ctx context.Context, cmd protocol.Command) (proto
 		expected = c.initialRun
 	}
 	if expected != row.Run.ID {
-		return protocol.Receipt{}, errors.New("stale run id")
+		return protocol.Receipt{}, protocol.ErrStaleRun
 	}
 	if !row.Run.Active() || row.Run.Status == "settling" {
 		return protocol.Receipt{}, errors.New("run settled; use continue")
 	}
 	switch cmd.Type {
 	case protocol.CommandSubmitInput:
-		if row.Purpose != childPurposeTask && row.Purpose != childPurposeReview {
+		if !isTaskChild(row.Purpose) {
 			return protocol.Receipt{}, errors.New("guardian is read-only")
 		}
 	case protocol.CommandApproveTool:
@@ -254,7 +254,7 @@ func (s *SessionSupervisor) priorChildInputReceipt(ctx context.Context, r *manag
 			return protocol.Receipt{}, false, ctx.Err()
 		}
 	}
-	records, _, err := s.readSessionRecords(ctx, cmd.SessionID)
+	records, _, _, err := s.readSessionRecords(ctx, cmd.SessionID)
 	if errors.Is(err, os.ErrNotExist) {
 		return protocol.Receipt{}, false, nil // queued child not constructed yet
 	}

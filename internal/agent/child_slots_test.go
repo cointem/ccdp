@@ -85,9 +85,9 @@ func TestGuardianSlotsIndependentFromTaskAndToolLimits(t *testing.T) {
 }
 
 func TestChildTaskDefaults(t *testing.T) {
-	for _, tc := range []struct{ role, workspace string }{{"worker", "isolated"}, {"explorer", "shared"}} {
+	for _, tc := range []struct{ role, workspace string }{{"worker", "shared"}, {"explorer", "shared"}} {
 		task, err := resolveChildTask(childTask{Role: tc.role})
-		if err != nil || task.WorkspaceMode != tc.workspace || task.ContextMode != "fresh" {
+		if err != nil || task.WorkspaceMode != tc.workspace || task.ContextMode != "fork" {
 			t.Fatalf("%+v %v", task, err)
 		}
 	}

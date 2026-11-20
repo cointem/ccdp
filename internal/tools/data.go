@@ -50,7 +50,7 @@ func (*LSTool) OutputSchema() map[string]any {
 	return objectOutput(map[string]any{"path": scalarOutput("string"), "entries": arrayOutput(objectOutput(map[string]any{"name": scalarOutput("string"), "is_dir": scalarOutput("boolean"), "size": scalarOutput("integer")})), "total": scalarOutput("integer"), "truncated": scalarOutput("boolean")})
 }
 func (*RgTool) OutputSchema() map[string]any {
-	return objectOutput(map[string]any{"mode": scalarOutput("string"), "entries": arrayOutput(objectOutput(map[string]any{"path": scalarOutput("string"), "line": scalarOutput("integer"), "text": scalarOutput("string"), "match": scalarOutput("boolean"), "count": scalarOutput("integer")})), "offset": scalarOutput("integer"), "next_offset": scalarOutput("integer"), "truncated": scalarOutput("boolean")})
+	return objectOutput(map[string]any{"mode": scalarOutput("string"), "entries": arrayOutput(objectOutput(map[string]any{"path": scalarOutput("string"), "line": scalarOutput("integer"), "text": scalarOutput("string"), "match": scalarOutput("boolean"), "count": scalarOutput("integer")})), "offset": scalarOutput("integer"), "next_offset": scalarOutput("integer"), "truncated": scalarOutput("boolean"), "context_limited": scalarOutput("boolean"), "before": scalarOutput("integer"), "after": scalarOutput("integer")})
 }
 
 // The process view produces structured data once. Text is a separate compact

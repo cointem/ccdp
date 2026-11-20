@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -124,6 +127,26 @@ func anthropicBetaHeader(body []byte) string {
 	return strings.Join(betas, ", ")
 }
 
+// Match a rejection of the feature itself. For example, an invalid schema
+// inside a tool_addition is an ordinary validation error.
+const (
+	inlineToolFeature = `\b(?:tool_addition|tool_removal|defer_loading|` + anthropicInlineToolsBeta + `)\b`
+	quotedFeature     = `["'\x60]?` + inlineToolFeature + `["'\x60]?`
+	rejectionSubject  = `(?:content block type|content type|block type|type|variant|tag|beta(?: flag| header)?|field|parameter|value(?:\(s\)|s)?)`
+)
+
+var inlineToolRejection = regexp.MustCompile(`(?i)\b(?:unsupported|unknown|unrecognized|unexpected|invalid)\s+(?:` +
+	rejectionSubject + `\s*[:=]?\s*)?` + quotedFeature + `|` +
+	quotedFeature + `[\s:]+(?:is |are )?(?:unsupported|not supported|not permitted|not allowed|unrecognized|extra inputs are not permitted)\b`)
+
+func rejectsAnthropicInlineTools(err error, body []byte) bool {
+	var rejection *HTTPRejection
+	if !errors.As(err, &rejection) || (rejection.StatusCode != http.StatusBadRequest && rejection.StatusCode != http.StatusUnprocessableEntity) {
+		return false
+	}
+	return inlineToolRejection.MatchString(rejection.Message) && strings.Contains(anthropicBetaHeader(body), anthropicInlineToolsBeta)
+}
+
 // blocksForContent converts a ChatMessage content value (string or parts list)
 // into Anthropic content blocks (text and base64 images).
 func anthropicBlocks(content any) ([]map[string]any, error) {
@@ -232,18 +255,20 @@ func toolUseBlock(tc ToolCall) map[string]any {
 	return map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": input}
 }
 
-// anthropicBody builds the Anthropic Messages request payload.
-func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
-	projection := projectTools(req, toolUpdatesChanges)
+func (c *Client) anthropicToolProjection(req CompletionRequest) toolProjection {
+	full := toolProjection{tools: req.Tools}
+	if _, plain := c.plainAnthropicTools.Load(req.Model); plain {
+		return full
+	}
+	projection := projectTools(req)
 	// Inline tools need an initially active tool, and the placeholder name must
 	// not shadow a real declaration.
 	if len(projection.tools) == 0 {
-		projection = toolProjection{tools: req.Tools}
+		return full
 	}
 	for _, tool := range slices.Concat(req.Tools, projection.tools) {
 		if tool.Function.Name == anthropicToolPlaceholder {
-			projection = toolProjection{tools: req.Tools}
-			break
+			return full
 		}
 	}
 	// A real tool may have used the reserved name and then been removed. Its
@@ -251,11 +276,16 @@ func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
 	for _, update := range projection.updates {
 		for _, tool := range update.Added {
 			if tool.Name == anthropicToolPlaceholder {
-				projection = toolProjection{tools: req.Tools}
-				break
+				return full
 			}
 		}
 	}
+	return projection
+}
+
+// anthropicBody builds the Anthropic Messages request payload.
+func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
+	projection := c.anthropicToolProjection(req)
 	var system strings.Builder
 	messages := make([]anthropicMessage, 0, len(req.Messages)+4)
 	var pending []anthropicMessage
@@ -391,7 +421,11 @@ func (c *Client) anthropicBody(req CompletionRequest) ([]byte, error) {
 	if projection.native {
 		br.Tools = append(br.Tools, anthropicTool{Name: anthropicToolPlaceholder, Description: "Reserved placeholder. Never available. Never call this.", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}, "required": []string{}}, DeferLoading: true})
 	}
-	if effort := anthropicEffort(req.ReasoningEffort); effort != "" {
+	effort := anthropicEffort(req.ReasoningEffort)
+	if req.NativeXHigh && req.ReasoningEffort == "xhigh" {
+		effort = "xhigh"
+	}
+	if effort != "" {
 		br.Thinking = &anthropicThinking{Type: "adaptive"}
 		br.OutputCfg = &anthropicOutputConfig{Effort: effort}
 	} else if req.Thinking != nil && req.Thinking.Type == "enabled" {
@@ -515,11 +549,11 @@ func (c *Client) anthropicStreamOnce(ctx context.Context, body []byte, onDelta f
 
 	type slot struct {
 		id, name string
+		input    json.RawMessage
 		args     strings.Builder
 	}
 	toolSlots := map[int]*slot{}
 	providerBlocks := map[int]map[string]any{}
-	providerArgs := map[int]string{}
 	// The thinking phase ends when a non-thinking block (text/tool_use) starts,
 	// when the thinking block stops, or at message_delta — claude uses the first
 	// text/tool_use block start to stop its thinking mode. Each boundary closes
@@ -564,9 +598,9 @@ func (c *Client) anthropicStreamOnce(ctx context.Context, body []byte, onDelta f
 		sort.Ints(indexes)
 		for _, index := range indexes {
 			block := providerBlocks[index]
-			if args, ok := providerArgs[index]; ok && args != "" {
+			if s := toolSlots[index]; s != nil && s.args.Len() > 0 && block["type"] == "tool_use" {
 				var input any
-				decoder := json.NewDecoder(strings.NewReader(args))
+				decoder := json.NewDecoder(strings.NewReader(s.args.String()))
 				decoder.UseNumber()
 				if decoder.Decode(&input) == nil {
 					block["input"] = input
@@ -659,7 +693,7 @@ loop:
 				case "tool_use":
 					// claude stops thinking mode when a tool input block starts.
 					thinking.end()
-					toolSlots[ev.Index] = &slot{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
+					toolSlots[ev.Index] = &slot{id: ev.ContentBlock.ID, name: ev.ContentBlock.Name, input: ev.ContentBlock.Input}
 				}
 			}
 		case "content_block_stop":
@@ -681,8 +715,6 @@ loop:
 				case "signature_delta":
 					old, _ := block["signature"].(string)
 					block["signature"] = old + ev.Delta.Signature
-				case "input_json_delta":
-					providerArgs[ev.Index] += ev.Delta.PartialJSON
 				}
 			}
 			switch ev.Delta.Type {
@@ -727,13 +759,19 @@ loop:
 		if s.id == "" || s.name == "" {
 			continue
 		}
+		// Some Messages endpoints supply the entire input in the start
+		// event. Once deltas arrive they are authoritative, even if truncated.
+		args := s.args.String()
+		if args == "" {
+			args = string(s.input)
+		}
 		result.ToolCalls = append(result.ToolCalls, ToolCall{
 			ID:    s.id,
 			Index: idx,
 			Type:  "function",
 			Function: Function{
 				Name:      s.name,
-				Arguments: ArgumentsJSON(s.args.String()),
+				Arguments: ArgumentsJSON(args),
 			},
 		})
 	}

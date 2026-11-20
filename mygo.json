@@ -1,0 +1,9 @@
+{
+  "name": "ccdp",
+  "slug": "ccdp-desktop",
+  "identifier": "dev.ccdp.desktop",
+  "version": "0.2.0",
+  "main": "./cmd/ccdp-desktop",
+  "icon": "assets/icon.png",
+  "out": "build/desktop"
+}

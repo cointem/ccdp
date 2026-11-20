@@ -301,21 +301,22 @@ func NewRgTool() *RgTool { return &RgTool{} }
 func (t *RgTool) Name() string { return "Rg" }
 
 func (t *RgTool) Description() string {
-	return `Search file contents with ripgrep (rg). Uses rg's default Unicode-aware regular expressions; literal=true uses fixed strings. Requires rg installed on PATH.
+	return `Search file contents by text or regex with ripgrep (rg/grep). Pass a file or directory as path. For a filename search, use Glob. Returned paths can be passed directly to Read.
 Respects scoped .gitignore rules and skips VCS/dependency/cache directories. Hidden files are included; recursive searches do not follow symlinks.
 mode="content" returns matching lines, "files" returns paths, "count" returns matching-line counts per file. Use context or before/after for surrounding lines, offset/limit for pagination. Multiline enables dot-all matching; oversized multiline files and output are reported as incomplete. All searches, including snapshots, run read-only inside the sandbox.`
 }
 
 func (t *RgTool) Parameters() map[string]any {
 	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
-		"pattern": map[string]any{"type": "string"}, "path": map[string]any{"type": "string"},
+		"pattern": map[string]any{"type": "string", "minLength": 1, "description": "Text or regular expression to find. Set literal=true for an exact string containing regex punctuation."},
+		"path":    map[string]any{"type": "string", "description": "File or directory. Relative paths start at the session workspace. Defaults to the working directory."},
 		"mode":    map[string]any{"default": "content", "type": "string", "enum": []string{"content", "files", "count"}},
 		"literal": map[string]any{"default": false, "type": "boolean"}, "ignore_case": map[string]any{"default": false, "type": "boolean"},
 		"multiline": map[string]any{"default": false, "type": "boolean"}, "only_matching": map[string]any{"default": false, "type": "boolean"},
-		"glob": map[string]any{"type": "string"}, "type": map[string]any{"type": "string"},
-		"context": map[string]any{"default": 0, "type": "integer", "minimum": 0, "maximum": 20},
-		"before":  map[string]any{"type": "integer", "minimum": 0, "maximum": 20},
-		"after":   map[string]any{"type": "integer", "minimum": 0, "maximum": 20},
+		"glob": map[string]any{"type": "string", "description": "Filter filenames, for example *.go or **/*.{ts,tsx}."}, "type": map[string]any{"type": "string", "description": "Comma-separated file types: " + strings.Join(rgTypeNames(), ", ")},
+		"context": map[string]any{"default": 0, "type": "integer", "minimum": 0, "description": "Lines before and after each match. Broad requests return bounded excerpts; use Read for more."},
+		"before":  map[string]any{"type": "integer", "minimum": 0, "description": "Override the number of context lines before each match."},
+		"after":   map[string]any{"type": "integer", "minimum": 0, "description": "Override the number of context lines after each match."},
 		"offset":  map[string]any{"default": 0, "type": "integer", "minimum": 0, "maximum": 100000},
 		"limit":   map[string]any{"default": 100, "type": "integer", "minimum": 1, "maximum": 1000},
 	}, "required": []string{"pattern"}}
@@ -327,7 +328,7 @@ func (t *RgTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 			return "", err
 		}
 		pattern := StringArg(ctx.Args, "pattern", "")
-		if strings.TrimSpace(pattern) == "" {
+		if pattern == "" {
 			return "", fmt.Errorf("Rg: missing pattern")
 		}
 		base := ctx.WorkingDir
@@ -336,11 +337,11 @@ func (t *RgTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 		}
 		base, err := ctx.ResolveRead(base)
 		if err != nil {
-			return "", fmt.Errorf("Rg: %w", err)
+			return "", fmt.Errorf("Rg: %w", readPathError(err))
 		}
 		info, err := os.Stat(base)
 		if err != nil {
-			return "", fmt.Errorf("Rg: %w", err)
+			return "", fmt.Errorf("Rg: %w", readPathError(err))
 		}
 		singleFile := ""
 		if !info.IsDir() {
@@ -367,32 +368,39 @@ func (t *RgTool) Execute(ctx *Context, args map[string]any) (Result, error) {
 		if headLimit < 1 || headLimit > 1000 {
 			return "", fmt.Errorf("Rg: limit must be 1..1000")
 		}
-		contextLines, err := boundedInt(ctx.Args, "context", 0, 0, 20)
+		contextLines, err := IntArgChecked(ctx.Args, "context", 0)
 		if err != nil {
 			return "", err
 		}
-		before, err := boundedInt(ctx.Args, "before", contextLines, 0, 20)
+		before, err := IntArgChecked(ctx.Args, "before", contextLines)
 		if err != nil {
 			return "", err
 		}
-		after, err := boundedInt(ctx.Args, "after", contextLines, 0, 20)
+		after, err := IntArgChecked(ctx.Args, "after", contextLines)
 		if err != nil {
 			return "", err
 		}
 
+		if contextLines < 0 || before < 0 || after < 0 {
+			return "", fmt.Errorf("Rg: context, before and after must be nonnegative")
+		}
+		// Larger excerpts share a fixed allowance beyond the original 20 lines
+		// per side. The backend retains matches through offset for pagination.
+		contextLimit := min(50, 20+5000/(offset+headLimit))
 		req := &rgRequest{
-			singleFile: singleFile,
-			pattern:    pattern,
-			literal:    BoolArg(ctx.Args, "literal", false),
-			base:       base,
-			outputMode: mode,
-			ignoreCase: BoolArg(ctx.Args, "ignore_case", false),
-			multiline:  BoolArg(ctx.Args, "multiline", false),
-			onlyMatch:  BoolArg(ctx.Args, "only_matching", false),
-			before:     before,
-			after:      after,
-			maxLines:   headLimit,
-			offset:     offset,
+			singleFile:     singleFile,
+			pattern:        pattern,
+			literal:        BoolArg(ctx.Args, "literal", false),
+			base:           base,
+			outputMode:     mode,
+			ignoreCase:     BoolArg(ctx.Args, "ignore_case", false),
+			multiline:      BoolArg(ctx.Args, "multiline", false),
+			onlyMatch:      BoolArg(ctx.Args, "only_matching", false),
+			before:         min(before, contextLimit),
+			after:          min(after, contextLimit),
+			contextLimited: mode == rgModeContent && max(before, after) > contextLimit,
+			maxLines:       headLimit,
+			offset:         offset,
 		}
 		if glob := StringArg(ctx.Args, "glob", ""); glob != "" {
 			req.globs = []string{glob}

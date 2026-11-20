@@ -127,7 +127,7 @@ func TestFormalToolFactsGateRealLoop(t *testing.T) {
 }
 
 func TestFormalMalformedToolArgumentsHaveNoEffect(t *testing.T) {
-	for _, raw := range []string{`null`, `[]`, `{"broken":`, `{} {}`} {
+	for _, raw := range []string{`null`, `[]`, `{"broken":`, `{} {}`, ` `, `{"bad":!}`} {
 		t.Run(raw, func(t *testing.T) {
 			provider := &formalToolFactProvider{args: raw}
 			a := newJournalRuntimeAgent(t, provider)
@@ -138,8 +138,8 @@ func TestFormalMalformedToolArgumentsHaveNoEffect(t *testing.T) {
 			if got := fixture.count.Load(); got != 0 {
 				t.Fatalf("malformed provider call executed %d effects", got)
 			}
-			if view.LastTurn.Status != protocol.TurnFailed {
-				t.Fatalf("malformed call should fail the turn: %+v", view.LastTurn)
+			if view.LastTurn.Status != protocol.TurnSucceeded || provider.calls.Load() != 2 {
+				t.Fatalf("malformed batch outcome = %+v, requests = %d", view.LastTurn, provider.calls.Load())
 			}
 		})
 	}

@@ -175,7 +175,7 @@ func TestStoppedChildQueuedInputRequiresFreshIdentity(t *testing.T) {
 			if err := p.PersistInputQueuedWithDigest("queued-input", "work", string(strategy), "turn-1", a.conversation.createdAt, digest); err != nil {
 				t.Fatal(err)
 			}
-			rows, blobs, err := p.ReadSnapshot()
+			rows, blobs, _, err := p.ReadSnapshot()
 			if err != nil {
 				t.Fatal(err)
 			}

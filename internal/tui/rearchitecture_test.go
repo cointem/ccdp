@@ -51,7 +51,7 @@ func TestHistoryUnknownToolDoesNotBlockFollowingAssistant(t *testing.T) {
 	if toolStatusComplete("unknown") {
 		t.Fatal("unknown outcome must not be treated as successful dispatch")
 	}
-	view := renderAgentSingle(toolPresentation{Name: "SpawnAgent", Status: "unknown"}, nil, 80)
+	view := renderAgentPresentation(toolPresentation{Name: "SpawnAgent", Status: "unknown"}, 80)
 	if strings.Contains(view, "已派出") {
 		t.Fatalf("unknown dispatch rendered as successful: %s", view)
 	}

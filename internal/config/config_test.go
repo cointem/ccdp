@@ -248,7 +248,7 @@ func TestProjectExecutableTrustRequiresExactFingerprint(t *testing.T) {
 	dst := Default()
 	dst.AlwaysDeny = []string{"Write:protected"}
 	ApplyProjectSettings(&dst, &proj)
-	if len(dst.Hooks) != 0 || len(dst.Tools) != 0 || len(dst.MCPServers) != 0 {
+	if len(dst.Hooks) != 0 || len(dst.Tools) != 0 || len(dst.MCPServers) != 1 || !dst.MCPServers["exa"].DefaultInstall {
 		t.Fatalf("untrusted executable settings applied: hooks=%v tools=%v mcp=%v", dst.Hooks, dst.Tools, dst.MCPServers)
 	}
 	if !containsString(strings.Join(dst.AlwaysDeny, "\n"), "Bash:rm *") || !containsString(strings.Join(dst.AlwaysDeny, "\n"), "Write:protected") {
@@ -366,5 +366,37 @@ func TestCloneDeepCopiesOptionalPointersAndNestedSchemas(t *testing.T) {
 	}
 	if got := cfg.Tools[0].InputSchema["properties"].(map[string]any)["items"].([]any)[0].(map[string]any)["type"]; got != "string" {
 		t.Fatalf("nested schema was aliased: %v", got)
+	}
+}
+
+func TestDefaultExaMCPConfiguration(t *testing.T) {
+	t.Setenv("EXA_API_KEY", "environment-credential")
+	for _, tt := range []struct {
+		doc              string
+		wantExa, wantKey bool
+	}{
+		{`{}`, true, true},
+		{`{"mcp_servers":{"notes":{"command":"notes"}}}`, true, true},
+		{`{"mcp_servers":{"exa":{"command":"custom"}}}`, true, false},
+		{`{"mcp_servers":{"exa":{"disabled":true},"notes":{"command":"notes"}}}`, false, false},
+		{`{"mcp_servers":{"exa":null,"notes":{"command":"notes"}}}`, false, false},
+		{`{"mcp_servers":{}}`, false, false},
+		{`{"enable_web_tools":false}`, false, false},
+	} {
+		cfg, err := ParseFile("config.json", []byte(tt.doc))
+		if err != nil {
+			t.Fatal(err)
+		}
+		servers := cfg.RuntimeMCPServers()
+		exa, ok := servers["exa"]
+		if ok != tt.wantExa || (exa.HTTPHeaders["x-api-key"] == "environment-credential") != tt.wantKey {
+			t.Errorf("wrong server or credential selection for %s", tt.doc)
+		}
+		if strings.Contains(tt.doc, "notes") && servers["notes"].Command != "notes" {
+			t.Errorf("custom MCP lost for %s", tt.doc)
+		}
+		if cfg.MCPServers["exa"].HTTPHeaders != nil {
+			t.Fatal("private headers persisted in the configuration")
+		}
 	}
 }

@@ -523,6 +523,7 @@ func (m *Model) runAgentCommand(args []string) tea.Cmd {
 }
 
 func (m *Model) applyTranscript(items []protocol.TranscriptItem) {
+	items = protocol.ChatItems(items)
 	m.inline.nextIndex, m.inline.boundaryID = 0, ""
 	converted := make([]historyCell, 0, len(items))
 	for _, item := range items {
@@ -557,7 +558,8 @@ func (m *Model) applyTranscript(items []protocol.TranscriptItem) {
 }
 
 func (m *Model) upsertTranscript(item protocol.TranscriptItem) {
-	if item.ID == "" {
+	item, visible := item.ChatItem()
+	if !visible || item.ID == "" {
 		return
 	}
 	value := projectTranscriptCell(item)

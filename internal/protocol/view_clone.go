@@ -7,6 +7,12 @@ import "slices"
 func CloneSessionView(v SessionView) SessionView {
 	v.Goal = CloneGoal(v.Goal)
 	v.Question = CloneQuestionRequest(v.Question)
+	if v.TranscriptPrompt != nil {
+		prompt := *v.TranscriptPrompt
+		prompt.Args = slices.Clone(prompt.Args)
+		prompt.Process = CloneProcessState(prompt.Process)
+		v.TranscriptPrompt = &prompt
+	}
 	v.Transcript = slices.Clone(v.Transcript)
 	for i := range v.Transcript {
 		v.Transcript[i].Args = slices.Clone(v.Transcript[i].Args)
@@ -29,6 +35,7 @@ func CloneSessionView(v SessionView) SessionView {
 		copy := *v.LastTurn
 		v.LastTurn = &copy
 	}
+	v.Settings.ReasoningEfforts = slices.Clone(v.Settings.ReasoningEfforts)
 	v.Settings.Permission.AlwaysAllow = slices.Clone(v.Settings.Permission.AlwaysAllow)
 	v.Settings.Permission.AlwaysDeny = slices.Clone(v.Settings.Permission.AlwaysDeny)
 	v.Settings.Sandbox.AdditionalDirectories = slices.Clone(v.Settings.Sandbox.AdditionalDirectories)

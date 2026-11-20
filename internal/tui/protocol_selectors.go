@@ -100,8 +100,6 @@ func (m *Model) executeSelectorAction(action selectorAction, optionID string) te
 		return m.submitCommand(protocol.Command{Type: protocol.CommandSetGeneration, Generation: generation}, string(action.Kind)+" → "+optionID)
 	case selectorAgent:
 		return m.openAgentView(optionID)
-	case selectorAgentOutput:
-		return m.agentOutputSelection(optionID)
 	case selectorModel:
 		return m.submitCommand(protocol.Command{Type: protocol.CommandSetModel,
 			Model: &protocol.SetModel{Model: optionID}}, "model → "+optionID)

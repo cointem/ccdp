@@ -167,6 +167,21 @@ func (a *Agent) runTurn(input turnInput) {
 		steps++
 		a.emitStatus("thinking…")
 		outcome := a.runStep(turnCtx, prepared, &continueCount)
+		if outcome.action == stepInvalidToolCall {
+			if a.interrupted() {
+				a.postTurnNote(turnNoteRecorded{interrupted: true})
+				return
+			}
+			if turnCtx.Err() != nil {
+				return
+			}
+			if preparation.toolCallError == nil && (cfg.MaxTurns <= 0 || steps < cfg.MaxTurns) {
+				preparation.toolCallError = outcome.err
+				a.emitStatus("工具调用格式有误，正在请求模型重新生成…")
+				continue
+			}
+			a.emit(protocol.EventView{Kind: protocol.EventError, Text: outcome.err.Error()})
+		}
 		if outcome.action == stepRecoverContext && !preparation.contextRecovered {
 			preparation.contextRecovered = true
 			changed, recoveryErr := a.prepareContextForRequest(turnCtx, prepared.request, true, prepared.runtime)

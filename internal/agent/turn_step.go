@@ -23,6 +23,7 @@ type stepPreparation struct {
 	compactChecked     bool
 	attachmentsChecked bool
 	contextRecovered   bool
+	toolCallError      error
 }
 
 type preparedStep struct {
@@ -39,6 +40,7 @@ const (
 	stepRetry
 	stepWait
 	stepRecoverContext
+	stepInvalidToolCall
 )
 
 type stepOutcome struct {
@@ -84,6 +86,14 @@ func (a *Agent) prepareStep(ctx context.Context, state *stepPreparation) (prepar
 		if err != nil {
 			a.releaseStepContext(step)
 			return preparedStep{}, err
+		}
+		if state.toolCallError != nil {
+			// The malformed batch cannot be replayed as native tool calls.
+			// Give the model the validation error for this request only.
+			req.Messages = append(req.Messages, llm.ChatMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("The previous tool-call batch failed validation: %s. No calls from that batch ran. Reissue the needed calls with complete JSON objects.", state.toolCallError),
+			})
 		}
 		if !state.compactChecked {
 			state.compactChecked = true
@@ -217,9 +227,7 @@ func (a *Agent) runStep(ctx context.Context, prepared preparedStep, continueCoun
 			a.failTurnPersistence(err)
 			return stepOutcome{err: err}
 		}
-		err := fmt.Errorf("invalid tool call: %w", toolCallErr)
-		a.emit(protocol.EventView{Kind: protocol.EventError, Text: err.Error()})
-		return stepOutcome{err: err}
+		return stepOutcome{action: stepInvalidToolCall, err: fmt.Errorf("invalid tool call: %w", toolCallErr)}
 	}
 	a.recordGoalResponse(callText, len(calls))
 	assistant := messages.AssistantWithTools(callText, calls)

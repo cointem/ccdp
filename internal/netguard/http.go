@@ -4,13 +4,16 @@ package netguard
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -126,4 +129,11 @@ func publicIP(_ string, _ string, ip net.IP) error {
 		return fmt.Errorf("blocked: request to internal/private address")
 	}
 	return nil
+}
+
+// Interrupted reports transient read and connection failures.
+func Interrupted(err error) bool {
+	var networkError net.Error
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || (errors.As(err, &networkError) && networkError.Timeout())
 }

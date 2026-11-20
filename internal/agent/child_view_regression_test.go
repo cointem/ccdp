@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"reflect"
+	"slices"
 	"testing"
 
 	"ccdp/internal/llm"
@@ -12,7 +14,9 @@ import (
 
 func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 	p := &childRuntimeTestProvider{name: "child-view"}
+	requests := make(chan llm.CompletionRequest, 4)
 	p.stream = func(_ context.Context, req llm.CompletionRequest, _ func(string)) (llm.StreamResult, error) {
+		requests <- req
 		text := ""
 		for _, m := range req.Messages {
 			if isTaskMessage(m) {
@@ -22,7 +26,7 @@ func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 		return llm.StreamResult{Text: text, FinishReason: "stop"}, nil
 	}
 	a, _ := newChildRuntimeTestAgent(t, p)
-	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "original"}, childPurposeTask, "call")
+	r, err := a.services.supervisor.launch(a, a.lifecycle.rootCtx, childTask{Description: "original", Role: "explorer", WorkspaceMode: "shared"}, childPurposeTask, "call")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +67,20 @@ func TestChildViewCompletedSnapshotAndDirectContinuation(t *testing.T) {
 	waitManaged(t, next)
 	if next.err != nil || next.fact.Child.Run.Output != "followup" {
 		t.Fatalf("continuation: %+v %v", next.fact.Child.Run, next.err)
+	}
+	first, followup := <-requests, <-requests
+	if len(first.Tools) == 0 || !reflect.DeepEqual(first.Tools, followup.Tools) || next.fact.Child.SessionID != view.SessionID || next.fact.Child.Run.ID == view.RunID {
+		t.Fatal("continuation must use the original child session and tool catalog in a fresh run")
+	}
+	for _, def := range followup.Tools {
+		if slices.Contains([]string{"Bash", "Edit", "Write", "SpawnAgent"}, def.Function.Name) {
+			t.Fatalf("explorer acquired %s", def.Function.Name)
+		}
+	}
+	for _, m := range followup.Messages {
+		if m.ToolUpdate != nil && !m.ToolUpdate.Initial {
+			t.Fatalf("continuing an unchanged explorer injected a tool update: %+v", m.ToolUpdate)
+		}
 	}
 	repeated, err := reader.Submit(context.Background(), cmd)
 	if err != nil || repeated.Status != protocol.ReceiptApplied || repeated.Revision.LogSeq == 0 {

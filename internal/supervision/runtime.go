@@ -15,11 +15,10 @@ import (
 	"ccdp/internal/session/journal"
 )
 
-// ChildFactory constructs a runtime from a run's frozen inputs. On failure it
-// releases partially acquired session resources; on success the caller owns
-// FinishRun/CloseContext. Each factory is scoped to one run.
-type ChildFactory interface {
-	Open(context.Context) (ChildRuntime, error)
+// RunRecordReader snapshots records and artifacts together with the last
+// recovered record, which distinguishes interrupted work from live activity.
+type RunRecordReader interface {
+	ReadRunRecords(context.Context) ([]session.Record, journal.ArtifactReader, session.Cursor, error)
 }
 
 // ChildRuntime owns its journal throughout FinishRun. A canceled waiter does
@@ -30,10 +29,9 @@ type ChildRuntime interface {
 	AdmitMessage(protocol.Command) (protocol.Receipt, error)
 	RunStatus() RuntimeStatus
 	RunOutput(map[string]bool) string
-	RunBudgetError() error
 	PersistenceFailure() error
 	RequestAdmitted(string) bool
-	ReadRunRecords(context.Context) ([]session.Record, journal.ArtifactReader, error)
+	RunRecordReader
 	Context() context.Context
 	Done() <-chan struct{}
 	CloseContext(context.Context) error

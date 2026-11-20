@@ -104,8 +104,8 @@ func TestFrontendCollaborationEscapes(t *testing.T) {
 	for _, m := range []protocol.CollaborationMessage{{Kind: "final_result", Name: payload, Outcome: "success"}, {Kind: "message", Name: "child", Text: payload}} {
 		cell := historyCell{kind: "collaboration", messageID: "m", text: protocol.EncodeCollaboration(m)}
 		rendered := renderItemWidth(&cell, 80)
-		if len(rendered) == 0 {
-			t.Fatal("empty")
+		if m.Kind == "final_result" && len(rendered) == 0 {
+			t.Fatal("missing final result")
 		}
 		for i := 0; i+len(payload) <= len(rendered); i++ {
 			if rendered[i:i+len(payload)] == payload {

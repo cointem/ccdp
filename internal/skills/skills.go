@@ -28,6 +28,11 @@ import (
 const (
 	DefaultMaxSkillFileBytes   = 256 << 10
 	DefaultMaxSkillsIndexBytes = 128 << 10
+	// ManagedPluginsDir is a user-scoped directory of atomically installed
+	// skill bundles. Other hidden directories, including installs in progress,
+	// do not contribute skills.
+	ManagedPluginsDir    = ".plugins"
+	ManagedPluginReceipt = ".ccdp-installed.json"
 )
 
 // Skill is one loaded skill.
@@ -66,22 +71,41 @@ func (s *Store) LoadChecked(authorize func(string) (string, error), userDir stri
 	if authorize == nil {
 		return fmt.Errorf("skills: read policy is required")
 	}
-	dirs := make([]string, 0, len(projectDirs)+1)
-	dirs = append(dirs, userDir)
-	dirs = append(dirs, projectDirs...)
-
 	seen := map[string]bool{}
 	loadedSkills := make([]Skill, 0)
 	loadedByName := make(map[string]Skill)
 
-	// De-duplication is first-come-first-served, so process earlier project
-	// dirs first (the first project dir wins the slot) and the user dir last
-	// (project skills always override user skills).
-	order := make([]string, 0, len(dirs))
-	order = append(order, dirs[1:]...)
-	order = append(order, dirs[0]) // user dir last
+	// Resolve each skill name in order: project, loose user skill, installed
+	// skill bundle. Installing a package cannot replace a user's own skill.
+	order := append([]string(nil), projectDirs...)
+	order = append(order, userDir)
+	if userDir != "" {
+		managed := filepath.Join(userDir, ManagedPluginsDir)
+		if info, err := os.Lstat(managed); err == nil && info.IsDir() {
+			packages, err := os.ReadDir(managed)
+			if err != nil {
+				return err
+			}
+			for _, p := range packages {
+				if !p.IsDir() || strings.HasPrefix(p.Name(), ".") {
+					continue
+				}
+				path := filepath.Join(managed, p.Name())
+				receipt, err := os.Lstat(filepath.Join(path, ManagedPluginReceipt))
+				if err != nil || !receipt.Mode().IsRegular() {
+					continue
+				}
+				skillDir := filepath.Join(path, "skills")
+				if st, err := os.Lstat(skillDir); err == nil && st.IsDir() {
+					order = append(order, skillDir)
+				}
+			}
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 
-	for _, dir := range order {
+	for i, dir := range order {
 		if dir == "" {
 			continue
 		}
@@ -121,7 +145,7 @@ func (s *Store) LoadChecked(authorize func(string) (string, error), userDir stri
 			if truncated {
 				return fmt.Errorf("skills: %q exceeds %d bytes", md, DefaultMaxSkillFileBytes)
 			}
-			sk := parse(string(data), dirName, filepath.Join(dir, dirName), dir == userDir)
+			sk := parse(string(data), dirName, filepath.Join(dir, dirName), i >= len(projectDirs))
 			sk.CanonicalFile = canonical
 			if sk.Name == "" || sk.Body == "" {
 				continue

@@ -12,6 +12,25 @@ import (
 func editArgs(path, old, next string) map[string]any {
 	return map[string]any{"file_path": path, "edits": []any{map[string]any{"old_text": old, "new_text": next}}}
 }
+
+func TestReadMissingDirectoryAndCorrectedPath(t *testing.T) {
+	ctx := freshCtx(t)
+	dir := filepath.Join(ctx.WorkingDir, "src", "mrapps")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "wc.go"), []byte("package main\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := runTool(t, NewReadTool(), ctx, map[string]any{"file_path": "src/main/mrapps/wc.go"})
+	if err == nil || !strings.Contains(err.Error(), "Glob") || !strings.Contains(err.Error(), "no such file or directory") {
+		t.Fatalf("missing-path diagnostic: %v", err)
+	}
+	out, err := runTool(t, NewReadTool(), ctx, map[string]any{"file_path": "src/mrapps/wc.go"})
+	if err != nil || !strings.Contains(out, "package main") {
+		t.Fatalf("corrected read: %q, %v", out, err)
+	}
+}
 func TestLocalEditAfterPartialReadPreservesOtherChanges(t *testing.T) {
 	ctx := freshCtx(t)
 	p := filepath.Join(ctx.WorkingDir, "a")

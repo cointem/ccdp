@@ -338,7 +338,7 @@ func renderItemWidth(it *historyCell, width int) string {
 	case "user":
 		return renderUserCell(text, width)
 	case "collaboration":
-		return renderCollaborationCell(text, width)
+		return renderCollaborationCell(text)
 
 	case "command":
 		return styleUser.Render("❯ " + text)

@@ -14,5 +14,4 @@ func (*ReadOutputTool) ProgramCallable() bool   { return true }
 func (*ReadSkillTool) ProgramCallable() bool    { return true }
 func (*CodeNavigateTool) ProgramCallable() bool { return true }
 func (*WebFetchTool) ProgramCallable() bool     { return true }
-func (*WebSearchTool) ProgramCallable() bool    { return true }
 func (*CommandTool) ProgramCallable() bool      { return true }

@@ -53,7 +53,7 @@ func TestSupervisorInterruptCancelsQueuedInputsAndPreservesReceipt(t *testing.T)
 	if r.fact.Child.Run.Status != "cancelled" {
 		t.Fatalf("outcome: %+v", r.fact.Child.Run)
 	}
-	records, _, err := a.services.supervisor.readSessionRecords(context.Background(), row.SessionID)
+	records, _, _, err := a.services.supervisor.readSessionRecords(context.Background(), row.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}

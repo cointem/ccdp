@@ -285,7 +285,7 @@ func TestDefaultPromptBudget(t *testing.T) {
 				}
 			}
 			if cost := estimateToolsTokens(req.Tools) + llm.EstimateTokens(sys) + runtimeTokens; cost > 8000 {
-				t.Fatalf("default prompt grew beyond 8000 estimated tokens: %d", cost)
+				t.Errorf("default prompt grew beyond 8000 estimated tokens: %d", cost)
 			}
 			t.Logf("initial_runtime_est_tokens=%d total_input_budget=%+v", runtimeTokens, llm.EstimateRequestBudget(req, 0))
 			extra := 0
